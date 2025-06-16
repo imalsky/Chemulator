@@ -1,0 +1,19 @@
+# Ignore everything inside the data folder
+data/*
+!data/.gitkeep
+
+# Ignore everything inside the figures folder
+figures/*
+!figures/.gitkeep
+
+plots/*
+plots/
+
+# Exclude older code that I want to keep just in case
+old_code/
+
+old/*
+old/
+
+
+tuning_results/
