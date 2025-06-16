@@ -46,13 +46,14 @@ def _suggest_hyperparams(trial: Trial, base_cfg: Dict[str, Any]) -> Dict[str, An
     return cfg
 
 def run_hyperparameter_search(
-    base_config: Dict[str, Any], data_dir_root: Path,
-    dataset_and_collate: Tuple[Any, Callable],
-    train_model_func: Callable[[optuna.Trial, Dict[str, Any], Any, Any, Any, Path], float],
-    setup_device_func: Callable[[], Any], save_config_func: Callable[[Dict[str, Any], Path], bool],
+    base_config: Dict[str, Any], 
+    data_dir_root: Path,
+    norm_data_dir: Path,
+    train_model_func: Callable[[optuna.Trial, Dict[str, Any], Any, Path, Path], float],
+    setup_device_func: Callable[[], Any], 
+    save_config_func: Callable[[Dict[str, Any], Path], bool],
 ) -> Optional[Dict[str, Any]]:
     """Executes the Optuna hyperparameter search process for the MLP model."""
-    dataset, collate_fn = dataset_and_collate
 
     def objective(trial: Trial) -> float:
         trial_cfg = _suggest_hyperparams(trial, base_config)
@@ -62,13 +63,14 @@ def run_hyperparameter_search(
         trial_dir = tuning_dir / f"trial_{trial.number}"
 
         try:
-            return train_model_func(trial, trial_cfg, device, dataset, collate_fn, trial_dir)
+            # The train function now takes the data directory and handles its own dataset creation.
+            return train_model_func(trial, trial_cfg, device, norm_data_dir, trial_dir)
         except Exception as e:
             logger.error(f"Trial {trial.number} failed critically: {e}", exc_info=True)
             raise TrialPruned("Training function raised a critical error.") from e
 
     optuna_cfg = base_config.get("optuna_settings", {})
-    study_name = optuna_cfg.get("study_name", "mlp-arch-tuning") # Updated name
+    study_name = optuna_cfg.get("study_name", "mlp-arch-tuning")
     output_folder = data_dir_root / base_config["output_paths_config"]["tuning_results_foldername"]
     output_folder.mkdir(parents=True, exist_ok=True)
     storage_path = output_folder / f"{study_name}.db"
