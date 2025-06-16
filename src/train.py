@@ -91,6 +91,7 @@ class ModelTrainer:
         self.use_amp = bool(self.cfg.get("use_amp") and device.type == "cuda")
         self.scaler = GradScaler(enabled=self.use_amp)
         if self.use_amp: logger.info("Automatic Mixed Precision (AMP) enabled.")
+        
         self.criterion = nn.MSELoss()
         self.max_grad_norm = self.cfg.get("gradient_clip_val", 1.0)
         self.log_path = self.save_dir / "training_log.csv"
