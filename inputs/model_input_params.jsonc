@@ -34,20 +34,20 @@
   "normalization": {
     "key_methods": { "T": "standard", "t_time": "log-min-max" },
     "default_method": "log-min-max",
-    "epsilon": 1e-9
+    "epsilon": 0
   },
 
   // ════════════════════════════════════════════════════════════════
   // MODEL HYPER-PARAMETERS (FOR MLP)
   // ════════════════════════════════════════════════════════════════
-  "hidden_dims": [256, 512, 512, 256],
-  "dropout": 0.1,
+  "hidden_dims": [256, 512, 256],
+  "dropout": 0.05,
 
   // ════════════════════════════════════════════════════════════════
   // TRAINING HYPER-PARAMETERS
   // ════════════════════════════════════════════════════════════════
-  "batch_size": 16,
-  "epochs": 100,
+  "batch_size": 1024,
+  "epochs": 500,
   "learning_rate": 1e-4,
   "optimizer": "adamw",
   "weight_decay": 1e-5,
