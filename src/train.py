@@ -26,25 +26,63 @@ from utils import save_json
 
 logger = logging.getLogger(__name__)
 
-def _split_dataset(dataset: ChemicalDataset, val_frac: float, test_frac: float, *, seed: int = 42) -> Tuple[Subset, Subset, Subset, List[str]]:
-    n = len(dataset)
+def _split_profiles(
+    data_dir: Path, val_frac: float, test_frac: float, seed: int
+) -> Tuple[List[Path], List[Path], List[Path]]:
+    """
+    Discovers and splits profile files into train, validation, and test sets.
+    This method is crucial for preventing data leakage by ensuring that all
+    time-points from a single profile belong to only one set.
+    """
+    profiles = sorted([p for p in data_dir.glob("*.json") if p.name != "normalization_metadata.json"])
+    if not profiles:
+        raise FileNotFoundError(f"No profiles found in {data_dir} to split.")
+
+    n = len(profiles)
     indices = torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
-    num_val, num_test = int(n * val_frac), int(n * test_frac)
-    test_indices, val_indices = indices[:num_test], indices[num_test:num_test+num_val]
-    train_indices = indices[num_test+num_val:]
-    logger.info(f"Dataset split: {len(train_indices)} train / {len(val_indices)} val / {len(test_indices)} test.")
-    # Return the test filenames as well
-    test_filenames = dataset.get_profile_filenames_by_indices(test_indices)
-    return Subset(dataset, train_indices), Subset(dataset, val_indices), Subset(dataset, test_indices), test_filenames
+    
+    num_val = int(n * val_frac)
+    num_test = int(n * test_frac)
+    
+    test_indices = indices[:num_test]
+    val_indices = indices[num_test : num_test + num_val]
+    train_indices = indices[num_test + num_val :]
+
+    train_paths = [profiles[i] for i in train_indices]
+    val_paths = [profiles[i] for i in val_indices]
+    test_paths = [profiles[i] for i in test_indices]
+
+    logger.info(f"Profiles split: {len(train_paths)} train / {len(val_paths)} val / {len(test_paths)} test.")
+    return train_paths, val_paths, test_paths
 
 class ModelTrainer:
-    def __init__(self, config: Dict[str, Any], device: torch.device, save_dir: Path, dataset: ChemicalDataset, collate_fn: Callable, *, optuna_trial: Optional[optuna.Trial] = None):
+    def __init__(
+        self, 
+        config: Dict[str, Any], 
+        device: torch.device, 
+        save_dir: Path, 
+        data_dir: Path,
+        collate_fn: Callable, 
+        *, 
+        optuna_trial: Optional[optuna.Trial] = None
+    ):
         self.cfg, self.device, self.save_dir, self.optuna_trial = config, device, save_dir, optuna_trial
         
-        # FIX: Capture test_filenames from the split
-        (self.train_ds, self.val_ds, self.test_ds, self.test_filenames) = _split_dataset(
-            dataset, self.cfg["val_frac"], self.cfg["test_frac"], seed=self.cfg.get("random_seed", 42)
+        # Robustly split data by profile files to prevent leakage
+        train_paths, val_paths, test_paths = _split_profiles(
+            data_dir, self.cfg["val_frac"], self.cfg["test_frac"], seed=self.cfg.get("random_seed", 42)
         )
+        self.test_filenames = [p.name for p in test_paths]
+        
+        # Create separate dataset instances for each split
+        dataset_args = {
+            "data_folder": data_dir,
+            "species_variables": self.cfg["species_variables"],
+            "global_variables": self.cfg["global_variables"],
+        }
+        self.train_ds = ChemicalDataset(**dataset_args, profile_paths=train_paths)
+        self.val_ds = ChemicalDataset(**dataset_args, profile_paths=val_paths)
+        self.test_ds = ChemicalDataset(**dataset_args, profile_paths=test_paths)
         
         self._build_dataloaders(collate_fn)
         self._build_model()
@@ -59,13 +97,14 @@ class ModelTrainer:
         self.log_path.write_text("epoch,train_loss,val_loss,lr,time_s\n")
         self.best_val_loss = float("inf")
         
-        # FIX: Save the test set info upon initialization
         self._save_test_set_info()
 
     def _build_dataloaders(self, collate_fn: Callable) -> None:
         hw_settings = configure_dataloader_settings()
         num_workers = 4 if self.device.type == 'cuda' else 0
         dl_args = dict(batch_size=self.cfg["batch_size"], num_workers=num_workers, pin_memory=hw_settings.get("pin_memory", False), persistent_workers=hw_settings.get("persistent_workers", False) and num_workers > 0, collate_fn=collate_fn)
+        # We shuffle the DataLoader, which now shuffles the flattened time-points.
+        # This is the desired behavior for stochastic gradient descent.
         self.train_loader = DataLoader(self.train_ds, shuffle=True, **dl_args)
         self.val_loader = DataLoader(self.val_ds, shuffle=False, **dl_args)
         self.test_loader = DataLoader(self.test_ds, shuffle=False, **dl_args)
@@ -173,9 +212,6 @@ class ModelTrainer:
         jit_save_path = self.save_dir / (Path(filename).stem + "_jit.pt")
         try:
             torch.jit.script(model_to_save).save(str(jit_save_path))
-            if not final:
-                pass
-                #logger.info(f"Saved new best checkpoint and JIT model to {self.save_dir}")
         except Exception as e:
             logger.error(f"Failed to JIT-save model: {e}")
 

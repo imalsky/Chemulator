@@ -70,33 +70,21 @@ def _validate_parameter(
 
 def validate_config(config: Dict[str, Any]) -> None:
     """
-    Validates the configuration dictionary. It checks for common parameters
-    and then conditionally validates model-specific hyperparameters.
+    Validates the configuration dictionary for the MLP model.
     """
-    # Common parameters for all models
+    # Common parameters
     _validate_parameter(config, "species_variables", list, required=True, non_empty=True)
     _validate_parameter(config, "global_variables", list, required=True) # Can be empty
     _validate_parameter(config, "all_variables", list, required=True, non_empty=True)
     
+    # MLP-specific parameters
+    _validate_parameter(config, "hidden_dims", list, required=True, non_empty=True)
+    
+    # Dropout validation
     dropout = config.get("dropout", 0.1)
     if not isinstance(dropout, (float, int)) or not (0.0 <= dropout < 1.0):
         raise ValueError("'dropout' must be a float or int in the range [0.0, 1.0).")
     config["dropout"] = float(dropout)
-
-    # --- Conditional Validation based on model type ---
-    # If "hidden_dims" is present, we assume it's an MLP config.
-    if "hidden_dims" in config:
-        _validate_parameter(config, "hidden_dims", list, required=True, non_empty=True)
-    # Otherwise, assume it's a Transformer config.
-    else:
-        d_model = _validate_parameter(config, "d_model", int, required=True, min_value=1)
-        nhead = _validate_parameter(config, "nhead", int, required=True, min_value=1)
-        if d_model % nhead != 0:
-            raise ValueError(f"'d_model' ({d_model}) must be divisible by 'nhead' ({nhead}).")
-        _validate_parameter(config, "num_encoder_layers", int, required=True, min_value=1)
-        _validate_parameter(config, "num_query_layers", int, required=True, min_value=1)
-        _validate_parameter(config, "dim_feedforward", int, required=True, min_value=1)
-        _validate_parameter(config, "max_sequence_length", int, required=True, min_value=1)
 
 def ensure_dirs(*paths: Union[str, Path]) -> bool:
     try:
@@ -130,4 +118,4 @@ def seed_everything(seed: int = 42) -> None:
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
     logger.info(f"Global random seed set to {seed}.")
 
-__all__ = ["setup_logging", "load_config", "validate_config", "ensure_dirs", "save_json", "seed_everything"]
+__all__ = ["setup_logging", "load__config", "validate_config", "ensure_dirs", "save_json", "seed_everything"]

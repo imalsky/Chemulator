@@ -126,7 +126,14 @@ class DataNormalizer:
         metadata: Dict[str, Any],
         var_name: str,
     ) -> Union[Tensor, List[float], float]:
-        """Inverts the normalization for a given variable."""
+        """
+        Inverts the normalization for a given variable.
+        This is a static method because it's a pure utility function that
+        doesn't depend on the state of a DataNormalizer instance. It can be
+        called directly as `DataNormalizer.denormalize(...)` in other parts
+        of the application (e.g., an inference script) as long as the
+        `normalization_metadata.json` file is loaded.
+        """
         method = metadata["normalization_methods"][var_name]
         stats = metadata["per_key_stats"][var_name]
         
