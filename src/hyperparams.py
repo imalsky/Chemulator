@@ -2,7 +2,7 @@
 """
 hyperparams.py – Optuna-based hyperparameter tuning for the MLP model.
 This version is driven dynamically by a descriptive search space in the
-configuration file.
+configuration file and safely handles commented-out parameters.
 """
 from __future__ import annotations
 
@@ -21,62 +21,65 @@ def _suggest_hyperparams(trial: Trial, base_cfg: Dict[str, Any]) -> Dict[str, An
     """
     Creates a new trial-specific configuration by suggesting hyperparameters
     based on the descriptive search space defined in the config file.
+    If a parameter is not in the search space, its default value from base_cfg is used.
     """
     cfg = copy.deepcopy(base_cfg)
-    search_space = cfg["optuna_hyperparam_search_space"]
+    search_space = cfg.get("optuna_hyperparam_search_space", {})
 
     # --- 1. Special Case: Network Architecture ---
-    arch_space = search_space["architecture"]
-    num_layers_config = arch_space["num_hidden_layers"]
-    hidden_dim_config = arch_space["hidden_dim"]
-    
-    num_layers = trial.suggest_int("num_hidden_layers", num_layers_config["low"], num_layers_config["high"])
-    
-    hidden_dims = [
-        trial.suggest_categorical(f"hidden_dim_l{i+1}", hidden_dim_config["choices"])
-        for i in range(num_layers)
-    ]
-    cfg["hidden_dims"] = hidden_dims
+    if "architecture" in search_space:
+        arch_space = search_space["architecture"]
+        if "num_hidden_layers" in arch_space and "hidden_dim" in arch_space:
+            num_layers_config = arch_space["num_hidden_layers"]
+            hidden_dim_config = arch_space["hidden_dim"]
+            num_layers = trial.suggest_int("num_hidden_layers", num_layers_config["low"], num_layers_config["high"])
+            hidden_dims = [
+                trial.suggest_categorical(f"hidden_dim_l{i+1}", hidden_dim_config["choices"])
+                for i in range(num_layers)
+            ]
+            cfg["hidden_dims"] = hidden_dims
 
     # --- 2. Generic Loop for Independent Hyperparameters ---
-    generic_params = search_space["hyperparameters"]
-    for name, params in generic_params.items():
-        param_type = params["type"]
-        if param_type == "float":
-            is_log = params.get("log", False)
-            cfg[name] = trial.suggest_float(name, params["low"], params["high"], log=is_log)
-        elif param_type == "int":
-            cfg[name] = trial.suggest_int(name, params["low"], params["high"])
-        elif param_type == "categorical":
-            cfg[name] = trial.suggest_categorical(name, params["choices"])
+    if "hyperparameters" in search_space:
+        generic_params = search_space["hyperparameters"]
+        for name, params in generic_params.items():
+            param_type = params["type"]
+            if param_type == "float":
+                is_log = params.get("log", False)
+                cfg[name] = trial.suggest_float(name, params["low"], params["high"], log=is_log)
+            elif param_type == "int":
+                cfg[name] = trial.suggest_int(name, params["low"], params["high"])
+            elif param_type == "categorical":
+                cfg[name] = trial.suggest_categorical(name, params["choices"])
 
     # --- 3. Explicit Handling for Conditional Hyperparameters ---
-    cond_params = search_space["conditional_hyperparameters"]
-    
-    # ============================ CHANGE: START ============================
-    # If time embedding is used, suggest its dimension.
-    if cfg["use_time_embedding"]:
-        time_emb_config = cond_params["time_embedding_dim"]
-        cfg["time_embedding_dim"] = trial.suggest_categorical("time_embedding_dim", time_emb_config["choices"])
-    # ============================= CHANGE: END =============================
-    
-    # If loss is 'huber', suggest a delta.
-    if cfg["loss_function"] == "huber":
-        huber_config = cond_params["huber_delta"]
-        cfg["huber_delta"] = trial.suggest_float("huber_delta", huber_config["low"], huber_config["high"])
+    if "conditional_hyperparameters" in search_space:
+        cond_params = search_space["conditional_hyperparameters"]
         
-    # If scheduler is 'plateau', suggest its specific parameters.
-    if cfg["scheduler_choice"] == "plateau":
-        patience_config = cond_params["lr_patience"]
-        factor_config = cond_params["lr_factor"]
-        cfg["lr_patience"] = trial.suggest_int("lr_patience", patience_config["low"], patience_config["high"])
-        cfg["lr_factor"] = trial.suggest_float("lr_factor", factor_config["low"], factor_config["high"])
+        # If using time embedding AND its dimension is specified in the search space
+        if cfg.get("use_time_embedding") and "time_embedding_dim" in cond_params:
+            time_emb_config = cond_params["time_embedding_dim"]
+            cfg["time_embedding_dim"] = trial.suggest_categorical("time_embedding_dim", time_emb_config["choices"])
         
-    # If scheduler is 'cosine', suggest its specific parameters.
-    elif cfg["scheduler_choice"] == "cosine":
-        cosine_config = cond_params["cosine_T_0"]
-        cfg["cosine_T_0"] = trial.suggest_int("cosine_T_0", cosine_config["low"], cosine_config["high"])
-        
+        # If loss is 'huber' AND its delta is specified in the search space
+        if cfg.get("loss_function") == "huber" and "huber_delta" in cond_params:
+            huber_config = cond_params["huber_delta"]
+            cfg["huber_delta"] = trial.suggest_float("huber_delta", huber_config["low"], huber_config["high"])
+            
+        # If scheduler is 'plateau' AND its params are in the search space
+        if cfg.get("scheduler_choice") == "plateau":
+            if "lr_patience" in cond_params:
+                patience_config = cond_params["lr_patience"]
+                cfg["lr_patience"] = trial.suggest_int("lr_patience", patience_config["low"], patience_config["high"])
+            if "lr_factor" in cond_params:
+                factor_config = cond_params["lr_factor"]
+                cfg["lr_factor"] = trial.suggest_float("lr_factor", factor_config["low"], factor_config["high"])
+            
+        # If scheduler is 'cosine' AND its param is in the search space
+        elif cfg.get("scheduler_choice") == "cosine" and "cosine_T_0" in cond_params:
+            cosine_config = cond_params["cosine_T_0"]
+            cfg["cosine_T_0"] = trial.suggest_int("cosine_T_0", cosine_config["low"], cosine_config["high"])
+            
     return cfg
 
 def run_hyperparameter_search(
