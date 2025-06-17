@@ -1,4 +1,10 @@
-// Configuration for the State-Evolution Predictor (MLP)
+// ========================================================================
+// ==      COMPLETE & DYNAMIC CONFIG FOR HYPERPARAMETER TUNING         ==
+// ========================================================================
+//
+// This version uses a descriptive search space. The hyperparams.py script
+// reads this structure to dynamically build the tuning trial.
+//
 {
   // ════════════════════════════════════════════════════════════════
   // DATA AND OUTPUT PATHS CONFIGURATION
@@ -22,9 +28,8 @@
   ],
   "global_variables": ["P", "T"],
   "all_variables": [
-      "P", "T", "t_time",
-      "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
-      "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
+      "P", "T", "t_time", "C2H2_evolution", "CH4_evolution", "CO2_evolution", 
+      "CO_evolution", "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
   ],
 
@@ -32,39 +37,78 @@
   // NORMALISATION SETTINGS
   // ════════════════════════════════════════════════════════════════
   "normalization": {
-    "key_methods": { "T": "standard", "t_time": "log-min-max" },
+    "key_methods": {"T": "standard", "t_time": "log-min-max"},
     "default_method": "log-min-max",
     "epsilon": 0
   },
 
   // ════════════════════════════════════════════════════════════════
-  // MODEL HYPER-PARAMETERS (FOR MLP)
+  // BASE PARAMETERS (DEFAULTS FOR --train)
   // ════════════════════════════════════════════════════════════════
-  "hidden_dims": [256, 512, 256],
+  "hidden_dims": [256, 256],
   "dropout": 0.05,
+  "use_time_embedding": true,
+  "time_embedding_dim": 16,
+  "use_residual": true,
+  "output_activation": "sigmoid",
+  "batch_size": 512,
+  "epochs": 100,
+  "learning_rate": 1e-4,
+  "weight_decay": 1e-4,
+  "gradient_clip_val": 1.0,
+  "loss_function": "huber",
+  "huber_delta": 0.1,
+  "optimizer": "adamw",
+  "scheduler_choice": "plateau",
+  "lr_patience": 5,
+  "lr_factor": 0.5,
 
   // ════════════════════════════════════════════════════════════════
-  // TRAINING HYPER-PARAMETERS
+  // OPTUNA HYPERPARAMETER SEARCH SETTINGS
   // ════════════════════════════════════════════════════════════════
-  "batch_size": 1024,
-  "epochs": 500,
-  "learning_rate": 1e-4,
-  "optimizer": "adamw",
-  "weight_decay": 1e-5,
-  "gradient_clip_val": 1.0,
-  "early_stopping_patience": 15,
-  "min_delta": 1e-6,
-  "lr_patience": 3,
-  "lr_factor": 0.5,
-  "min_lr": 1e-7,
+  "optuna_settings": {
+    "study_name": "mlp-dynamic-search-v2-time-emb",
+    "num_trials": 500
+  },
   
+  "optuna_hyperparam_search_space": {
+    // --- Special Case: Architecture (handled explicitly in hyperparams.py) ---
+    "architecture": {
+        "num_hidden_layers": {"type": "int", "low": 2, "high": 6},
+        "hidden_dim": {"type": "categorical", "choices": [64, 128, 256, 512, 768, 1024]}
+    },
+    
+    // --- Generic Search Space (dynamically processed) ---
+    "hyperparameters": {
+        "dropout": {"type": "float", "low": 0.0, "high": 0.2},
+        "use_time_embedding": {"type": "categorical", "choices": [true, false]},
+        "output_activation": {"type": "categorical", "choices": ["sigmoid", "softplus", "identity"]},
+        //"batch_size": {"type": "categorical", "choices": [256, 512, 1024]},
+        //"optimizer": {"type": "categorical", "choices": ["adamw", "adam", "rmsprop"]},
+        //"learning_rate": {"type": "float", "low": 5e-6, "high": 5e-4, "log": true},
+        "weight_decay": {"type": "float", "low": 1e-7, "high": 1e-2, "log": true},
+        "loss_function": {"type": "categorical", "choices": ["huber", "mse"]},
+        //"scheduler_choice": {"type": "categorical", "choices": ["plateau", "cosine"]},
+        //"gradient_clip_val": {"type": "float", "low": 0.5, "high": 5.0}
+    },
+
+    // --- Conditional Search Space (handled explicitly after the generic loop) ---
+    "conditional_hyperparameters": {
+        "time_embedding_dim": {"type": "categorical", "choices": [32, 128]}, 
+        //"huber_delta": {"type": "float", "low": 0.05, "high": 0.5},
+        //"lr_patience": {"type": "int", "low": 3, "high": 15},
+        //"lr_factor": {"type": "float", "low": 0.1, "high": 0.5},
+        //"cosine_T_0": {"type": "int", "low": 10, "high": 50}
+    }
+  },
+
   // ════════════════════════════════════════════════════════════════
-  // MISCELLANEOUS
+  // MISCELLANEOUS / SYSTEM SETTINGS
   // ════════════════════════════════════════════════════════════════
   "val_frac": 0.15,
   "test_frac": 0.15,
   "random_seed": 42,
-  "validate_profiles": false,
   "use_amp": true,
-  "use_torch_compile": true
+  "use_torch_compile": true,
+  "show_epoch_progress": false
 }
