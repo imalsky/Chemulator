@@ -103,7 +103,6 @@ class ModelTrainer:
         self._build_dataloaders(collate_fn)
         self._build_model()
         self._build_optimiser()
-        self._build_scheduler()
         
         self.use_amp = bool(self.cfg.get("use_amp") and device.type == "cuda")
         self.scaler = GradScaler(enabled=self.use_amp)
@@ -128,11 +127,14 @@ class ModelTrainer:
         self.accumulation_steps = self.cfg.get("gradient_accumulation_steps", 1)
         self.warmup_epochs = self.cfg.get("warmup_epochs", 5)
         self.initial_lr = self.optimizer.param_groups[0]['lr']
+        self.min_delta = self.cfg.get("min_delta", 1e-10)
+
+        # Build scheduler after its dependencies (optimizer, min_delta) are set
+        self._build_scheduler()
         
         self.log_path = self.save_dir / "training_log.csv"
         self.log_path.write_text("epoch,train_loss,val_loss,lr,time_s,grad_norm\n")
         self.best_val_loss = float("inf")
-        self.min_delta = self.cfg.get("min_delta", 1e-10)
 
         self._save_test_set_info()
 
