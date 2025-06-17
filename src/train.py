@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/b-in/env python3
 """
 train.py - Main training script for the State-Evolution Predictor.
 This version dynamically creates components based on the configuration.
@@ -55,6 +55,13 @@ def _split_profiles(
     return train_paths, val_paths, test_paths
 
 class ModelTrainer:
+    """
+    Manages the entire training, validation, and testing pipeline for a model.
+
+    This class encapsulates all the components required for a training run,
+    including data loading, model building, optimization, and logging. It is
+    driven by a configuration dictionary.
+    """
     def __init__(
         self, 
         config: Dict[str, Any], 
@@ -65,6 +72,17 @@ class ModelTrainer:
         *, 
         optuna_trial: Optional[optuna.Trial] = None
     ):
+        """
+        Initializes the ModelTrainer.
+
+        Args:
+            config (Dict[str, Any]): The configuration dictionary for the run.
+            device (torch.device): The device (CPU or CUDA) to run on.
+            save_dir (Path): The directory to save logs, models, and results.
+            data_dir (Path): The directory containing the normalized dataset.
+            collate_fn (Callable): The function to collate data into batches.
+            optuna_trial (Optional[optuna.Trial]): An Optuna trial object for hyperparameter tuning.
+        """
         self.cfg, self.device, self.save_dir, self.optuna_trial = config, device, save_dir, optuna_trial
         
         train_paths, val_paths, test_paths = _split_profiles(
@@ -91,7 +109,6 @@ class ModelTrainer:
         self.scaler = GradScaler(enabled=self.use_amp)
         if self.use_amp: logger.info("Automatic Mixed Precision (AMP) enabled.")
         
-        # === DYNAMIC LOSS FUNCTION ===
         loss_function_name = self.cfg.get("loss_function", "huber").lower()
         if loss_function_name == "huber":
             delta = self.cfg.get("huber_delta", 0.1)
@@ -106,10 +123,8 @@ class ModelTrainer:
         else:
             raise ValueError(f"Unsupported loss function: '{loss_function_name}'")
 
-        # === DYNAMIC GRADIENT CLIPPING ===
         self.max_grad_norm = self.cfg.get("gradient_clip_val", 1.0)
         self.non_finite_grad_threshold = self.cfg.get("non_finite_grad_threshold", 10)
-        
         self.accumulation_steps = self.cfg.get("gradient_accumulation_steps", 1)
         self.warmup_epochs = self.cfg.get("warmup_epochs", 5)
         self.initial_lr = self.optimizer.param_groups[0]['lr']
@@ -117,10 +132,12 @@ class ModelTrainer:
         self.log_path = self.save_dir / "training_log.csv"
         self.log_path.write_text("epoch,train_loss,val_loss,lr,time_s,grad_norm\n")
         self.best_val_loss = float("inf")
-        
+        self.min_delta = self.cfg.get("min_delta", 1e-10)
+
         self._save_test_set_info()
 
     def _build_dataloaders(self, collate_fn: Callable) -> None:
+        """Configures and creates DataLoaders for train, validation, and test sets."""
         hw_settings = configure_dataloader_settings()
         num_workers = self.cfg.get("num_workers", 4 if self.device.type == 'cuda' else 0)
         
@@ -138,6 +155,7 @@ class ModelTrainer:
         logger.info(f"DataLoaders created with batch_size={self.cfg['batch_size']}, num_workers={num_workers}")
 
     def _build_model(self) -> None:
+        """Builds the prediction model based on the configuration."""
         self.model = create_prediction_model(self.cfg, self.device)
         if self.cfg.get("use_torch_compile") and self.device.type == "cuda":
             logger.info("Compiling model with torch.compile()...")
@@ -145,6 +163,7 @@ class ModelTrainer:
         logger.info(f"Model built with {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,} trainable parameters.")
 
     def _build_optimiser(self) -> None:
+        """Builds the optimizer (e.g., AdamW) based on the configuration."""
         optimizer_name = self.cfg.get("optimizer", "adamw").lower()
         lr = self.cfg["learning_rate"]
         weight_decay = self.cfg.get("weight_decay", 0.01)
@@ -161,6 +180,7 @@ class ModelTrainer:
         logger.info(f"Using {optimizer_name.upper()} optimizer with lr={lr:.2e}, weight_decay={weight_decay:.2e}")
 
     def _build_scheduler(self) -> None:
+        """Builds the learning rate scheduler (e.g., ReduceLROnPlateau)."""
         scheduler_name = self.cfg.get("scheduler_choice", "plateau").lower()
         
         if scheduler_name == "plateau":
@@ -168,7 +188,9 @@ class ModelTrainer:
                 self.optimizer, 'min', 
                 factor=self.cfg.get("lr_factor", 0.5),
                 patience=self.cfg.get("lr_patience", 10),
-                min_lr=self.cfg.get("min_lr", 1e-7)
+                min_lr=self.cfg.get("min_lr", 1e-7),
+                threshold=self.min_delta, # Use min_delta from config
+                threshold_mode='abs'      # Use absolute difference for comparison
             )
             logger.info("Using ReduceLROnPlateau scheduler.")
         elif scheduler_name == "cosine":
@@ -182,12 +204,29 @@ class ModelTrainer:
             raise ValueError(f"Unsupported scheduler: '{scheduler_name}'")
 
     def _warmup_lr(self, epoch: int) -> None:
+        """
+        Linearly warms up the learning rate for the initial epochs.
+        
+        Args:
+            epoch (int): The current epoch number (1-based).
+        """
         if epoch <= self.warmup_epochs:
             warmup_factor = epoch / self.warmup_epochs
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = self.initial_lr * warmup_factor
 
     def _run_epoch(self, loader: DataLoader, train_phase: bool) -> Tuple[float, float]:
+        """
+        Runs a single epoch of training or validation.
+
+        Args:
+            loader (DataLoader): The DataLoader for the current phase.
+            train_phase (bool): True if in training mode, False for validation.
+
+        Returns:
+            Tuple[float, float]: A tuple containing the average loss and average gradient norm.
+                                 Gradient norm is 0 for the validation phase.
+        """
         self.model.train(train_phase)
         total_loss, total_grad_norm, batch_count, non_finite_batch_count = 0.0, 0.0, 0, 0
         
@@ -244,7 +283,23 @@ class ModelTrainer:
         return total_loss / len(loader), total_grad_norm / batch_count if batch_count > 0 else 0.0
 
     def train(self) -> float:
-        epochs_without_improvement, final_epoch = 0, 0
+        """
+        Executes the main training loop over all epochs.
+
+        This method handles:
+        - Iterating through epochs.
+        - Calling the training and validation epoch runs.
+        - Stepping the learning rate scheduler.
+        - Logging results to console and file.
+        - Checkpointing the best model.
+        - Handling Optuna pruning.
+        - Triggering early stopping.
+        - Running final testing after the loop.
+
+        Returns:
+            float: The best validation loss achieved during training.
+        """
+        final_epoch = 0
         for epoch in range(1, self.cfg["epochs"] + 1):
             self.current_epoch, start_time = epoch, time.time()
             if epoch <= self.warmup_epochs: self._warmup_lr(epoch)
@@ -261,13 +316,11 @@ class ModelTrainer:
             
             lr, elapsed_time = self.optimizer.param_groups[0]['lr'], time.time() - start_time
             log_message = f"Epoch {epoch:03d}/{self.cfg['epochs']} | Train Loss: {train_loss:.4e} | Val Loss: {val_loss:.4e} | Grad Norm: {train_grad_norm:.3f} | LR: {lr:.2e} | Time: {elapsed_time:.1f}s"
-
-            if val_loss < self.best_val_loss - self.cfg.get("min_delta", 1e-6):
+            
+            if val_loss < self.best_val_loss - self.min_delta:
                 log_message += " | New Best!"
-                self.best_val_loss, epochs_without_improvement = val_loss, 0
+                self.best_val_loss = val_loss
                 self._checkpoint("best_model.pt", epoch, val_loss)
-            else:
-                epochs_without_improvement += 1
             
             logger.info(log_message)
             with self.log_path.open("a", encoding="utf-8") as f:
@@ -276,11 +329,16 @@ class ModelTrainer:
             if self.optuna_trial:
                 self.optuna_trial.report(val_loss, epoch)
                 if self.optuna_trial.should_prune(): raise TrialPruned()
-
-            if epochs_without_improvement >= self.cfg.get("early_stopping_patience", 30) or val_loss < self.cfg.get("target_loss", -1):
-                if val_loss < self.cfg.get("target_loss", -1): logger.info("Target loss achieved!")
-                else: logger.info(f"Early stopping triggered at epoch {epoch}.")
+            
+            epochs_without_improvement = self.scheduler.num_bad_epochs if isinstance(self.scheduler, ReduceLROnPlateau) else 0
+            if epochs_without_improvement >= self.cfg.get("early_stopping_patience", 30):
+                logger.info(f"Early stopping triggered at epoch {epoch} after {epochs_without_improvement} epochs with no improvement.")
                 break
+            
+            if val_loss < self.cfg.get("target_loss", -1):
+                logger.info("Target loss achieved! Stopping training.")
+                break
+
             final_epoch = epoch
         
         self._checkpoint("final_model.pt", final_epoch, val_loss, final=True)
@@ -288,6 +346,19 @@ class ModelTrainer:
         return self.best_val_loss
 
     def _checkpoint(self, filename: str, epoch: int, val_loss: float, *, final: bool = False):
+        """
+        Saves a model checkpoint.
+
+        Saves both the regular PyTorch model state and a JIT-scripted version
+        for deployment.
+
+        Args:
+            filename (str): The name of the file to save the model to.
+            epoch (int): The current epoch number.
+            val_loss (float): The validation loss at this checkpoint.
+            final (bool, optional): If True, indicates this is the final model save.
+                                    Defaults to False.
+        """
         model_to_save = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
         torch.save({
             "state_dict": model_to_save.state_dict(), "epoch": epoch, "val_loss": val_loss,
@@ -299,7 +370,9 @@ class ModelTrainer:
         try:
             original_device = self.device
             model_to_save.to('cpu').eval()
-            example_input = torch.randn(1, len(self.cfg["species_variables"]) + len(self.cfg["global_variables"]) + 1, device='cpu')
+            # Create an example input based on model's expected input feature count
+            num_input_features = len(self.cfg["species_variables"]) + len(self.cfg["global_variables"]) + 1 # +1 for time
+            example_input = torch.randn(1, num_input_features, device='cpu')
             traced_model = torch.jit.trace(model_to_save, example_input)
             torch.jit.save(traced_model, str(jit_save_path))
             model_to_save.to(original_device).train()
@@ -307,6 +380,12 @@ class ModelTrainer:
             logger.error(f"Failed to JIT-save model: {e}")
 
     def test(self) -> None:
+        """
+        Evaluates the best-performing model on the test set.
+
+        Loads the checkpoint with the best validation loss and computes final
+        test metrics, saving them to a JSON file.
+        """
         best_model_path = self.save_dir / "best_model.pt"
         if not best_model_path.exists():
             logger.warning("No best model found. Testing with final model state.")
@@ -346,6 +425,7 @@ class ModelTrainer:
         save_json(test_metrics, self.save_dir / "test_metrics.json")
     
     def _save_test_set_info(self) -> None:
+        """Saves the list of filenames used in the test set to a JSON file."""
         save_json({"test_filenames": sorted(self.test_filenames)}, self.save_dir / "test_set_info.json")
         logger.info(f"Test set filenames saved to {self.save_dir / 'test_set_info.json'}")
 
