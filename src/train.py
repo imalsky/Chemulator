@@ -104,7 +104,7 @@ class ModelTrainer:
         self._build_model()
         self._build_optimiser()
         
-        self.use_amp = bool(self.cfg.get("use_amp") and device.type == "cuda")
+        self.use_amp = self.cfg.get("use_amp", False) and device.type == "cuda"
         self.scaler = GradScaler(enabled=self.use_amp)
         if self.use_amp: logger.info("Automatic Mixed Precision (AMP) enabled.")
         
