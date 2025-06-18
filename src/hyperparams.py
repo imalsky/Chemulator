@@ -113,7 +113,11 @@ def run_hyperparameter_search(
 
     optuna_cfg = base_config.get("optuna_settings", {})
     study_name = optuna_cfg.get("study_name", "mlp-dynamic-search-v1")
+    
+    # --- UPDATED: Use the correct folder name from the config ---
     output_folder = data_dir_root / base_config["output_paths_config"]["tuning_results_foldername"]
+    # --- END UPDATE ---
+    
     output_folder.mkdir(parents=True, exist_ok=True)
     storage_path = output_folder / f"{study_name}.db"
 
@@ -144,19 +148,16 @@ def run_hyperparameter_search(
     logger.info(f"  - Best Value (val_loss): {study.best_trial.value:.6f}")
     logger.info(f"  - Best Parameters: {study.best_trial.params}")
     
-    # --- Reconstruct the best configuration from the winning trial's parameters ---
     best_config = copy.deepcopy(base_config)
     
-    # Update all simple key-value hyperparameters from the best trial
     for key, value in study.best_trial.params.items():
         if not key.startswith("hidden_dim_l"):
             best_config[key] = value
 
-    # Rebuild the `hidden_dims` list from the individual layer parameters
     num_layers = study.best_trial.params.get("num_hidden_layers")
     if num_layers is not None:
         best_hidden_dims = [
-            study.best_trial.params.get(f"hidden_dim_l{i+1}")
+            study.best_trial.params[f"hidden_dim_l{i+1}"]
             for i in range(num_layers)
         ]
         best_config["hidden_dims"] = best_hidden_dims
