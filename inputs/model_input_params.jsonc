@@ -1,10 +1,10 @@
 // ========================================================================
-// ==      CONFIG FOR FNO-INSPIRED MODEL HYPERPARAMETER TUNING         ==
+// ==  CONFIG FOR A NEURAL ODE SOLVER (MLP/SIREN) HYPERPARAMETER TUNING  ==
 // ========================================================================
 //
-// This is a focused configuration for the ChemicalFNO model. It removes
-// obsolete MLP-specific keys but retains the full hyperparameter search
-// space for Optuna tuning.
+// This configuration supports both the bug-fixed MLP and the new, superior
+// SIREN architecture for learning the mapping from initial conditions to
+// the state at a future time `t`.
 //
 {
   // ════════════════════════════════════════════════════════════════
@@ -15,12 +15,12 @@
     "normalized_profiles_foldername": "clean_profiles_normalized_xi"
   },
   "output_paths_config": {
-    "fixed_model_foldername": "trained_model_final_fno",
-    "tuning_results_foldername": "tuning_runs_final_fno"
+    "fixed_model_foldername": "trained_model_siren_mlp",
+    "tuning_results_foldername": "tuning_runs_siren"
   },
 
   // ════════════════════════════════════════════════════════════════
-  // DATA SPECIFICATION (Unchanged)
+  // DATA SPECIFICATION
   // ════════════════════════════════════════════════════════════════
   "species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
@@ -34,33 +34,38 @@
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
   ],
   "normalization": {
-    "key_methods": {"T": "standard", "t_time": "log-min-max"},
-    "default_method": "log-min-max",
-    "epsilon": 1e-9
+    "key_methods": {
+        "T": "standard", 
+        "t_time": "log-min-max"
+    },
+    "default_method": "log-standard",
+    "epsilon": 1e-30
   },
 
   // ════════════════════════════════════════════════════════════════
-  // BASE PARAMETERS (Defaults for a --train run)
+  // BASE PARAMETERS (Defaults for a --train run, will be overridden by Optuna)
   // ════════════════════════════════════════════════════════════════
-  "hidden_dims": [64, 64],
-  "dropout": 0.0,
+  "model_type": "siren",
+  "hidden_dims": [256, 256, 256, 256],
+  "dropout": 0.00,
+  "use_time_embedding": true,
+  "time_embedding_dim": 64,
+  "use_residual": true,
+  "siren_w0_initial": 30.0,
+  "siren_w0_hidden": 10.0,
   "output_activation": "identity",
-  "fno_fourier_features": 32,
-  "fno_fourier_scale": 1.0,
-  "fno_spectral_modes": 8,
-  "fno_seq_length": 16,
-  "batch_size": 512,
-  "epochs": 150,
-  "learning_rate": 1e-3,
-  "weight_decay": 1e-5,
+  "batch_size": 1024,
+  "epochs": 200,
+  "learning_rate": 5e-4,
+  "weight_decay": 1e-6,
   "gradient_clip_val": 1.0,
   "loss_function": "huber",
   "huber_delta": 0.1,
   "optimizer": "adamw",
   "scheduler_choice": "cosine",
-  "lr_patience": 10,       // Used only if scheduler_choice is "plateau"
-  "lr_factor": 0.5,        // Used only if scheduler_choice is "plateau"
-  "cosine_T_0": 15,        // Used only if scheduler_choice is "cosine"
+  "lr_patience": 15,
+  "lr_factor": 0.5,
+  "cosine_T_0": 25,
   "min_delta": 1e-7,
   "early_stopping_patience": 30,
 
@@ -68,38 +73,37 @@
   // OPTUNA HYPERPARAMETER SEARCH SETTINGS
   // ════════════════════════════════════════════════════════════════
   "optuna_settings": {
-    "study_name": "fno-dynamic-search-v1",
-    "num_trials": 500
+    "study_name": "hyperparm-search",
+    "num_trials": 300
   },
   
   "optuna_hyperparam_search_space": {
-    // --- Architecture (Handled by hyperparams.py) ---
+    // --- Architecture (Applies to both MLP and SIREN) ---
     "architecture": {
-        "num_hidden_layers": {"type": "int", "low": 2, "high": 5},
-        "hidden_dim": {"type": "categorical", "choices": [128, 256, 512]}
+        "num_hidden_layers": {"type": "int", "low": 2, "high": 8},
+        "hidden_dim": {"type": "categorical", "choices": [64, 256, 512]}
     },
     
     // --- Generic Hyperparameters (Dynamically processed) ---
     "hyperparameters": {
-        "dropout": {"type": "float", "low": 0.0, "high": 0.25},
-        "output_activation": {"type": "categorical", "choices": ["identity", "softplus"]},
-        "learning_rate": {"type": "float", "low": 1e-4, "high": 2e-3, "log": true},
-        "weight_decay": {"type": "float", "low": 1e-7, "high": 1e-3, "log": true},
-        "loss_function": {"type": "categorical", "choices": ["huber", "mse"]},
-        "optimizer": {"type": "categorical", "choices": ["adamw"]},
-        "scheduler_choice": {"type": "categorical", "choices": ["plateau", "cosine"]},
-        "fno_fourier_features": {"type": "categorical", "choices": [64, 128, 256]},
-        "fno_fourier_scale": {"type": "float", "low": 0.5, "high": 5.0},
-        "fno_spectral_modes": {"type": "categorical", "choices": [8, 12, 16, 24]},
-        "fno_seq_length": {"type": "categorical", "choices": [16, 32, 64]}
+        "model_type": {"type": "categorical", "choices": ["siren", "mlp"]},
+        "dropout": {"type": "float", "low": 0.0, "high": 0.1},
+        //"learning_rate": {"type": "float", "low": 1e-4, "high": 2e-3, "log": true},
+        //"weight_decay": {"type": "float", "low": 1e-7, "high": 5e-5, "log": true},
+        //"loss_function": {"type": "categorical", "choices": ["huber", "mse"]},
+        //"optimizer": {"type": "categorical", "choices": ["adamw"]},
+        //"scheduler_choice": {"type": "categorical", "choices": ["cosine", "plateau"]},
+        "siren_w0_initial": {"type": "float", "low": 10.0, "high": 50.0},
+        "siren_w0_hidden": {"type": "categorical", "choices": [1.0, 5.0, 10.0, 30.0]}
     },
 
     // --- Conditional Hyperparameters (Handled by hyperparams.py) ---
     "conditional_hyperparameters": {
-        "huber_delta": {"type": "float", "low": 0.05, "high": 0.5},
-        "lr_patience": {"type": "int", "low": 5, "high": 15},
-        "lr_factor": {"type": "float", "low": 0.1, "high": 0.5},
-        "cosine_T_0": {"type": "int", "low": 10, "high": 40}
+        "time_embedding_dim": {"type": "categorical", "choices": [16, 64, 128]},
+        //"huber_delta": {"type": "float", "low": 0.05, "high": 0.2},
+        //"lr_patience": {"type": "int", "low": 8, "high": 20},
+        //"lr_factor": {"type": "float", "low": 0.1, "high": 0.5},
+        //"cosine_T_0": {"type": "int", "low": 15, "high": 40}
     }
   },
 

@@ -73,6 +73,10 @@ def _execute_model_training(
     model_save_dir: Path
 ) -> float:
     ensure_dirs(model_save_dir)
+    # --- ADDED: Save the configuration used for this specific run ---
+    save_json(train_config, model_save_dir / "run_config.json")
+    logger.info(f"Saved run configuration to {model_save_dir / 'run_config.json'}")
+    # --- END ADDITION ---
     try:
         # The trainer now handles its own dataset creation internally.
         trainer = ModelTrainer(
@@ -134,6 +138,13 @@ def main() -> int:
     logger.info("Pipeline started with config: %s", cli_args.config.resolve())
     main_config = load_config(cli_args.config)
     if not main_config: return 1
+    
+    # --- ADDED: Update output paths from the newly provided config ---
+    if "output_paths_config" in main_config:
+        logger.info("Applying output path configuration from file.")
+    else:
+        logger.warning("No 'output_paths_config' found in config file. Using defaults.")
+    # --- END ADDITION ---
 
     seed_everything(main_config.get("random_seed", 42))
     action_successful = False
