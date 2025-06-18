@@ -15,8 +15,8 @@
     "normalized_profiles_foldername": "clean_profiles_normalized_xi"
   },
   "output_paths_config": {
-    "fixed_model_foldername": "trained_model_siren_mlp",
-    "tuning_results_foldername": "tuning_runs_siren"
+    "fixed_model_foldername": "trained_model",
+    "tuning_results_foldername": "tuning_runs"
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -46,7 +46,7 @@
   // BASE PARAMETERS (Defaults for a --train run, will be overridden by Optuna)
   // ════════════════════════════════════════════════════════════════
   "model_type": "siren",
-  "hidden_dims": [256, 256, 256, 256],
+  "hidden_dims": [256, 512, 512, 256],
   "dropout": 0.00,
   "use_time_embedding": true,
   "time_embedding_dim": 64,
