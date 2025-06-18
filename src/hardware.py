@@ -120,10 +120,7 @@ def configure_dataloader_settings() -> Dict[str, Any]:
     selected_device_type = get_device_type()
 
     settings: Dict[str, Any] = {
-        # pin_memory is most effective with CUDA devices.
         "pin_memory": selected_device_type == "cuda",
-        # persistent_workers is also primarily for CUDA to avoid re-initializing
-        # workers between epochs. It's not supported/needed for MPS.
         "persistent_workers": selected_device_type == "cuda",
     }
 

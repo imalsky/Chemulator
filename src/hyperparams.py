@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-hyperparams.py – Optuna-based hyperparameter tuning for the MLP model.
-This version is driven dynamically by a descriptive search space in the
-configuration file and safely handles commented-out parameters.
+hyperparams.py – Optuna-based hyperparameter tuning.
 """
 from __future__ import annotations
 
 import copy
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 import optuna
 from optuna import Study, Trial
@@ -114,10 +112,7 @@ def run_hyperparameter_search(
     optuna_cfg = base_config.get("optuna_settings", {})
     study_name = optuna_cfg.get("study_name", "mlp-dynamic-search-v1")
     
-    # --- UPDATED: Use the correct folder name from the config ---
-    output_folder = data_dir_root / base_config["output_paths_config"]["tuning_results_foldername"]
-    # --- END UPDATE ---
-    
+    output_folder = data_dir_root / base_config["output_paths_config"]["tuning_results_foldername"]    
     output_folder.mkdir(parents=True, exist_ok=True)
     storage_path = output_folder / f"{study_name}.db"
 
