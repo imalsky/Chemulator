@@ -109,7 +109,6 @@
   "val_frac": 0.15,
   "test_frac": 0.15,
   "random_seed": 42,
-  "use_amp": true,
   "use_torch_compile": true,
   "show_epoch_progress": false
 }

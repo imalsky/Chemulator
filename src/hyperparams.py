@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import optuna
-from optuna import Trial
+from optuna import Study, Trial
 from optuna.exceptions import TrialPruned
+from optuna.trial import FrozenTrial
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,13 @@ def _suggest_hyperparams(trial: Trial, base_cfg: Dict[str, Any]) -> Dict[str, An
             
     return cfg
 
+def _log_best_trial_callback(study: Study, trial: FrozenTrial):
+    """Callback to log the current best trial's information after each trial."""
+    if study.best_trial:
+        logger.info(
+            f"Current best trial is #{study.best_trial.number} with value: {study.best_trial.value:.6f}"
+        )
+
 def run_hyperparameter_search(
     base_config: Dict[str, Any],
     data_dir_root: Path,
@@ -122,7 +130,8 @@ def run_hyperparameter_search(
             objective,
             n_trials=optuna_cfg.get("num_trials", 500),
             gc_after_trial=True,
-            show_progress_bar=True
+            show_progress_bar=True,
+            callbacks=[_log_best_trial_callback]
         )
     except KeyboardInterrupt:
         logger.warning("Optuna search interrupted by user.")
