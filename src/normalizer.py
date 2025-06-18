@@ -32,7 +32,7 @@ def welford_finalize(existing_aggregate: WelfordState) -> Tuple[float, float]:
     """Finalizes Welford's algorithm to get mean and standard deviation."""
     count, mean, M2 = existing_aggregate
     if count < 2:
-        return mean, 1.0  # Return std=1 to avoid division by zero
+        return mean, 1.0
     variance = M2 / (count - 1)
     return mean, math.sqrt(variance)
 
