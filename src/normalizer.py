@@ -213,7 +213,6 @@ class DataNormalizer:
             log_val = x_clipped * (stats["max"] - stats["min"]) + stats["min"]
             y = torch.pow(10, log_val)
         else:
-            # This is the line that was causing the error. Now it's a true fallback.
             raise ValueError(f"Unsupported method '{method}' for denormalization.")
 
         # Return in the original format
@@ -271,4 +270,5 @@ class DataNormalizer:
                 
         logger.info(f"Profile processing complete. Successfully processed: {processed_count}, Errors/Skipped: {error_count}")
 
-__all__ = ["DataNormalizer"]
+
+__all__ = ["DataNormalizer", "denormalize"]

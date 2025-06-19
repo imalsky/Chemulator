@@ -39,8 +39,13 @@ class TimeEmbedding(nn.Module):
         
         device = t.device
         half_dim = self.dim // 2
+        
+        if half_dim == 0:
+            return torch.zeros(t.shape[0], self.dim, device=device)
+
+        denominator = half_dim - 1 if half_dim > 1 else 1.0
         inv_freq = 1.0 / (
-            10000 ** (torch.arange(0, half_dim, device=device).float() / half_dim)
+            10000 ** (torch.arange(0, half_dim, device=device).float() / denominator)
         )
         
         emb = t * inv_freq
@@ -183,6 +188,8 @@ class SineLayer(nn.Module):
                 bound = 1.0 / self.linear.in_features
                 self.linear.weight.uniform_(-bound, bound)
             else:
+                # This initialization is crucial for SIREN's performance.
+                # It depends on omega_0.
                 bound = math.sqrt(6.0 / self.linear.in_features) / self.omega_0
                 self.linear.weight.uniform_(-bound, bound)
 
@@ -252,9 +259,7 @@ class FiLM_MLP(nn.Module):
         self.output_norm = nn.LayerNorm(hidden_dims[-1])
         self.output_proj = nn.Linear(hidden_dims[-1], num_species)
         
-        self.output_act: nn.Module = (
-            nn.Identity() if output_activation != "tanh" else nn.Tanh()
-        )
+        self.output_act: nn.Module = (nn.Identity() if output_activation != "tanh" else nn.Tanh())
 
     def forward(self, x: Tensor) -> Tensor:
         initial_species = x[..., :self.num_species]
@@ -279,6 +284,8 @@ class FiLM_MLP(nn.Module):
         hidden = self.mlp_body(hidden)
         hidden = self.output_norm(hidden)
         delta = self.output_proj(hidden)
+        
+        # Applying the configured output activation (e.g., tanh) to the delta
         delta = self.output_act(delta)
         
         return initial_species + delta
@@ -327,20 +334,21 @@ class FiLM_SIREN(nn.Module):
         current_dim = hidden_dims[0]
         
         for i, dim in enumerate(hidden_dims):
+            # The omega_0 value for each layer is critical. 
+            # The config change to "siren_w0_hidden": 30.0 will be passed here.
+            current_omega = w0_initial if i == 0 else w0_hidden
             siren_layers.append(SineLayer(
                 current_dim, 
                 dim, 
                 is_first=(i == 0), 
-                omega_0=(w0_initial if i == 0 else w0_hidden)
+                omega_0=current_omega
             ))
             current_dim = dim
         
         self.net = nn.Sequential(*siren_layers)
         self.output_linear = nn.Linear(current_dim, num_species)
         
-        self.output_act: nn.Module = (
-            nn.Identity() if output_activation != "tanh" else nn.Tanh()
-        )
+        self.output_act: nn.Module = (nn.Identity() if output_activation != "tanh" else nn.Tanh())
 
     def forward(self, x: Tensor) -> Tensor:
         initial_species = x[..., :self.num_species]
@@ -364,6 +372,8 @@ class FiLM_SIREN(nn.Module):
         coords = self.film_layer(coords, condition_vector)
         coords = self.net(coords)
         delta = self.output_linear(coords)
+
+        # Applying the configured output activation (e.g., tanh) to the delta
         delta = self.output_act(delta)
         
         return initial_species + delta
@@ -429,9 +439,7 @@ class FiLM_FNO(nn.Module):
             nn.Linear(hidden_dims[-1] * 2, num_species)
         )
         
-        self.output_act: nn.Module = (
-            nn.Identity() if output_activation != "tanh" else nn.Tanh()
-        )
+        self.output_act: nn.Module = (nn.Identity() if output_activation != "tanh" else nn.Tanh())
 
     def forward(self, x: Tensor) -> Tensor:
         initial_species = x[..., :self.num_species]
@@ -459,6 +467,8 @@ class FiLM_FNO(nn.Module):
 
         # Final projection
         delta = self.projection(hidden)
+        
+        # Applying the configured output activation (e.g., tanh) to the delta
         delta = self.output_act(delta)
         
         return initial_species + delta
@@ -472,17 +482,15 @@ def create_prediction_model(
 ) -> nn.Module:
     """Factory function to create the appropriate model based on config."""
     model_type = config.get("model_type", "mlp").lower()
-    use_film = config.get("use_film", True)  # Default to using FiLM
+    use_film = config.get("use_film", True)
 
     logger.info(f"Creating model of type: '{model_type}' with FiLM: {use_film}")
 
-    # For now, all advanced models use FiLM. This can be expanded later.
     if not use_film:
         raise NotImplementedError(
             "Modern architectures in this file require use_film=True."
         )
 
-    # Model selection and configuration
     model_class: type[nn.Module]
     model_config: Dict[str, Any] = {}
 
@@ -503,7 +511,6 @@ def create_prediction_model(
         fno_seq_length = config.get("fno_seq_length", 32)
         fno_spectral_modes = config.get("fno_spectral_modes", 16)
         
-        # Enforce Nyquist limit
         if fno_spectral_modes > fno_seq_length // 2:
             fno_spectral_modes = fno_seq_length // 2
             logger.warning(
@@ -523,7 +530,6 @@ def create_prediction_model(
             f"Available types: {available_types}"
         )
 
-    # Common parameters for all FiLM models
     try:
         species_vars = config["species_variables"]
         global_vars = config["global_variables"]

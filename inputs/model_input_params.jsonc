@@ -1,8 +1,22 @@
-// ========================================================================
-// ==  CONFIG FOR STATE EVOLUTION PREDICTOR (MLP/SIREN/FNO w/ FiLM) TUNING   ==
-// ========================================================================
+// =========================================================================================
+// ==        CONFIGURATION FILE FOR STATE EVOLUTION PREDICTOR (MLP/SIREN/FNO)             ==
+// =========================================================================================
+// This file uses JSON5 syntax, which allows for comments.
+//
+// OVERVIEW:
+// 1. PROJECT & DATA SETUP: File paths, data splits, variable definitions, normalization.
+// 2. MODEL ARCHITECTURE:   Base settings for a fixed run (--train). Select model type here.
+// 3. TRAINING & OPTIMIZATION: Base settings for the training loop (optimizer, scheduler, etc).
+// 4. HYPERPARAMETER TUNING: Search space definitions for an Optuna run (--tune).
+//
+// =========================================================================================
+
 {
-  // ... (Data and Output paths remain the same)
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  // │ 1. PROJECT & DATA SETUP                                                            │
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  
+  // --- File Paths (relative to the --data-dir argument) ---
   "data_paths_config": {
     "raw_profiles_foldername": "clean_xi_profiles",
     "normalized_profiles_foldername": "clean_profiles_normalized_xi"
@@ -12,7 +26,8 @@
     "tuning_results_foldername": "tuning_runs"
   },
 
-  // ... (Data Specification remains the same)
+  // --- Variable Definitions ---
+  // These lists MUST be consistent with the data in the raw profiles.
   "species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
@@ -24,80 +39,136 @@
       "CO_evolution", "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
   ],
+
+  // --- Data Normalization Settings ---
+  // "standard", "log-standard", or "log-min-max"
   "normalization": {
-    "key_methods": { "T": "standard", "t_time": "log-min-max" },
-    "default_method": "log-standard", "epsilon": 1e-30
+    "default_method": "log-min-max", 
+    "key_methods": { 
+      "T": "standard", 
+      "P": "log-standard", // Keep pressure as log-standard for wider range
+      "t_time": "log-min-max" 
+    },
+    "epsilon": 1e-30
   },
 
-  // ════════════════════════════════════════════════════════════════
-  // BASE PARAMETERS (Defaults for a --train run, will be overridden by Optuna)
-  // ════════════════════════════════════════════════════════════════
-  "model_type": "siren",               // "siren", "mlp", or "fno"
-  "use_film": true,
-  "hidden_dims": [256, 256],
-  "dropout": 0.0,
-  "use_time_embedding": true,
-  "time_embedding_dim": 32,
-  "condition_dim": 64,
-  "output_activation": "identity",     // "identity" or "tanh"
+  // --- Data Splitting & System Settings ---
+  "val_frac": 0.15,
+  "test_frac": 0.15,
+  "random_seed": 42,
+  "use_torch_compile": true, 
+  "show_epoch_progress": false,
 
-  // --- Model-Specific Base Params ---
-  "use_residual": true,
-  "siren_w0_initial": 30.0,
-  "siren_w0_hidden": 10.0,
-  "fno_spectral_modes": 16,
-  "fno_seq_length": 32,
-  
-  // --- Training Hyperparameters ---
-  "batch_size": 1024,
-  "epochs": 200,
+
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  // │ 2. MODEL ARCHITECTURE (Base settings for a fixed --train run)                      │
+  // ══════════════════════════════════════════════════════════════════════════════════════
+
+  // --- Primary Model Selection ---
+  // "mlp", "siren", or "fno"
+  "model_type": "siren", 
+
+  // --- Common Architectural Parameters (used by most models) ---
+  "use_film": true,                   // Use FiLM conditioning (required by current models)
+  "hidden_dims": [256, 256, 256, 256],     // Defines the depth and width of the network
+  "use_time_embedding": true,         // Use sinusoidal time embedding
+  "time_embedding_dim": 64,           // Dimension for the time embedding vector
+  "condition_dim": 64,                // Dimension of the conditioning vector for FiLM
+  "output_activation": "tanh",    // "identity" or "tanh". Affects the output of the delta prediction.
+
+  // --- MLP & FNO Specific ---
+  "dropout": 0.0,                     // Dropout rate (used in MLP and FNO, usually 0 for SIREN)
+  "use_residual": true,               // Use residual blocks in MLP
+
+  // --- SIREN Specific ---
+  "siren_w0_initial": 30.0,           // 'omega_0' for the first SIREN layer (changed from 50)
+  "siren_w0_hidden": 30.0,            // 'omega_0' for subsequent SIREN layers
+
+  // --- FNO Specific ---
+  "fno_spectral_modes": 16,           // Number of Fourier modes to keep
+  "fno_seq_length": 32,               // Positional encoding sequence length
+
+
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  // │ 3. TRAINING & OPTIMIZATION (Base settings for a fixed --train run)                 │
+  // ══════════════════════════════════════════════════════════════════════════════════════
+
+  "epochs": 50,
+  "batch_size": 512,
   "learning_rate": 5e-4,
   "weight_decay": 1e-6,
   "gradient_clip_val": 1.0,
-  "loss_function": "huber",
-  "huber_delta": 0.1,
-  "optimizer": "adamw",
-  "scheduler_choice": "cosine",
-  "lr_patience": 15,
-  "lr_factor": 0.5,
-  "cosine_T_0": 25,
-  "min_delta": 1e-7,
-  "early_stopping_patience": 30,
+  
+  // --- Loss Function ---
+  "loss_function": "mse", // "huber", "mse", or "l1"
+  //"huber_delta": 0.1,       // Delta parameter (only if loss_function is "huber")
 
-  // ════════════════════════════════════════════════════════════════
-  // OPTUNA HYPERPARAMETER SEARCH SETTINGS
-  // ════════════════════════════════════════════════════════════════
+  // --- Physics-Informed Loss (PINN) ---
+  // This makes the PINN component optional. Set to false to disable.
+  "use_conservation_loss": true,
+  // Weighting factor for the conservation loss term relative to the prediction loss.
+  "conservation_loss_weight": 0.5,
+
+  // --- Optimizer ---
+  // "adamw", "adam", "rmsprop"
+  "optimizer": "adamw", 
+
+  // --- Learning Rate Scheduler ---
+  "scheduler_choice": "plateau", // "plateau" or "cosine"
+  "min_delta": 1e-10,          
+  "early_stopping_patience": 10, // Epochs to wait for improvement before stopping
+
+  // --- "plateau" scheduler settings (ReduceLROnPlateau) ---
+  "lr_patience": 5,
+  "lr_factor": 0.2,
+
+  // --- "cosine" scheduler settings (CosineAnnealingWarmRestarts) ---
+  "cosine_T_0": 25,
+
+
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  // │ 4. HYPERPARAMETER TUNING (Settings for an --tune run with Optuna)                  │
+  // ══════════════════════════════════════════════════════════════════════════════════════
+
   "optuna_settings": {
-    "study_name": "full-arch-search-v1",
-    "num_trials": 500 // Increased for the larger search space
+    "study_name": "full-arch-search-v2-clear",
+    "num_trials": 500
   },
   
   "optuna_hyperparam_search_space": {
+    
     // --- Major Architectural Choices ---
+    // These define the overall network structure.
     "architecture": {
         "num_hidden_layers": {"type": "int", "low": 2, "high": 6},
         "hidden_dim": {"type": "categorical", "choices": [128, 256, 512]}
     },
     
-    // --- Generic Hyperparameters (Apply to all models) ---
+    // --- Generic Hyperparameters ---
+    // These are high-level choices that apply to all models.
     "hyperparameters": {
-        "model_type": {"type": "categorical", "choices": ["fno", "siren"]},
-        "use_film": {"type": "categorical", "choices": [true]},
+        "model_type": {"type": "categorical", "choices": ["fno", "siren", "mlp"]},
+        "use_film": {"type": "categorical", "choices": [true]}, // All modern models require this
         "use_time_embedding": {"type": "categorical", "choices": [true, false]},
         "output_activation": {"type": "categorical", "choices": ["identity", "tanh"]},
-        //"learning_rate": {"type": "float", "low": 1e-4, "high": 1e-3, "log": true},
-        //"weight_decay": {"type": "float", "low": 1e-7, "high": 1e-5, "log": true},
-        //"loss_function": {"type": "categorical", "choices": ["huber", "mse", "l1"]},
-        //"optimizer": {"type": "categorical", "choices": ["adamw", "adam"]},
-        //"scheduler_choice": {"type": "categorical", "choices": ["cosine", "plateau"]}
+        "learning_rate": {"type": "float", "low": 1e-4, "high": 1e-3, "log": true},
+        "weight_decay": {"type": "float", "low": 1e-7, "high": 1e-5, "log": true},
+        "loss_function": {"type": "categorical", "choices": ["huber", "mse", "l1"]},
+        "optimizer": {"type": "categorical", "choices": ["adamw", "adam"]},
+        "scheduler_choice": {"type": "categorical", "choices": ["cosine", "plateau"]},
+        // Add the PINN options to the hyperparameter search
+        "use_conservation_loss": {"type": "categorical", "choices": [true, false]},
+        "conservation_loss_weight": {"type": "float", "low": 0.01, "high": 10.0, "log": true}
     },
 
-    // --- Conditional Hyperparameters (Handled by hyperparams.py logic) ---
+    // --- Conditional Hyperparameters ---
+    // These are suggested only if their parent option is chosen (e.g., siren_w0_initial only if model_type is "siren").
+    // This logic is handled by hyperparams.py.
     "conditional_hyperparameters": {
-        // FiLM & Time Embedding
+        // Shared & FiLM-related
         "condition_dim": {"type": "categorical", "choices": [64, 128, 256]},
-        "time_embedding_dim": {"type": "categorical", "choices": [32, 64, 128]},
-        "dropout": {"type": "float", "low": 0.0, "high": 0.2},
+        "time_embedding_dim": {"type": "categorical", "choices": [32, 64, 128]}, // Applied only if use_time_embedding is true
+        "dropout": {"type": "float", "low": 0.0, "high": 0.2}, // Applied only to MLP and FNO models
 
         // FNO-specific
         "fno_spectral_modes": {"type": "categorical", "choices": [8, 16]},
@@ -105,22 +176,13 @@
         
         // SIREN-specific
         "siren_w0_initial": {"type": "float", "low": 20.0, "high": 40.0},
-        "siren_w0_hidden": {"type": "categorical", "choices": [1.0, 10.0, 30.0]},
+        "siren_w0_hidden": {"type": "categorical", "choices": [1.0, 10.0, 30.0, 50.0]},
 
         // Loss & Scheduler specific
-        "huber_delta": {"type": "float", "low": 0.05, "high": 0.5},
-        "lr_patience": {"type": "int", "low": 10, "high": 25},
-        "lr_factor": {"type": "float", "low": 0.1, "high": 0.5},
-        "cosine_T_0": {"type": "int", "low": 15, "high": 50}
+        "huber_delta": {"type": "float", "low": 0.05, "high": 0.5}, // Applied only if loss_function is "huber"
+        "lr_patience": {"type": "int", "low": 10, "high": 25},      // Applied only if scheduler_choice is "plateau"
+        "lr_factor": {"type": "float", "low": 0.1, "high": 0.5},   // Applied only if scheduler_choice is "plateau"
+        "cosine_T_0": {"type": "int", "low": 15, "high": 50}        // Applied only if scheduler_choice is "cosine"
     }
-  },
-
-  // ════════════════════════════════════════════════════════════════
-  // SYSTEM & DATA SPLIT SETTINGS
-  // ════════════════════════════════════════════════════════════════
-  "val_frac": 0.15,
-  "test_frac": 0.15,
-  "random_seed": 42,
-  "use_torch_compile": true,
-  "show_epoch_progress": true
+  }
 }
