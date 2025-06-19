@@ -773,7 +773,7 @@ class ModelTrainer:
                     loss = self.criterion(predictions, targets)
                 
                 total_loss += loss.item()
-                all_errors.append(torch.abs(predictions - targets))
+                all_errors.append(torch.abs(predictions - targets).cpu())
         
         # Calculate test metrics
         test_loss = total_loss / len(self.test_loader)

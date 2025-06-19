@@ -52,6 +52,7 @@ RANDOM_SEED_KEY = "random_seed"
 # Configure PyTorch and warnings
 torch.set_float32_matmul_precision(MATMUL_PRECISION)
 warnings.filterwarnings("ignore", ".*non-base types in `__init__`.*")
+warnings.filterwarnings("ignore", message=".*torch.compile for Metal is an early protoype.*")
 
 logger = logging.getLogger(__name__)
 
