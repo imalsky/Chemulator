@@ -43,7 +43,8 @@ class TimeEmbedding(nn.Module):
         if half_dim == 0:
             return torch.zeros(t.shape[0], self.dim, device=device)
 
-        denominator = half_dim - 1 if half_dim > 1 else 1.0
+        denominator = (half_dim - 1.0) if half_dim > 1 else 1.0
+        
         inv_freq = 1.0 / (
             10000 ** (torch.arange(0, half_dim, device=device).float() / denominator)
         )
@@ -188,8 +189,6 @@ class SineLayer(nn.Module):
                 bound = 1.0 / self.linear.in_features
                 self.linear.weight.uniform_(-bound, bound)
             else:
-                # This initialization is crucial for SIREN's performance.
-                # It depends on omega_0.
                 bound = math.sqrt(6.0 / self.linear.in_features) / self.omega_0
                 self.linear.weight.uniform_(-bound, bound)
 
@@ -211,24 +210,21 @@ class FiLM_MLP(nn.Module):
         use_time_embedding: bool, 
         time_embedding_dim: int, 
         condition_dim: int, 
-        use_residual: bool,
-        output_activation: str
+        use_residual: bool
     ) -> None:
         super().__init__()
         self.num_species = num_species
         
-        # Set up conditioning input dimension
+        self.time_embed: Optional[TimeEmbedding]
+        
         condition_input_dim = num_global_vars
         if use_time_embedding:
-            self.time_embed: Optional[TimeEmbedding] = TimeEmbedding(
-                time_embedding_dim
-            )
+            self.time_embed = TimeEmbedding(time_embedding_dim)
             condition_input_dim += time_embedding_dim
         else:
             self.time_embed = None
             condition_input_dim += 1
 
-        # Conditioning network
         self.conditioning_net = nn.Sequential(
             nn.Linear(condition_input_dim, condition_dim),
             nn.SiLU(),
@@ -238,7 +234,6 @@ class FiLM_MLP(nn.Module):
         self.input_proj = nn.Linear(num_species, hidden_dims[0])
         self.film_layer = FiLMLayer(condition_dim, hidden_dims[0])
         
-        # Build body layers
         body_layers: List[nn.Module] = []
         for i in range(len(hidden_dims)):
             in_dim = hidden_dims[i-1] if i > 0 else hidden_dims[0]
@@ -258,14 +253,11 @@ class FiLM_MLP(nn.Module):
         self.mlp_body = nn.Sequential(*body_layers)
         self.output_norm = nn.LayerNorm(hidden_dims[-1])
         self.output_proj = nn.Linear(hidden_dims[-1], num_species)
-        
-        self.output_act: nn.Module = (nn.Identity() if output_activation != "tanh" else nn.Tanh())
 
     def forward(self, x: Tensor) -> Tensor:
         initial_species = x[..., :self.num_species]
         global_and_time = x[..., self.num_species:]
         
-        # Prepare conditioning input
         if self.time_embed is not None:
             time = global_and_time[..., -1:]
             global_vars = global_and_time[..., :-1]
@@ -278,15 +270,11 @@ class FiLM_MLP(nn.Module):
         
         condition_vector = self.conditioning_net(condition_input)
         
-        # Forward pass
         hidden = self.input_proj(initial_species)
         hidden = self.film_layer(hidden, condition_vector)
         hidden = self.mlp_body(hidden)
         hidden = self.output_norm(hidden)
         delta = self.output_proj(hidden)
-        
-        # Applying the configured output activation (e.g., tanh) to the delta
-        delta = self.output_act(delta)
         
         return initial_species + delta
 
@@ -303,18 +291,16 @@ class FiLM_SIREN(nn.Module):
         time_embedding_dim: int,
         condition_dim: int, 
         w0_initial: float, 
-        w0_hidden: float, 
-        output_activation: str
+        w0_hidden: float
     ) -> None:
         super().__init__()
         self.num_species = num_species
         
-        # Set up conditioning input dimension
+        self.time_embed: Optional[TimeEmbedding]
+
         condition_input_dim = num_global_vars
         if use_time_embedding:
-            self.time_embed: Optional[TimeEmbedding] = TimeEmbedding(
-                time_embedding_dim
-            )
+            self.time_embed = TimeEmbedding(time_embedding_dim)
             condition_input_dim += time_embedding_dim
         else:
             self.time_embed = None
@@ -329,32 +315,25 @@ class FiLM_SIREN(nn.Module):
         self.input_proj = nn.Linear(num_species, hidden_dims[0])
         self.film_layer = FiLMLayer(condition_dim, hidden_dims[0])
         
-        # Build SIREN network
         siren_layers: List[nn.Module] = []
         current_dim = hidden_dims[0]
         
         for i, dim in enumerate(hidden_dims):
-            # The omega_0 value for each layer is critical. 
-            # The config change to "siren_w0_hidden": 30.0 will be passed here.
-            current_omega = w0_initial if i == 0 else w0_hidden
             siren_layers.append(SineLayer(
                 current_dim, 
                 dim, 
                 is_first=(i == 0), 
-                omega_0=current_omega
+                omega_0=(w0_initial if i == 0 else w0_hidden)
             ))
             current_dim = dim
         
         self.net = nn.Sequential(*siren_layers)
         self.output_linear = nn.Linear(current_dim, num_species)
-        
-        self.output_act: nn.Module = (nn.Identity() if output_activation != "tanh" else nn.Tanh())
 
     def forward(self, x: Tensor) -> Tensor:
         initial_species = x[..., :self.num_species]
         global_and_time = x[..., self.num_species:]
         
-        # Prepare conditioning input
         if self.time_embed is not None:
             time = global_and_time[..., -1:]
             global_vars = global_and_time[..., :-1]
@@ -367,14 +346,10 @@ class FiLM_SIREN(nn.Module):
         
         condition_vector = self.conditioning_net(condition_input)
         
-        # Forward pass
         coords = self.input_proj(initial_species)
         coords = self.film_layer(coords, condition_vector)
         coords = self.net(coords)
         delta = self.output_linear(coords)
-
-        # Applying the configured output activation (e.g., tanh) to the delta
-        delta = self.output_act(delta)
         
         return initial_species + delta
 
@@ -392,18 +367,16 @@ class FiLM_FNO(nn.Module):
         time_embedding_dim: int, 
         condition_dim: int, 
         fno_spectral_modes: int,
-        fno_seq_length: int, 
-        output_activation: str
+        fno_seq_length: int
     ) -> None:
         super().__init__()
         self.num_species = num_species
         
-        # Set up conditioning network (for FiLM)
+        self.time_embed: Optional[TimeEmbedding]
+
         condition_input_dim = num_global_vars
         if use_time_embedding:
-            self.time_embed: Optional[TimeEmbedding] = TimeEmbedding(
-                time_embedding_dim
-            )
+            self.time_embed = TimeEmbedding(time_embedding_dim)
             condition_input_dim += time_embedding_dim
         else:
             self.time_embed = None
@@ -415,7 +388,6 @@ class FiLM_FNO(nn.Module):
             nn.Linear(condition_dim, condition_dim)
         )
 
-        # Main FNO path
         self.lifting = nn.Linear(num_species, hidden_dims[0])
         self.film_layer = FiLMLayer(condition_dim, hidden_dims[0])
 
@@ -425,7 +397,6 @@ class FiLM_FNO(nn.Module):
             prev_dim = hidden_dims[i-1] if i > 0 else hidden_dims[0]
             
             if dim != prev_dim:
-                # Adapt dimension if needed
                 self.fno_blocks.append(nn.Linear(prev_dim, dim))
             
             valid_modes = min(fno_spectral_modes, fno_seq_length // 2)
@@ -438,14 +409,11 @@ class FiLM_FNO(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dims[-1] * 2, num_species)
         )
-        
-        self.output_act: nn.Module = (nn.Identity() if output_activation != "tanh" else nn.Tanh())
 
     def forward(self, x: Tensor) -> Tensor:
         initial_species = x[..., :self.num_species]
         global_and_time = x[..., self.num_species:]
         
-        # Create conditioning vector
         if self.time_embed is not None:
             time = global_and_time[..., -1:]
             global_vars = global_and_time[..., :-1]
@@ -458,18 +426,13 @@ class FiLM_FNO(nn.Module):
         
         condition_vector = self.conditioning_net(condition_input)
 
-        # Main FNO path
         hidden = self.lifting(initial_species)
-        hidden = self.film_layer(hidden, condition_vector)  # Apply FiLM modulation
+        hidden = self.film_layer(hidden, condition_vector)
         
         for block in self.fno_blocks:
             hidden = block(hidden)
 
-        # Final projection
         delta = self.projection(hidden)
-        
-        # Applying the configured output activation (e.g., tanh) to the delta
-        delta = self.output_act(delta)
         
         return initial_species + delta
 
@@ -543,7 +506,7 @@ def create_prediction_model(
         "use_time_embedding": config.get("use_time_embedding", True),
         "time_embedding_dim": config.get("time_embedding_dim", DEFAULT_TIME_EMBEDDING_DIM),
         "condition_dim": config.get("condition_dim", DEFAULT_CONDITION_DIM),
-        "output_activation": config.get("output_activation", "identity"),
+        # Note: "output_activation" is no longer passed to the models
     })
         
     model = model_class(**model_config)

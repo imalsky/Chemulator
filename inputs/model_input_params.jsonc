@@ -18,8 +18,8 @@
   
   // --- File Paths (relative to the --data-dir argument) ---
   "data_paths_config": {
-    "raw_profiles_foldername": "clean_xi_profiles",
-    "normalized_profiles_foldername": "clean_profiles_normalized_xi"
+    "raw_profiles_foldername": "chem-profiles",
+    "normalized_profiles_foldername": "chem-profiles-normalized"
   },
   "output_paths_config": {
     "fixed_model_foldername": "trained_model",
@@ -43,10 +43,9 @@
   // --- Data Normalization Settings ---
   // "standard", "log-standard", or "log-min-max"
   "normalization": {
-    "default_method": "log-min-max", 
+    "default_method": "log-standard", 
     "key_methods": { 
       "T": "standard", 
-      "P": "log-standard", // Keep pressure as log-standard for wider range
       "t_time": "log-min-max" 
     },
     "epsilon": 1e-30
@@ -70,23 +69,22 @@
 
   // --- Common Architectural Parameters (used by most models) ---
   "use_film": true,                   // Use FiLM conditioning (required by current models)
-  "hidden_dims": [256, 256, 256, 256],     // Defines the depth and width of the network
+  "hidden_dims": [512, 512],     // Defines the depth and width of the network
   "use_time_embedding": true,         // Use sinusoidal time embedding
-  "time_embedding_dim": 64,           // Dimension for the time embedding vector
-  "condition_dim": 64,                // Dimension of the conditioning vector for FiLM
-  "output_activation": "tanh",    // "identity" or "tanh". Affects the output of the delta prediction.
+  "time_embedding_dim": 16,           // Dimension for the time embedding vector
+  "condition_dim": 32,                // Dimension of the conditioning vector for FiLM
 
   // --- MLP & FNO Specific ---
   "dropout": 0.0,                     // Dropout rate (used in MLP and FNO, usually 0 for SIREN)
   "use_residual": true,               // Use residual blocks in MLP
 
   // --- SIREN Specific ---
-  "siren_w0_initial": 30.0,           // 'omega_0' for the first SIREN layer (changed from 50)
-  "siren_w0_hidden": 30.0,            // 'omega_0' for subsequent SIREN layers
+  "siren_w0_initial": 30.0,
+  "siren_w0_hidden": 10.0,
 
   // --- FNO Specific ---
-  "fno_spectral_modes": 16,           // Number of Fourier modes to keep
-  "fno_seq_length": 32,               // Positional encoding sequence length
+  "fno_spectral_modes": 16,
+  "fno_seq_length": 32,
 
 
   // ══════════════════════════════════════════════════════════════════════════════════════
@@ -101,22 +99,19 @@
   
   // --- Loss Function ---
   "loss_function": "mse", // "huber", "mse", or "l1"
-  //"huber_delta": 0.1,       // Delta parameter (only if loss_function is "huber")
+  //"huber_delta": 0.1,   // Only if loss_function is "huber"
 
   // --- Physics-Informed Loss (PINN) ---
-  // This makes the PINN component optional. Set to false to disable.
-  "use_conservation_loss": true,
-  // Weighting factor for the conservation loss term relative to the prediction loss.
-  "conservation_loss_weight": 0.5,
+  "use_conservation_loss": false,
+  "conservation_loss_weight": 0.001,
 
   // --- Optimizer ---
-  // "adamw", "adam", "rmsprop"
-  "optimizer": "adamw", 
+  "optimizer": "adamw", // "adamw", "adam", "rmsprop"
 
   // --- Learning Rate Scheduler ---
   "scheduler_choice": "plateau", // "plateau" or "cosine"
   "min_delta": 1e-10,          
-  "early_stopping_patience": 10, // Epochs to wait for improvement before stopping
+  "early_stopping_patience": 10,
 
   // --- "plateau" scheduler settings (ReduceLROnPlateau) ---
   "lr_patience": 5,
@@ -131,44 +126,38 @@
   // ══════════════════════════════════════════════════════════════════════════════════════
 
   "optuna_settings": {
-    "study_name": "full-arch-search-v2-clear",
+    "study_name": "full-arch-search-v3-simplified",
     "num_trials": 500
   },
   
   "optuna_hyperparam_search_space": {
     
     // --- Major Architectural Choices ---
-    // These define the overall network structure.
     "architecture": {
         "num_hidden_layers": {"type": "int", "low": 2, "high": 6},
         "hidden_dim": {"type": "categorical", "choices": [128, 256, 512]}
     },
     
     // --- Generic Hyperparameters ---
-    // These are high-level choices that apply to all models.
     "hyperparameters": {
         "model_type": {"type": "categorical", "choices": ["fno", "siren", "mlp"]},
-        "use_film": {"type": "categorical", "choices": [true]}, // All modern models require this
+        "use_film": {"type": "categorical", "choices": [true]},
         "use_time_embedding": {"type": "categorical", "choices": [true, false]},
-        "output_activation": {"type": "categorical", "choices": ["identity", "tanh"]},
+        // "output_activation" removed from search space
         "learning_rate": {"type": "float", "low": 1e-4, "high": 1e-3, "log": true},
         "weight_decay": {"type": "float", "low": 1e-7, "high": 1e-5, "log": true},
         "loss_function": {"type": "categorical", "choices": ["huber", "mse", "l1"]},
         "optimizer": {"type": "categorical", "choices": ["adamw", "adam"]},
         "scheduler_choice": {"type": "categorical", "choices": ["cosine", "plateau"]},
-        // Add the PINN options to the hyperparameter search
         "use_conservation_loss": {"type": "categorical", "choices": [true, false]},
         "conservation_loss_weight": {"type": "float", "low": 0.01, "high": 10.0, "log": true}
     },
 
     // --- Conditional Hyperparameters ---
-    // These are suggested only if their parent option is chosen (e.g., siren_w0_initial only if model_type is "siren").
-    // This logic is handled by hyperparams.py.
     "conditional_hyperparameters": {
-        // Shared & FiLM-related
         "condition_dim": {"type": "categorical", "choices": [64, 128, 256]},
-        "time_embedding_dim": {"type": "categorical", "choices": [32, 64, 128]}, // Applied only if use_time_embedding is true
-        "dropout": {"type": "float", "low": 0.0, "high": 0.2}, // Applied only to MLP and FNO models
+        "time_embedding_dim": {"type": "categorical", "choices": [32, 64, 128]},
+        "dropout": {"type": "float", "low": 0.0, "high": 0.2},
 
         // FNO-specific
         "fno_spectral_modes": {"type": "categorical", "choices": [8, 16]},
@@ -176,13 +165,13 @@
         
         // SIREN-specific
         "siren_w0_initial": {"type": "float", "low": 20.0, "high": 40.0},
-        "siren_w0_hidden": {"type": "categorical", "choices": [1.0, 10.0, 30.0, 50.0]},
+        "siren_w0_hidden": {"type": "categorical", "choices": [10.0, 30.0, 50.0]},
 
         // Loss & Scheduler specific
-        "huber_delta": {"type": "float", "low": 0.05, "high": 0.5}, // Applied only if loss_function is "huber"
-        "lr_patience": {"type": "int", "low": 10, "high": 25},      // Applied only if scheduler_choice is "plateau"
-        "lr_factor": {"type": "float", "low": 0.1, "high": 0.5},   // Applied only if scheduler_choice is "plateau"
-        "cosine_T_0": {"type": "int", "low": 15, "high": 50}        // Applied only if scheduler_choice is "cosine"
+        "huber_delta": {"type": "float", "low": 0.05, "high": 0.5},
+        "lr_patience": {"type": "int", "low": 10, "high": 25},
+        "lr_factor": {"type": "float", "low": 0.1, "high": 0.5},
+        "cosine_T_0": {"type": "int", "low": 15, "high": 50}
     }
   }
 }
