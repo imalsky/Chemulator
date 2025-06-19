@@ -8,9 +8,10 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -266,6 +267,65 @@ def ensure_dirs(*paths: Union[str, Path]) -> bool:
         return False
 
 
+# --- NEW FUNCTION for Physics-Informed Loss ---
+def parse_species_atoms(species_names: List[str]) -> Tuple[np.ndarray, List[str]]:
+    """
+    Parses a list of species names to create an atom count matrix.
+
+    This function extracts the chemical formula from names like "C2H2_evolution"
+    and builds a matrix for calculating atom conservation.
+
+    Args:
+        species_names: A list of species names from the configuration.
+
+    Returns:
+        A tuple containing:
+        - A numpy array (atom_matrix) of shape (num_species, num_unique_atoms).
+        - A list of unique atom names (e.g., ['C', 'H', 'N', 'O']).
+
+    Example:
+        >>> parse_species_atoms(["H2O_evolution", "CO2_evolution"])
+        (array([[2., 1., 0.], [0., 2., 1.]]), ['H', 'O', 'C'])
+    """
+    # Regex to find an element (e.g., 'C', 'H', 'He') followed by an optional number
+    atom_regex = re.compile(r"([A-Z][a-z]*)(\d*)")
+    
+    all_atom_counts = []
+    unique_atoms = set()
+
+    for name in species_names:
+        formula = name.split("_")[0]  # Extract formula part, e.g., "C2H2"
+        counts = {}
+        
+        for element, number in atom_regex.findall(formula):
+            unique_atoms.add(element)
+            # If no number follows, it's 1 atom (e.g., 'O' in 'H2O')
+            count = int(number) if number else 1
+            counts[element] = counts.get(element, 0) + count
+        
+        all_atom_counts.append(counts)
+
+    if not unique_atoms:
+        logger.warning("Could not parse any atoms from species names.")
+        return np.array([[] for _ in species_names]), []
+
+    # Create a sorted, consistent list of unique atoms
+    sorted_atoms = sorted(list(unique_atoms))
+    atom_map = {atom: i for i, atom in enumerate(sorted_atoms)}
+
+    # Build the matrix
+    num_species = len(species_names)
+    num_atoms = len(sorted_atoms)
+    atom_matrix = np.zeros((num_species, num_atoms), dtype=np.float32)
+
+    for i, counts in enumerate(all_atom_counts):
+        for atom, count in counts.items():
+            if atom in atom_map:
+                atom_matrix[i, atom_map[atom]] = count
+
+    return atom_matrix, sorted_atoms
+
+
 def _json_serializer(obj: Any) -> Any:
     """
     Custom JSON serializer for numpy and torch objects.
@@ -370,5 +430,6 @@ __all__ = [
     "validate_config", 
     "ensure_dirs", 
     "save_json", 
-    "seed_everything"
+    "seed_everything",
+    "parse_species_atoms"
 ]

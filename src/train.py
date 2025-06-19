@@ -4,6 +4,7 @@ train.py - Training script
 """
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
@@ -23,7 +24,9 @@ from tqdm import tqdm
 from dataset import ChemicalDataset
 from hardware import configure_dataloader_settings
 from model import create_prediction_model
-from utils import save_json
+# MODIFICATION: Import denormalizer and atom parser
+from normalizer import DataNormalizer
+from utils import save_json, parse_species_atoms
 
 # Constants
 DEFAULT_RANDOM_SEED = 42
@@ -138,6 +141,11 @@ class ModelTrainer:
         self.train_ds = ChemicalDataset(**dataset_args, profile_paths=train_paths)
         self.val_ds = ChemicalDataset(**dataset_args, profile_paths=val_paths)
         self.test_ds = ChemicalDataset(**dataset_args, profile_paths=test_paths)
+
+        # MODIFICATION: Setup for physics-informed loss
+        self.use_conservation_loss = self.cfg.get("use_conservation_loss", False)
+        if self.use_conservation_loss:
+            self._setup_conservation_loss(data_dir)
         
         # Initialize all components
         self._build_dataloaders(collate_fn)
@@ -149,6 +157,33 @@ class ModelTrainer:
         self._build_scheduler()
         self._setup_logging()
         self._save_test_set_info()
+
+    # --- NEW METHOD for Physics-Informed Loss ---
+    def _setup_conservation_loss(self, data_dir: Path) -> None:
+        """Sets up the necessary components for the atom conservation loss."""
+        logger.info("Setting up physics-informed atom conservation loss.")
+        
+        # Load normalization metadata required for denormalizing predictions
+        metadata_path = data_dir / NORMALIZATION_METADATA_FILE
+        if not metadata_path.exists():
+            raise FileNotFoundError(
+                f"Normalization metadata not found at {metadata_path}. "
+                "Needed for conservation loss."
+            )
+        with metadata_path.open("r") as f:
+            self.norm_metadata = json.load(f)
+
+        # Parse atom counts from species names
+        self.species_vars = sorted(self.cfg["species_variables"])
+        atom_matrix, self.atom_names = parse_species_atoms(self.species_vars)
+        
+        # Move matrix to the correct device for calculations
+        self.atom_matrix = torch.tensor(
+            atom_matrix, dtype=torch.float32, device=self.device
+        )
+        logger.info(
+            f"Atom conservation will be enforced for: {self.atom_names}"
+        )
 
     def _build_dataloaders(self, collate_fn: Callable) -> None:
         """Configures and creates DataLoaders for train, validation, and test sets."""
@@ -250,7 +285,6 @@ class ModelTrainer:
 
     def _setup_mixed_precision(self) -> None:
         """Sets up Automatic Mixed Precision (AMP) if enabled and supported."""
-        # AMP is only beneficial on CUDA with Tensor Cores
         self.use_amp = (
             self.cfg.get("use_amp", False) and self.device.type == "cuda"
         )
@@ -339,6 +373,28 @@ class ModelTrainer:
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = self.initial_lr * warmup_factor
 
+    def _calculate_conservation_loss(
+        self,
+        initial_species: torch.Tensor,
+        predicted_species: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Calculates the loss based on atom conservation.
+        This function assumes species are already DENORMALIZED.
+        """
+        # Calculate total atoms for each element at the initial state
+        # (batch_size, num_species) @ (num_species, num_atoms) -> (batch_size, num_atoms)
+        initial_atoms = torch.matmul(initial_species, self.atom_matrix)
+
+        # Calculate total atoms for each element at the predicted state
+        predicted_atoms = torch.matmul(predicted_species, self.atom_matrix)
+
+        # The loss is the mean squared error between the atom counts
+        conservation_loss = torch.nn.functional.mse_loss(
+            predicted_atoms, initial_atoms
+        )
+        return conservation_loss
+
     def _handle_non_finite_loss(
         self, epoch: int, batch_idx: int, non_finite_count: int
     ) -> int:
@@ -407,12 +463,41 @@ class ModelTrainer:
                 # Forward pass
                 with torch.autocast(self.device.type, enabled=self.use_amp):
                     predictions = self.model(input_tensor)
-                    loss = self.criterion(predictions, targets)
+                    
+                    # --- MODIFICATION: Calculate combined loss ---
+                    # 1. Standard prediction loss
+                    prediction_loss = self.criterion(predictions, targets)
+                    total_loss_val = prediction_loss
+
+                    # 2. (Optional) Physics-informed conservation loss
+                    if self.use_conservation_loss and train_phase:
+                        # Denormalize predictions and initial state to physical values
+                        num_species = len(self.species_vars)
+                        initial_species_norm = input_tensor[:, :num_species]
+
+                        denorm_predictions = torch.stack([
+                            DataNormalizer.denormalize(predictions[:, i], self.norm_metadata, var)
+                            for i, var in enumerate(self.species_vars)
+                        ], dim=1)
+
+                        denorm_initial_species = torch.stack([
+                            DataNormalizer.denormalize(initial_species_norm[:, i], self.norm_metadata, var)
+                            for i, var in enumerate(self.species_vars)
+                        ], dim=1)
+                        
+                        # Calculate conservation loss on denormalized values
+                        conservation_loss = self._calculate_conservation_loss(
+                            denorm_initial_species, denorm_predictions
+                        )
+                        
+                        weight = self.cfg.get("conservation_loss_weight", 1.0)
+                        total_loss_val = prediction_loss + (weight * conservation_loss)
+                    
                     if train_phase:
-                        loss = loss / self.accumulation_steps
+                        total_loss_val = total_loss_val / self.accumulation_steps
 
                 # Handle non-finite loss
-                if not torch.isfinite(loss):
+                if not torch.isfinite(total_loss_val):
                     non_finite_batch_count = self._handle_non_finite_loss(
                         self.current_epoch, batch_idx, non_finite_batch_count
                     )
@@ -422,7 +507,7 @@ class ModelTrainer:
 
                 # Backward pass for training
                 if train_phase:
-                    self.scaler.scale(loss).backward()
+                    self.scaler.scale(total_loss_val).backward()
                     
                     should_step = (
                         (batch_idx + 1) % self.accumulation_steps == 0 or 
@@ -451,10 +536,8 @@ class ModelTrainer:
                         
                         self.optimizer.zero_grad(set_to_none=True)
 
-                # Update metrics and progress bar
-                actual_loss = loss.item() * (
-                    self.accumulation_steps if train_phase else 1
-                )
+                # Update metrics and progress bar (using prediction loss for logging)
+                actual_loss = prediction_loss.item()
                 total_loss += actual_loss
                 
                 if show_progress:
