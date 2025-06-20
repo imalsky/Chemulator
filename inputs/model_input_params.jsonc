@@ -69,10 +69,10 @@
 
   // --- Common Architectural Parameters (used by most models) ---
   "use_film": true,                   // Use FiLM conditioning (required by current models)
-  "hidden_dims": [512, 512],     // Defines the depth and width of the network
-  "use_time_embedding": true,         // Use sinusoidal time embedding
+  "hidden_dims": [256, 256],     // Defines the depth and width of the network
+  "use_time_embedding": false,         // Use sinusoidal time embedding
   "time_embedding_dim": 16,           // Dimension for the time embedding vector
-  "condition_dim": 32,                // Dimension of the conditioning vector for FiLM
+  "condition_dim": 64,                // Dimension of the conditioning vector for FiLM
 
   // --- MLP & FNO Specific ---
   "dropout": 0.0,                     // Dropout rate (used in MLP and FNO, usually 0 for SIREN)
@@ -91,10 +91,10 @@
   // │ 3. TRAINING & OPTIMIZATION (Base settings for a fixed --train run)                 │
   // ══════════════════════════════════════════════════════════════════════════════════════
 
-  "epochs": 50,
+  "epochs": 20,
   "batch_size": 512,
   "learning_rate": 5e-4,
-  "weight_decay": 1e-6,
+  "weight_decay": 1e-7,
   "gradient_clip_val": 1.0,
   
   // --- Loss Function ---
@@ -135,43 +135,42 @@
     // --- Major Architectural Choices ---
     "architecture": {
         "num_hidden_layers": {"type": "int", "low": 2, "high": 6},
-        "hidden_dim": {"type": "categorical", "choices": [128, 256, 512]}
+        "hidden_dim": {"type": "categorical", "choices": [128, 256, 512, 1024]}
     },
     
     // --- Generic Hyperparameters ---
     "hyperparameters": {
-        "model_type": {"type": "categorical", "choices": ["fno", "siren", "mlp"]},
+        "model_type": {"type": "categorical", "choices": ["siren"]},
         "use_film": {"type": "categorical", "choices": [true]},
         "use_time_embedding": {"type": "categorical", "choices": [true, false]},
-        // "output_activation" removed from search space
-        "learning_rate": {"type": "float", "low": 1e-4, "high": 1e-3, "log": true},
-        "weight_decay": {"type": "float", "low": 1e-7, "high": 1e-5, "log": true},
-        "loss_function": {"type": "categorical", "choices": ["huber", "mse", "l1"]},
-        "optimizer": {"type": "categorical", "choices": ["adamw", "adam"]},
-        "scheduler_choice": {"type": "categorical", "choices": ["cosine", "plateau"]},
+        //"learning_rate": {"type": "float", "low": 1e-4, "high": 1e-3, "log": true},
+        "weight_decay": {"type": "float", "low": 1e-7, "high": 1e-4, "log": true},
+        //"loss_function": {"type": "categorical", "choices": ["huber", "mse", "l1"]},
+        //"optimizer": {"type": "categorical", "choices": ["adamw", "adam"]},
+        //"scheduler_choice": {"type": "categorical", "choices": ["cosine", "plateau"]},
         "use_conservation_loss": {"type": "categorical", "choices": [true, false]},
-        "conservation_loss_weight": {"type": "float", "low": 0.01, "high": 10.0, "log": true}
+        "conservation_loss_weight": {"type": "float", "low": 1e-3, "high": 1e5, "log": true}
     },
 
     // --- Conditional Hyperparameters ---
     "conditional_hyperparameters": {
-        "condition_dim": {"type": "categorical", "choices": [64, 128, 256]},
+        "condition_dim": {"type": "categorical", "choices": [32, 64, 128, 256]},
         "time_embedding_dim": {"type": "categorical", "choices": [32, 64, 128]},
-        "dropout": {"type": "float", "low": 0.0, "high": 0.2},
+        "dropout": {"type": "float", "low": 0.0, "high": 0.1},
 
         // FNO-specific
-        "fno_spectral_modes": {"type": "categorical", "choices": [8, 16]},
-        "fno_seq_length": {"type": "categorical", "choices": [16, 32, 64]},
+        //"fno_spectral_modes": {"type": "categorical", "choices": [8, 16]},
+        //"fno_seq_length": {"type": "categorical", "choices": [16, 32, 64]},
         
         // SIREN-specific
         "siren_w0_initial": {"type": "float", "low": 20.0, "high": 40.0},
         "siren_w0_hidden": {"type": "categorical", "choices": [10.0, 30.0, 50.0]},
 
         // Loss & Scheduler specific
-        "huber_delta": {"type": "float", "low": 0.05, "high": 0.5},
-        "lr_patience": {"type": "int", "low": 10, "high": 25},
-        "lr_factor": {"type": "float", "low": 0.1, "high": 0.5},
-        "cosine_T_0": {"type": "int", "low": 15, "high": 50}
+        //"huber_delta": {"type": "float", "low": 0.05, "high": 0.5},
+        //"lr_patience": {"type": "int", "low": 10, "high": 25},
+        //"lr_factor": {"type": "float", "low": 0.1, "high": 0.5},
+        //"cosine_T_0": {"type": "int", "low": 15, "high": 50}
     }
   }
 }
