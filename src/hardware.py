@@ -6,130 +6,99 @@ This module provides utilities to detect the best available PyTorch device
 (CUDA, MPS, CPU) and to configure device-specific DataLoader settings
 for optimal performance.
 """
-
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict
+
 import torch
 
 logger = logging.getLogger(__name__)
 
 
-def _has_mps() -> bool:
-    """Checks if the current PyTorch build supports MPS and if it's available."""
-    # Check for MPS backend availability, introduced in PyTorch 1.12
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return True
-    return False
-
-
-def get_device_type() -> str:
-    """
-    Determines the best available hardware acceleration backend.
-
-    The priority for device selection is: CUDA > MPS (Apple Silicon) > CPU.
-
-    Returns:
-        A string representing the selected device type ("cuda", "mps", or "cpu").
-    """
-    if torch.cuda.is_available():
-        return "cuda"
-    if _has_mps():
-        return "mps"
-    return "cpu"
-
-
 def setup_device() -> torch.device:
     """
     Selects and returns a `torch.device` object for the best available backend.
-
-    Logs the chosen device and, if CUDA is selected, also logs the specific
-    CUDA device name for better traceability.
+    Priority: CUDA > MPS (Apple Silicon) > CPU.
 
     Returns:
-        A `torch.device` object (e.g., torch.device('cuda:0')).
+        torch.device: A `torch.device` object (e.g., torch.device('cuda:0')).
     """
-    selected_device_type = get_device_type()
-    device_instance = torch.device(selected_device_type)
-
-    if selected_device_type == "cuda":
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
         try:
-            # Attempt to get and log the name of the current CUDA device.
-            cuda_device_name = torch.cuda.get_device_name(torch.cuda.current_device())
-            logger.info("Using CUDA device: %s", cuda_device_name)
-        except Exception as exc:
-            # Fallback if device name cannot be queried.
-            logger.warning(
-                "Could not query CUDA device name (Exception: %s). Proceeding with CUDA.", exc
-            )
-    elif selected_device_type == "mps":
+            device_name = torch.cuda.get_device_name(torch.cuda.current_device())
+            logger.info(f"Using CUDA device: {device_name}")
+        except Exception:
+            logger.info("Using CUDA device.") # Fallback message
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
         logger.info("Using Apple Silicon MPS device.")
+        logger.warning(
+            "MPS backend detected. Note: Some operations may have limited support or "
+            "performance. If you encounter errors, consider setting the environment "
+            "variable PYTORCH_ENABLE_MPS_FALLBACK=1"
+        )
     else:
+        device = torch.device("cpu")
         logger.info("Using CPU device.")
-
-    return device_instance
+    
+    return device
 
 
 def get_device_properties() -> Dict[str, Any]:
     """
     Retrieves a dictionary of properties for the selected backend.
 
-    Properties include the device type, AMP support, and (for CUDA) the device name,
-    total memory, and compute capability.
-
     Returns:
-        A dictionary containing properties of the selected device.
+        A dictionary containing properties of the selected device, such as
+        type, name, memory (for CUDA), and AMP support.
     """
-    selected_device_type = get_device_type()
+    device = setup_device()
+    device_type = device.type
+    
     properties: Dict[str, Any] = {
-        "type": selected_device_type,
-        "supports_amp": selected_device_type == "cuda"
+        "type": device_type,
+        "supports_amp": device_type == "cuda"  # Currently, stable AMP is best on CUDA
     }
 
-    if selected_device_type == "cuda":
+    if device_type == "cuda":
         try:
-            current_cuda_device_idx = torch.cuda.current_device()
-            cuda_spec = torch.cuda.get_device_properties(current_cuda_device_idx)
-            properties.update(
-                {
-                    "name": cuda_spec.name,
-                    "memory": cuda_spec.total_memory,
-                    "capability": (cuda_spec.major, cuda_spec.minor),
-                }
-            )
-        except Exception as exc:
-            logger.warning(
-                "Could not read CUDA device properties (Exception: %s).", exc
-            )
+            idx = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(idx)
+            properties.update({
+                "name": props.name,
+                "memory_gb": round(props.total_memory / (1024**3), 2),
+                "capability": (props.major, props.minor),
+            })
+        except Exception as e:
+            logger.warning(f"Could not read CUDA device properties: {e}")
+    elif device_type == "mps":
+        properties["name"] = "Apple Silicon GPU"
+        
     return properties
 
 
 def configure_dataloader_settings() -> Dict[str, Any]:
     """
-    Returns recommended keyword arguments for a PyTorch DataLoader,
-    tuned to the current backend (excluding 'num_workers', which is
-    handled in the trainer).
-
-    This function configures 'pin_memory' and 'persistent_workers'
-    based on the device type for optimal data transfer performance.
+    Returns recommended keyword arguments for a PyTorch DataLoader based on device type.
+    This helps optimize data transfer to the GPU.
 
     Returns:
-        A dictionary with recommended DataLoader settings.
+        A dictionary with recommended DataLoader settings like 'pin_memory'
+        and 'persistent_workers'.
     """
-    selected_device_type = get_device_type()
-
-    settings: Dict[str, Any] = {
-        "pin_memory": selected_device_type == "cuda",
-        "persistent_workers": selected_device_type == "cuda",
+    device_type = setup_device().type
+    is_cuda = (device_type == "cuda")
+    
+    return {
+        "pin_memory": is_cuda,          # Speeds up CPU-to-CUDA memory transfers
+        "persistent_workers": is_cuda,  # Reduces worker startup overhead between epochs
     }
-
-    return settings
 
 
 __all__ = [
-    "get_device_type",
     "setup_device",
-    "get_device_properties",
+    "get_device_properties", 
     "configure_dataloader_settings",
 ]

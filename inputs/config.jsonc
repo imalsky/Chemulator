@@ -1,0 +1,154 @@
+// =========================================================================================
+// ==      CONFIGURATION FILE FOR CHEMICAL KINETICS STATE PREDICTOR (Fully Explicit)      ==
+// =========================================================================================
+// This file uses JSON5 syntax, which allows for comments. This version makes ALL
+// configurable parameters from the codebase explicit for maximum clarity and control.
+
+{
+  // ════════════════════════════════════════════════════════════════
+  // ║                1. DATA & OUTPUT PATHS CONFIGURATION          ║
+  // ════════════════════════════════════════════════════════════════
+  "data_paths_config": {
+    "raw_profiles_foldername": "chem-profiles"
+  },
+  "output_paths_config": {
+    "fixed_model_foldername": "trained_model_siren",
+    "tuning_results_foldername": "tuning_runs_siren"
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // ║                      2. DATA SPECIFICATION                   ║
+  // ════════════════════════════════════════════════════════════════
+  "data_specification": {
+    "species_variables": [
+      "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
+      "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
+      "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
+    ],
+    "global_variables": ["P", "T"],
+    // A complete list of all variables for the normalizer.
+    "all_variables": [
+      "P", "T", "t_time", "C2H2_evolution", "CH4_evolution", "CO2_evolution",
+      "CO_evolution", "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
+      "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
+    ]
+  },
+
+  // ══════════════════════════════════════════════════════════════════
+  // ║                    3. NORMALIZATION SETTINGS                     ║
+  // ══════════════════════════════════════════════════════════════════
+  "normalization": {
+    // Methods: "standard", "log-standard", "log-min-max", "iqr", "symlog", "max-out", "bool", "none".
+    "default_method": "log-standard",
+    "key_methods": {
+      "T": "standard",
+      "t_time": "log-min-max"
+    },
+    "epsilon": 1e-40,
+    "quantile_max_values_in_memory": 10000000,
+    "clip_outliers_before_scaling": false,
+    "symlog_percentile": 0.5,
+    "symlog_thresholds": {}
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // ║         4. MODEL HYPERPARAMETERS (For a fixed --train run)     ║
+  // ════════════════════════════════════════════════════════════════
+  "model_hyperparameters": {
+    // Core model type: "mlp", "siren".
+    "model_type": "siren",
+    // --- General MLP/Shared Settings ---
+    "hidden_dims": [256, 256, 256],
+    "dropout": 0.0,
+    // --- FiLM Conditioning Settings ---
+    "use_film": true, // Kept for consistency, but modern models require it.
+    "condition_dim": 128,
+    "use_time_embedding": true,
+    "time_embedding_dim": 64,
+    // --- MLP-Specific Settings ---
+    "use_residual": true, // Only used if model_type is "mlp"
+    // --- SIREN-Specific Settings ---
+    "siren_w0_initial": 30.0,
+    "siren_w0_hidden": 30.0,
+    // --- FNO-Specific Settings (Ignored unless model_type is 'fno') ---
+    "fno_spectral_modes": 16,
+    "fno_seq_length": 32
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // ║        5. TRAINING HYPERPARAMETERS (For a fixed --train run)   ║
+  // ════════════════════════════════════════════════════════════════
+  "training_hyperparameters": {
+    // --- Core Training Loop ---
+    "epochs": 100,
+    "batch_size": 32,
+    // --- Optimizer Settings ---
+    "optimizer": "adamw", // "adamw", "adam", "rmsprop"
+    "learning_rate": 1e-4,
+    "weight_decay": 1e-07,
+    // --- Loss Function Settings ---
+    "loss_function": "huber", // "mse", "huber", or "l1"
+    "huber_delta": 0.1, // Only used if loss_function is "huber"
+    // --- Physics-Informed Loss ---
+    "use_conservation_loss": false,
+    "conservation_loss_weight": 0.001,
+    // --- LR Scheduler Settings ---
+    "scheduler_choice": "plateau", // "plateau" or "cosine"
+    "lr_patience": 5,          // For "plateau" scheduler
+    "lr_factor": 0.2,            // For "plateau" scheduler
+    "min_lr": 1e-7,              // For "plateau" scheduler
+    "cosine_T_0": 25,            // For "cosine" scheduler
+    "cosine_T_mult": 2,          // For "cosine" scheduler
+    // --- Regularization & Early Stopping ---
+    "gradient_clip_val": 1.0,
+    "early_stopping_patience": 15,
+    "min_delta": 1e-08, // Minimum change in val_loss to be considered an improvement
+    // --- Performance ---
+    "use_amp": true // Use Automatic Mixed Precision (requires CUDA)
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // ║      6. OPTUNA HYPERPARAMETER TUNING (For a --tune run)      ║
+  // ════════════════════════════════════════════════════════════════
+  "optuna_settings": {
+    "study_name": "siren-kinetics-search-v1",
+    "num_trials": 500,
+    "pruner_warmup_steps": 5,
+    "pruner_startup_trials": 5,
+    "gc_after_trial": true,
+    "show_progress_bar": true
+  },
+  "optuna_hyperparam_search_space": {
+    "architecture": {
+      "num_hidden_layers": {"type": "int", "low": 2, "high": 6},
+      "hidden_dim": {"type": "categorical", "choices": [128, 256, 512]}
+    },
+    "hyperparameters": {
+      "model_type": {"type": "categorical", "choices": ["siren"]},
+      "learning_rate": {"type": "float", "low": 1e-5, "high": 1e-3, "log": true},
+      "use_time_embedding": {"type": "categorical", "choices": [true, false]},
+      "weight_decay": {"type": "float", "low": 1e-7, "high": 1e-4, "log": true},
+      "use_conservation_loss": {"type": "categorical", "choices": [true, false]},
+      "conservation_loss_weight": {"type": "float", "low": 1e-4, "high": 1.0, "log": true}
+    },
+    "conditional_hyperparameters": {
+      "condition_dim": {"type": "categorical", "choices": [64, 128, 256]},
+      "time_embedding_dim": {"type": "categorical", "choices": [32, 64, 128]},
+      "siren_w0_initial": {"type": "float", "low": 20.0, "high": 40.0},
+      "siren_w0_hidden": {"type": "categorical", "choices": [10.0, 30.0, 50.0]}
+    }
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // ║               7. PIPELINE & MISCELLANEOUS SETTINGS           ║
+  // ════════════════════════════════════════════════════════════════
+  "miscellaneous_settings": {
+    "random_seed": 42,
+    "val_frac": 0.15,
+    "test_frac": 0.15,
+    "num_workers": 0,       // Set > 0 for parallel data loading (Linux/macOS recommended).
+    "dataset_cache_size": -1, // -1 to cache all raw profiles in RAM.
+    "use_torch_compile": false, // Experimental, may speed up training on newer GPUs.
+    "show_epoch_progress": true // Show a tqdm progress bar for each epoch.
+  }
+}

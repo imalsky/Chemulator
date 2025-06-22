@@ -1,274 +1,293 @@
 #!/usr/bin/env python3
 """
-normalizer.py -- Creates self-contained, normalized data files using robust methods.
+normalizer.py -- Compute and invert various normalization schemes.
+
+This module calculates global statistics from a given set of training profiles.
+It uses a memory-efficient streaming approach for most methods (like z-score)
+and a memory-safe approach for quantile-based methods. Crucially, it provides
+a `ValueError` with detailed context if it encounters data incompatible with
+a chosen log-based normalization method, enabling rapid debugging.
 """
 from __future__ import annotations
+
 import json
 import logging
 import math
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple, Union
 
 import torch
 from torch import Tensor
-from utils import save_json
 
 logger = logging.getLogger(__name__)
 
-# A tuple to hold the state for Welford's online algorithm: (count, mean, M2)
-WelfordState = Tuple[int, float, float]
+# --- Constants ---
+DTYPE = torch.float32
+DEFAULT_EPSILON = 1e-9
+DEFAULT_QUANTILE_MEMORY_LIMIT = 5_000_000
+DEFAULT_SYMLOG_PERCENTILE = 0.5
+WelfordState = Tuple[int, float, float]  # (count, mean, M2)
 
-def welford_update(existing_aggregate: WelfordState, new_value: float) -> WelfordState:
-    """Performs a single update step of Welford's algorithm."""
-    count, mean, M2 = existing_aggregate
+
+def welford_update(state: WelfordState, new_value: float) -> WelfordState:
+    """Performs a single update step of Welford's algorithm for online variance."""
+    count, mean, m2 = state
     count += 1
     delta = new_value - mean
     mean += delta / count
     delta2 = new_value - mean
-    M2 += delta * delta2
-    return count, mean, M2
+    m2 += delta * delta2
+    return count, mean, m2
 
-def welford_finalize(existing_aggregate: WelfordState) -> Tuple[float, float]:
+
+def welford_finalize(state: WelfordState, eps: float) -> Tuple[float, float]:
     """Finalizes Welford's algorithm to get mean and standard deviation."""
-    count, mean, M2 = existing_aggregate
+    count, mean, m2 = state
     if count < 2:
         return mean, 1.0
-    variance = M2 / (count - 1)
-    return mean, math.sqrt(variance)
+    variance = m2 / (count - 1)
+    return mean, max(math.sqrt(variance), eps)
+
 
 class DataNormalizer:
     """
-    Handles the normalization of chemical profile data.
-
-    This class supports three main normalization methods:
-    - 'standard': Z-score normalization (subtract mean, divide by std).
-    - 'log-standard': Applies a log10 transform then Z-score normalizes.
-    - 'log-min-max': Applies a log10 transform then scales to a [0, 1] range.
-    
-    It operates in a streaming fashion to handle datasets that may not fit in memory.
+    Handles data normalization by calculating statistics from training data
+    and providing static methods to apply or invert the normalization.
     """
-    METHODS = {"standard", "log-standard", "log-min-max"}
+    METHODS = {"standard", "log-standard", "log-min-max", "iqr", "max-out",
+               "scaled_signed_offset_log", "symlog", "bool", "none"}
+    QUANTILE_METHODS = {"iqr", "symlog", "log-min-max"}
 
-    def __init__(self, input_folder: Union[str, Path], output_folder: Union[str, Path], *, config_data: Dict[str, Any], epsilon: float = 1e-9):
-        self.input_dir = Path(input_folder)
-        self.output_dir = Path(output_folder)
-        if not self.input_dir.is_dir():
-            raise FileNotFoundError(f"Input folder not found: {self.input_dir}")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+    def __init__(self, *, config_data: Dict[str, Any]):
         self.config = config_data
-        self.eps = float(epsilon)
+        self.data_spec = self.config.get("data_specification", {})
+        self.norm_cfg = self.config.get("normalization", {})
+        
+        self.eps = float(self.norm_cfg.get("epsilon", DEFAULT_EPSILON))
         self.keys_to_process, self.key_methods = self._get_keys_and_methods()
 
     def _get_keys_and_methods(self) -> Tuple[Set[str], Dict[str, str]]:
-        """Parses the configuration to determine which keys to process and with which method."""
-        keys_to_process = set(self.config.get("all_variables", []))
-        norm_config = self.config.get("normalization", {})
-        user_key_methods = norm_config.get("key_methods", {})
-        default_method = norm_config.get("default_method", "standard")
+        """Parses config to determine which keys to process and with which method."""
+        all_vars = set(self.data_spec.get("all_variables", []))
+        user_key_methods = self.norm_cfg.get("key_methods", {})
+        default_method = self.norm_cfg.get("default_method", "standard")
         
-        key_methods = {key: user_key_methods.get(key, default_method).lower() for key in keys_to_process}
+        key_methods = {key: user_key_methods.get(key, default_method).lower() for key in all_vars}
         
         for key, method in key_methods.items():
             if method not in self.METHODS:
-                raise ValueError(f"Unsupported normalization method '{method}' for key '{key}'. Supported methods are: {self.METHODS}")
-            if method.startswith("log-"):
-                logger.info(f"Variable '{key}' will use '{method}' normalization. Ensure all values are positive.")
+                raise ValueError(f"Unsupported method '{method}' for key '{key}'.")
         
-        return keys_to_process, key_methods
+        return all_vars, key_methods
 
-    def calculate_global_stats(self) -> Dict[str, Any]:
-        """Calculates global statistics for all variables in a single pass over the data."""
-        logger.info("Starting calculation of global statistics via streaming...")
-        json_files = [p for p in self.input_dir.glob("*.json") if p.name != "normalization_metadata.json"]
-        if not json_files:
-            raise FileNotFoundError(f"No JSON profiles found in {self.input_dir}")
+    def calculate_stats(self, profile_paths: List[Path]) -> Dict[str, Any]:
+        """Calculates global statistics for all variables from a list of profiles."""
+        logger.info(f"Starting statistics calculation on {len(profile_paths)} profiles...")
+        if not profile_paths:
+            logger.warning("Cannot calculate statistics from an empty list of profiles. Returning empty stats.")
+            return {"normalization_methods": {}, "per_key_stats": {}}
 
-        # Initialize accumulators for each method type
-        welford_accumulators = {k: (0, 0.0, 0.0) for k, m in self.key_methods.items() if m == "standard"}
-        log_welford_accumulators = {k: (0, 0.0, 0.0) for k, m in self.key_methods.items() if m == "log-standard"}
-        log_min_max_accumulators = {k: (float('inf'), float('-inf')) for k, m in self.key_methods.items() if m == "log-min-max"}
-        
-        log_invalid_counts = {k: 0 for k, m in self.key_methods.items() if m.startswith("log-")}
+        accumulators = self._initialize_accumulators()
 
-        for fpath in json_files:
+        for fpath in profile_paths:
             try:
                 data = json.loads(fpath.read_text(encoding="utf-8-sig"))
                 for key in self.keys_to_process:
-                    if key not in data or data[key] is None:
-                        continue
-                        
-                    method = self.key_methods[key]
-                    values = data[key] if isinstance(data[key], list) else [data[key]]
-                    
-                    for v in values:
-                        if not (isinstance(v, (int, float)) and math.isfinite(v)):
-                            continue
-
-                        if method == "standard":
-                            welford_accumulators[key] = welford_update(welford_accumulators[key], v)
-                        elif method.startswith("log-"):
-                            if v <= 0:
-                                log_invalid_counts[key] += 1
-                                continue
-                            log_v = math.log10(v)
-
-                            if method == "log-standard":
-                                log_welford_accumulators[key] = welford_update(log_welford_accumulators[key], log_v)
-                            elif method == "log-min-max":
-                                current_min, current_max = log_min_max_accumulators[key]
-                                log_min_max_accumulators[key] = (min(current_min, log_v), max(current_max, log_v))
-                            
+                    if key in data and data[key] is not None:
+                        self._update_stats_for_key(key, data[key], accumulators, fpath)
             except (json.JSONDecodeError, IOError) as e:
                 logger.error(f"Error processing {fpath.name}: {e}. Skipping.")
 
-        computed_stats: Dict[str, Any] = {}
-        for key, method in self.key_methods.items():
-            stats: Dict[str, Any] = {"epsilon": self.eps, "method": method}
-            
-            if log_invalid_counts.get(key, 0) > 0:
-                logger.error(f"FATAL: Variable '{key}' has {log_invalid_counts[key]} non-positive values but requires a log-based normalization.")
-
-            if method == "standard":
-                mean, std = welford_finalize(welford_accumulators[key])
-                if std < self.eps:
-                    logger.warning(f"Variable '{key}' has near-zero variance. Setting std=1.0.")
-                    std = 1.0
-                stats.update({"mean": mean, "std": std})
-            
-            elif method == "log-standard":
-                log_mean, log_std = welford_finalize(log_welford_accumulators[key])
-                if log_std < self.eps:
-                    logger.warning(f"Log-transformed variable '{key}' has near-zero variance. Setting log_std=1.0.")
-                    log_std = 1.0
-                stats.update({"log_mean": log_mean, "log_std": log_std})
-
-            elif method == "log-min-max":
-                min_val, max_val = log_min_max_accumulators[key]
-                if min_val == float('inf') or max_val == float('-inf'):
-                    logger.error(f"Variable '{key}' has no valid positive values for 'log-min-max'. Using defaults [0, 1].")
-                    min_val, max_val = 0.0, 1.0
-                elif (max_val - min_val) < self.eps:
-                    logger.warning(f"Variable '{key}' has constant log values. Setting range to [min, min+1] for 'log-min-max'.")
-                    max_val = min_val + 1.0
-                stats.update({"min": min_val, "max": max_val})
-            
-            computed_stats[key] = stats
-            
+        computed_stats = self._finalize_stats(accumulators)
         metadata = {"normalization_methods": self.key_methods, "per_key_stats": computed_stats}
-        self._save_metadata(metadata)
         logger.info("Global statistics calculation complete.")
         return metadata
 
-    def _save_metadata(self, metadata: Dict[str, Any]):
-        save_json(metadata, self.output_dir / "normalization_metadata.json")
+    def _initialize_accumulators(self) -> Dict[str, Dict[str, Any]]:
+        """Initializes data structures for statistics accumulation."""
+        accumulators = {}
+        for key, method in self.key_methods.items():
+            if method in ("none", "bool"): continue
+            key_stats = {"min": float('inf'), "max": float('-inf')}
+            if method in ("standard", "log-standard"):
+                key_stats["welford"] = (0, 0.0, 0.0)
+            if method in self.QUANTILE_METHODS:
+                key_stats["values"] = []
+            accumulators[key] = key_stats
+        return accumulators
+
+    def _update_stats_for_key(self, key: str, value: Any, accumulators: Dict, fpath: Path) -> None:
+        """Updates accumulators for a single key, failing fast on invalid data for log methods."""
+        if key not in accumulators: return
+        method = self.key_methods[key]
+        key_acc = accumulators[key]
+        
+        values_to_process = value if isinstance(value, list) else [value]
+        for v in values_to_process:
+            if not isinstance(v, (int, float)) or not math.isfinite(v): continue
+            
+            # CORRECTED: The threshold for log-based methods should be 0, not epsilon.
+            if method.startswith("log-") and v <= 0:
+                raise ValueError(
+                    f"Variable '{key}' in profile '{fpath.name}' has non-positive value ({v}) "
+                    f"but requires a log-based normalization ('{method}'). Please check data or config."
+                )
+
+            key_acc["min"] = min(key_acc["min"], v)
+            key_acc["max"] = max(key_acc["max"], v)
+
+            if method == "standard":
+                key_acc["welford"] = welford_update(key_acc["welford"], v)
+            elif method == "log-standard":
+                key_acc["welford"] = welford_update(key_acc["welford"], math.log10(v))
+            elif method in self.QUANTILE_METHODS:
+                key_acc["values"].append(v)
+
+    def _finalize_stats(self, accumulators: Dict) -> Dict[str, Any]:
+        """Finalizes statistics from accumulators after the full data pass."""
+        final_stats = {}
+        
+        for key, method in self.key_methods.items():
+            stats: Dict[str, Any] = {"method": method, "epsilon": self.eps}
+
+            if key not in accumulators:
+                if method not in ("none", "bool"):
+                    logger.warning(
+                        f"Variable '{key}' was specified in config but not found in any training profiles. "
+                        f"Assigning 'none' normalization as a fallback."
+                    )
+                self.key_methods[key] = "none"
+                stats["method"] = "none"
+                final_stats[key] = stats
+                continue
+            
+            key_acc = accumulators[key]
+            
+            if method == "standard":
+                mean, std = welford_finalize(key_acc["welford"], self.eps)
+                stats.update({"mean": mean, "std": std})
+            elif method == "log-standard":
+                log_mean, log_std = welford_finalize(key_acc["welford"], self.eps)
+                stats.update({"log_mean": log_mean, "log_std": log_std})
+            elif method == "max-out":
+                stats["max_val"] = max(abs(key_acc["min"]), abs(key_acc["max"]), self.eps)
+            elif method == "scaled_signed_offset_log":
+                m_pos = math.log10(max(0, key_acc["max"]) + 1 + self.eps)
+                m_neg = math.log10(max(0, -key_acc["min"]) + 1 + self.eps)
+                stats.update({"m": max(m_pos, m_neg, 1.0)})
+            elif method in self.QUANTILE_METHODS:
+                stats.update(self._finalize_quantile_stats(key, key_acc, method, self.norm_cfg))
+            
+            final_stats[key] = stats
+        return final_stats
+    
+    def _finalize_quantile_stats(self, key: str, key_acc: dict, method: str, norm_cfg: dict) -> dict:
+        """Computes stats for methods requiring all data (quantiles) with memory safety."""
+        values_list = key_acc.get("values", [])
+        max_values = norm_cfg.get("quantile_max_values_in_memory", DEFAULT_QUANTILE_MEMORY_LIMIT)
+        if len(values_list) > max_values:
+            logger.warning(f"Key '{key}' has {len(values_list):,} values, exceeding limit of {max_values:,}. Using random sample.")
+            values_list = random.sample(values_list, max_values)
+        if not values_list:
+            logger.warning(f"No valid data found for quantile method on key '{key}'. Using defaults.")
+            return {"median": 0, "iqr": 1.0, "threshold": 1.0, "scale_factor": 1.0, "min": 0.0, "max": 1.0}
+        values = torch.tensor(values_list, dtype=DTYPE)
+        stats: Dict[str, Any] = {}
+        if method == "iqr":
+            q1, med, q3 = torch.quantile(values, torch.tensor([0.25, 0.5, 0.75])).tolist()
+            stats.update({"median": med, "iqr": max(q3 - q1, self.eps)})
+        elif method == "log-min-max":
+            log_vals = torch.log10(torch.clamp(values, min=self.eps))
+            min_v, max_v = log_vals.min().item(), log_vals.max().item()
+            stats.update({"min": min_v, "max": max(max_v, min_v + self.eps)})
+        elif method == "symlog":
+            thresholds = norm_cfg.get("symlog_thresholds", {})
+            percentile = norm_cfg.get("symlog_percentile", DEFAULT_SYMLOG_PERCENTILE)
+            thr = thresholds.get(key, torch.quantile(torch.abs(values), percentile).item())
+            thr = max(thr, self.eps)
+            abs_v = torch.abs(values)
+            mask = abs_v > thr
+            transformed = torch.zeros_like(values)
+            transformed[mask] = torch.sign(values[mask]) * (torch.log10(abs_v[mask] / thr) + 1)
+            transformed[~mask] = values[~mask] / thr
+            sf = transformed.abs().max().item() if transformed.numel() > 0 else 1.0
+            stats.update({"threshold": thr, "scale_factor": max(sf, 1.0)})
+        return stats
 
     @staticmethod
     def normalize_tensor(x: Tensor, method: str, stats: Dict[str, Any]) -> Tensor:
-        """Applies the specified normalization to a tensor."""
-        eps = stats.get("epsilon", 1e-9)
+        """Applies the specified normalization method to a tensor."""
+        eps = stats.get("epsilon", DEFAULT_EPSILON)
+        if method in ("none", "bool"): return x
         
         if method == "standard":
             return (x - stats["mean"]) / stats["std"]
-            
         elif method == "log-standard":
-            x_positive = torch.where(x > 0, x, torch.full_like(x, eps))
-            x_log = torch.log10(x_positive)
-            return (x_log - stats["log_mean"]) / stats["log_std"]
-            
+            # CORRECTED: Added clamp for safety
+            safe_x = torch.clamp(x, min=eps)
+            return (torch.log10(safe_x) - stats["log_mean"]) / stats["log_std"]
         elif method == "log-min-max":
-            x_positive = torch.where(x > 0, x, torch.full_like(x, eps))
-            x_log = torch.log10(x_positive)
-            denominator = stats["max"] - stats["min"]
-            if denominator < eps:
-                return torch.zeros_like(x_log)
-            return torch.clamp((x_log - stats["min"]) / denominator, 0.0, 1.0)
-            
+            # CORRECTED: Added clamp for safety
+            safe_x = torch.clamp(x, min=eps)
+            denom = stats["max"] - stats["min"]
+            return torch.clamp((torch.log10(safe_x) - stats["min"]) / max(denom, eps), 0.0, 1.0)
+        elif method == "max-out":
+            return x / stats["max_val"]
+        elif method == "iqr":
+            return (x - stats["median"]) / stats["iqr"]
+        elif method == "scaled_signed_offset_log":
+            y = torch.sign(x) * torch.log10(torch.abs(x) + 1 + eps)
+            return y / stats["m"]
+        elif method == "symlog":
+            thr, sf = stats["threshold"], stats["scale_factor"]
+            abs_x = torch.abs(x)
+            mask = abs_x > thr
+            y = torch.zeros_like(x)
+            y[mask] = torch.sign(x[mask]) * (torch.log10(abs_x[mask] / thr) + 1)
+            y[~mask] = x[~mask] / thr
+            return torch.clamp(y / sf, -1.0, 1.0)
         else:
-            # This branch should ideally not be reached if config is validated
             raise ValueError(f"Unsupported normalization method '{method}'")
 
     @staticmethod
-    def denormalize(
-        v: Union[Tensor, List[float], float], 
-        metadata: Dict[str, Any],
-        var_name: str,
-    ) -> Union[Tensor, List[float], float]:
-        """Inverts the normalization for a given variable, restoring its original scale."""
-        method = metadata["normalization_methods"][var_name]
-        stats = metadata["per_key_stats"][var_name]
+    def denormalize(v: Union[Tensor, List, float, bool, None], metadata: Dict[str, Any], var_name: str) -> Union[Tensor, List, float, bool, None]:
+        """Applies the inverse normalization to a value, tensor, or list."""
+        if v is None: return None
+        method = metadata["normalization_methods"].get(var_name, "none")
+        if method in ("none", "bool"): return v
         
-        is_scalar = not isinstance(v, (torch.Tensor, list))
-        x = torch.tensor(v, dtype=torch.float32) if not isinstance(v, torch.Tensor) else v.clone().detach()
+        stats = metadata["per_key_stats"].get(var_name)
+        if not stats: raise ValueError(f"No stats for '{var_name}' in metadata")
 
-        y = None
+        is_scalar = not isinstance(v, (torch.Tensor, list))
+        x = torch.tensor(v, dtype=DTYPE) if not isinstance(v, torch.Tensor) else v.clone().detach().to(DTYPE)
+        
+        y: Tensor
         if method == "standard":
             y = x * stats["std"] + stats["mean"]
         elif method == "log-standard":
-            log_val = x * stats["log_std"] + stats["log_mean"]
-            y = torch.pow(10, log_val)
+            y = torch.pow(10, x * stats["log_std"] + stats["log_mean"])
         elif method == "log-min-max":
-            # Clamp normalized values to valid range before denormalizing
-            x_clipped = torch.clamp(x, 0.0, 1.0)
-            log_val = x_clipped * (stats["max"] - stats["min"]) + stats["min"]
-            y = torch.pow(10, log_val)
+            y = torch.pow(10, torch.clamp(x, 0, 1) * (stats["max"] - stats["min"]) + stats["min"])
+        elif method == "max-out":
+            y = x * stats["max_val"]
+        elif method == "iqr":
+            y = x * stats["iqr"] + stats["median"]
+        elif method == "scaled_signed_offset_log":
+            ytmp = x * stats["m"]
+            y = torch.sign(ytmp) * (torch.pow(10, torch.abs(ytmp)) - 1 - stats["epsilon"])
+        elif method == "symlog":
+            unscaled = x * stats["scale_factor"]
+            abs_unscaled = torch.abs(unscaled)
+            mask = abs_unscaled > 1.0
+            y = torch.zeros_like(x)
+            y[mask] = torch.sign(unscaled[mask]) * stats["threshold"] * torch.pow(10, abs_unscaled[mask] - 1)
+            y[~mask] = unscaled[~mask] * stats["threshold"]
         else:
-            raise ValueError(f"Unsupported method '{method}' for denormalization.")
+            raise ValueError(f"Unsupported denormalization method '{method}'")
 
-        # Return in the original format
-        if is_scalar:
-            return y.item()
-        if isinstance(v, list):
-            return y.tolist()
-        return y
+        if is_scalar: return y.item()
+        return y.tolist() if isinstance(v, list) else y
 
-    def process_profiles(self, stats_metadata: Dict[str, Any]):
-        """Normalizes all profiles from the input folder and saves them to the output folder."""
-        logger.info(f"Normalizing all profiles and saving to: {self.output_dir}")
-        methods = stats_metadata["normalization_methods"]
-        stats = stats_metadata["per_key_stats"]
-        
-        processed_count, error_count = 0, 0
-        
-        for fpath in self.input_dir.glob("*.json"):
-            if fpath.name == "normalization_metadata.json": 
-                continue
-                
-            try:
-                profile_data = json.loads(fpath.read_text(encoding="utf-8-sig"))
-                output_profile = {}
-                is_valid = True
-                
-                for key in self.keys_to_process:
-                    if key not in profile_data:
-                        logger.warning(f"Key '{key}' missing in {fpath.name}. Skipping this file.")
-                        is_valid = False
-                        break
-                        
-                    value = profile_data[key]
-                    
-                    if methods[key].startswith("log-"):
-                        values_to_check = value if isinstance(value, list) else [value]
-                        if any(v <= 0 for v in values_to_check if isinstance(v, (int, float))):
-                            logger.error(f"Profile {fpath.name} contains non-positive values for log-based variable '{key}'. Skipping file.")
-                            is_valid = False
-                            break
-                    
-                    tensor_val = torch.tensor(value, dtype=torch.float32)
-                    norm_tensor = self.normalize_tensor(tensor_val, methods[key], stats[key])
-                    output_profile[key] = norm_tensor.tolist() if isinstance(value, list) else norm_tensor.item()
-                    
-                if is_valid:
-                    save_json(output_profile, self.output_dir / fpath.name)
-                    processed_count += 1
-                else:
-                    error_count += 1
-                    
-            except Exception as e:
-                logger.error(f"Failed to process profile {fpath.name}: {e}", exc_info=True)
-                error_count += 1
-                
-        logger.info(f"Profile processing complete. Successfully processed: {processed_count}, Errors/Skipped: {error_count}")
-
-
-__all__ = ["DataNormalizer", "denormalize"]
+__all__ = ["DataNormalizer"]
