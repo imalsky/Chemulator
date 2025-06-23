@@ -1,16 +1,18 @@
 // =========================================================================================
-// ==      CONFIGURATION FILE FOR CHEMICAL KINETICS STATE PREDICTOR (Fully Explicit)      ==
+// ==      CONFIGURATION FILE FOR CHEMICAL KINETICS STATE PREDICTOR (Enhanced Version)    ==
 // =========================================================================================
-// This file uses JSON5 syntax, which allows for comments. This version makes ALL
-// configurable parameters from the codebase explicit for maximum clarity and control.
+// This configuration includes all accuracy improvements and best practices.
 
 {
   // ════════════════════════════════════════════════════════════════
   // ║                1. DATA & OUTPUT PATHS CONFIGURATION          ║
   // ════════════════════════════════════════════════════════════════
   "data_paths_config": {
-    "raw_profiles_foldername": "chem-profiles"
+    "hdf5_dataset_filename": "chem_data/data.h5",
+    // Optional: If this file exists, it will be used. Otherwise, splits will be generated.
+    "dataset_splits_filename": "chem_data/data_splits.json"
   },
+  
   "output_paths_config": {
     "fixed_model_foldername": "trained_model_siren",
     "tuning_results_foldername": "tuning_runs_siren"
@@ -20,16 +22,21 @@
   // ║                      2. DATA SPECIFICATION                   ║
   // ════════════════════════════════════════════════════════════════
   "data_specification": {
+    // Chemical species that evolve over time
     "species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
+    
+    // Global conditions (temperature, pressure)
     "global_variables": ["P", "T"],
-    // A complete list of all variables for the normalizer.
+    
+    // All variables for normalization
     "all_variables": [
-      "P", "T", "t_time", "C2H2_evolution", "CH4_evolution", "CO2_evolution",
-      "CO_evolution", "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
+      "P", "T", "t_time",
+      "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
+      "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ]
   },
@@ -38,117 +45,168 @@
   // ║                    3. NORMALIZATION SETTINGS                     ║
   // ══════════════════════════════════════════════════════════════════
   "normalization": {
-    // Methods: "standard", "log-standard", "log-min-max", "iqr", "symlog", "max-out", "bool", "none".
+    // Default method for most variables
     "default_method": "log-standard",
-    "key_methods": {
-      "T": "standard",
-      "t_time": "log-min-max"
+    
+    // Override for specific variables
+    "key_methods": { 
+      "T": "standard",           // Temperature - linear scale
+      "P": "standard",           // Pressure - linear scale  
+      "t_time": "log-min-max"    // Time - bounded log scale
     },
+    
+    // Numerical stability
     "epsilon": 1e-40,
-    "quantile_max_values_in_memory": 10000000,
-    "clip_outliers_before_scaling": false,
-    "symlog_percentile": 0.5,
-    "symlog_thresholds": {}
+    
+    // Memory limit for quantile methods
+    "quantile_max_values_in_memory": 10000000
   },
 
   // ════════════════════════════════════════════════════════════════
-  // ║         4. MODEL HYPERPARAMETERS (For a fixed --train run)     ║
+  // ║              4. MODEL HYPERPARAMETERS (Fixed Training)         ║
   // ════════════════════════════════════════════════════════════════
   "model_hyperparameters": {
-    // Core model type: "mlp", "siren".
-    "model_type": "siren",
-    // --- General MLP/Shared Settings ---
-    "hidden_dims": [256, 256, 256],
-    "dropout": 0.0,
-    // --- FiLM Conditioning Settings ---
-    "use_film": true, // Kept for consistency, but modern models require it.
-    "condition_dim": 128,
+    // Model architecture choice
+    "model_type": "siren",  // Options: "mlp", "siren", "fno"
+    
+    // Network architecture
+    "hidden_dims": [384, 384, 256, 128],  // Deeper network
+    "dropout": 0.1,                       // Regularization
+    
+    // Conditioning parameters
+    "condition_dim": 64,
     "use_time_embedding": true,
-    "time_embedding_dim": 64,
-    // --- MLP-Specific Settings ---
-    "use_residual": true, // Only used if model_type is "mlp"
-    // --- SIREN-Specific Settings ---
-    "siren_w0_initial": 30.0,
-    "siren_w0_hidden": 30.0,
-    // --- FNO-Specific Settings (Ignored unless model_type is 'fno') ---
+    "time_embedding_dim": 32,
+    
+    // MLP-specific parameters
+    "use_residual": true,
+    "activation": "silu",           // Options: relu, gelu, silu, elu, tanh
+    "use_layer_norm": true,
+    "init_type": "xavier_uniform",  // Weight initialization
+    "stochastic_depth": 0.1,        // Stochastic depth regularization
+    
+    // SIREN-specific parameters
+    "siren_w0_initial": 30.0,       // First layer frequency
+    "siren_w0_hidden": 1.0,         // Hidden layer frequency
+    "use_batch_norm": false,        // Batch norm for SIREN
+    "final_activation": false,      // Final layer activation
+    
+    // FNO-specific parameters
     "fno_spectral_modes": 16,
-    "fno_seq_length": 32
+    "fno_seq_length": 32,
+    "fno_compression": 0.5          // Spectral compression ratio
   },
 
   // ════════════════════════════════════════════════════════════════
-  // ║        5. TRAINING HYPERPARAMETERS (For a fixed --train run)   ║
+  // ║               5. TRAINING HYPERPARAMETERS                      ║
   // ════════════════════════════════════════════════════════════════
   "training_hyperparameters": {
-    // --- Core Training Loop ---
-    "epochs": 100,
-    "batch_size": 32,
-    // --- Optimizer Settings ---
-    "optimizer": "adamw", // "adamw", "adam", "rmsprop"
-    "learning_rate": 1e-4,
-    "weight_decay": 1e-07,
-    // --- Loss Function Settings ---
-    "loss_function": "huber", // "mse", "huber", or "l1"
-    "huber_delta": 0.1, // Only used if loss_function is "huber"
-    // --- Physics-Informed Loss ---
-    "use_conservation_loss": false,
-    "conservation_loss_weight": 0.001,
-    // --- LR Scheduler Settings ---
-    "scheduler_choice": "plateau", // "plateau" or "cosine"
-    "lr_patience": 5,          // For "plateau" scheduler
-    "lr_factor": 0.2,            // For "plateau" scheduler
-    "min_lr": 1e-7,              // For "plateau" scheduler
-    "cosine_T_0": 25,            // For "cosine" scheduler
-    "cosine_T_mult": 2,          // For "cosine" scheduler
-    // --- Regularization & Early Stopping ---
+    // Data split parameters (used when generating splits)
+    "val_frac": 0.15,                // Fraction for validation
+    "test_frac": 0.15,               // Fraction for test
+    
+    // Partial training on all splits
+    "data_fraction": 1.0,           // Fraction of data to use (1.0 = all)
+
+    // Training duration
+    "epochs": 50,
+    "early_stopping_patience": 30,
+    "min_delta": 1e-8,
+    
+    // Batch settings
+    "batch_size": 64,
+    "gradient_accumulation_steps": 1,  // Effective batch = batch_size * this
+    
+    // Optimizer settings
+    "optimizer": "adamw",
+    "learning_rate": 5e-4,
+    "weight_decay": 1e-4,
+    
+    // Learning rate schedule
+    "scheduler_choice": "plateau",     // Options: "plateau", "cosine"
+    "warmup_epochs": 5,               // Linear warmup
+    "patience": 10,                   // For plateau scheduler
+    "factor": 0.5,                    // LR reduction factor
+    "min_lr": 1e-7,
+    
+    // Cosine scheduler settings (if used)
+    "cosine_T_0": 20,                // Restarts every T_0 epochs (adjusted for grad accum)
+    "cosine_T_mult": 2,
+    
+    // Loss function
+    "loss_function": "huber",         // Options: "mse", "huber", "l1"
+    "huber_delta": 0.1,
+    
+    // Physics-informed learning
+    "use_conservation_loss": false,     // Atom conservation
+    "conservation_loss_weight": 0.01,
+    
+    // Training stability
     "gradient_clip_val": 1.0,
-    "early_stopping_patience": 15,
-    "min_delta": 1e-08, // Minimum change in val_loss to be considered an improvement
-    // --- Performance ---
-    "use_amp": true // Use Automatic Mixed Precision (requires CUDA)
+    "use_amp": true,                  // Mixed precision training
+    
+    // Model averaging
+    "use_ema": true,                  // Exponential moving average
+    "ema_decay": 0.999
   },
 
   // ════════════════════════════════════════════════════════════════
-  // ║      6. OPTUNA HYPERPARAMETER TUNING (For a --tune run)      ║
+  // ║              6. OPTUNA HYPERPARAMETER SEARCH                   ║
   // ════════════════════════════════════════════════════════════════
   "optuna_settings": {
-    "study_name": "siren-kinetics-search-v1",
-    "num_trials": 500,
-    "pruner_warmup_steps": 5,
-    "pruner_startup_trials": 5,
+    "study_name": "siren-kinetics-enhanced-v1",
+    "n_trials": 300,
+    "pruner_warmup_steps": 10,
+    "pruner_startup_trials": 10,
     "gc_after_trial": true,
     "show_progress_bar": true
   },
+  
   "optuna_hyperparam_search_space": {
+    // Architecture search
     "architecture": {
       "num_hidden_layers": {"type": "int", "low": 2, "high": 6},
-      "hidden_dim": {"type": "categorical", "choices": [128, 256, 512]}
+      "hidden_dim": {"type": "categorical", "choices": [128, 256, 384, 512]}
     },
+    
+    // Hyperparameter search
     "hyperparameters": {
-      "model_type": {"type": "categorical", "choices": ["siren"]},
+      // Learning parameters
       "learning_rate": {"type": "float", "low": 1e-5, "high": 1e-3, "log": true},
-      "use_time_embedding": {"type": "categorical", "choices": [true, false]},
       "weight_decay": {"type": "float", "low": 1e-7, "high": 1e-4, "log": true},
+      "dropout": {"type": "float", "low": 0.0, "high": 0.3},
+      "batch_size": {"type": "categorical", "choices": [512, 1024, 2048, 4096]},
+      
+      // Regularization
+      "stochastic_depth": {"type": "float", "low": 0.0, "high": 0.2},
+      "gradient_accumulation_steps": {"type": "categorical", "choices": [1, 2, 4]},
+      
+      // Conservation loss
       "use_conservation_loss": {"type": "categorical", "choices": [true, false]},
-      "conservation_loss_weight": {"type": "float", "low": 1e-4, "high": 1.0, "log": true}
-    },
-    "conditional_hyperparameters": {
-      "condition_dim": {"type": "categorical", "choices": [64, 128, 256]},
-      "time_embedding_dim": {"type": "categorical", "choices": [32, 64, 128]},
-      "siren_w0_initial": {"type": "float", "low": 20.0, "high": 40.0},
-      "siren_w0_hidden": {"type": "categorical", "choices": [10.0, 30.0, 50.0]}
+      "conservation_loss_weight": {"type": "float", "low": 1e-4, "high": 0.1, "log": true},
+      
+      // Model-specific parameters
+      "siren_w0_initial": {"type": "float", "low": 1.0, "high": 50.0},
+      "siren_w0_hidden": {"type": "float", "low": 0.1, "high": 5.0},
+      "condition_dim": {"type": "categorical", "choices": [32, 64, 128]},
+      
+      // Training settings
+      "warmup_epochs": {"type": "int", "low": 0, "high": 10},
+      "use_ema": {"type": "categorical", "choices": [true, false]},
+      
+      // Activation functions (for MLP)
+      "activation": {"type": "categorical", "choices": ["relu", "gelu", "silu", "elu"]}
     }
   },
 
   // ════════════════════════════════════════════════════════════════
-  // ║               7. PIPELINE & MISCELLANEOUS SETTINGS           ║
+  // ║                   7. MISCELLANEOUS SETTINGS                    ║
   // ════════════════════════════════════════════════════════════════
   "miscellaneous_settings": {
     "random_seed": 42,
-    "val_frac": 0.15,
-    "test_frac": 0.15,
-    "num_workers": 0,       // Set > 0 for parallel data loading (Linux/macOS recommended).
-    "dataset_cache_size": -1, // -1 to cache all raw profiles in RAM.
-    "use_torch_compile": false, // Experimental, may speed up training on newer GPUs.
-    "show_epoch_progress": true // Show a tqdm progress bar for each epoch.
+    "num_workers": 0,               // Must be 0 for HDF5
+    "dataset_cache_size": -1,       // -1 = cache all profiles
+    "use_torch_compile": true,      // Compile model (CUDA only)
+    "show_epoch_progress": true     // Progress bars during training
   }
 }

@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import sys
+import h5py
 
 try:
     import json5 as _json_backend
@@ -86,8 +87,8 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("Config section 'model_hyperparameters' is missing or not a dictionary.")
     if not isinstance(model_params.get("hidden_dims"), list) or not model_params.get("hidden_dims"):
         raise ValueError("Config key 'hidden_dims' in 'model_hyperparameters' must be a non-empty list.")
-    dropout = model_params.get("dropout", -1.0)
-    if not isinstance(dropout, (float, int)) or not (0.0 <= dropout < 1.0):
+    dropout = model_params.get("dropout")
+    if dropout is not None and not (0.0 <= dropout < 1.0):
         raise ValueError("'dropout' in 'model_hyperparameters' must be a float in the range [0.0, 1.0).")
 
 def ensure_dirs(*paths: Union[str, Path]) -> bool:
@@ -131,7 +132,6 @@ def seed_everything(seed: int = DEFAULT_SEED) -> None:
         torch.cuda.manual_seed_all(seed)
     logger.info(f"Global random seed set to {seed}.")
 
-# CORRECTED: A much more robust parser for chemical formulas.
 def _parse_formula_recursive(formula: str) -> Counter[str]:
     """Recursively parses a chemical formula, handling parentheses."""
     counts: Counter[str] = Counter()
@@ -143,6 +143,7 @@ def _parse_formula_recursive(formula: str) -> Counter[str]:
             balance = 1
             while balance > 0:
                 j += 1
+                if j >= len(formula): raise ValueError(f"Mismatched parentheses in formula: {formula}")
                 if formula[j] == '(': balance += 1
                 if formula[j] == ')': balance -= 1
             sub_counts = _parse_formula_recursive(formula[i+1:j])
@@ -156,6 +157,7 @@ def _parse_formula_recursive(formula: str) -> Counter[str]:
                 counts[elem] += count * multiplier
         # Handle elements
         else:
+            if not formula[i].isupper(): raise ValueError(f"Element must start with uppercase letter: {formula[i:]}")
             j = i + 1
             while j < len(formula) and formula[j].islower():
                 j += 1
@@ -200,7 +202,138 @@ def parse_species_atoms(species_names: List[str]) -> Tuple[np.ndarray, List[str]
                 atom_matrix[i, atom_map[atom]] = count
     return atom_matrix, sorted_atoms
 
+
+def generate_dataset_splits(
+    h5_path: Path, 
+    val_frac: float = 0.15, 
+    test_frac: float = 0.15,
+    random_seed: int = DEFAULT_SEED
+) -> Dict[str, List[int]]:
+    """
+    Generate train/validation/test splits from HDF5 dataset.
+    
+    Args:
+        h5_path: Path to the HDF5 dataset
+        val_frac: Fraction of data for validation
+        test_frac: Fraction of data for test
+        random_seed: Random seed for reproducibility
+        
+    Returns:
+        Dictionary with 'train', 'validation', and 'test' keys containing indices
+    """
+    # Validate fractions
+    if not (0 < val_frac < 1 and 0 < test_frac < 1 and val_frac + test_frac < 1):
+        raise ValueError(f"Invalid split fractions: val={val_frac}, test={test_frac}")
+    
+    # Get number of profiles from HDF5
+    with h5py.File(h5_path, 'r') as hf:
+        # Find any dataset to get the first dimension (number of profiles)
+        # Assuming all datasets have the same first dimension
+        first_key = next(iter(hf.keys()))
+        n_profiles = hf[first_key].shape[0]
+    
+    if n_profiles == 0:
+        raise ValueError(f"No profiles found in {h5_path}")
+    
+    # Calculate split sizes
+    n_val = int(round(n_profiles * val_frac))
+    n_test = int(round(n_profiles * test_frac))
+    n_train = n_profiles - n_val - n_test
+    
+    # Generate and shuffle indices
+    indices = list(range(n_profiles))
+    rng = random.Random(random_seed)
+    rng.shuffle(indices)
+    
+    # Create splits
+    train_idx = sorted(indices[:n_train])
+    val_idx = sorted(indices[n_train:n_train + n_val])
+    test_idx = sorted(indices[n_train + n_val:])
+    
+    splits = {
+        "train": train_idx,
+        "validation": val_idx,
+        "test": test_idx
+    }
+    
+    logger.info(f"Generated splits from {n_profiles} profiles: "
+                f"train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+    
+    return splits
+
+
+def get_config_str(config: Dict[str, Any], section: str, key: str, op_desc: str) -> str:
+    """Safely extracts a path string from configuration."""
+    if section not in config or not isinstance(config[section], dict):
+        raise ValueError(f"Config section '{section}' missing or invalid for {op_desc}.")
+    path_val = config[section].get(key)
+    if not isinstance(path_val, str) or not path_val.strip():
+        raise ValueError(f"Config key '{key}' in '{section}' missing or empty for {op_desc}.")
+    return path_val.strip()
+
+
+def load_or_generate_splits(
+    config: Dict[str, Any], 
+    data_root_dir: Path, 
+    h5_path: Path
+) -> Tuple[Dict[str, List[int]], Path]:
+    """
+    Load existing splits or generate new ones based on config.
+    
+    Returns:
+        Tuple of (splits dict, splits file path)
+    """
+    # Check if splits file is specified and exists
+    try:
+        splits_filename = get_config_str(
+            config, "data_paths_config", "dataset_splits_filename", "dataset splits"
+        )
+        splits_path = data_root_dir / splits_filename
+        
+        if splits_path.is_file():
+            # Load existing splits
+            with open(splits_path, 'r') as f:
+                splits = json.load(f)
+            required = {"train", "validation", "test"}
+            if not required.issubset(splits.keys()):
+                raise ValueError(f"Splits file must contain keys: {required}")
+            logger.info(f"Loaded existing dataset splits from {splits_path}")
+            logger.info(f"Split sizes: {len(splits['train'])} train, "
+                       f"{len(splits['validation'])} val, {len(splits['test'])} test.")
+            return splits, splits_path
+    except (KeyError, ValueError) as e:
+        logger.info(f"No valid splits file found, will generate new splits. Reason: {e}")
+    
+    # Generate new splits
+    logger.info("Generating new dataset splits...")
+    
+    # Get split parameters from config
+    train_params = config.get("training_hyperparameters", {})
+    val_frac = train_params.get("val_frac", 0.15)
+    test_frac = train_params.get("test_frac", 0.15)
+    
+    # Get random seed from config
+    misc_settings = config.get("miscellaneous_settings", {})
+    random_seed = misc_settings.get("random_seed", DEFAULT_SEED)
+    
+    # Generate splits
+    splits = generate_dataset_splits(
+        h5_path=h5_path,
+        val_frac=val_frac,
+        test_frac=test_frac,
+        random_seed=random_seed
+    )
+    
+    # Save splits
+    splits_path = h5_path.with_name(h5_path.stem + "_splits.json")
+    save_json(splits, splits_path)
+    logger.info(f"Saved generated splits to {splits_path}")
+    
+    return splits, splits_path
+
+
 __all__ = [
     "setup_logging", "load_config", "validate_config", "ensure_dirs", 
-    "save_json", "seed_everything", "parse_species_atoms"
+    "save_json", "seed_everything", "parse_species_atoms",
+    "generate_dataset_splits", "get_config_str", "load_or_generate_splits"
 ]
