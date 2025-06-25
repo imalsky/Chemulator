@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py - Main entry point and orchestrator for the training pipeline.
+main.py - Optimized main entry point for the training pipeline.
 """
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ RANDOM_SEED_KEY = "random_seed"
 # --- Global PyTorch & Warning Settings ---
 torch.set_float32_matmul_precision("high")
 warnings.filterwarnings("ignore", ".*torch.compile for Metal is an early protoype.*")
+warnings.filterwarnings("ignore", ".*Torch was not compiled with flash attention.*")
 logger = logging.getLogger(__name__)
 
 
@@ -132,7 +133,7 @@ def _run_hyperparameter_tuning(config: Dict[str, Any], data_root_dir: Path) -> N
 
 def _parse_command_line_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Chemical reaction predictor training pipeline.",
+        description="Chemical reaction predictor training pipeline (Optimized).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(

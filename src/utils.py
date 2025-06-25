@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-utils.py - A collection of shared helper functions for the project.
+utils.py - Optimized helper functions without atom parsing.
 """
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ import json
 import logging
 import os
 import random
-import re
-from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -58,6 +56,7 @@ def setup_logging(level: int = logging.INFO, log_file: Optional[Union[str, Path]
     else:
         logger.info("Logging to console only.")
 
+
 def load_config(path: Union[str, Path]) -> Dict[str, Any]:
     """Loads and validates a configuration file (supports JSON with comments via JSON5)."""
     config_path = Path(path)
@@ -72,6 +71,7 @@ def load_config(path: Union[str, Path]) -> Dict[str, Any]:
         return config_dict
     except Exception as e:
         raise RuntimeError(f"Failed to load or validate config {config_path}: {e}") from e
+
 
 def validate_config(config: Dict[str, Any]) -> None:
     """Validates the nested structure and key values of the configuration dictionary."""
@@ -91,6 +91,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if dropout is not None and not (0.0 <= dropout < 1.0):
         raise ValueError("'dropout' in 'model_hyperparameters' must be a float in the range [0.0, 1.0).")
 
+
 def ensure_dirs(*paths: Union[str, Path]) -> bool:
     """Creates one or more directories if they do not already exist."""
     try:
@@ -101,26 +102,35 @@ def ensure_dirs(*paths: Union[str, Path]) -> bool:
         logger.error(f"Failed to create directories {paths}: {e}")
         return False
 
+
 def _json_serializer(obj: Any) -> Any:
     """Custom JSON serializer for handling numpy, torch, Path, and set objects."""
-    if isinstance(obj, (np.integer, np.floating)): return obj.item()
-    if isinstance(obj, np.ndarray): return obj.tolist()
-    if isinstance(obj, torch.Tensor): return obj.detach().cpu().tolist()
-    if isinstance(obj, Path): return str(obj)
-    if isinstance(obj, set): return sorted(list(obj))
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, set):
+        return sorted(list(obj))
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable.")
+
 
 def save_json(data: Dict[str, Any], path: Union[str, Path]) -> bool:
     """Saves a dictionary to a JSON file with pretty printing and robust serialization."""
     try:
         json_path = Path(path)
-        if not ensure_dirs(json_path.parent): return False
+        if not ensure_dirs(json_path.parent):
+            return False
         with json_path.open("w", encoding=UTF8_ENCODING) as f:
             json.dump(data, f, indent=2, default=_json_serializer, ensure_ascii=False)
         return True
     except Exception as e:
         logger.error(f"Failed to save JSON to {path}: {e}", exc_info=True)
         return False
+
 
 def seed_everything(seed: int = DEFAULT_SEED) -> None:
     """Sets the random seed for Python, NumPy, and PyTorch for reproducibility."""
@@ -131,76 +141,6 @@ def seed_everything(seed: int = DEFAULT_SEED) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     logger.info(f"Global random seed set to {seed}.")
-
-def _parse_formula_recursive(formula: str) -> Counter[str]:
-    """Recursively parses a chemical formula, handling parentheses."""
-    counts: Counter[str] = Counter()
-    i = 0
-    while i < len(formula):
-        # Handle parentheses
-        if formula[i] == '(':
-            j = i
-            balance = 1
-            while balance > 0:
-                j += 1
-                if j >= len(formula): raise ValueError(f"Mismatched parentheses in formula: {formula}")
-                if formula[j] == '(': balance += 1
-                if formula[j] == ')': balance -= 1
-            sub_counts = _parse_formula_recursive(formula[i+1:j])
-            i = j + 1
-            num_str = ''
-            while i < len(formula) and formula[i].isdigit():
-                num_str += formula[i]
-                i += 1
-            multiplier = int(num_str) if num_str else 1
-            for elem, count in sub_counts.items():
-                counts[elem] += count * multiplier
-        # Handle elements
-        else:
-            if not formula[i].isupper(): raise ValueError(f"Element must start with uppercase letter: {formula[i:]}")
-            j = i + 1
-            while j < len(formula) and formula[j].islower():
-                j += 1
-            element = formula[i:j]
-            i = j
-            num_str = ''
-            while i < len(formula) and formula[i].isdigit():
-                num_str += formula[i]
-                i += 1
-            count = int(num_str) if num_str else 1
-            counts[element] += count
-    return counts
-
-def parse_species_atoms(species_names: List[str]) -> Tuple[np.ndarray, List[str]]:
-    """
-    Parses species names (e.g., "C2H2_evolution", "Ca(OH)2") to create an atom count matrix.
-    """
-    all_atom_counts: List[Counter[str]] = []
-    unique_atoms: set[str] = set()
-
-    for name in species_names:
-        formula = name.split("_")[0]
-        try:
-            counts = _parse_formula_recursive(formula)
-            all_atom_counts.append(counts)
-            unique_atoms.update(counts.keys())
-        except Exception as e:
-            logger.error(f"Failed to parse formula '{formula}' from species '{name}': {e}")
-            all_atom_counts.append(Counter())
-
-    if not unique_atoms:
-        logger.warning("Could not parse any atoms from any species names.")
-        return np.array([[] for _ in species_names]), []
-
-    sorted_atoms = sorted(list(unique_atoms))
-    atom_map = {atom: i for i, atom in enumerate(sorted_atoms)}
-    atom_matrix = np.zeros((len(species_names), len(sorted_atoms)), dtype=np.float32)
-
-    for i, counts in enumerate(all_atom_counts):
-        for atom, count in counts.items():
-            if atom in atom_map:
-                atom_matrix[i, atom_map[atom]] = count
-    return atom_matrix, sorted_atoms
 
 
 def generate_dataset_splits(
@@ -228,7 +168,6 @@ def generate_dataset_splits(
     # Get number of profiles from HDF5
     with h5py.File(h5_path, 'r') as hf:
         # Find any dataset to get the first dimension (number of profiles)
-        # Assuming all datasets have the same first dimension
         first_key = next(iter(hf.keys()))
         n_profiles = hf[first_key].shape[0]
     
@@ -334,6 +273,6 @@ def load_or_generate_splits(
 
 __all__ = [
     "setup_logging", "load_config", "validate_config", "ensure_dirs", 
-    "save_json", "seed_everything", "parse_species_atoms",
-    "generate_dataset_splits", "get_config_str", "load_or_generate_splits"
+    "save_json", "seed_everything", "generate_dataset_splits", 
+    "get_config_str", "load_or_generate_splits"
 ]

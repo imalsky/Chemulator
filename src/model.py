@@ -124,6 +124,8 @@ class FiLMLayer(nn.Module):
         
         if use_norm:
             self.norm = nn.LayerNorm(feature_dim)
+        else:
+            self.norm = nn.Identity()
     
     def forward(self, features: Tensor, condition: Tensor) -> Tensor:
         if self.use_norm:
@@ -131,7 +133,7 @@ class FiLMLayer(nn.Module):
         
         params = self.generator(condition)
         gamma, beta = torch.chunk(params, 2, dim=-1)
-        return (1 + gamma) * features + beta  # (1 + gamma) for residual learning
+        return (1 + gamma) * features + beta
 
 
 class ResidualBlock(nn.Module):
