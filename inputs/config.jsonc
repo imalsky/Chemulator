@@ -1,7 +1,7 @@
 // =========================================================================================
-// ==      CONFIGURATION FILE FOR CHEMICAL KINETICS STATE PREDICTOR (Enhanced Version)    ==
+// ==                 OPTIMIZED CONFIGURATION FILE FOR CHEMICAL KINETICS                  ==
 // =========================================================================================
-// This configuration includes all accuracy improvements and best practices.
+// This configuration includes performance optimizations and removed physics-informed loss.
 
 {
   // ════════════════════════════════════════════════════════════════
@@ -9,7 +9,6 @@
   // ════════════════════════════════════════════════════════════════
   "data_paths_config": {
     "hdf5_dataset_filename": "chem_data/data.h5",
-    // Optional: If this file exists, it will be used. Otherwise, splits will be generated.
     "dataset_splits_filename": "chem_data/data_splits.json"
   },
   
@@ -50,16 +49,13 @@
     
     // Override for specific variables
     "key_methods": { 
-      "T": "standard",           // Temperature - linear scale
-      "P": "standard",           // Pressure - linear scale  
+      "T": "log-standard",           
+      "P": "log-standard",     
       "t_time": "log-min-max"    // Time - bounded log scale
     },
     
-    // Numerical stability
-    "epsilon": 1e-40,
-    
     // Memory limit for quantile methods
-    "quantile_max_values_in_memory": 10000000
+    "quantile_max_values_in_memory": 50000000
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -70,7 +66,7 @@
     "model_type": "siren",  // Options: "mlp", "siren", "fno"
     
     // Network architecture
-    "hidden_dims": [384, 384, 256, 128],  // Deeper network
+    "hidden_dims": [256, 256],  // Deeper network
     "dropout": 0.1,                       // Regularization
     
     // Conditioning parameters
@@ -109,12 +105,12 @@
     "data_fraction": 1.0,           // Fraction of data to use (1.0 = all)
 
     // Training duration
-    "epochs": 50,
+    "epochs": 10,
     "early_stopping_patience": 30,
     "min_delta": 1e-8,
     
     // Batch settings
-    "batch_size": 64,
+    "batch_size": 1024,
     "gradient_accumulation_steps": 1,  // Effective batch = batch_size * this
     
     // Optimizer settings
@@ -123,11 +119,11 @@
     "weight_decay": 1e-4,
     
     // Learning rate schedule
-    "scheduler_choice": "plateau",     // Options: "plateau", "cosine"
+    "scheduler_choice": "cosine",     // Options: "plateau", "cosine"
     "warmup_epochs": 5,               // Linear warmup
     "patience": 10,                   // For plateau scheduler
     "factor": 0.5,                    // LR reduction factor
-    "min_lr": 1e-7,
+    "min_lr": 1e-8,
     
     // Cosine scheduler settings (if used)
     "cosine_T_0": 20,                // Restarts every T_0 epochs (adjusted for grad accum)
@@ -137,13 +133,8 @@
     "loss_function": "huber",         // Options: "mse", "huber", "l1"
     "huber_delta": 0.1,
     
-    // Physics-informed learning
-    "use_conservation_loss": false,     // Atom conservation
-    "conservation_loss_weight": 0.01,
-    
     // Training stability
     "gradient_clip_val": 1.0,
-    "use_amp": true,                  // Mixed precision training
     
     // Model averaging
     "use_ema": true,                  // Exponential moving average
@@ -154,7 +145,7 @@
   // ║              6. OPTUNA HYPERPARAMETER SEARCH                   ║
   // ════════════════════════════════════════════════════════════════
   "optuna_settings": {
-    "study_name": "siren-kinetics-enhanced-v1",
+    "study_name": "siren-kinetics-optimized-v2",
     "n_trials": 300,
     "pruner_warmup_steps": 10,
     "pruner_startup_trials": 10,
@@ -181,10 +172,6 @@
       "stochastic_depth": {"type": "float", "low": 0.0, "high": 0.2},
       "gradient_accumulation_steps": {"type": "categorical", "choices": [1, 2, 4]},
       
-      // Conservation loss
-      "use_conservation_loss": {"type": "categorical", "choices": [true, false]},
-      "conservation_loss_weight": {"type": "float", "low": 1e-4, "high": 0.1, "log": true},
-      
       // Model-specific parameters
       "siren_w0_initial": {"type": "float", "low": 1.0, "high": 50.0},
       "siren_w0_hidden": {"type": "float", "low": 0.1, "high": 5.0},
@@ -206,7 +193,13 @@
     "random_seed": 42,
     "num_workers": 0,               // Must be 0 for HDF5
     "dataset_cache_size": -1,       // -1 = cache all profiles
-    "use_torch_compile": true,      // Compile model (CUDA only)
+    
+    // Model compilation and export settings
+    "use_torch_compile": true,      // Compile model with torch.compile
+    "torch_compile_mode": "reduce-overhead",  // Options: "default", "reduce-overhead", "max-autotune"
+    "export_jit_model": true,       // Export JIT model after training
+    "export_jit_during_training": true,  // Export JIT at each best epoch
+    
     "show_epoch_progress": true     // Progress bars during training
   }
 }

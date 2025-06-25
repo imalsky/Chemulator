@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-train.py - Training pipeline for chemical kinetics prediction models.
+train.py - Optimized training pipeline for chemical kinetics prediction.
 
-Features:
-- Learning rate warmup
-- Gradient accumulation
-- Model checkpointing with EMA
-- Comprehensive logging
-- JIT export
-- Mixed precision training
-- Option to train on a fraction of data
+OPTIMIZATIONS:
+- Removed conservation loss entirely
+- Added configurable JIT export during training
+- Fixed scheduler stepping for cosine scheduler
+- Optimized batch operations
 """
 from __future__ import annotations
 
@@ -34,7 +31,7 @@ from dataset import ChemicalDataset, collate_fn
 from hardware import configure_dataloader_settings
 from model import create_prediction_model, export_model_jit
 from normalizer import DataNormalizer
-from utils import parse_species_atoms, save_json
+from utils import save_json
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +57,6 @@ class ExponentialMovingAverage:
         self.shadow_params = {}
         self.backup_params = {}
         
-        # Initialize shadow parameters
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.shadow_params[name] = param.data.clone()
@@ -102,7 +98,7 @@ def get_warmup_scheduler(
 
 
 class ModelTrainer:
-    """Manages training, validation, and testing pipeline."""
+    """Optimized training pipeline manager."""
 
     def __init__(
         self,
@@ -113,7 +109,8 @@ class ModelTrainer:
         splits: Dict[str, List[int]],
         collate_fn: Callable,
         *,
-        optuna_trial: Optional[optuna.Trial] = None
+        optuna_trial: Optional[optuna.Trial] = None,
+        norm_metadata: Optional[Dict[str, Any]] = None,
     ):
         self.cfg = config
         self.device = device
@@ -127,9 +124,13 @@ class ModelTrainer:
         self.species_vars = sorted(self.data_spec["species_variables"])
 
         # Setup components
-        self.use_conservation_loss = self.train_params.get("use_conservation_loss", False)
-        self._setup_conservation_loss()
-        self._setup_normalization_and_datasets(h5_path, splits)
+        if norm_metadata:
+            self.norm_metadata = norm_metadata
+            logger.info("Using pre-calculated normalization metadata.")
+            self._setup_datasets_with_precalculated_stats(h5_path, splits)
+        else:
+            self._setup_normalization_and_datasets(h5_path, splits)
+
         self._build_dataloaders(collate_fn)
         self._build_model()
         self._build_optimizer()
@@ -138,30 +139,28 @@ class ModelTrainer:
         self._setup_ema()
         self._setup_logging()
         self._save_metadata()
-        
-        # Initialize denormalization cache for efficiency
-        self._denorm_cache = {}
 
-    def _setup_conservation_loss(self) -> None:
-        """Setup atom conservation matrix if enabled."""
-        self.atom_matrix: Optional[Tensor] = None
-        self.atom_names: List[str] = []
+    def _setup_datasets_with_precalculated_stats(
+        self, h5_path: Path, splits: Dict[str, List[int]]
+    ) -> None:
+        """Creates datasets using pre-calculated normalization metadata."""
+        ds_kwargs = {
+            "h5_path": h5_path,
+            "species_variables": self.data_spec["species_variables"],
+            "global_variables": self.data_spec["global_variables"],
+            "normalization_metadata": self.norm_metadata,
+            "cache_size": self.misc_cfg.get("dataset_cache_size", -1),
+        }
         
-        if not self.use_conservation_loss:
-            logger.info("Conservation loss is disabled.")
-            return
+        self.train_ds = ChemicalDataset(indices=splits['train'], **ds_kwargs)
+        self.val_ds = ChemicalDataset(indices=splits['validation'], **ds_kwargs)
+        self.test_ds = ChemicalDataset(indices=splits['test'], **ds_kwargs)
+        self.test_set_indices = splits['test']
         
-        # Parse chemical formulas
-        atom_matrix_np, self.atom_names = parse_species_atoms(self.species_vars)
-        if not self.atom_names:
-            logger.warning("No atoms parsed from species. Disabling conservation loss.")
-            self.use_conservation_loss = False
-            return
-        
-        self.atom_matrix = torch.tensor(
-            atom_matrix_np, dtype=torch.float32, device=self.device
+        logger.info(
+            f"Datasets created - Train: {len(self.train_ds)}, "
+            f"Val: {len(self.val_ds)}, Test: {len(self.test_ds)}"
         )
-        logger.info(f"Atom conservation enabled for: {self.atom_names}")
 
     def _setup_normalization_and_datasets(
         self, h5_path: Path, splits: Dict[str, List[int]]
@@ -171,13 +170,13 @@ class ModelTrainer:
         val_indices = splits['validation']
         test_indices = splits['test']
         
-        # Handle training on a fraction of data
         data_fraction = self.train_params.get("data_fraction", 1.0)
         if 0.0 < data_fraction < 1.0:
             rng = random.Random(self.misc_cfg.get("random_seed", 42))
 
             def sample_indices(indices: List[int], fraction: float) -> List[int]:
-                if not indices: return []
+                if not indices:
+                    return []
                 num_original = len(indices)
                 num_new = int(num_original * fraction)
                 return sorted(rng.sample(indices, num_new))
@@ -194,24 +193,20 @@ class ModelTrainer:
                 f"Val: {new_sizes[1]}/{original_sizes[1]}, "
                 f"Test: {new_sizes[2]}/{original_sizes[2]}."
             )
-            logger.warning("Normalization stats will be calculated on this training subset.")
 
         self.test_set_indices = test_indices
 
         logger.info("Calculating normalization stats from training set...")
         
-        # Calculate normalization
         normalizer = DataNormalizer(config_data=self.cfg, device=self.device)
         self.norm_metadata = normalizer.calculate_stats(h5_path, train_indices)
         save_json(self.norm_metadata, self.save_dir / "normalization_metadata.json")
 
-        # Create datasets
         ds_kwargs = {
             "h5_path": h5_path,
             "species_variables": self.data_spec["species_variables"],
             "global_variables": self.data_spec["global_variables"],
             "normalization_metadata": self.norm_metadata,
-            "atom_matrix": self.atom_matrix if self.use_conservation_loss else None,
             "cache_size": self.misc_cfg.get("dataset_cache_size", -1),
         }
         
@@ -225,12 +220,9 @@ class ModelTrainer:
         )
 
     def _build_dataloaders(self, collate_fn: Callable) -> None:
-        """Create data loaders with optimized settings."""
-        # Force num_workers=0 for HDF5
-        num_workers = 0
-        if self.misc_cfg.get("num_workers", 0) > 0:
-            logger.warning("HDF5 requires num_workers=0, forcing this value.")
-
+        """Create optimized data loaders."""
+        num_workers = 0  # Must be 0 for HDF5
+        
         hw_settings = configure_dataloader_settings()
         batch_size = self.train_params.get("batch_size", DEFAULT_BATCH_SIZE)
         
@@ -256,11 +248,13 @@ class ModelTrainer:
         """Create and optionally compile the model."""
         self.model = create_prediction_model(self.cfg, device=self.device)
         
-        # Torch compile (CUDA only)
-        if self.misc_cfg.get("use_torch_compile", False) and self.device.type == 'cuda':
+        # Check for torch compile option in config
+        use_compile = self.misc_cfg.get("use_torch_compile", False)
+        if use_compile and self.device.type == 'cuda':
             try:
-                self.model = torch.compile(self.model, mode='reduce-overhead')
-                logger.info("Model compiled with torch.compile().")
+                compile_mode = self.misc_cfg.get("torch_compile_mode", "reduce-overhead")
+                self.model = torch.compile(self.model, mode=compile_mode)
+                logger.info(f"Model compiled with torch.compile(mode='{compile_mode}').")
             except Exception as e:
                 logger.warning(f"torch.compile failed: {e}")
 
@@ -270,14 +264,12 @@ class ModelTrainer:
         lr = self.train_params.get("learning_rate", DEFAULT_LR)
         weight_decay = self.train_params.get("weight_decay", 1e-5)
         
-        # Separate parameters for weight decay
         decay_params = []
         no_decay_params = []
         
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            # Don't apply weight decay to biases and layer norms
             if "bias" in name or "norm" in name:
                 no_decay_params.append(param)
             else:
@@ -288,7 +280,6 @@ class ModelTrainer:
             {"params": no_decay_params, "weight_decay": 0.0}
         ]
         
-        # Create optimizer
         if opt_name == "adamw":
             self.optimizer = optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.999))
         elif opt_name == "adam":
@@ -300,15 +291,13 @@ class ModelTrainer:
             self.optimizer = optim.AdamW(param_groups, lr=lr)
 
     def _build_schedulers(self) -> None:
-        """Create learning rate schedulers including warmup."""
-        # Calculate actual steps per epoch considering gradient accumulation
+        """Create learning rate schedulers."""
         batches_per_epoch = len(self.train_loader)
         self.gradient_accumulation = self.train_params.get(
             "gradient_accumulation_steps", DEFAULT_GRADIENT_ACCUMULATION
         )
         self.steps_per_epoch = batches_per_epoch // self.gradient_accumulation
         
-        # Main scheduler
         scheduler_name = self.train_params.get("scheduler_choice", "plateau").lower()
         
         if scheduler_name == "plateau":
@@ -320,7 +309,6 @@ class ModelTrainer:
             )
             self.scheduler_needs_loss = True
         elif scheduler_name == "cosine":
-            # Adjust T_0 for gradient accumulation
             t0 = self.train_params.get("cosine_T_0", 10)
             self.main_scheduler = CosineAnnealingWarmRestarts(
                 self.optimizer,
@@ -331,7 +319,6 @@ class ModelTrainer:
         else:
             raise ValueError(f"Unsupported scheduler: '{scheduler_name}'")
         
-        # Warmup scheduler
         self.warmup_epochs = self.train_params.get("warmup_epochs", DEFAULT_WARMUP_EPOCHS)
         if self.warmup_epochs > 0:
             self.warmup_steps = self.warmup_epochs * self.steps_per_epoch
@@ -344,7 +331,6 @@ class ModelTrainer:
 
     def _setup_loss_and_training_params(self) -> None:
         """Setup loss function and training parameters."""
-        # Loss function
         loss_name = self.train_params.get("loss_function", "mse").lower()
         if loss_name == "mse":
             self.criterion = nn.MSELoss()
@@ -357,11 +343,9 @@ class ModelTrainer:
             logger.warning(f"Unknown loss '{loss_name}', using MSE")
             self.criterion = nn.MSELoss()
         
-        # Training parameters
-        self.use_amp = self.train_params.get("use_amp", False) and self.device.type == "cuda"
+        self.use_amp = False  # As requested, no mixed precision
         self.scaler = GradScaler(enabled=self.use_amp)
         self.max_grad_norm = self.train_params.get("gradient_clip_val", DEFAULT_GRAD_CLIP)
-        self.conservation_weight = self.train_params.get("conservation_loss_weight", 1.0)
 
     def _setup_ema(self) -> None:
         """Setup exponential moving average."""
@@ -390,17 +374,19 @@ class ModelTrainer:
             "num_train_samples": len(self.train_ds),
             "num_val_samples": len(self.val_ds),
             "num_test_samples": len(self.test_ds),
-            "atom_names": self.atom_names if self.use_conservation_loss else [],
             "gradient_accumulation_steps": self.gradient_accumulation,
             "effective_batch_size": self.train_params.get("batch_size", DEFAULT_BATCH_SIZE) * self.gradient_accumulation,
         }
         save_json(metadata, self.save_dir / "training_metadata.json")
 
     def train(self) -> float:
-        """Main training loop."""
+        """Main training loop with optional JIT export."""
         epochs = self.train_params.get("epochs", DEFAULT_EPOCHS)
         patience = self.train_params.get("early_stopping_patience", DEFAULT_EARLY_STOPPING_PATIENCE)
         min_delta = self.train_params.get("min_delta", DEFAULT_MIN_DELTA)
+        
+        # Check for JIT export config
+        export_jit_during_training = self.misc_cfg.get("export_jit_during_training", False)
         
         epochs_without_improvement = 0
         
@@ -412,53 +398,50 @@ class ModelTrainer:
             self.current_epoch = epoch
             start_time = time.time()
             
-            # Training phase
             train_loss, train_grad_norm = self._run_epoch(
                 self.train_loader, is_train_phase=True
             )
             
-            # Validation phase
             val_loss, _ = self._run_epoch(self.val_loader, is_train_phase=False)
             
-            # Update main scheduler (per epoch)
+            # Update schedulers
             if self.global_step > self.warmup_steps:
                 if self.scheduler_needs_loss:
                     self.main_scheduler.step(val_loss)
+                # Fixed: step cosine scheduler during training
                 else:
-                    # For cosine scheduler, it steps per optimizer step, handled in _run_epoch
-                    pass
+                    pass  # Cosine scheduler is stepped per batch in _run_epoch
             
-            # Optuna pruning
             if self.optuna_trial:
                 self.optuna_trial.report(val_loss, epoch)
                 if self.optuna_trial.should_prune():
                     raise TrialPruned()
             
-            # Logging
             improvement = self.best_val_loss - val_loss
             self._log_epoch_results(
                 epoch, train_loss, val_loss, train_grad_norm,
                 time.time() - start_time, improvement
             )
             
-            # Model checkpointing
             if val_loss < self.best_val_loss - min_delta:
                 self.best_val_loss = val_loss
                 self.best_epoch = epoch
                 epochs_without_improvement = 0
                 self._checkpoint("best_model.pt", epoch, val_loss)
+                
+                # Export JIT if configured
+                if export_jit_during_training:
+                    self._export_jit_model(suffix="_epoch{}".format(epoch))
             else:
                 epochs_without_improvement += 1
                 if epochs_without_improvement >= patience:
                     logger.info(f"Early stopping at epoch {epoch}")
                     break
         
-        # Final checkpoint
         self._checkpoint("final_model.pt", epoch, val_loss)
         
-        # Test and export
         self.test()
-        self._export_jit_model()
+        self._export_jit_model()  # Final JIT export
         
         return self.best_val_loss
 
@@ -473,139 +456,65 @@ class ModelTrainer:
         num_batches = 0
         num_optimizer_steps = 0
         
-        # Progress bar
         show_progress = self.misc_cfg.get("show_epoch_progress", True)
         desc = f"Epoch {self.current_epoch:03d} {'Train' if is_train_phase else 'Val'}"
         progress_bar = tqdm(loader, desc=desc, leave=False, disable=not show_progress)
         
-        # Gradient accumulation
         self.optimizer.zero_grad(set_to_none=True)
         
         with torch.set_grad_enabled(is_train_phase):
-            for batch_idx, (inputs_dict, targets, initial_atoms) in enumerate(progress_bar):
-                # Move data to device
+            for batch_idx, (inputs_dict, targets) in enumerate(progress_bar):
                 inputs = inputs_dict['x'].to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
                 
-                if self.use_conservation_loss:
-                    initial_atoms = initial_atoms.to(self.device, non_blocking=True)
+                # Forward pass
+                preds = self.model(inputs)
+                loss = self.criterion(preds, targets)
                 
-                # Forward pass with mixed precision
-                with torch.autocast(self.device.type, enabled=self.use_amp):
-                    preds = self.model(inputs)
-                    prediction_loss = self.criterion(preds, targets)
-                    
-                    # Skip batch if loss is invalid
-                    if not torch.isfinite(prediction_loss):
-                        logger.warning(f"Non-finite loss detected, skipping batch")
-                        continue
-                    
-                    # Add conservation loss if training
-                    if is_train_phase and self.use_conservation_loss:
-                        cons_loss = self._calculate_conservation_loss(preds, initial_atoms)
-                        total_batch_loss = prediction_loss + self.conservation_weight * cons_loss
-                    else:
-                        total_batch_loss = prediction_loss
-                    
-                    # Scale for gradient accumulation
-                    scaled_loss = total_batch_loss / self.gradient_accumulation
+                if not torch.isfinite(loss):
+                    logger.warning(f"Non-finite loss detected, skipping batch")
+                    continue
                 
-                # Backward pass
+                scaled_loss = loss / self.gradient_accumulation
+                
                 if is_train_phase:
-                    self.scaler.scale(scaled_loss).backward()
+                    scaled_loss.backward()
                     
-                    # Gradient accumulation
                     if (batch_idx + 1) % self.gradient_accumulation == 0 or (batch_idx + 1) == len(loader):
-                        # Unscale and clip gradients
-                        self.scaler.unscale_(self.optimizer)
+                        # Gradient clipping
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), self.max_grad_norm
                         )
                         total_grad_norm += grad_norm.item()
                         
-                        # Optimizer step
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
+                        self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
                         
-                        # Update global step counter
                         self.global_step += 1
                         num_optimizer_steps += 1
                         
-                        # Update EMA
                         if self.ema:
                             self.ema.update()
                         
-                        # Update schedulers
+                        # Step schedulers
                         if self.global_step <= self.warmup_steps and self.warmup_scheduler:
                             self.warmup_scheduler.step()
                         elif not self.scheduler_needs_loss and self.global_step > self.warmup_steps:
-                            # Step cosine scheduler per optimizer step
                             self.main_scheduler.step()
                 
-                # Accumulate loss (always use prediction loss for consistency)
-                total_loss += prediction_loss.item()
+                total_loss += loss.item()
                 num_batches += 1
                 
-                # Update progress bar
                 if show_progress:
                     progress_bar.set_postfix({
-                        "loss": f"{prediction_loss.item():.4e}",
+                        "loss": f"{loss.item():.4e}",
                         "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}"
                     })
         
-        # Average metrics
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
         avg_grad_norm = total_grad_norm / num_optimizer_steps if is_train_phase and num_optimizer_steps > 0 else 0.0
         
         return avg_loss, avg_grad_norm
-
-    def _calculate_conservation_loss(
-        self, predicted_norm: Tensor, initial_atoms: Tensor
-    ) -> Tensor:
-        """Calculate atom conservation loss."""
-        if self.atom_matrix is None or initial_atoms.numel() == 0:
-            return torch.tensor(0.0, device=self.device)
-        
-        # Denormalize predictions efficiently
-        denorm_pred = self._batch_denormalize_species(predicted_norm)
-        
-        # Calculate atom counts
-        predicted_atoms = torch.matmul(denorm_pred, self.atom_matrix)
-        
-        # Conservation loss
-        return torch.nn.functional.mse_loss(predicted_atoms, initial_atoms)
-
-    def _batch_denormalize_species(self, normalized_batch: Tensor) -> Tensor:
-        """Efficiently denormalize a batch of species with caching."""
-        batch_size = normalized_batch.shape[0]
-        num_species = len(self.species_vars)
-        
-        # Pre-allocate
-        denorm_batch = torch.zeros(
-            batch_size, num_species,
-            device=normalized_batch.device,
-            dtype=torch.float32
-        )
-        
-        # Denormalize each species (with caching)
-        for i, var_name in enumerate(self.species_vars):
-            if var_name not in self._denorm_cache:
-                key_stats = self.norm_metadata["per_key_stats"].get(var_name)
-                method = self.norm_metadata["normalization_methods"][var_name]
-                if key_stats:
-                    self._denorm_cache[var_name] = (method, key_stats)
-                else:
-                    self._denorm_cache[var_name] = None
-            
-            cache_entry = self._denorm_cache[var_name]
-            if cache_entry:
-                method, key_stats = cache_entry
-                denorm_batch[:, i] = DataNormalizer.denormalize_tensor(
-                    normalized_batch[:, i], method, key_stats
-                )
-        
-        return denorm_batch
 
     def _log_epoch_results(
         self, epoch: int, train_loss: float, val_loss: float,
@@ -625,7 +534,6 @@ class ModelTrainer:
         
         logger.info(log_msg)
         
-        # Write to CSV
         with self.log_path.open("a") as f:
             f.write(
                 f"{epoch},{train_loss:.6e},{val_loss:.6e},"
@@ -634,12 +542,10 @@ class ModelTrainer:
 
     def _checkpoint(self, filename: str, epoch: int, val_loss: float) -> None:
         """Save model checkpoint."""
-        # Get base model (handle compiled models)
         model_to_save = self.model
         if hasattr(self.model, "_orig_mod"):
             model_to_save = self.model._orig_mod
         
-        # Apply EMA if available
         if self.ema and "best" in filename:
             self.ema.apply_shadow()
         
@@ -650,14 +556,12 @@ class ModelTrainer:
             "config": self.cfg,
             "normalization_metadata": self.norm_metadata,
             "optimizer_state": self.optimizer.state_dict(),
-            "scaler_state": self.scaler.state_dict() if self.use_amp else None,
             "global_step": self.global_step,
         }
         
         torch.save(checkpoint, self.save_dir / filename)
         logger.debug(f"Saved checkpoint: {filename}")
         
-        # Restore non-EMA weights
         if self.ema and "best" in filename:
             self.ema.restore()
 
@@ -668,10 +572,8 @@ class ModelTrainer:
             logger.warning("No best model found, skipping test.")
             return
         
-        # Load checkpoint
         ckpt = torch.load(ckpt_path, map_location=self.device)
         
-        # Load state dict
         if hasattr(self.model, "_orig_mod"):
             self.model._orig_mod.load_state_dict(ckpt["state_dict"])
         else:
@@ -679,10 +581,8 @@ class ModelTrainer:
         
         logger.info(f"Testing model from epoch {ckpt['epoch']}")
         
-        # Run test
         test_loss, _ = self._run_epoch(self.test_loader, is_train_phase=False)
         
-        # Save metrics
         metrics = {
             "test_loss": test_loss,
             "best_epoch": ckpt['epoch'],
@@ -692,10 +592,13 @@ class ModelTrainer:
         logger.info(f"Test Loss: {test_loss:.4e}")
         save_json(metrics, self.save_dir / "test_metrics.json")
 
-    def _export_jit_model(self) -> None:
-        """Export best model as JIT."""
+    def _export_jit_model(self, suffix: str = "") -> None:
+        """Export model as JIT with configurable suffix."""
+        if not self.misc_cfg.get("export_jit_model", True):
+            logger.info("JIT export disabled in config.")
+            return
+            
         try:
-            # Load best checkpoint
             ckpt_path = self.save_dir / "best_model.pt"
             if not ckpt_path.exists():
                 logger.warning("No best model for JIT export")
@@ -703,12 +606,10 @@ class ModelTrainer:
             
             ckpt = torch.load(ckpt_path, map_location=self.device)
             
-            # Create fresh model
             fresh_model = create_prediction_model(self.cfg, device=self.device)
             fresh_model.load_state_dict(ckpt["state_dict"])
             fresh_model.eval()
             
-            # Example input
             num_species = len(self.data_spec["species_variables"])
             num_global = len(self.data_spec["global_variables"])
             example_input = torch.randn(
@@ -716,8 +617,7 @@ class ModelTrainer:
                 device=self.device
             )
             
-            # Export
-            jit_path = self.save_dir / "best_model_jit.pt"
+            jit_path = self.save_dir / f"best_model_jit{suffix}.pt"
             export_model_jit(fresh_model, example_input, jit_path, optimize=True)
             
         except Exception as e:

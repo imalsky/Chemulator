@@ -1,2 +1,0 @@
-# Chemulator
-Another emulator

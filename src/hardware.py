@@ -35,9 +35,7 @@ def setup_device() -> torch.device:
         device = torch.device("mps")
         logger.info("Using Apple Silicon MPS device.")
         logger.warning(
-            "MPS backend detected. Note: Some operations may have limited support or "
-            "performance. If you encounter errors, consider setting the environment "
-            "variable PYTORCH_ENABLE_MPS_FALLBACK=1"
+            "MPS backend detected. Note: Some operations may be bad."
         )
     else:
         device = torch.device("cpu")

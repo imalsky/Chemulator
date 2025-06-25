@@ -27,19 +27,29 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
+# Intentionally leaving "./NEW_DATA/run8001-result.h5", as a holdout
+#"./NEW_DATA/run8001-result.h5",
 # ─────────────────────────────
 # User-editable configuration
 # ─────────────────────────────
 CONFIG: Dict[str, object] = {
-    "input_files": ["./run21-result.h5"],
-    "output_h5": "data.h5",
+    "input_files": ["./NEW_DATA/run8002-result.h5",
+                    "./NEW_DATA/run8003-result.h5",
+                    "./NEW_DATA/run8004-result.h5",
+                    "./NEW_DATA/run8005-result.h5",
+                    "./NEW_DATA/run8006-result.h5",
+                    "./NEW_DATA/run8007-result.h5",
+                    "./NEW_DATA/run8008-result.h5",
+                    "./NEW_DATA/run8009-result.h5",
+                    "./NEW_DATA/run8010-result.h5"],
+    "output_h5": "Xi_chem_data.h5",
     "val_frac": 0.15,
     "test_frac": 0.15,
     "batch_size": 2048,
     "allow_negative": [],
-    "allow_zero": ["O_evolution", "H_evolution", "OH_evolution"],  # Species that can be zero
+    "allow_zero": [],  # Species that can be zero
     "zero_threshold": 1e-50,  # Values below this are considered zero
-    "log_file": None,
+    "log_file": "NEW_DATA_LOGS.txt",
     "split_seed": 42,
 }
 

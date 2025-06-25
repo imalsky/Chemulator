@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hyperparams.py – Optuna-based hyperparameter tuning for the chemical kinetics model.
+hyperparams.py – Optimized Optuna-based hyperparameter tuning.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from optuna.trial import FrozenTrial
 from hardware import setup_device
 from train import ModelTrainer
 from utils import save_json
+from normalizer import DataNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ PRUNER_WARMUP_STEPS = 5
 PRUNER_STARTUP_TRIALS = 5
 DEFAULT_GC_AFTER_TRIAL = True
 DEFAULT_SHOW_PROGRESS_BAR = True
+
 
 def _suggest_hyperparams(trial: Trial, base_cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Creates a trial-specific configuration by suggesting hyperparameters."""
@@ -48,6 +50,10 @@ def _suggest_hyperparams(trial: Trial, base_cfg: Dict[str, Any]) -> Dict[str, An
 
     # Suggest independent hyperparameters
     for name, params in search_space.get("hyperparameters", {}).items():
+        # Skip conservation loss parameters as they're removed
+        if name in ("use_conservation_loss", "conservation_loss_weight"):
+            continue
+            
         suggested_val = None
         if params["type"] == "categorical":
             suggested_val = trial.suggest_categorical(name, params["choices"])
@@ -56,9 +62,14 @@ def _suggest_hyperparams(trial: Trial, base_cfg: Dict[str, Any]) -> Dict[str, An
                 name, params["low"], params["high"], log=params.get("log", False)
             )
         elif params["type"] == "int":
-            suggested_val = trial.suggest_int(
-                name, params["low"], params["high"], log=params.get("log", False)
-            )
+            if params.get("log", False):
+                suggested_val = int(trial.suggest_float(
+                    name, params["low"], params["high"], log=True
+                ))
+            else:
+                suggested_val = trial.suggest_int(
+                    name, params["low"], params["high"]
+                )
 
         if suggested_val is not None:
             if name in train_params:
@@ -66,8 +77,9 @@ def _suggest_hyperparams(trial: Trial, base_cfg: Dict[str, Any]) -> Dict[str, An
             elif name in model_params:
                 model_params[name] = suggested_val
             else:
-                cfg[name] = suggested_val  # Fallback to root
+                cfg[name] = suggested_val
     return cfg
+
 
 def _reconstruct_config_from_trial(
     trial: FrozenTrial, base_cfg: Dict[str, Any]
@@ -79,7 +91,6 @@ def _reconstruct_config_from_trial(
     model_params = cfg["model_hyperparameters"]
     train_params = cfg["training_hyperparameters"]
 
-    # Handle special case for network architecture
     arch_space = search_space.get("architecture", {})
     if "num_hidden_layers" in arch_space and "hidden_dim" in arch_space:
         if "num_hidden_layers" in params:
@@ -88,21 +99,20 @@ def _reconstruct_config_from_trial(
                 params[f"hidden_dim_l{i+1}"] for i in range(num_layers)
             ]
 
-    # Update other hyperparameters
     for name, value in params.items():
         if name.startswith("hidden_dim_l") or name == "num_hidden_layers":
-            continue  # Already handled
+            continue
 
         if name in train_params:
             train_params[name] = value
         elif name in model_params:
             model_params[name] = value
         else:
-            # Check against the search space definition to avoid misplaced keys
             if name in search_space.get("hyperparameters", {}):
                  cfg[name] = value
     
     return cfg
+
 
 def run_hyperparameter_search(
     base_config: Dict[str, Any],
@@ -112,6 +122,13 @@ def run_hyperparameter_search(
     collate_fn: Callable,
 ) -> Optional[Dict[str, Any]]:
     """Executes the complete Optuna hyperparameter search process."""
+
+    # Pre-calculate normalization stats ONCE for efficiency
+    logger.info("Pre-calculating normalization statistics for the entire tuning study...")
+    device = setup_device()
+    normalizer = DataNormalizer(config_data=base_config, device=device)
+    pre_calculated_norm_metadata = normalizer.calculate_stats(h5_path, splits['train'])
+    logger.info("Normalization statistics pre-calculation complete.")
 
     def objective(trial: Trial) -> float:
         """Objective function for Optuna, called for each trial."""
@@ -125,12 +142,14 @@ def run_hyperparameter_search(
         try:
             trainer = ModelTrainer(
                 config=trial_cfg,
-                device=setup_device(),
+                device=device,
                 save_dir=trial_dir,
                 h5_path=h5_path,
                 splits=splits,
                 collate_fn=collate_fn,
                 optuna_trial=trial,
+                # Pass pre-calculated stats to the trainer
+                norm_metadata=pre_calculated_norm_metadata,
             )
             return trainer.train()
         except TrialPruned:
@@ -144,14 +163,6 @@ def run_hyperparameter_search(
     
     output_folder = data_root_dir / base_config["output_paths_config"]["tuning_results_foldername"]
     storage_path = output_folder / f"{study_name}.db"
-    
-    # Add support for 'int' suggestion type
-    for _, params in base_config.get("optuna_hyperparam_search_space", {}).get("hyperparameters", {}).items():
-        if params["type"] == "int":
-            # This is a bit of a hack to make sure the trial suggestion works
-            # without a large refactor. In a real scenario, the _suggest_hyperparams
-            # should handle this directly. For this fix, it is assumed this is the only `int`.
-            if 'log' not in params: params['log'] = False
 
     study = optuna.create_study(
         study_name=study_name,
@@ -181,5 +192,6 @@ def run_hyperparameter_search(
     save_json(best_config, output_folder / "best_config.json")
     logger.info(f"Best configuration saved to {output_folder / 'best_config.json'}")
     return best_config
+
 
 __all__ = ["run_hyperparameter_search"]
