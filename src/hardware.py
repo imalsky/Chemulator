@@ -91,7 +91,6 @@ def configure_dataloader_settings() -> Dict[str, Any]:
     
     return {
         "pin_memory": is_cuda,          # Speeds up CPU-to-CUDA memory transfers
-        "persistent_workers": is_cuda,  # Reduces worker startup overhead between epochs
     }
 
 
