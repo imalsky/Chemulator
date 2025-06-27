@@ -1,0 +1,97 @@
+2025-06-26 13:38:52,522 | INFO     | 
+================================================================================
+2025-06-26 13:38:52,522 | INFO     | HDF5 FILE INVESTIGATION: ../data/chem_data/Xi_chem_data.h5
+2025-06-26 13:38:52,522 | INFO     | File size: 18.99 GB
+2025-06-26 13:38:52,522 | INFO     | ================================================================================
+
+2025-06-26 13:38:52,522 | INFO     | Checking available HDF5 compression filters:
+2025-06-26 13:38:52,527 | INFO     |   gzip: Available
+2025-06-26 13:38:52,527 | INFO     |   lzf: Available
+2025-06-26 13:38:52,527 | INFO     |   szip: Not available
+2025-06-26 13:38:52,527 | INFO     | Successfully opened HDF5 file
+2025-06-26 13:38:52,527 | INFO     | HDF5 Library version: 1.12.2
+2025-06-26 13:38:52,527 | INFO     | h5py version: 3.12.1
+2025-06-26 13:38:52,527 | INFO     | File driver: sec2
+2025-06-26 13:38:52,527 | INFO     | 
+============================================================
+2025-06-26 13:38:52,527 | INFO     | ROOT LEVEL ANALYSIS
+2025-06-26 13:38:52,527 | INFO     | ============================================================
+2025-06-26 13:38:52,528 | INFO     | Total root items: 15
+2025-06-26 13:38:52,528 | INFO     |   Scalar datasets: 15
+2025-06-26 13:38:52,528 | INFO     |   Profile groups: 0
+2025-06-26 13:38:52,528 | INFO     |   Other items: 0
+2025-06-26 13:38:52,528 | INFO     | 
+============================================================
+2025-06-26 13:38:52,528 | INFO     | SCALAR DATASETS ANALYSIS
+2025-06-26 13:38:52,528 | INFO     | ============================================================
+2025-06-26 13:38:52,547 | INFO     | 
+T:
+2025-06-26 13:38:52,547 | INFO     |   Shape: (1957814,)
+2025-06-26 13:38:52,547 | INFO     |   Dtype: float64
+2025-06-26 13:38:52,548 | INFO     |   Size: 14.94 MB
+2025-06-26 13:38:52,548 | INFO     |   Compression: None
+2025-06-26 13:38:52,564 | INFO     | 
+P:
+2025-06-26 13:38:52,564 | INFO     |   Shape: (1957814,)
+2025-06-26 13:38:52,564 | INFO     |   Dtype: float64
+2025-06-26 13:38:52,564 | INFO     |   Size: 14.94 MB
+2025-06-26 13:38:52,564 | INFO     |   Compression: None
+2025-06-26 13:38:52,564 | INFO     | 
+============================================================
+2025-06-26 13:38:52,564 | INFO     | PROFILE GROUPS ANALYSIS
+2025-06-26 13:38:52,564 | INFO     | ============================================================
+2025-06-26 13:38:52,564 | INFO     | 
+============================================================
+2025-06-26 13:38:52,564 | INFO     | TIME DATA ANALYSIS (t_time)
+2025-06-26 13:38:52,564 | INFO     | ============================================================
+2025-06-26 13:38:52,581 | INFO     |   Shape: (1957814, 100)
+2025-06-26 13:38:52,581 | INFO     |   Dtype: float64
+2025-06-26 13:38:52,581 | INFO     |   Compression: None
+2025-06-26 13:38:52,581 | INFO     |   Number of timesteps: 100
+2025-06-26 13:38:52,581 | INFO     | 
+============================================================
+2025-06-26 13:38:52,581 | INFO     | COMPRESSION AND PERFORMANCE ANALYSIS
+2025-06-26 13:38:52,581 | INFO     | ============================================================
+2025-06-26 13:38:52,602 | INFO     | 
+Compression summary:
+2025-06-26 13:38:52,602 | INFO     |   none: 15 datasets
+2025-06-26 13:38:52,602 | INFO     | 
+Chunking examples:
+2025-06-26 13:38:52,602 | INFO     |   C2H2_evolution: shape=(1957814, 100), chunks=(2048, 100)
+2025-06-26 13:38:52,602 | INFO     |   CH4_evolution: shape=(1957814, 100), chunks=(2048, 100)
+2025-06-26 13:38:52,602 | INFO     |   CO2_evolution: shape=(1957814, 100), chunks=(2048, 100)
+2025-06-26 13:38:52,602 | INFO     |   CO_evolution: shape=(1957814, 100), chunks=(2048, 100)
+2025-06-26 13:38:52,602 | INFO     |   H2O_evolution: shape=(1957814, 100), chunks=(2048, 100)
+2025-06-26 13:38:52,602 | INFO     | 
+============================================================
+2025-06-26 13:38:52,602 | INFO     | POTENTIAL ISSUES CHECK
+2025-06-26 13:38:52,602 | INFO     | ============================================================
+2025-06-26 13:38:52,603 | INFO     | 
+✓ No major structural issues detected
+2025-06-26 13:38:52,603 | INFO     | 
+============================================================
+2025-06-26 13:38:52,603 | INFO     | SUMMARY
+2025-06-26 13:38:52,603 | INFO     | ============================================================
+2025-06-26 13:38:52,603 | ERROR    | Error opening HDF5 file: 'bool' object is not iterable
+2025-06-26 13:38:52,603 | ERROR    | This could be due to:
+2025-06-26 13:38:52,603 | ERROR    |   - File corruption
+2025-06-26 13:38:52,603 | ERROR    |   - Missing compression filters
+2025-06-26 13:38:52,603 | ERROR    |   - Version mismatch
+2025-06-26 13:38:52,603 | ERROR    |   - File still being written
+2025-06-26 13:38:52,603 | INFO     | 
+Attempting to open with different drivers...
+2025-06-26 13:38:52,603 | INFO     |   ✓ Successfully opened with driver: sec2
+2025-06-26 13:38:52,603 | INFO     | 
+============================================================
+2025-06-26 13:38:52,603 | INFO     | COMPATIBILITY CHECKS
+2025-06-26 13:38:52,603 | INFO     | ============================================================
+2025-06-26 13:38:52,603 | INFO     | Is valid HDF5 file: True
+2025-06-26 13:38:52,603 | INFO     | Library version bounds not available in this h5py version
+2025-06-26 13:38:52,603 | INFO     | SWMR mode: False
+2025-06-26 13:38:52,603 | INFO     | 
+Recommendations for large file:
+2025-06-26 13:38:52,603 | INFO     |   - Use chunked datasets for better performance
+2025-06-26 13:38:52,603 | INFO     |   - Consider compression (gzip level 1-4 for speed)
+2025-06-26 13:38:52,604 | INFO     |   - Enable SWMR mode if using concurrent readers
+2025-06-26 13:38:52,604 | INFO     | 
+Investigation complete! Check the log file for full details.

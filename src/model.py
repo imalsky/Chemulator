@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 """
-model.py - Neural network architectures for chemical state prediction.
-
-This module provides MLP, SIREN, and FNO architectures that predict chemical
-system states at future times. All models use Feature-wise Linear Modulation
-(FiLM) for conditioning on global parameters and time.
-
-Key features:
-- JIT compilation support
-- Multiple initialization schemes
-- Flexible activation functions
-- Efficient implementations
+model.py
 """
 from __future__ import annotations
 
@@ -23,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 # --- Constants ---
 DEFAULT_TIME_EMBEDDING_DIM = 32
@@ -30,10 +21,10 @@ DEFAULT_CONDITION_DIM = 128
 DEFAULT_DROPOUT = 0.1
 DEFAULT_OMEGA_0 = 30.0
 MATMUL_PRECISION = "high"
+SIREN_INIT_SCALE = 0.1
 
 logger = logging.getLogger(__name__)
 torch.set_float32_matmul_precision(MATMUL_PRECISION)
-
 
 # --- Activation Functions ---
 def get_activation(name: str) -> nn.Module:
@@ -41,10 +32,11 @@ def get_activation(name: str) -> nn.Module:
     activations = {
         "relu": nn.ReLU(),
         "gelu": nn.GELU(),
-        "silu": nn.SiLU(),  # Swish
+        "silu": nn.SiLU(),
         "elu": nn.ELU(),
         "leaky_relu": nn.LeakyReLU(0.1),
         "tanh": nn.Tanh(),
+        "softsign": nn.Softsign(),
     }
     if name.lower() not in activations:
         raise ValueError(f"Unknown activation: {name}")
@@ -65,30 +57,89 @@ def init_weights(module: nn.Module, init_type: str = "xavier_uniform") -> None:
             nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
         elif init_type == "orthogonal":
             nn.init.orthogonal_(module.weight)
+        elif init_type == "truncated_normal":
+            # Truncated normal for better stability
+            nn.init.trunc_normal_(module.weight, std=0.02)
         
         if module.bias is not None:
             nn.init.zeros_(module.bias)
 
 
+# --- FNO Helper Module (FIX) ---
+class SpectralConv1d(nn.Module):
+    """1D Fourier layer. It does FFT, linear transform, and Inverse FFT."""
+    def __init__(self, in_channels: int, out_channels: int, modes: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes = modes
+
+        scale = (1 / (in_channels * out_channels))
+        self.weights = nn.Parameter(scale * torch.randn(in_channels, out_channels, self.modes, dtype=torch.cfloat))
+
+    def forward(self, x: Tensor) -> Tensor:
+        batchsize = x.shape[0]
+
+        # Compute Fourier coeff
+        x_ft = torch.fft.rfft(x)
+
+        # Multiply relevant Fourier modes
+        out_ft = torch.zeros(batchsize, self.out_channels, x.size(-1)//2 + 1, device=x.device, dtype=torch.cfloat)
+        out_ft[:, :, :self.modes] = torch.einsum("bix,iox->box", x_ft[:, :, :self.modes], self.weights)
+
+        # Return to physical space
+        x = torch.fft.irfft(out_ft, n=x.size(-1))
+        return x
+
+class FNOBlock(nn.Module):
+    """A single block of the Fourier Neural Operator."""
+    def __init__(self, channels: int, modes: int, activation: str, dropout: float):
+        super().__init__()
+        self.spectral_conv = SpectralConv1d(channels, channels, modes)
+        self.spatial_conv = nn.Conv1d(channels, channels, 1)
+        self.norm = nn.LayerNorm(channels)
+        self.activation = get_activation(activation)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x_res = x
+        x1 = self.spectral_conv(x)
+        x2 = self.spatial_conv(x)
+        x = x1 + x2
+        x = self.dropout(x)
+
+        x = x + x_res
+        
+        # Normalize the combined result.
+        # Transpose for LayerNorm, then transpose back
+        x = self.norm(x.transpose(1, 2)).transpose(1, 2)
+        
+        return self.activation(x)
+
+
 # --- Core Helper Modules ---
 
 class TimeEmbedding(nn.Module):
-    """Sinusoidal time embedding with learnable scaling."""
-    def __init__(self, dim: int, learnable_scale: bool = False) -> None:
+    """Sinusoidal time embedding with learnable scaling and normalization."""
+    
+    def __init__(self, dim: int, learnable_scale: bool = True, max_period: float = 10000.0) -> None:
         super().__init__()
         self.dim = dim
+        self.max_period = max_period
         
         # Pre-compute frequency components
         half_dim = self.dim // 2
         denominator = max(half_dim - 1.0, 1.0)
         freqs = torch.arange(0, half_dim).float() / denominator
-        self.register_buffer('inv_freq', 1.0 / (10000 ** freqs))
+        self.register_buffer('inv_freq', 1.0 / (self.max_period ** freqs))
         
-        # Optional learnable scaling
+        # Learnable scaling and shift for better adaptation
         if learnable_scale:
             self.scale = nn.Parameter(torch.ones(1))
+            self.shift = nn.Parameter(torch.zeros(1))
         else:
             self.register_buffer('scale', torch.ones(1))
+            self.register_buffer('shift', torch.zeros(1))
 
     def forward(self, t: Tensor) -> Tensor:
         if t.dim() == 1:
@@ -98,29 +149,39 @@ class TimeEmbedding(nn.Module):
             return t.expand(-1, self.dim)
         
         # Apply scaling and compute embeddings
-        t_scaled = t.float() * self.scale
+        t_scaled = (t.float() + self.shift) * self.scale
         emb = t_scaled * self.inv_freq
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         
         if self.dim % 2 == 1:
             emb = F.pad(emb, (0, 1), "constant", 0.0)
         
+        # Normalize to prevent extreme values
+        emb = emb / math.sqrt(self.dim)
+        
         return emb.to(t.dtype)
 
 
 class FiLMLayer(nn.Module):
-    """Feature-wise Linear Modulation with optional normalization."""
+    """Feature-wise Linear Modulation with stability improvements."""
+    
     def __init__(self, condition_dim: int, feature_dim: int, 
-                 use_norm: bool = False) -> None:
+                 use_norm: bool = True, residual: bool = True) -> None:
         super().__init__()
         self.use_norm = use_norm
+        self.residual = residual
         
-        # Generate gamma and beta parameters
+        # Generate gamma and beta parameters with better initialization
         self.generator = nn.Sequential(
             nn.Linear(condition_dim, feature_dim * 2),
+            nn.LayerNorm(feature_dim * 2),
             nn.SiLU(),
             nn.Linear(feature_dim * 2, feature_dim * 2)
         )
+        
+        # Initialize last layer to near-zero for stability
+        nn.init.trunc_normal_(self.generator[-1].weight, std=0.01)
+        nn.init.zeros_(self.generator[-1].bias)
         
         if use_norm:
             self.norm = nn.LayerNorm(feature_dim)
@@ -133,15 +194,28 @@ class FiLMLayer(nn.Module):
         
         params = self.generator(condition)
         gamma, beta = torch.chunk(params, 2, dim=-1)
-        return (1 + gamma) * features + beta
+        
+        # Constrain gamma to prevent extreme scaling
+        gamma = torch.tanh(gamma) * 0.5 + 1.0  # Range: [0.5, 1.5]
+        beta = torch.tanh(beta) * 0.1  # Range: [-0.1, 0.1]
+        
+        modulated = gamma * features + beta
+        
+        if self.residual:
+            return 0.9 * features + 0.1 * modulated
+        else:
+            return modulated
 
 
 class ResidualBlock(nn.Module):
-    """Residual block with pre-activation and optional stochastic depth."""
+    """Residual block with pre-activation and gradient checkpointing support."""
+    
     def __init__(self, dim: int, dropout: float = DEFAULT_DROPOUT,
-                 activation: str = "silu", stochastic_depth: float = 0.0) -> None:
+                 activation: str = "silu", stochastic_depth: float = 0.0,
+                 use_checkpoint: bool = False) -> None:
         super().__init__()
         self.stochastic_depth = stochastic_depth
+        self.use_checkpoint = use_checkpoint
         
         self.net = nn.Sequential(
             nn.LayerNorm(dim),
@@ -152,112 +226,71 @@ class ResidualBlock(nn.Module):
             nn.Dropout(dropout)
         )
     
+    def _forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+    
     def forward(self, x: Tensor) -> Tensor:
         # Stochastic depth (drop path)
         if self.training and self.stochastic_depth > 0:
             if torch.rand(1).item() < self.stochastic_depth:
                 return x
         
-        return x + self.net(x)
+        # Use gradient checkpointing if enabled
+        if self.use_checkpoint and self.training:
+            return x + checkpoint(self._forward, x)
+        else:
+            return x + self._forward(x)
 
 
 # --- SIREN-Specific Modules ---
 class SineLayer(nn.Module):
-    """SIREN sine activation layer with careful initialization."""
+    """SIREN sine activation layer with improved initialization and stability."""
+    
     def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 is_first: bool = False, omega_0: float = DEFAULT_OMEGA_0) -> None:
+                 is_first: bool = False, omega_0: float = DEFAULT_OMEGA_0,
+                 use_erf_approx: bool = False) -> None:
         super().__init__()
         self.omega_0 = omega_0
         self.is_first = is_first
+        self.use_erf_approx = use_erf_approx
         self.linear = nn.Linear(in_features, out_features, bias=bias)
         self._init_weights()
     
     def _init_weights(self) -> None:
         with torch.no_grad():
             if self.is_first:
-                # First layer: uniform initialization
-                bound = 1.0 / self.linear.in_features
+                # More conservative initialization for first layer
+                bound = SIREN_INIT_SCALE / self.linear.in_features
                 self.linear.weight.uniform_(-bound, bound)
             else:
-                # Hidden layers: account for sine activation
+                # Account for sine activation variance
                 bound = math.sqrt(6.0 / self.linear.in_features) / self.omega_0
+                # Apply additional safety scaling
+                bound *= SIREN_INIT_SCALE
                 self.linear.weight.uniform_(-bound, bound)
+            
+            if self.linear.bias is not None:
+                # Initialize bias to small values
+                fan_in = self.linear.in_features
+                bound = 1 / math.sqrt(fan_in) * 0.1
+                self.linear.bias.uniform_(-bound, bound)
     
     def forward(self, x: Tensor) -> Tensor:
-        return torch.sin(self.omega_0 * self.linear(x))
-
-
-# --- FNO-Specific Modules (Corrected) ---
-class SpectralConv1d(nn.Module):
-    """1D Spectral convolution for function approximation."""
-    def __init__(self, in_channels: int, out_channels: int, 
-                 modes: int) -> None:
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes = modes
+        # Linear transformation
+        out = self.linear(x)
         
-        # Complex weights for Fourier modes
-        scale = 1 / (in_channels * out_channels)
-        self.weights = nn.Parameter(
-            scale * torch.randn(in_channels, out_channels, modes, 2)
-        )
-    
-    def compl_mul1d(self, input: Tensor, weights: Tensor) -> Tensor:
-        """Complex multiplication for 1D signals."""
-        # input: (batch, in_channel, x), weights: (in_channel, out_channel, x)
-        # output: (batch, out_channel, x)
-        return torch.einsum("bix,iox->box", input, weights)
-    
-    def forward(self, x: Tensor) -> Tensor:
-        # x shape: (batch, channels, width)
-        batchsize = x.shape[0]
-        
-        # Fourier transform
-        x_ft = torch.fft.rfft(x)
-        
-        # Multiply relevant Fourier modes
-        out_ft = torch.zeros(batchsize, self.out_channels, x.size(-1)//2 + 1,
-                           dtype=torch.cfloat, device=x.device)
-        
-        # Convert weights to complex
-        weights_complex = torch.view_as_complex(self.weights)
-        
-        # Apply spectral convolution on low frequencies
-        out_ft[:, :, :self.modes] = self.compl_mul1d(
-            x_ft[:, :, :self.modes], weights_complex
-        )
-        
-        # Inverse FFT
-        x = torch.fft.irfft(out_ft, n=x.size(-1))
-        return x
-
-
-class FNOBlock(nn.Module):
-    """Fourier Neural Operator block with spectral convolution and skip connection."""
-    def __init__(self, width: int, modes: int, activation: str = "gelu",
-                 dropout: float = 0.1) -> None:
-        super().__init__()
-        self.conv = SpectralConv1d(width, width, modes)
-        self.w = nn.Conv1d(width, width, 1)
-        self.norm = nn.LayerNorm(width)
-        self.activation = get_activation(activation)
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, x: Tensor) -> Tensor:
-        # x shape: (batch, width, grid)
-        x1 = self.conv(x)
-        x2 = self.w(x)
-        x = x1 + x2
-        
-        # Reshape for layer norm
-        x = x.permute(0, 2, 1)  # (batch, grid, width)
-        x = self.norm(x)
-        x = x.permute(0, 2, 1)  # (batch, width, grid)
-        
-        x = self.activation(x)
-        x = self.dropout(x)
-        return x
+        if self.use_erf_approx:
+            # Use erf as a smooth approximation to sine for very large inputs
+            # This prevents numerical issues with sin of large values
+            scaled = self.omega_0 * out
+            mask = scaled.abs() > 10
+            result = torch.sin(scaled)
+            if mask.any():
+                # For large values, use a bounded smooth function
+                result[mask] = torch.erf(scaled[mask] / 10) * 0.9
+            return result
+        else:
+            return torch.sin(self.omega_0 * out)
 
 
 # --- Main Model Architectures ---
@@ -270,7 +303,7 @@ class FiLM_MLP(nn.Module):
         dropout: float, use_time_embedding: bool, time_embedding_dim: int,
         condition_dim: int, use_residual: bool, activation: str = "silu",
         use_layer_norm: bool = True, init_type: str = "xavier_uniform",
-        stochastic_depth: float = 0.0, **kwargs
+        stochastic_depth: float = 0.0, use_checkpoint: bool = False, **kwargs
     ) -> None:
         super().__init__()
         self.num_species = num_species
@@ -281,15 +314,18 @@ class FiLM_MLP(nn.Module):
             time_embedding_dim, learnable_scale=True
         ) if use_time_embedding else None
         
-        # Conditioning network with skip connection
+        # Conditioning network with normalization
         condition_input_dim = num_global_vars + (
             time_embedding_dim if use_time_embedding else 1
         )
+        self.condition_input_norm = nn.LayerNorm(condition_input_dim)
         self.conditioning_net = nn.Sequential(
             nn.Linear(condition_input_dim, condition_dim),
+            nn.LayerNorm(condition_dim),
             get_activation(activation),
-            nn.Dropout(dropout * 0.5),  # Less dropout in conditioning
+            nn.Dropout(dropout * 0.5),
             nn.Linear(condition_dim, condition_dim),
+            nn.LayerNorm(condition_dim),
             get_activation(activation),
             nn.Linear(condition_dim, condition_dim)
         )
@@ -297,7 +333,7 @@ class FiLM_MLP(nn.Module):
         # Input projection with layer norm
         self.input_norm = nn.LayerNorm(num_species) if use_layer_norm else nn.Identity()
         self.input_proj = nn.Linear(num_species, hidden_dims[0])
-        self.film_layer = FiLMLayer(condition_dim, hidden_dims[0], use_norm=True)
+        self.film_layer = FiLMLayer(condition_dim, hidden_dims[0], use_norm=True, residual=True)
         
         # Main body with residual blocks
         layers = nn.ModuleList()
@@ -308,7 +344,7 @@ class FiLM_MLP(nn.Module):
                 # Stochastic depth increases with depth
                 sd_prob = stochastic_depth * (i / len(hidden_dims))
                 layers.append(ResidualBlock(
-                    in_dim, dropout, activation, sd_prob
+                    in_dim, dropout, activation, sd_prob, use_checkpoint
                 ))
             else:
                 # Dimension change block
@@ -326,9 +362,13 @@ class FiLM_MLP(nn.Module):
         self.output_norm = nn.LayerNorm(hidden_dims[-1])
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dims[-1], hidden_dims[-1] // 2),
+            nn.LayerNorm(hidden_dims[-1] // 2),
             get_activation(activation),
             nn.Linear(hidden_dims[-1] // 2, num_species)
         )
+        
+        # Output scaling for stability
+        self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
         
         # Initialize weights
         self.apply(lambda m: init_weights(m, init_type))
@@ -338,13 +378,14 @@ class FiLM_MLP(nn.Module):
         initial_species = x[:, :self.num_species]
         global_and_time = x[:, self.num_species:]
         
-        # Process conditioning
+        # Process conditioning with normalization
         if self.use_time_embedding and self.time_embed is not None:
             time_emb = self.time_embed(global_and_time[:, -1])
             condition_input = torch.cat([global_and_time[:, :-1], time_emb], dim=-1)
         else:
             condition_input = global_and_time
         
+        condition_input = self.condition_input_norm(condition_input)
         condition_vector = self.conditioning_net(condition_input)
         
         # Process species through network
@@ -356,22 +397,22 @@ class FiLM_MLP(nn.Module):
         for layer in self.mlp_body:
             hidden = layer(hidden)
         
-        # Output
+        # Output with controlled scaling
         hidden = self.output_norm(hidden)
-        delta = self.output_proj(hidden)
+        delta = self.output_proj(hidden) * self.output_scale
         
         # Residual connection
         return initial_species + delta
 
 
 class FiLM_SIREN(nn.Module):
-    """SIREN model with FiLM conditioning."""
+    """SIREN model with FiLM conditioning and improved stability."""
     
     def __init__(
         self, num_species: int, num_global_vars: int, hidden_dims: List[int],
         use_time_embedding: bool, time_embedding_dim: int, condition_dim: int,
         w0_initial: float, w0_hidden: float, use_batch_norm: bool = False,
-        final_activation: bool = False, **kwargs
+        final_activation: bool = True, use_erf_approx: bool = True, **kwargs
     ) -> None:
         super().__init__()
         self.num_species = num_species
@@ -382,21 +423,24 @@ class FiLM_SIREN(nn.Module):
             time_embedding_dim, learnable_scale=True
         ) if use_time_embedding else None
         
-        # Conditioning network
+        # Conditioning network with stability improvements
         condition_input_dim = num_global_vars + (
             time_embedding_dim if use_time_embedding else 1
         )
+        self.condition_input_norm = nn.LayerNorm(condition_input_dim)
         self.conditioning_net = nn.Sequential(
             nn.Linear(condition_input_dim, condition_dim),
+            nn.LayerNorm(condition_dim),
             nn.SiLU(),
             nn.Linear(condition_dim, condition_dim)
         )
         
-        # Input projection
+        # Input projection with normalization
+        self.input_norm = nn.LayerNorm(num_species)
         self.input_proj = nn.Linear(num_species, hidden_dims[0])
-        self.film_layer = FiLMLayer(condition_dim, hidden_dims[0])
+        self.film_layer = FiLMLayer(condition_dim, hidden_dims[0], residual=True)
         
-        # SIREN layers
+        # SIREN layers with stability improvements
         siren_layers = nn.ModuleList()
         in_dim = hidden_dims[0]
         
@@ -404,7 +448,10 @@ class FiLM_SIREN(nn.Module):
             is_first = (i == 0)
             omega = w0_initial if is_first else w0_hidden
             
-            layer = [SineLayer(in_dim, out_dim, is_first=is_first, omega_0=omega)]
+            layer = [SineLayer(
+                in_dim, out_dim, is_first=is_first, 
+                omega_0=omega, use_erf_approx=use_erf_approx
+            )]
             
             # Optional batch norm
             if use_batch_norm and not is_first:
@@ -415,37 +462,45 @@ class FiLM_SIREN(nn.Module):
         
         self.net = siren_layers
         
-        # Output
+        # Output with stability
+        self.output_norm = nn.LayerNorm(in_dim)
         if final_activation:
             self.output_linear = nn.Sequential(
                 nn.Linear(in_dim, num_species),
-                nn.Tanh()  # Bound output changes
+                nn.Tanh()
             )
+            self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
         else:
             self.output_linear = nn.Linear(in_dim, num_species)
+            self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, x: Tensor) -> Tensor:
         # Split input
         initial_species = x[:, :self.num_species]
         global_and_time = x[:, self.num_species:]
         
-        # Process conditioning
+        # Process conditioning with normalization
         if self.use_time_embedding and self.time_embed is not None:
             time_emb = self.time_embed(global_and_time[:, -1])
             condition_input = torch.cat([global_and_time[:, :-1], time_emb], dim=-1)
         else:
             condition_input = global_and_time
         
+        condition_input = self.condition_input_norm(condition_input)
         condition_vector = self.conditioning_net(condition_input)
         
-        # Process through SIREN
-        coords = self.input_proj(initial_species)
+        # Process through SIREN with normalization
+        coords = self.input_norm(initial_species)
+        coords = self.input_proj(coords)
         coords = self.film_layer(coords, condition_vector)
         
         for layer in self.net:
             coords = layer(coords)
         
-        delta = self.output_linear(coords)
+        # Output with controlled scaling
+        coords = self.output_norm(coords)
+        delta = self.output_linear(coords) * self.output_scale
+        
         return initial_species + delta
 
 
@@ -453,10 +508,17 @@ class FiLM_FNO(nn.Module):
     """Fourier Neural Operator with FiLM conditioning for chemical kinetics."""
     
     def __init__(
-        self, num_species: int, num_global_vars: int, hidden_dims: List[int],
-        dropout: float, use_time_embedding: bool, time_embedding_dim: int,
-        condition_dim: int, fno_spectral_modes: int, fno_seq_length: int,
-        compression: float = 0.5, activation: str = "gelu", **kwargs
+        self, num_species: int, 
+        num_global_vars: int,
+        hidden_dims: List[int],
+        dropout: float,
+        use_time_embedding: bool,
+        time_embedding_dim: int,
+        condition_dim: int, 
+        fno_spectral_modes: int, 
+        fno_seq_length: int,
+        compression: float = 0.5, 
+        activation: str = "gelu", **kwargs
     ) -> None:
         super().__init__()
         self.num_species = num_species
@@ -472,8 +534,10 @@ class FiLM_FNO(nn.Module):
         condition_input_dim = num_global_vars + (
             time_embedding_dim if use_time_embedding else 1
         )
+        self.condition_input_norm = nn.LayerNorm(condition_input_dim)
         self.conditioning_net = nn.Sequential(
             nn.Linear(condition_input_dim, condition_dim),
+            nn.LayerNorm(condition_dim),
             get_activation(activation),
             nn.Linear(condition_dim, condition_dim)
         )
@@ -481,6 +545,7 @@ class FiLM_FNO(nn.Module):
         # Lifting layer - expand to function space
         self.lifting = nn.Sequential(
             nn.Linear(num_species + condition_dim, hidden_dims[0]),
+            nn.LayerNorm(hidden_dims[0]),
             get_activation(activation)
         )
         
@@ -505,13 +570,20 @@ class FiLM_FNO(nn.Module):
                 FNOBlock(out_channels, fno_spectral_modes, activation, dropout)
             )
         
-        # Projection back to species space
+        # Calculate the intermediate dimension for the projection bottleneck
+        projection_dim = max(1, int(hidden_dims[-1] * compression))
+        
+        # Projection back to species space with stability
         self.projection = nn.Sequential(
-            nn.Conv1d(hidden_dims[-1], hidden_dims[-1] // 2, 1),
+            nn.Conv1d(hidden_dims[-1], projection_dim, 1),
+            nn.BatchNorm1d(projection_dim),
             get_activation(activation),
             nn.Dropout(dropout),
-            nn.Conv1d(hidden_dims[-1] // 2, num_species, 1)
+            nn.Conv1d(projection_dim, num_species, 1)
         )
+        
+        # Output scaling
+        self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
 
     def _create_position_encoding(self, length: int, d_model: int) -> Tensor:
         """Create sinusoidal position encoding."""
@@ -539,6 +611,7 @@ class FiLM_FNO(nn.Module):
         else:
             condition_input = global_and_time
         
+        condition_input = self.condition_input_norm(condition_input)
         condition_vector = self.conditioning_net(condition_input)
         
         # Combine species and conditioning
@@ -547,11 +620,8 @@ class FiLM_FNO(nn.Module):
         # Lift to function space
         lifted = self.lifting(combined)  # (batch, channels)
         
-        # Create function representation using position encoding
-        # Expand lifted features across sequence dimension
+        # Create function representation by expanding and adding position encoding
         func_repr = lifted.unsqueeze(-1).expand(-1, -1, self.seq_length)
-        
-        # Add position encoding
         pos_enc = self.pos_encoding.permute(0, 2, 1).expand(batch_size, -1, -1)
         func_repr = func_repr + pos_enc
         
@@ -563,7 +633,7 @@ class FiLM_FNO(nn.Module):
         output = self.projection(func_repr)
         
         # Global average pooling to get single prediction
-        delta = output.mean(dim=-1)
+        delta = output.mean(dim=-1) * self.output_scale
         
         return initial_species + delta
 
@@ -603,6 +673,7 @@ def create_prediction_model(
             "use_layer_norm": model_params.get("use_layer_norm", True),
             "init_type": model_params.get("init_type", "xavier_uniform"),
             "stochastic_depth": model_params.get("stochastic_depth", 0.0),
+            "use_checkpoint": model_params.get("use_gradient_checkpointing", False),
         })
         
     elif model_type == "siren":
@@ -611,7 +682,8 @@ def create_prediction_model(
             "w0_initial": model_params.get("siren_w0_initial", DEFAULT_OMEGA_0),
             "w0_hidden": model_params.get("siren_w0_hidden", DEFAULT_OMEGA_0),
             "use_batch_norm": model_params.get("use_batch_norm", False),
-            "final_activation": model_params.get("final_activation", False),
+            "final_activation": model_params.get("final_activation", True),
+            "use_erf_approx": model_params.get("siren_use_erf_approx", True),
         })
         
     elif model_type == "fno":
