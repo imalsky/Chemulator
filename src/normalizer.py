@@ -36,9 +36,9 @@ class DataNormalizer:
     }
     QUANTILE_METHODS = {"iqr", "symlog", "log-min-max"}
 
-    def __init__(self, *, config_data: Dict[str, Any], device: torch.device = None):
+    def __init__(self, *, config_data: Dict[str, Any]):
         self.config = config_data
-        self.device = device or torch.device('cpu')
+        self.device = torch.device('cpu') # Hardcode to CPU for efficiency
         self.data_spec = self.config.get("data_specification", {})
         self.norm_cfg = self.config.get("normalization", {})
         

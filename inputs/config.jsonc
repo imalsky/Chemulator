@@ -1,7 +1,7 @@
 // =========================================================================================
-// ==                 OPTIMIZED CONFIGURATION FILE FOR CHEMICAL KINETICS                  ==
+// ==                 OPTIMIZED CONFIGURATION WITH AUTO-DETECTION                        ==
 // =========================================================================================
-// This configuration includes numerical stability improvements and best starting values.
+// This configuration includes auto-configuration for optimal hardware utilization.
 
 {
   // ════════════════════════════════════════════════════════════════
@@ -82,6 +82,7 @@
     "use_layer_norm": true,
     "init_type": "xavier_uniform",
     "stochastic_depth": 0.1,
+    "use_gradient_checkpointing": "auto",  // Auto-detect based on GPU memory
     
     // SIREN-specific parameters (reduced for stability)
     "siren_w0_initial": 10.0,       // Reduced from 30.0
@@ -104,7 +105,7 @@
     "val_frac": 0.15,
     "test_frac": 0.15,
     
-    // Start with small data fraction for testing
+    // Start with small data fraction for testing, then increase
     "data_fraction": 1.0,           // Use full data
     
     // Training duration
@@ -112,40 +113,35 @@
     "early_stopping_patience": 20,
     "min_delta": 1e-6,
     
-    // Batch settings - start smaller for stability
-    "batch_size": 4096,
-    "gradient_accumulation_steps": 2,  // Effective batch = 8192
+    // Batch settings - AUTO configured based on GPU
+    "batch_size": "auto",           // Will auto-detect optimal size
+    "gradient_accumulation_steps": "auto",  // Will target effective batch of 16384
     
-    // Conservative optimizer settings
-    "optimizer": "adamw",
+    // Optimizer settings (AdamW only)
     "learning_rate": 1e-4,          // Conservative start
     "weight_decay": 1e-5,
     
-    // Learning rate schedule
-    "scheduler_choice": "cosine",
+    // Learning rate schedule (cosine or plateau only)
+    "scheduler_choice": "cosine",   // Options: "cosine", "plateau"
     "warmup_epochs": 5,
-    "patience": 10,
-    "factor": 0.5,
+    "patience": 10,                 // For plateau scheduler
+    "factor": 0.5,                  // For plateau scheduler
     "min_lr": 1e-7,
     
     // Cosine scheduler settings
     "cosine_T_0": 20,
     "cosine_T_mult": 2,
     
-    // Loss function - Huber is more robust
-    "loss_function": "huber",
-    "huber_delta": 0.5,            // More forgiving than 0.1
+    // Loss function (MSE or Huber only)
+    "loss_function": "huber",       // Options: "mse", "huber"
+    "huber_delta": 0.5,            // For Huber loss
     
     // Training stability
     "gradient_clip_val": 1.0,
     "gradient_clip_mode": "norm",   // "norm" or "value"
     
-    // Model averaging
-    "use_ema": true,
-    "ema_decay": 0.999,
-    
-    // Mixed precision training (disable for debugging)
-    "use_amp": false,
+    // Mixed precision training - AUTO configured
+    "use_amp": "auto",              // Will enable on capable GPUs
     
     // Loss tracking
     "max_invalid_batches": 100,     // Stop if too many NaN losses
@@ -177,11 +173,9 @@
       "learning_rate": {"type": "float", "low": 1e-5, "high": 5e-4, "log": true},
       "weight_decay": {"type": "float", "low": 1e-7, "high": 1e-4, "log": true},
       "dropout": {"type": "float", "low": 0.0, "high": 0.3},
-      "batch_size": {"type": "categorical", "choices": [256, 512, 1024, 2048, 4096]},
       
       // Regularization
       "stochastic_depth": {"type": "float", "low": 0.0, "high": 0.2},
-      "gradient_accumulation_steps": {"type": "categorical", "choices": [1, 2, 4]},
       
       // Model-specific parameters (conservative ranges)
       "siren_w0_initial": {"type": "float", "low": 1.0, "high": 30.0},
@@ -190,11 +184,13 @@
       
       // Training settings
       "warmup_epochs": {"type": "int", "low": 0, "high": 10},
-      "use_ema": {"type": "categorical", "choices": [true, false]},
       "huber_delta": {"type": "float", "low": 0.1, "high": 1.0},
       
       // Activation functions (for MLP)
-      "activation": {"type": "categorical", "choices": ["relu", "gelu", "silu", "elu"]}
+      "activation": {"type": "categorical", "choices": ["relu", "gelu", "silu", "elu"]},
+      
+      // Scheduler choice
+      "scheduler_choice": {"type": "categorical", "choices": ["cosine", "plateau"]}
     }
   },
 
@@ -204,15 +200,18 @@
   "miscellaneous_settings": {
     "random_seed": 42,
     
-    // DataLoader settings - CRITICAL FOR HDF5
-    "num_dataloader_workers": 0,    // MUST be 0 for HDF5 to avoid file locking
+    // DataLoader settings - AUTO configured
+    "num_dataloader_workers": "auto",    // Will be 0 for HDF5, otherwise optimized
     
-    // Memory management
-    "profiles_per_chunk": 2048,     // Number of profiles to read at once
-    "max_memory_per_worker_gb": 2.0, // Max memory per worker for chunking
+    // Memory management - AUTO configured
+    "profiles_per_chunk": "auto",        // Will be set based on available memory
+    "max_memory_per_worker_gb": "auto",  // Will be set based on system memory
     
-    // Model compilation and export
-    "use_torch_compile": false,     // Disable initially for debugging
+    // Dataset caching - AUTO configured
+    "cache_dataset": "auto",             // Will cache if dataset fits in memory
+    
+    // Model compilation and export - AUTO configured
+    "use_torch_compile": "auto",         // Will enable on capable GPUs
     "torch_compile_mode": "reduce-overhead",
     "export_jit_model": true,
     "export_jit_during_training": false,  // Only export at end
