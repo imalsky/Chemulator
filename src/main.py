@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py - Optimized main entry point for the training pipeline.
+main.py - Optimized main entry point with auto-configuration support
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from typing import Any, Dict
 import torch
 
 from dataset import collate_fn
-from hardware import setup_device
+from hardware import setup_device, auto_configure_training_params
 from hyperparams import run_hyperparameter_search
 from train import ModelTrainer
 from utils import (
@@ -71,13 +71,17 @@ def _get_h5_path(config: Dict[str, Any], data_root_dir: Path) -> Path:
 def _run_fixed_training(config: Dict[str, Any], data_root_dir: Path) -> None:
     """Runs training with a single, fixed configuration."""
     logger.info("Starting model training with fixed configuration...")
+    
+    # Get HDF5 path
+    h5_path = _get_h5_path(config, data_root_dir)
+    
+    # Auto-configure parameters
+    config = auto_configure_training_params(config, str(h5_path))
+    
     model_folder = get_config_str(config, OUTPUT_PATHS_SECTION, FIXED_MODEL_KEY, "fixed training")
     model_save_dir = data_root_dir / model_folder
     ensure_dirs(model_save_dir)
     save_json(config, model_save_dir / "run_config.json")
-    
-    # Get HDF5 path
-    h5_path = _get_h5_path(config, data_root_dir)
     
     # Load or generate splits
     splits, splits_path = load_or_generate_splits(config, data_root_dir, h5_path)
@@ -106,6 +110,9 @@ def _run_hyperparameter_tuning(config: Dict[str, Any], data_root_dir: Path) -> N
     
     # Get HDF5 path
     h5_path = _get_h5_path(config, data_root_dir)
+    
+    # Auto-configure base parameters
+    config = auto_configure_training_params(config, str(h5_path))
     
     # Load or generate splits
     splits, splits_path = load_or_generate_splits(config, data_root_dir, h5_path)

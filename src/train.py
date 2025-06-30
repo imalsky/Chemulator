@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-train.py - Optimized training pipeline with improved stability.
-
-Key improvements:
-- Fixed num_workers configuration handling
-- Enhanced HDF5 compatibility checks
-- Better memory management for large datasets
-- Improved gradient monitoring and anomaly detection
+train.py - Optimized training pipeline with dataset caching
 """
 from __future__ import annotations
 
+import gc
 import logging
 import random
 import time
@@ -28,7 +23,7 @@ from torch.optim.lr_scheduler import (
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import ChemicalDataset, collate_fn
+from dataset import create_dataset, collate_fn
 from hardware import configure_dataloader_settings
 from model import create_prediction_model, export_model_jit
 from normalizer import DataNormalizer
@@ -40,60 +35,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_BATCH_SIZE = 4096
 DEFAULT_EPOCHS = 100
 DEFAULT_LR = 5e-4
-DEFAULT_OPTIMIZER = "adamw"
 DEFAULT_GRAD_CLIP = 1.0
 DEFAULT_EARLY_STOPPING_PATIENCE = 20
 DEFAULT_MIN_DELTA = 1e-8
 DEFAULT_WARMUP_EPOCHS = 5
 DEFAULT_GRADIENT_ACCUMULATION = 1
-DEFAULT_EMA_DECAY = 0.999
 DEFAULT_MAX_INVALID_BATCHES = 100
 DEFAULT_INVALID_BATCH_THRESHOLD = 0.5
 DEFAULT_NUM_WORKERS = 0  # Safe default for HDF5
-
-
-class ExponentialMovingAverage:
-    """
-    Maintains exponential moving average of model parameters.
-    
-    This helps stabilize training and often improves final model quality.
-    """
-    
-    def __init__(self, model: nn.Module, decay: float = DEFAULT_EMA_DECAY):
-        """Initialize EMA with model parameters."""
-        self.model = model
-        self.decay = decay
-        self.shadow_params = {}
-        self.backup_params = {}
-        
-        # Create shadow copies of trainable parameters
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow_params[name] = param.data.clone()
-    
-    def update(self):
-        """Update shadow parameters using exponential moving average."""
-        with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                if param.requires_grad and name in self.shadow_params:
-                    # EMA update: shadow = decay * shadow + (1 - decay) * param
-                    self.shadow_params[name].mul_(self.decay).add_(
-                        param.data, alpha=1 - self.decay
-                    )
-    
-    def apply_shadow(self):
-        """Replace model parameters with shadow parameters."""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.shadow_params:
-                self.backup_params[name] = param.data.clone()
-                param.data.copy_(self.shadow_params[name])
-    
-    def restore(self):
-        """Restore original model parameters."""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.backup_params:
-                param.data.copy_(self.backup_params[name])
-        self.backup_params = {}
 
 
 def get_warmup_scheduler(
@@ -116,16 +65,16 @@ def get_warmup_scheduler(
 
 class ModelTrainer:
     """
-    Optimized training pipeline manager with improved stability features.
+    Optimized training pipeline manager with dataset caching support.
     
     Features:
     - Automatic mixed precision (optional)
     - Gradient accumulation
     - Learning rate scheduling with warmup
-    - Exponential moving average
     - Invalid batch tracking
     - Checkpoint management
     - HDF5-aware data loading
+    - Optional dataset caching for faster training
     """
 
     def __init__(
@@ -165,6 +114,11 @@ class ModelTrainer:
             "save_checkpoint_every_n_epochs", 10
         )
         
+        # Dataset caching
+        self.cache_dataset = self.misc_cfg.get("cache_dataset", False)
+        if self.cache_dataset:
+            logger.info("Dataset caching enabled - will load all data into memory")
+        
         # Anomaly detection for debugging
         if self.misc_cfg.get("detect_anomaly", False):
             torch.autograd.set_detect_anomaly(True)
@@ -183,64 +137,92 @@ class ModelTrainer:
         self._build_optimizer()
         self._build_schedulers()
         self._setup_loss_and_training_params()
-        self._setup_ema()
         self._setup_logging()
         self._save_metadata()
+        
+        # Force garbage collection after setup
+        gc.collect()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def _get_num_workers(self) -> int:
         """
-        Get the number of dataloader workers, with HDF5 compatibility check.
+        Get the number of dataloader workers, with caching and HDF5 awareness.
         
-        Returns 0 for HDF5 to avoid file locking issues.
+        The streaming ChemicalDataset is designed for multi-worker HDF5 access,
+        so we enable it here.
         """
-        # First check if explicitly set in config
-        num_workers = self.misc_cfg.get("num_dataloader_workers", None)
-        
-        if num_workers is not None:
-            # Respect explicit configuration
-            if num_workers > 0 and self.h5_path.suffix.lower() in ('.h5', '.hdf5'):
-                logger.warning(
-                    f"Using {num_workers} workers with HDF5 may cause issues. "
-                    "Consider setting num_dataloader_workers=0 for HDF5 files."
+        # First, check for an explicit integer value in the config
+        num_workers_cfg = self.misc_cfg.get("num_dataloader_workers")
+        if isinstance(num_workers_cfg, int):
+            # Respect explicit user configuration
+            if num_workers_cfg > 0 and not self.cache_dataset:
+                logger.info(
+                    f"Using {num_workers_cfg} workers with HDF5 streaming as configured."
                 )
-            return num_workers
-        
-        # If not set, use safe defaults
-        if self.h5_path.suffix.lower() in ('.h5', '.hdf5'):
-            logger.info("Using 0 workers for HDF5 dataset (recommended for file locking)")
-            return 0
-        else:
-            # For non-HDF5, use a reasonable default
-            import multiprocessing
-            cpu_count = multiprocessing.cpu_count()
-            default_workers = min(8, cpu_count)
-            logger.info(f"Using {default_workers} workers for non-HDF5 dataset")
+            return num_workers_cfg
+
+        # If config is "auto" or not set, determine the optimal number
+        import multiprocessing
+        cpu_count = multiprocessing.cpu_count()
+        # Reserve at least one CPU for the main process and other tasks
+        available_cpus = max(1, cpu_count - 1)
+
+        if self.cache_dataset:
+            # Cached dataset is in RAM, it's always safe to use multiple workers.
+            # An A100 can handle many workers. Let's be aggressive.
+            default_workers = min(12, available_cpus)
+            logger.info(f"Auto-configuring num_workers: {default_workers} (Cached Dataset in RAM)")
             return default_workers
+        
+        # If we are here, it's the streaming ChemicalDataset.
+        # It is designed to be multi-worker safe. Let's enable it.
+        # Start with a healthy but not excessive number to avoid lock contention.
+        default_workers = min(8, available_cpus)
+        logger.info(
+            f"Auto-configuring num_workers: {default_workers} "
+            f"(Streaming HDF5 with optimized parallel-safe reader)"
+        )
+        return default_workers
 
     def _setup_datasets_with_precalculated_stats(
         self, h5_path: Path, splits: Dict[str, List[int]]
     ) -> None:
         """Creates datasets using pre-calculated normalization metadata."""
-        # Get memory limit per worker
+        # Get memory settings
         max_memory_gb = self.misc_cfg.get("max_memory_per_worker_gb", 2.0)
+        profiles_per_chunk = self.misc_cfg.get("profiles_per_chunk", 2048)
         
         ds_kwargs = {
             "h5_path": h5_path,
             "species_variables": self.data_spec["species_variables"],
             "global_variables": self.data_spec["global_variables"],
             "normalization_metadata": self.norm_metadata,
-            "profiles_per_chunk": self.misc_cfg.get("profiles_per_chunk", 2048),
+            "cache_dataset": self.cache_dataset,
+            "profiles_per_chunk": profiles_per_chunk,
             "max_memory_gb": max_memory_gb,
         }
         
-        self.train_ds = ChemicalDataset(indices=splits['train'], **ds_kwargs)
-        self.val_ds = ChemicalDataset(indices=splits['validation'], **ds_kwargs)
-        self.test_ds = ChemicalDataset(indices=splits['test'], **ds_kwargs)
+        self.train_ds = create_dataset(indices=splits['train'], **ds_kwargs)
+        self.val_ds = create_dataset(indices=splits['validation'], **ds_kwargs)
+        self.test_ds = create_dataset(indices=splits['test'], **ds_kwargs)
         self.test_set_indices = splits['test']
         
+        # Get sample counts
+        if hasattr(self.train_ds, '__len__'):
+            # Cached dataset
+            train_samples = len(self.train_ds)
+            val_samples = len(self.val_ds)
+            test_samples = len(self.test_ds)
+        else:
+            # Streaming dataset
+            train_samples = self.train_ds.total_samples
+            val_samples = self.val_ds.total_samples
+            test_samples = self.test_ds.total_samples
+        
         logger.info(
-            f"Datasets created - Train: ~{self.train_ds.total_samples:,}, "
-            f"Val: ~{self.val_ds.total_samples:,}, Test: ~{self.test_ds.total_samples:,}"
+            f"Datasets created - Train: {train_samples:,}, "
+            f"Val: {val_samples:,}, Test: {test_samples:,}"
         )
 
     def _setup_normalization_and_datasets(
@@ -280,34 +262,48 @@ class ModelTrainer:
 
         # Calculate normalization statistics
         logger.info("Calculating normalization statistics from training set...")
-        normalizer = DataNormalizer(config_data=self.cfg, device=self.device)
+        normalizer = DataNormalizer(config_data=self.cfg)
         self.norm_metadata = normalizer.calculate_stats(h5_path, train_indices)
         save_json(self.norm_metadata, self.save_dir / "normalization_metadata.json")
 
         # Create datasets
         max_memory_gb = self.misc_cfg.get("max_memory_per_worker_gb", 2.0)
+        profiles_per_chunk = self.misc_cfg.get("profiles_per_chunk", 2048)
         
         ds_kwargs = {
             "h5_path": h5_path,
             "species_variables": self.data_spec["species_variables"],
             "global_variables": self.data_spec["global_variables"],
             "normalization_metadata": self.norm_metadata,
-            "profiles_per_chunk": self.misc_cfg.get("profiles_per_chunk", 2048),
+            "cache_dataset": self.cache_dataset,
+            "profiles_per_chunk": profiles_per_chunk,
             "max_memory_gb": max_memory_gb,
         }
         
-        self.train_ds = ChemicalDataset(indices=train_indices, **ds_kwargs)
-        self.val_ds = ChemicalDataset(indices=val_indices, **ds_kwargs)
-        self.test_ds = ChemicalDataset(indices=test_indices, **ds_kwargs)
+        self.train_ds = create_dataset(indices=train_indices, **ds_kwargs)
+        self.val_ds = create_dataset(indices=val_indices, **ds_kwargs)
+        self.test_ds = create_dataset(indices=test_indices, **ds_kwargs)
+        
+        # Get sample counts
+        if hasattr(self.train_ds, '__len__'):
+            # Cached dataset
+            train_samples = len(self.train_ds)
+            val_samples = len(self.val_ds)
+            test_samples = len(self.test_ds)
+        else:
+            # Streaming dataset
+            train_samples = self.train_ds.total_samples
+            val_samples = self.val_ds.total_samples
+            test_samples = self.test_ds.total_samples
         
         logger.info(
-            f"Datasets created - Train: ~{self.train_ds.total_samples:,}, "
-            f"Val: ~{self.val_ds.total_samples:,}, Test: ~{self.test_ds.total_samples:,}"
+            f"Datasets created - Train: {train_samples:,}, "
+            f"Val: {val_samples:,}, Test: {test_samples:,}"
         )
 
     def _build_dataloaders(self, collate_fn: Callable) -> None:
         """Create optimized data loaders with proper worker configuration."""
-        # Get number of workers with HDF5 compatibility check
+        # Get number of workers with caching awareness
         num_workers = self._get_num_workers()
         
         # Get hardware-specific settings
@@ -331,15 +327,22 @@ class ModelTrainer:
             "prefetch_factor": 2 if num_workers > 0 else None,
         }
         
-        # Create dataloaders
-        # Note: IterableDataset doesn't support shuffle parameter
-        self.train_loader = DataLoader(self.train_ds, **dl_kwargs)
-        self.val_loader = DataLoader(self.val_ds, **dl_kwargs)
-        self.test_loader = DataLoader(self.test_ds, **dl_kwargs)
+        # Add shuffle for cached datasets
+        if hasattr(self.train_ds, '__len__'):
+            # Cached dataset supports shuffle
+            self.train_loader = DataLoader(self.train_ds, shuffle=True, **dl_kwargs)
+            self.val_loader = DataLoader(self.val_ds, shuffle=False, **dl_kwargs)
+            self.test_loader = DataLoader(self.test_ds, shuffle=False, **dl_kwargs)
+        else:
+            # IterableDataset doesn't support shuffle parameter
+            self.train_loader = DataLoader(self.train_ds, **dl_kwargs)
+            self.val_loader = DataLoader(self.val_ds, **dl_kwargs)
+            self.test_loader = DataLoader(self.test_ds, **dl_kwargs)
         
         logger.info(
             f"DataLoaders created with batch_size={batch_size}, "
-            f"num_workers={num_workers}, pin_memory={dl_kwargs['pin_memory']}"
+            f"num_workers={num_workers}, pin_memory={dl_kwargs['pin_memory']}, "
+            f"cached={self.cache_dataset}"
         )
 
     def _build_model(self) -> None:
@@ -357,8 +360,7 @@ class ModelTrainer:
                 logger.warning(f"torch.compile failed: {e}. Continuing without compilation.")
 
     def _build_optimizer(self) -> None:
-        """Create optimizer with weight decay settings."""
-        opt_name = self.train_params.get("optimizer", DEFAULT_OPTIMIZER).lower()
+        """Create AdamW optimizer with weight decay settings."""
         lr = self.train_params.get("learning_rate", DEFAULT_LR)
         weight_decay = self.train_params.get("weight_decay", 1e-5)
         
@@ -380,44 +382,28 @@ class ModelTrainer:
             {"params": no_decay_params, "weight_decay": 0.0}
         ]
         
-        # Create optimizer
-        if opt_name == "adamw":
-            self.optimizer = optim.AdamW(
-                param_groups, lr=lr, 
-                betas=(0.9, 0.999), 
-                eps=1e-8
-            )
-        elif opt_name == "adam":
-            self.optimizer = optim.Adam(
-                param_groups, lr=lr,
-                betas=(0.9, 0.999),
-                eps=1e-8
-            )
-        elif opt_name == "rmsprop":
-            self.optimizer = optim.RMSprop(
-                param_groups, lr=lr,
-                alpha=0.99,
-                eps=1e-8
-            )
-        elif opt_name == "sgd":
-            self.optimizer = optim.SGD(
-                param_groups, lr=lr,
-                momentum=0.9,
-                nesterov=True
-            )
-        else:
-            logger.warning(f"Unknown optimizer '{opt_name}', using AdamW")
-            self.optimizer = optim.AdamW(param_groups, lr=lr)
+        # Create AdamW optimizer
+        self.optimizer = optim.AdamW(
+            param_groups, 
+            lr=lr, 
+            betas=(0.9, 0.999), 
+            eps=1e-8
+        )
         
         logger.info(
-            f"Optimizer: {opt_name.upper()} with lr={lr:.2e}, "
-            f"weight_decay={weight_decay:.2e}"
+            f"Optimizer: AdamW with lr={lr:.2e}, weight_decay={weight_decay:.2e}"
         )
 
     def _build_schedulers(self) -> None:
-        """Create learning rate schedulers."""
-        # Estimate steps per epoch for IterableDataset
-        estimated_total_samples = self.train_ds.total_samples
+        """Create learning rate schedulers (cosine or plateau)."""
+        # Calculate steps per epoch
+        if hasattr(self.train_ds, '__len__'):
+            # Cached dataset - exact length known
+            total_samples = len(self.train_ds)
+        else:
+            # Streaming dataset - estimate
+            total_samples = self.train_ds.total_samples
+        
         batch_size = self.train_params.get("batch_size", DEFAULT_BATCH_SIZE)
         self.gradient_accumulation = self.train_params.get(
             "gradient_accumulation_steps", DEFAULT_GRADIENT_ACCUMULATION
@@ -425,7 +411,7 @@ class ModelTrainer:
         
         # Calculate effective steps per epoch
         self.steps_per_epoch = max(
-            1, estimated_total_samples // (batch_size * self.gradient_accumulation)
+            1, total_samples // (batch_size * self.gradient_accumulation)
         )
         
         logger.info(
@@ -456,25 +442,8 @@ class ModelTrainer:
                 eta_min=self.train_params.get("min_lr", 1e-7)
             )
             self.scheduler_needs_loss = False
-            
-        elif scheduler_name == "linear":
-            # Linear decay to min_lr
-            epochs = self.train_params.get("epochs", DEFAULT_EPOCHS)
-            total_steps = epochs * self.steps_per_epoch
-            min_lr = self.train_params.get("min_lr", 1e-7)
-            initial_lr = self.train_params.get("learning_rate", DEFAULT_LR)
-            
-            def linear_lambda(step: int) -> float:
-                if total_steps <= 0:
-                    return 1.0
-                progress = min(1.0, float(step) / float(total_steps))
-                return (1 - progress) + progress * (min_lr / initial_lr)
-            
-            self.main_scheduler = LambdaLR(self.optimizer, linear_lambda)
-            self.scheduler_needs_loss = False
-            
         else:
-            raise ValueError(f"Unsupported scheduler: '{scheduler_name}'")
+            raise ValueError(f"Unsupported scheduler: '{scheduler_name}'. Use 'plateau' or 'cosine'.")
         
         # Setup warmup scheduler
         self.warmup_epochs = self.train_params.get("warmup_epochs", DEFAULT_WARMUP_EPOCHS)
@@ -489,7 +458,7 @@ class ModelTrainer:
             self.warmup_steps = 0
 
     def _setup_loss_and_training_params(self) -> None:
-        """Setup loss function and training parameters."""
+        """Setup loss function (MSE or Huber) and training parameters."""
         loss_name = self.train_params.get("loss_function", "mse").lower()
         
         if loss_name == "mse":
@@ -498,12 +467,6 @@ class ModelTrainer:
             delta = self.train_params.get("huber_delta", 0.1)
             self.criterion = nn.HuberLoss(delta=delta)
             logger.info(f"Using Huber loss with delta={delta}")
-        elif loss_name == "l1":
-            self.criterion = nn.L1Loss()
-        elif loss_name == "smoothl1":
-            beta = self.train_params.get("smoothl1_beta", 1.0)
-            self.criterion = nn.SmoothL1Loss(beta=beta)
-            logger.info(f"Using SmoothL1 loss with beta={beta}")
         else:
             logger.warning(f"Unknown loss '{loss_name}', using MSE")
             self.criterion = nn.MSELoss()
@@ -518,16 +481,6 @@ class ModelTrainer:
         # Gradient clipping
         self.max_grad_norm = self.train_params.get("gradient_clip_val", DEFAULT_GRAD_CLIP)
         self.grad_clip_mode = self.train_params.get("gradient_clip_mode", "norm")
-
-    def _setup_ema(self) -> None:
-        """Setup exponential moving average."""
-        use_ema = self.train_params.get("use_ema", False)
-        if use_ema:
-            ema_decay = self.train_params.get("ema_decay", DEFAULT_EMA_DECAY)
-            self.ema = ExponentialMovingAverage(self.model, ema_decay)
-            logger.info(f"EMA enabled with decay={ema_decay}")
-        else:
-            self.ema = None
 
     def _setup_logging(self) -> None:
         """Setup training logs and metrics tracking."""
@@ -550,11 +503,21 @@ class ModelTrainer:
 
     def _save_metadata(self) -> None:
         """Save training metadata for reproducibility."""
+        # Get dataset info
+        if hasattr(self.train_ds, '__len__'):
+            train_samples = len(self.train_ds)
+            val_samples = len(self.val_ds)
+            test_samples = len(self.test_ds)
+        else:
+            train_samples = self.train_ds.total_samples
+            val_samples = self.val_ds.total_samples
+            test_samples = self.test_ds.total_samples
+        
         metadata = {
             "test_set_indices": sorted(self.test_set_indices),
-            "num_train_samples": self.train_ds.total_samples,
-            "num_val_samples": self.val_ds.total_samples,
-            "num_test_samples": self.test_ds.total_samples,
+            "num_train_samples": train_samples,
+            "num_val_samples": val_samples,
+            "num_test_samples": test_samples,
             "num_train_profiles": len(self.train_ds.indices),
             "num_val_profiles": len(self.val_ds.indices),
             "num_test_profiles": len(self.test_ds.indices),
@@ -567,6 +530,7 @@ class ModelTrainer:
             "invalid_batch_threshold": self.invalid_batch_threshold,
             "num_workers": self._get_num_workers(),
             "device": str(self.device),
+            "cache_dataset": self.cache_dataset,
         }
         save_json(metadata, self.save_dir / "training_metadata.json")
 
@@ -673,6 +637,12 @@ class ModelTrainer:
                     f"exceeded maximum ({self.max_invalid_batches})"
                 )
                 raise RuntimeError("Training instability - too many total invalid batches")
+            
+            # Periodic garbage collection
+            if epoch % 5 == 0:
+                gc.collect()
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
         
         # Save final checkpoint
         self._checkpoint("final_model.pt", epoch, val_loss)
@@ -710,8 +680,13 @@ class ModelTrainer:
         show_progress = self.misc_cfg.get("show_epoch_progress", True)
         desc = f"Epoch {self.current_epoch:03d} {'Train' if is_train_phase else 'Val'}"
         
-        # For IterableDataset, we can't know the exact length
-        total_batches = self.steps_per_epoch if is_train_phase else None
+        # Get total batches
+        if hasattr(loader.dataset, '__len__'):
+            # Cached dataset - exact length
+            total_batches = len(loader)
+        else:
+            # Streaming dataset - estimate
+            total_batches = self.steps_per_epoch if is_train_phase else None
         
         progress_bar = tqdm(
             loader, 
@@ -753,8 +728,8 @@ class ModelTrainer:
                             scaled_loss.backward()
                         
                         # Gradient accumulation and optimizer step
-                        if ((batch_idx + 1) % self.gradient_accumulation == 0 or 
-                            (batch_idx + 1) == len(loader)):
+                        if ((batch_idx + 1) % self.gradient_accumulation == 0 or
+                            (batch_idx + 1) == total_batches):
                             
                             # Gradient clipping
                             if self.use_amp:
@@ -801,10 +776,6 @@ class ModelTrainer:
                             
                             if grad_norms is not None:
                                 grad_norms.append(grad_norm.item())
-                            
-                            # Update EMA
-                            if self.ema:
-                                self.ema.update()
                             
                             # Update schedulers
                             if self.global_step <= self.warmup_steps and self.warmup_scheduler:
@@ -907,10 +878,6 @@ class ModelTrainer:
         if hasattr(self.model, "_orig_mod"):
             model_to_save = self.model._orig_mod
         
-        # Apply EMA for best model
-        if self.ema and "best" in filename:
-            self.ema.apply_shadow()
-        
         checkpoint = {
             "state_dict": model_to_save.state_dict(),
             "epoch": epoch,
@@ -932,10 +899,6 @@ class ModelTrainer:
         checkpoint_path = self.save_dir / filename
         torch.save(checkpoint, checkpoint_path)
         logger.debug(f"Saved checkpoint: {filename}")
-        
-        # Restore EMA
-        if self.ema and "best" in filename:
-            self.ema.restore()
 
     def test(self) -> None:
         """Test the best model on test set."""
@@ -1008,4 +971,4 @@ class ModelTrainer:
             logger.error(f"JIT export failed: {e}", exc_info=True)
 
 
-__all__ = ["ModelTrainer", "ExponentialMovingAverage", "get_warmup_scheduler"]
+__all__ = ["ModelTrainer", "get_warmup_scheduler"]
