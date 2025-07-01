@@ -528,9 +528,10 @@ class ChemicalDataset(IterableDataset):
                 
             except Exception as e:
                 logger.error(f"Error reading variable '{var}': {e}")
+                raise IOError(f"Failed to read HDF5 variable '{var}'. Halting to prevent data corruption.") from e
                 # Return zeros as fallback
-                shape = (len(chunk_indices),) + h5_file[var].shape[1:]
-                chunk_data[var] = np.zeros(shape, dtype=np.float32)
+                #shape = (len(chunk_indices),) + h5_file[var].shape[1:]
+                #chunk_data[var] = np.zeros(shape, dtype=np.float32)
         
         return chunk_data
 
