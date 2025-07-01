@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 normalizer.py - Data normalization with improved numerical stability and efficiency.
+This version is GPU-aware for accelerated statistics calculation.
 """
 from __future__ import annotations
 
 import h5py
 import logging
 import math
+import random
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple, Union
@@ -16,23 +18,25 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from hardware import setup_device
+
 logger = logging.getLogger(__name__)
 
 # Constants
 DTYPE = torch.float32
 EPSILON = 1e-50
 DEFAULT_QUANTILE_MEMORY_LIMIT = 50_000_000
-DEFAULT_SYMLOG_PERCENTILE = 0.1
-STATS_CHUNK_SIZE = 1024
-NORMALIZED_VALUE_CLAMP = 50.0  
+DEFAULT_SYMLOG_PERCENTILE = 0.5
+STATS_CHUNK_SIZE = 8192
+NORMALIZED_VALUE_CLAMP = 50.0
 
 
 class DataNormalizer:
     """
     Handles data normalization with multiple methods and improved numerical stability.
     
-    This class provides various normalization techniques optimized for both CPU and GPU,
-    with special attention to numerical stability in log-based transformations.
+    This class is GPU-aware and will use the best available device (CUDA/MPS/CPU)
+    to accelerate tensor-based statistics calculations.
     """
     
     METHODS = {
@@ -49,12 +53,11 @@ class DataNormalizer:
             config_data: Configuration dictionary containing normalization settings
         """
         self.config = config_data
-        self.device = torch.device('cpu')
+        self.device = setup_device()
         self.data_spec = self.config.get("data_specification", {})
         self.norm_cfg = self.config.get("normalization", {})
         
         self.keys_to_process, self.key_methods = self._get_keys_and_methods()
-        # Track which keys use approximated quantiles
         self._approximated_quantile_keys = set()
         logger.info(f"DataNormalizer initialized on device '{self.device}'.")
 
@@ -84,8 +87,8 @@ class DataNormalizer:
         """
         Calculate normalization statistics by streaming data in chunks for memory efficiency.
         
-        This method reads data in chunks to avoid loading the entire dataset into memory,
-        making it suitable for large datasets. It also returns the raw data for caching.
+        This method uses pre-allocation and direct memory copies to efficiently build
+        the raw dataset for caching, avoiding slow concatenation operations.
         
         Args:
             h5_path: Path to HDF5 file
@@ -100,7 +103,8 @@ class DataNormalizer:
         
         sorted_train_indices = sorted(train_indices)
         
-        raw_train_data_chunks = {}
+        # This will hold the final, pre-allocated numpy arrays
+        final_raw_data = {}
         accumulators = None
         
         with h5py.File(h5_path, 'r', swmr=True, libver='latest') as hf:
@@ -110,21 +114,33 @@ class DataNormalizer:
                 logger.warning(f"Keys not found in HDF5 and will be skipped: {missing}")
             
             accumulators = self._initialize_accumulators(available_keys)
-            for key in available_keys:
-                raw_train_data_chunks[key] = []
 
+            logger.info("Pre-allocating memory for raw data caching...")
+            for key in available_keys:
+                dataset_shape = hf[key].shape
+                # The final shape is (num_train_indices, ...other_dims)
+                final_shape = (len(train_indices),) + dataset_shape[1:]
+                final_raw_data[key] = np.empty(final_shape, dtype=hf[key].dtype)
+            
             logger.info("Reading training data and calculating stats in chunks...")
             start_time = time.time()
             
             num_chunks = (len(sorted_train_indices) + STATS_CHUNK_SIZE - 1) // STATS_CHUNK_SIZE
+            current_position = 0
             for i in tqdm(range(0, len(sorted_train_indices), STATS_CHUNK_SIZE), desc="Calculating Stats", total=num_chunks):
                 chunk_indices = sorted_train_indices[i:i + STATS_CHUNK_SIZE]
                 
                 batch_of_tensors = {}
                 for key in available_keys:
                     data_chunk_np = hf[key][chunk_indices]
-                    raw_train_data_chunks[key].append(data_chunk_np)
+                    
+                    chunk_size = data_chunk_np.shape[0]
+                    final_raw_data[key][current_position : current_position + chunk_size] = data_chunk_np
+                    
                     batch_of_tensors[key] = torch.from_numpy(data_chunk_np)
+                
+                # Update current position for the next insertion
+                current_position += len(chunk_indices)
                 
                 self._update_accumulators_with_batch(batch_of_tensors, accumulators)
             
@@ -133,9 +149,6 @@ class DataNormalizer:
 
         computed_stats = self._finalize_stats(accumulators)
         metadata = {"normalization_methods": self.key_methods, "per_key_stats": computed_stats}
-        
-        logger.info("Concatenating data chunks for caching...")
-        final_raw_data = {key: np.concatenate(chunks) for key, chunks in raw_train_data_chunks.items()}
         
         logger.info("Statistics calculation and data pre-loading complete.")
         return metadata, final_raw_data
@@ -166,7 +179,6 @@ class DataNormalizer:
             
             if method in self.QUANTILE_METHODS:
                 acc["values"] = []
-                # Add a counter for total values seen for this key
                 acc["total_values_seen"] = 0
             
             if method in ("max-out", "scaled_signed_offset_log", "log-min-max"):
@@ -181,20 +193,17 @@ class DataNormalizer:
 
     def _update_accumulators_with_batch(self, batch: Dict[str, Tensor], accumulators: Dict) -> None:
         """
-        Update accumulators for each key using Welford's algorithm for numerical stability.
-        
-        Args:
-            batch: Dictionary of tensors for current batch
-            accumulators: Dictionary of accumulator states to update
+        Update accumulators for each key. Moves data to the designated device (GPU/CPU)
+        before performing calculations.
         """
-        # Get the quantile memory limit from config or use default
         quantile_max_values = self.norm_cfg.get("quantile_max_values_in_memory", DEFAULT_QUANTILE_MEMORY_LIMIT)
 
         for key, data_batch in batch.items():
             if key not in accumulators:
                 continue
             
-            data = data_batch.to(dtype=DTYPE, device=self.device).flatten()
+            data = data_batch.to(device=self.device, dtype=DTYPE).flatten()
+            
             valid_data = data[torch.isfinite(data)]
             if valid_data.numel() == 0:
                 continue
@@ -211,33 +220,23 @@ class DataNormalizer:
             if "count" in key_acc:
                 n_new = data_for_stats.numel()
                 if n_new > 0:
-                    count_old = key_acc["count"]
-                    mean_old = key_acc["mean"]
-                    m2_old = key_acc["m2"]
+                    count_old, mean_old, m2_old = key_acc["count"], key_acc["mean"], key_acc["m2"]
                     count_new = count_old + n_new
                     delta = torch.mean(data_for_stats) - mean_old
                     mean_new = mean_old + delta * (n_new / count_new)
                     m2_new = m2_old + torch.sum((data_for_stats - mean_old) * (data_for_stats - mean_new))
-                    key_acc["count"] = count_new
-                    key_acc["mean"] = mean_new
-                    key_acc["m2"] = m2_new
+                    key_acc.update({"count": count_new, "mean": mean_new, "m2": m2_new})
             
             if "values" in key_acc:
                 key_acc["total_values_seen"] += valid_data.numel()
                 current_stored_size = sum(t.numel() for t in key_acc["values"])
 
-                # If we have space, just append
                 if current_stored_size + valid_data.numel() <= quantile_max_values:
                     key_acc["values"].append(valid_data)
                 else:
-                    # Reservoir sampling: we need to make space
                     self._approximated_quantile_keys.add(key)
-                    
-                    # Combine existing and new data, then subsample to the limit
                     combined_data = torch.cat(key_acc["values"] + [valid_data])
                     perm = torch.randperm(combined_data.numel(), device=self.device)[:quantile_max_values]
-                    
-                    # Store as a single tensor to avoid future concatenations
                     key_acc["values"] = [combined_data[perm]]
 
             if "max" in key_acc:
@@ -246,13 +245,8 @@ class DataNormalizer:
 
     def _finalize_stats(self, accumulators: Dict) -> Dict[str, Any]:
         """
-        Finalize statistics from accumulated values with numerical stability checks.
-        
-        Args:
-            accumulators: Dictionary of accumulator states
-            
-        Returns:
-            Dictionary of finalized statistics for each key
+        Finalize statistics from accumulated values. Note: final values are returned
+        as standard Python types, independent of the device they were computed on.
         """
         quantile_max_values = self.norm_cfg.get("quantile_max_values_in_memory", DEFAULT_QUANTILE_MEMORY_LIMIT)
 
@@ -269,7 +263,7 @@ class DataNormalizer:
 
             if "count" in key_acc and key_acc["count"] > 1:
                 mean = key_acc["mean"].item()
-                std = math.sqrt(key_acc["m2"] / (key_acc["count"] - 1))
+                std = math.sqrt(key_acc["m2"].item() / (key_acc["count"] - 1))
                 std = max(std, 1e-6)
                 if method == "standard":
                     stats.update({"mean": mean, "std": std})
@@ -294,14 +288,13 @@ class DataNormalizer:
                  stats["max_val"] = max(max_val, 1e-10)
             
             elif method == "scaled_signed_offset_log":
-                max_val, min_val = key_acc["max"].item(), key_acc["min"].item()
-                m_pos = torch.log10(torch.tensor(max(0, max_val) + 1, dtype=DTYPE)).item()
-                m_neg = torch.log10(torch.tensor(max(0, -min_val) + 1, dtype=DTYPE)).item()
+                m_pos = torch.log10(torch.clamp(key_acc["max"], min=0) + 1).item()
+                m_neg = torch.log10(torch.clamp(-key_acc["min"], min=0) + 1).item()
                 stats.update({"m": max(m_pos, m_neg, 1e-6)})
 
             final_stats[key] = stats
         return final_stats
-
+    
     def _compute_quantile_stats(self, values: Tensor, key: str, method: str) -> dict:
         """
         Compute statistics for quantile-based normalization methods with stability checks.
@@ -346,6 +339,9 @@ class DataNormalizer:
         """
         Apply normalization to a tensor with numerical stability and clamping.
         
+        This method applies the specified normalization technique with careful
+        handling of edge cases and numerical stability.
+        
         Args:
             x: Input tensor to normalize
             method: Normalization method name
@@ -373,7 +369,7 @@ class DataNormalizer:
             elif method == "log-min-max":
                 log_x = torch.log10(torch.clamp(x, min=EPSILON))
                 denom = stats["max"] - stats["min"]
-                normed = (log_x - stats["min"]) / denom
+                normed = (log_x - stats["min"]) / (denom if denom > 0 else 1.0)
                 result = torch.clamp(normed, 0.0, 1.0)
             elif method == "max-out":
                 result = x / stats["max_val"]
@@ -498,6 +494,5 @@ class DataNormalizer:
             return denorm_tensor.tolist()
         else:
             return denorm_tensor
-
 
 __all__ = ["DataNormalizer"]
