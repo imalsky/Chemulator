@@ -15,17 +15,20 @@ import psutil
 from typing import Any, Dict, Optional, Union
 
 import torch
+import h5py
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 def setup_device() -> torch.device:
     """
-    Selects and returns a `torch.device` object for the best available backend.
-    Priority: CUDA > MPS (Apple Silicon) > CPU.
-
+    Select and return the best available PyTorch device.
+    
+    Priority order: CUDA > MPS (Apple Silicon) > CPU.
+    
     Returns:
-        torch.device: A `torch.device` object (e.g., torch.device('cuda:0')).
+        torch.device: The selected device object
     """
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -33,7 +36,7 @@ def setup_device() -> torch.device:
             device_name = torch.cuda.get_device_name(torch.cuda.current_device())
             logger.info(f"Using CUDA device: {device_name}")
         except Exception:
-            logger.info("Using CUDA device.") # Fallback message
+            logger.info("Using CUDA device.")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
         logger.info("Using Apple Silicon MPS device.")
@@ -49,18 +52,18 @@ def setup_device() -> torch.device:
 
 def get_device_properties() -> Dict[str, Any]:
     """
-    Retrieves a dictionary of properties for the selected backend.
-
+    Retrieve detailed properties of the selected device.
+    
     Returns:
-        A dictionary containing properties of the selected device, such as
-        type, name, memory (for CUDA), compute capability, and AMP support.
+        Dictionary containing device properties including type, name, memory,
+        compute capability, and AMP support
     """
     device = setup_device()
     device_type = device.type
     
     properties: Dict[str, Any] = {
         "type": device_type,
-        "supports_amp": device_type == "cuda"  # Currently, stable AMP is best on CUDA
+        "supports_amp": device_type == "cuda"
     }
 
     if device_type == "cuda":
@@ -76,7 +79,7 @@ def get_device_properties() -> Dict[str, Any]:
             
             # Determine GPU tier for optimization
             memory_gb = properties["memory_gb"]
-            if "A100" in props.name or memory_gb >= 40:
+            if "A100" in props.name or "H100" in props.name or memory_gb >= 40:
                 properties["gpu_tier"] = "high"
             elif "V100" in props.name or "A10" in props.name or memory_gb >= 24:
                 properties["gpu_tier"] = "medium"
@@ -88,7 +91,7 @@ def get_device_properties() -> Dict[str, Any]:
             properties["gpu_tier"] = "unknown"
     elif device_type == "mps":
         properties["name"] = "Apple Silicon GPU"
-        properties["gpu_tier"] = "medium"  # Conservative estimate
+        properties["gpu_tier"] = "medium"
     else:
         properties["gpu_tier"] = "cpu"
         
@@ -109,32 +112,32 @@ def get_device_properties() -> Dict[str, Any]:
 
 def configure_dataloader_settings() -> Dict[str, Any]:
     """
-    Returns recommended keyword arguments for a PyTorch DataLoader based on device type.
-    This helps optimize data transfer to the GPU.
-
+    Return recommended DataLoader settings based on device type.
+    
     Returns:
-        A dictionary with recommended DataLoader settings like 'pin_memory'
-        and 'persistent_workers'.
+        Dictionary with DataLoader configuration like 'pin_memory' and 'persistent_workers'
     """
     device_type = setup_device().type
     is_cuda = (device_type == "cuda")
     
     return {
-        "pin_memory": is_cuda,          # Speeds up CPU-to-CUDA memory transfers
-        "persistent_workers": True,     # Keep workers alive between epochs
+        "pin_memory": is_cuda,
+        "persistent_workers": True,
     }
 
 
-def auto_configure_training_params(config: Dict[str, Any], h5_path: Optional[str] = None) -> Dict[str, Any]:
+def auto_configure_training_params(
+    config: Dict[str, Any], h5_path: Optional[Union[str, Path]] = None
+) -> Dict[str, Any]:
     """
     Automatically configure training parameters based on detected hardware.
     
-    This function modifies config values that are set to 'auto' with optimal
-    values for the detected hardware.
+    This function replaces 'auto' values in the config with optimal values
+    for the detected hardware and dataset characteristics.
     
     Args:
         config: The configuration dictionary
-        h5_path: Optional path to HDF5 file for file-specific optimizations
+        h5_path: Optional path to HDF5 file for dataset-specific optimizations
         
     Returns:
         Modified configuration dictionary with auto values replaced
@@ -146,7 +149,7 @@ def auto_configure_training_params(config: Dict[str, Any], h5_path: Optional[str
     cpu_count = properties.get("cpu_count", 4)
     
     # Check if using HDF5
-    is_hdf5 = h5_path and h5_path.lower().endswith(('.h5', '.hdf5'))
+    is_hdf5 = h5_path and str(h5_path).lower().endswith(('.h5', '.hdf5'))
     
     logger.info(f"Auto-configuring for: GPU tier={gpu_tier}, "
                 f"GPU memory={gpu_memory_gb}GB, "
@@ -168,10 +171,8 @@ def auto_configure_training_params(config: Dict[str, Any], h5_path: Optional[str
         else:  # CPU or unknown
             base_batch_size = 256
             
-        # Adjust based on actual GPU memory
         if gpu_memory_gb > 0:
-            # Rough estimate: 1GB can handle ~1000 samples for typical models
-            memory_based_batch = int(gpu_memory_gb * 500)
+            memory_based_batch = int(gpu_memory_gb * 800)
             train_params["batch_size"] = min(base_batch_size, memory_based_batch)
         else:
             train_params["batch_size"] = base_batch_size
@@ -181,14 +182,12 @@ def auto_configure_training_params(config: Dict[str, Any], h5_path: Optional[str
     # Auto-configure gradient accumulation
     if train_params.get("gradient_accumulation_steps") == "auto":
         batch_size = train_params.get("batch_size", 4096)
-        # Target effective batch size of 16384 for stability
-        target_effective_batch = 16384
+        target_effective_batch = batch_size * 4
         train_params["gradient_accumulation_steps"] = max(1, target_effective_batch // batch_size)
         logger.info(f"Auto-configured gradient_accumulation_steps: {train_params['gradient_accumulation_steps']}")
     
     # Auto-configure mixed precision
     if train_params.get("use_amp") == "auto":
-        # Enable AMP for CUDA with compute capability >= 7.0
         if properties.get("type") == "cuda" and properties.get("capability", (0, 0))[0] >= 7:
             train_params["use_amp"] = True
         else:
@@ -200,9 +199,6 @@ def auto_configure_training_params(config: Dict[str, Any], h5_path: Optional[str
     
     # Auto-configure number of dataloader workers
     if misc_settings.get("num_dataloader_workers") == "auto":
-        # The final decision is made in ModelTrainer, which knows about caching.
-        # This part of the code is now a placeholder and its value will be
-        # determined later. We log that the final decision is deferred.
         logger.info(
             "Setting 'num_dataloader_workers' to 'auto'. "
             "Final value will be determined by the trainer based on caching state."
@@ -211,8 +207,8 @@ def auto_configure_training_params(config: Dict[str, Any], h5_path: Optional[str
     # Auto-configure memory settings
     if misc_settings.get("profiles_per_chunk") == "auto":
         # Estimate based on available system memory
-        # Assume each profile with 100 timesteps and 14 variables takes ~10KB
-        bytes_per_profile = 10 * 1024  # 10KB estimate
+        # Conservative estimate for chemical kinetics data
+        bytes_per_profile = 15 * 1024
         # Use 25% of available memory for chunking
         available_for_chunks = int(system_memory_gb * 0.25 * 1024 * 1024 * 1024)
         profiles_per_chunk = min(50000, max(1024, available_for_chunks // bytes_per_profile))
@@ -220,15 +216,13 @@ def auto_configure_training_params(config: Dict[str, Any], h5_path: Optional[str
         logger.info(f"Auto-configured profiles_per_chunk: {profiles_per_chunk}")
     
     if misc_settings.get("max_memory_per_worker_gb") == "auto":
-            # Since the final number of workers might also be 'auto' and determined later,
-            # we decouple this setting and assign a safe, reasonable default. 2GB per worker
-            # is a good balance for most systems and prevents memory-related crashes.
-            safe_default_mem_gb = 2.0
-            misc_settings["max_memory_per_worker_gb"] = safe_default_mem_gb
-            logger.info(
-                f"Auto-configured max_memory_per_worker_gb: {safe_default_mem_gb} "
-                "(safe default)"
-            )
+        # Safe default of 2GB per worker prevents memory issues
+        safe_default_mem_gb = 2.0
+        misc_settings["max_memory_per_worker_gb"] = safe_default_mem_gb
+        logger.info(
+            f"Auto-configured max_memory_per_worker_gb: {safe_default_mem_gb} "
+            "(safe default)"
+        )
             
     # Auto-configure torch compile
     if misc_settings.get("use_torch_compile") == "auto":
@@ -243,28 +237,105 @@ def auto_configure_training_params(config: Dict[str, Any], h5_path: Optional[str
     # Model-specific optimizations
     model_params = config.get("model_hyperparameters", {})
     if model_params.get("use_gradient_checkpointing") == "auto":
-        # Enable for large models or limited GPU memory
-        if gpu_memory_gb < 16:
+        # Enable for limited GPU memory
+        if gpu_memory_gb > 0 and gpu_memory_gb < 16:
             model_params["use_gradient_checkpointing"] = True
         else:
             model_params["use_gradient_checkpointing"] = False
         logger.info(f"Auto-configured use_gradient_checkpointing: {model_params['use_gradient_checkpointing']}")
     
-    # Auto-configure cache_dataset
+    # Auto-configure cache_dataset with robust error handling
     if misc_settings.get("cache_dataset") == "auto":
-        # Estimate dataset size (rough)
-        # ~1.37M profiles * 100 timesteps * 14 vars * 4 bytes = ~7.6GB
-        estimated_dataset_gb = 8.0  # Conservative estimate
+        estimated_dataset_gb = _estimate_dataset_size(config, h5_path)
         
-        # Cache if we have enough memory (need 2x for safety)
-        if system_memory_gb > estimated_dataset_gb * 3:
+        # Cache if we have enough memory (need 2.5x for safety)
+        memory_threshold = 2.5
+        if system_memory_gb > estimated_dataset_gb * memory_threshold:
             misc_settings["cache_dataset"] = True
-            logger.info(f"Auto-configured cache_dataset: True (dataset ~{estimated_dataset_gb}GB, system has {system_memory_gb}GB)")
+            logger.info(
+                f"Auto-configured cache_dataset: True "
+                f"(dataset ~{estimated_dataset_gb:.2f}GB, system has {system_memory_gb:.2f}GB)"
+            )
         else:
             misc_settings["cache_dataset"] = False
-            logger.info(f"Auto-configured cache_dataset: False (insufficient memory)")
+            logger.info(
+                f"Auto-configured cache_dataset: False "
+                f"(dataset ~{estimated_dataset_gb:.2f}GB needs {estimated_dataset_gb * memory_threshold:.2f}GB, "
+                f"system has {system_memory_gb:.2f}GB)"
+            )
     
     return config
+
+
+def _estimate_dataset_size(config: Dict[str, Any], h5_path: Optional[Union[str, Path]]) -> float:
+    """
+    Estimate dataset size with robust error handling.
+    
+    Args:
+        config: Configuration dictionary
+        h5_path: Path to HDF5 file
+        
+    Returns:
+        Estimated dataset size in GB
+    """
+    estimated_dataset_gb = 20.0
+    
+    if not h5_path or not Path(h5_path).exists():
+        logger.warning(f"HDF5 path not provided or doesn't exist. Using default estimate: {estimated_dataset_gb}GB")
+        return estimated_dataset_gb
+    
+    try:
+        with h5py.File(h5_path, 'r') as hf:
+            if not hf.keys():
+                logger.warning("HDF5 file is empty. Using default estimate.")
+                return estimated_dataset_gb
+            
+            all_vars = config.get("data_specification", {}).get("all_variables", [])
+            if not all_vars:
+                logger.warning("No variables specified in config. Using default estimate.")
+                return estimated_dataset_gb
+            
+            total_bytes = 0
+            vars_found = 0
+            
+            for var in all_vars:
+                if var in hf:
+                    try:
+                        dataset = hf[var]
+                        # Calculate size: total elements * bytes per element
+                        var_bytes = dataset.size * dataset.dtype.itemsize
+                        total_bytes += var_bytes
+                        vars_found += 1
+                    except Exception as e:
+                        logger.warning(f"Error reading variable '{var}': {e}")
+                        continue
+            
+            if vars_found == 0:
+                logger.warning("No variables could be read from HDF5. Using default estimate.")
+                return estimated_dataset_gb
+            
+            # If we only found some variables, extrapolate
+            if vars_found < len(all_vars):
+                logger.warning(
+                    f"Only {vars_found}/{len(all_vars)} variables found. "
+                    f"Extrapolating total size."
+                )
+                total_bytes = total_bytes * len(all_vars) / vars_found
+            
+            estimated_dataset_gb = total_bytes / (1024**3)
+            
+            # Sanity check - if estimate seems unreasonable, use default
+            if estimated_dataset_gb < 0.001 or estimated_dataset_gb > 1000:
+                logger.warning(
+                    f"Estimated size {estimated_dataset_gb:.2f}GB seems unreasonable. "
+                    f"Using default estimate: 8.0GB"
+                )
+                return 8.0
+                
+    except Exception as e:
+        logger.warning(f"Could not estimate dataset size due to error: {e}. Using default estimate: {estimated_dataset_gb}GB")
+    
+    return estimated_dataset_gb
 
 
 def get_optimal_device_config(device_name: Optional[str] = None) -> Dict[str, Any]:
@@ -275,13 +346,13 @@ def get_optimal_device_config(device_name: Optional[str] = None) -> Dict[str, An
         device_name: Optional device name override
         
     Returns:
-        Dictionary of recommended settings
+        Dictionary of recommended settings for the device
     """
     if device_name is None:
         properties = get_device_properties()
         device_name = properties.get("name", "unknown")
     
-    # Device-specific optimizations
+    # Device-specific optimizations for SIREN models
     configs = {
         "A100": {
             "batch_size": 8192,

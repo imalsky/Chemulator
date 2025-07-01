@@ -1,7 +1,7 @@
 // =========================================================================================
-// ==                 OPTIMIZED CONFIGURATION WITH AUTO-DETECTION                        ==
+// ==                 OPTIMIZED SIREN CONFIGURATION WITH AUTO-DETECTION                   ==
 // =========================================================================================
-// This configuration includes auto-configuration for optimal hardware utilization.
+// This configuration is optimized for SIREN models with automatic hardware detection.
 
 {
   // ════════════════════════════════════════════════════════════════
@@ -44,7 +44,7 @@
   // ║                    3. NORMALIZATION SETTINGS                     ║
   // ══════════════════════════════════════════════════════════════════
   "normalization": {
-    "default_method": "log-standard",
+    "default_method": "symlog",
     
     // Override for specific variables
     "key_methods": { 
@@ -61,40 +61,25 @@
   },
 
   // ════════════════════════════════════════════════════════════════
-  // ║              4. MODEL HYPERPARAMETER       ║
+  // ║              4. MODEL HYPERPARAMETER (SIREN)                 ║
   // ════════════════════════════════════════════════════════════════
   "model_hyperparameters": {
-    // Model architecture choice
-    "model_type": "siren",  // Options: "mlp", "siren", "fno"
+    // Model architecture - SIREN only
+    "model_type": "siren",
     
-    // Network architecture - start conservative
-    "hidden_dims": [256, 256, 256],  // 3 layers is often sufficient
-    "dropout": 0.1,                  // Moderate regularization
+    // Network architecture - optimized for chemical kinetics
+    "hidden_dims": [256, 256, 256],  // 3 layers with consistent width
     
-    // Conditioning parameters
+    // Conditioning parameters for FiLM modulation
     "condition_dim": 64,
     "use_time_embedding": true,
     "time_embedding_dim": 32,
     
-    // MLP-specific parameters
-    "use_residual": true,
-    "activation": "silu",           // Smooth activation
-    "use_layer_norm": true,
-    "init_type": "xavier_uniform",
-    "stochastic_depth": 0.1,
-    "use_gradient_checkpointing": "auto",  // Auto-detect based on GPU memory
-    
-    // SIREN-specific parameters (reduced for stability)
-    "siren_w0_initial": 10.0,       // Reduced from 30.0
+    // SIREN-specific parameters (optimized for stability)
+    "siren_w0_initial": 10.0,       // Reduced from 30.0 for stability
     "siren_w0_hidden": 1.0,         // Keep hidden layers stable
-    "use_batch_norm": false,
-    "final_activation": true,       // Helps bound outputs
-    "siren_use_erf_approx": true,   // Prevent numerical issues
-    
-    // FNO-specific parameters
-    "fno_spectral_modes": 16,
-    "fno_seq_length": 32,
-    "fno_compression": 0.5
+    "final_activation": true,       // Tanh to bound outputs
+    "use_gradient_checkpointing": "auto"  // Auto-detect based on GPU memory
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -105,8 +90,8 @@
     "val_frac": 0.15,
     "test_frac": 0.15,
     
-    // Start with small data fraction for testing, then increase
-    "data_fraction": 1.0,           // Use full data
+    // Use full dataset
+    "data_fraction": 1.0,
     
     // Training duration
     "epochs": 100,
@@ -117,11 +102,11 @@
     "batch_size": "auto",           // Will auto-detect optimal size
     "gradient_accumulation_steps": "auto",  // Will target effective batch of 16384
     
-    // Optimizer settings (AdamW only)
-    "learning_rate": 1e-4,          // Conservative start
+    // Optimizer settings (AdamW)
+    "learning_rate": 1e-4,          // Conservative learning rate for SIREN
     "weight_decay": 1e-5,
     
-    // Learning rate schedule (cosine or plateau only)
+    // Learning rate schedule
     "scheduler_choice": "cosine",   // Options: "cosine", "plateau"
     "warmup_epochs": 5,
     "patience": 10,                 // For plateau scheduler
@@ -132,8 +117,8 @@
     "cosine_T_0": 20,
     "cosine_T_mult": 2,
     
-    // Loss function (MSE or Huber only)
-    "loss_function": "huber",       // Options: "mse", "huber"
+    // Loss function
+    "loss_function": "mse",       // Options: "mse", "huber"
     "huber_delta": 0.5,            // For Huber loss
     
     // Training stability
@@ -161,7 +146,7 @@
   },
   
   "optuna_hyperparam_search_space": {
-    // Architecture search
+    // Architecture search for SIREN
     "architecture": {
       "num_hidden_layers": {"type": "int", "low": 2, "high": 5},
       "hidden_dim": {"type": "categorical", "choices": [128, 256, 384, 512]}
@@ -172,12 +157,8 @@
       // Learning parameters
       "learning_rate": {"type": "float", "low": 1e-5, "high": 5e-4, "log": true},
       "weight_decay": {"type": "float", "low": 1e-7, "high": 1e-4, "log": true},
-      "dropout": {"type": "float", "low": 0.0, "high": 0.3},
       
-      // Regularization
-      "stochastic_depth": {"type": "float", "low": 0.0, "high": 0.2},
-      
-      // Model-specific parameters (conservative ranges)
+      // SIREN-specific parameters (conservative ranges)
       "siren_w0_initial": {"type": "float", "low": 1.0, "high": 30.0},
       "siren_w0_hidden": {"type": "float", "low": 0.5, "high": 2.0},
       "condition_dim": {"type": "categorical", "choices": [32, 64, 128]},
@@ -185,9 +166,6 @@
       // Training settings
       "warmup_epochs": {"type": "int", "low": 0, "high": 10},
       "huber_delta": {"type": "float", "low": 0.1, "high": 1.0},
-      
-      // Activation functions (for MLP)
-      "activation": {"type": "categorical", "choices": ["relu", "gelu", "silu", "elu"]},
       
       // Scheduler choice
       "scheduler_choice": {"type": "categorical", "choices": ["cosine", "plateau"]}
@@ -201,7 +179,7 @@
     "random_seed": 42,
     
     // DataLoader settings - AUTO configured
-    "num_dataloader_workers": "auto",    // Will be 0 for HDF5, otherwise optimized
+    "num_dataloader_workers": "auto",    // Will optimize based on system
     
     // Memory management - AUTO configured
     "profiles_per_chunk": "auto",        // Will be set based on available memory
@@ -211,10 +189,10 @@
     "cache_dataset": "auto",             // Will cache if dataset fits in memory
     
     // Model compilation and export - AUTO configured
-    "use_torch_compile": "auto",         // Will enable on capable GPUs
+    "use_torch_compile": "true",         // Will enable on capable GPUs
     "torch_compile_mode": "reduce-overhead",
     "export_jit_model": true,
-    "export_jit_during_training": false,  // Only export at end
+    "export_jit_during_training": true,  // Only export at end
     
     "show_epoch_progress": true,
     
