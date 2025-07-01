@@ -63,7 +63,7 @@ def _get_h5_path(config: Dict[str, Any], data_root_dir: Path) -> Path:
     h5_path = data_root_dir / h5_filename
     
     if not h5_path.is_file():
-        raise PipelineError(f"HDF5 dataset file not found: '{h5_path}'")
+        raise PipelineError(f"HDF5 dataset file not found: '{h5_path.resolve()}'")
     
     return h5_path
 
@@ -75,19 +75,19 @@ def _run_fixed_training(config: Dict[str, Any], data_root_dir: Path) -> None:
     # Get HDF5 path
     h5_path = _get_h5_path(config, data_root_dir)
     
-    # Auto-configure parameters
-    config = auto_configure_training_params(config, str(h5_path))
+    # Auto-configure parameters if 'auto' is present
+    config = auto_configure_training_params(config, h5_path)
     
     model_folder = get_config_str(config, OUTPUT_PATHS_SECTION, FIXED_MODEL_KEY, "fixed training")
     model_save_dir = data_root_dir / model_folder
-    ensure_dirs(model_save_dir)
+    # Directory will be created by save_json if needed
     save_json(config, model_save_dir / "run_config.json")
     
     # Load or generate splits
     splits, splits_path = load_or_generate_splits(config, data_root_dir, h5_path)
     
     # Save splits info to model directory
-    save_json({"splits_file": str(splits_path)}, model_save_dir / "splits_info.json")
+    save_json({"splits_file": str(splits_path.resolve())}, model_save_dir / "splits_info.json")
     
     try:
         trainer = ModelTrainer(
@@ -111,8 +111,8 @@ def _run_hyperparameter_tuning(config: Dict[str, Any], data_root_dir: Path) -> N
     # Get HDF5 path
     h5_path = _get_h5_path(config, data_root_dir)
     
-    # Auto-configure base parameters
-    config = auto_configure_training_params(config, str(h5_path))
+    # Auto-configure base parameters if 'auto' is present
+    config = auto_configure_training_params(config, h5_path)
     
     # Load or generate splits
     splits, splits_path = load_or_generate_splits(config, data_root_dir, h5_path)
@@ -120,8 +120,8 @@ def _run_hyperparameter_tuning(config: Dict[str, Any], data_root_dir: Path) -> N
     # Save splits info to tuning directory
     tuning_folder = get_config_str(config, OUTPUT_PATHS_SECTION, TUNING_RESULTS_KEY, "tuning results")
     tuning_dir = data_root_dir / tuning_folder
-    ensure_dirs(tuning_dir)
-    save_json({"splits_file": str(splits_path)}, tuning_dir / "splits_info.json")
+    # Directory will be created by save_json if needed
+    save_json({"splits_file": str(splits_path.resolve())}, tuning_dir / "splits_info.json")
 
     try:
         best_config = run_hyperparameter_search(
@@ -139,6 +139,7 @@ def _run_hyperparameter_tuning(config: Dict[str, Any], data_root_dir: Path) -> N
 
 
 def _parse_command_line_arguments() -> argparse.Namespace:
+    """Parses command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Chemical reaction predictor training pipeline (Optimized).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -165,34 +166,38 @@ def _parse_command_line_arguments() -> argparse.Namespace:
 
 def main() -> int:
     """Main entry point for the pipeline."""
+    args = _parse_command_line_arguments()
+    
+    # Ensure root data directory exists before setting up logging
+    ensure_dirs(args.data_dir)
+    log_file = args.data_dir / f"run_{datetime.now().strftime(LOG_TIMESTAMP_FORMAT)}.log"
+    setup_logging(log_file=log_file)
+    
     try:
-        args = _parse_command_line_arguments()
-        
-        ensure_dirs(args.data_dir)
-        log_file = args.data_dir / f"run_{datetime.now().strftime(LOG_TIMESTAMP_FORMAT)}.log"
-        setup_logging(log_file=log_file)
-        
-        logger.info(f"Pipeline started with config: {args.config.resolve()}")
+        logger.info(f"Pipeline started with action: {'--train' if args.train else '--tune'}")
+        logger.info(f"Using config: {args.config.resolve()}")
         config = load_config(args.config)
+        
         seed = config.get(MISC_SECTION, {}).get(RANDOM_SEED_KEY, DEFAULT_RANDOM_SEED)
         seed_everything(seed)
         
-        action_name = "Training" if args.train else "Hyperparameter Tuning"
         if args.train:
             _run_fixed_training(config, args.data_dir)
         elif args.tune:
             _run_hyperparameter_tuning(config, args.data_dir)
         
-        logger.info(f"{action_name} process completed successfully.")
+        logger.info("Pipeline process completed successfully.")
         return EXIT_SUCCESS
         
-    except (PipelineError, FileNotFoundError, ValueError, RuntimeError) as e:
-        logger.error(f"Pipeline error: {e}", exc_info=False)
+    except PipelineError as e:
+        # Expected pipeline errors (e.g., file not found, bad config)
+        logger.error(f"A pipeline error occurred: {e}", exc_info=False)
         return EXIT_FAILURE
     except KeyboardInterrupt:
         logger.warning("Pipeline execution interrupted by user (Ctrl+C).")
-        return 130
+        return 130 # Standard exit code for Ctrl+C
     except Exception as e:
+        # Unexpected errors
         logger.critical(f"An unhandled exception occurred: {e}", exc_info=True)
         return EXIT_FAILURE
 

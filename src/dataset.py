@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-dataset.py - Optimized data loading with optional caching
+dataset.py - Efficient data loading with caching and streaming support.
+
+This module provides two dataset implementations:
+1. CachedChemicalDataset: Loads all data into memory for fastest training
+2. ChemicalDataset: Streams data from disk for memory-efficient training
 """
 from __future__ import annotations
 
@@ -10,7 +14,6 @@ import logging
 import numpy as np
 import random
 import time
-from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, Iterator
 
@@ -29,11 +32,11 @@ logger = logging.getLogger(__name__)
 
 class CachedChemicalDataset(Dataset):
     """
-    OPTIMIZED version of CachedChemicalDataset.
-    It loads all data, then PRE-NORMALIZES and PRE-BUILDS all input/target
-    tensors in memory once. This makes __getitem__ a trivial and extremely
-    fast tensor slicing operation, ensuring the data pipeline never
-    bottlenecks the GPU.
+    Pre-loads and caches all data in memory for fastest possible training.
+    
+    This dataset loads all data once, normalizes it, and builds all input/target
+    tensors in memory. This makes __getitem__ extremely fast (just tensor slicing)
+    at the cost of higher memory usage.
     """
 
     def __init__(
@@ -43,8 +46,19 @@ class CachedChemicalDataset(Dataset):
         species_variables: List[str],
         global_variables: List[str],
         normalization_metadata: Dict[str, Any],
+        raw_data_for_caching: Optional[Dict[str, np.ndarray]] = None,
     ) -> None:
-        """Initialize and cache the entire pre-processed dataset in memory."""
+        """
+        Initialize and cache the entire dataset in memory.
+        
+        Args:
+            h5_path: Path to HDF5 file
+            indices: Profile indices to use
+            species_variables: List of species variable names
+            global_variables: List of global variable names
+            normalization_metadata: Pre-calculated normalization statistics
+            raw_data_for_caching: Optional pre-loaded raw data to avoid re-reading
+        """
         super().__init__()
         self.h5_path = Path(h5_path)
         self.indices = indices
@@ -52,44 +66,78 @@ class CachedChemicalDataset(Dataset):
         self.species_vars = sorted(species_variables)
         self.global_vars = sorted(global_variables)
 
-        # Define variable order
+        # Define variable order for consistent tensor structure
         self.input_var_order = self.species_vars + self.global_vars + [TIME_KEY]
         self.target_var_order = self.species_vars
 
         # Load, normalize, and build tensors
         logger.info(f"Pre-processing and caching {len(indices)} profiles into memory...")
         start_time = time.time()
-        self._load_and_pre_process_data()
-        load_time = time.time() - start_time
+        
+        if raw_data_for_caching:
+            logger.info("Using pre-loaded raw data for caching.")
+            self._build_tensors(raw_data_for_caching)
+        else:
+            logger.info(f"Reading raw data from {self.h5_path} for caching.")
+            self._load_and_build_tensors()
 
+        load_time = time.time() - start_time
         memory_mb = (self.input_tensors.nbytes + self.target_tensors.nbytes) / (1024 * 1024)
+        
         logger.info(
-            f"Fully cached and pre-processed {len(self.indices)} profiles ({self.total_samples:,} samples) "
-            f"in {load_time:.1f}s, using ~{memory_mb:.1f}MB of pre-built tensors."
+            f"Fully cached {len(self.indices)} profiles ({self.total_samples:,} samples) "
+            f"in {load_time:.1f}s, using ~{memory_mb:.1f}MB of memory."
         )
 
-    def _load_and_pre_process_data(self) -> None:
-        """Load data, normalize it, and build final tensors all at once."""
-        # 1. Load raw data into NumPy arrays on CPU
+    def _load_and_build_tensors(self) -> None:
+        """Load data from HDF5 and build cached tensors."""
         raw_data = {}
         with h5py.File(self.h5_path, 'r') as hf:
             if TIME_KEY not in hf:
                 raise ValueError(f"HDF5 file must contain dataset '{TIME_KEY}'.")
             
-            self.num_time_steps = hf[TIME_KEY].shape[1]
-            if self.num_time_steps < MIN_TIME_STEPS:
-                raise ValueError(f"Profiles must have at least {MIN_TIME_STEPS} time steps.")
-
+            num_time_steps = hf[TIME_KEY].shape[1]
             all_vars_to_load = set(self.input_var_order) | set(self.target_var_order)
+            
             for var in all_vars_to_load:
                 if var in hf:
                     raw_data[var] = hf[var][self.indices]
                 else:
                     logger.warning(f"Variable '{var}' not in HDF5, using zeros.")
-                    shape = (len(self.indices), self.num_time_steps)
+                    if var in self.global_vars:
+                        shape = (len(self.indices),)
+                    else:
+                        shape = (len(self.indices), num_time_steps)
                     raw_data[var] = np.zeros(shape, dtype=np.float32)
+                    
+        self._build_tensors(raw_data)
 
-        # 2. Normalize all data in-place (vectorized on CPU)
+    def _build_tensors(self, raw_data: Dict[str, np.ndarray]) -> None:
+        """
+        Build normalized input/target tensors using memory-efficient strategy.
+        
+        This method normalizes data and constructs samples directly into
+        pre-allocated tensors to minimize peak memory usage.
+        
+        Args:
+            raw_data: Dictionary of raw numpy arrays
+        """
+        logger.debug("Starting tensor building...")
+        start_time = time.time()
+        
+        # Determine dimensions
+        time_var_data = raw_data.get(TIME_KEY)
+        if time_var_data is None:
+            raise ValueError(f"'{TIME_KEY}' is missing from raw data.")
+        
+        self.num_time_steps = time_var_data.shape[1]
+        if self.num_time_steps < MIN_TIME_STEPS:
+            raise ValueError(f"Profiles must have at least {MIN_TIME_STEPS} time steps.")
+        
+        logger.debug(f"Determined {self.num_time_steps} timesteps.")
+
+        # Normalize all data
+        logger.debug("Normalizing all raw data...")
         normalized_data = {}
         for var, data in raw_data.items():
             method = self.norm_metadata["normalization_methods"].get(var, "none")
@@ -97,46 +145,49 @@ class CachedChemicalDataset(Dataset):
             tensor = torch.from_numpy(data)
             normalized_data[var] = DataNormalizer.normalize_tensor(tensor, method, stats)
         
-        del raw_data # Free memory
+        # Free raw data memory
+        del raw_data
         gc.collect()
+        logger.debug(f"Normalization complete. Time: {time.time() - start_time:.2f}s")
 
-        # 3. Build final input and target tensors
+        # Pre-allocate final tensors
         num_profiles = len(self.indices)
         num_samples_per_profile = self.num_time_steps - 1
         self.total_samples = num_profiles * num_samples_per_profile
 
-        # Prepare components for input tensor
-        # Initial species (t=0)
-        initial_species = torch.stack(
-            [normalized_data[var][:, 0] for var in self.species_vars], dim=1
-        )
-        # Global vars (assumed constant, take from t=0)
-        global_vars = torch.stack(
-            [normalized_data[var][:, 0] for var in self.global_vars], dim=1
-        )
-
-        # Expand for each time step
-        # Shape: (num_profiles, num_samples_per_profile, num_vars)
-        initial_species_expanded = initial_species.unsqueeze(1).expand(-1, num_samples_per_profile, -1)
-        global_vars_expanded = global_vars.unsqueeze(1).expand(-1, num_samples_per_profile, -1)
+        num_input_features = len(self.species_vars) + len(self.global_vars) + 1
+        num_target_features = len(self.species_vars)
         
-        # Time values for each sample (t=1, t=2, ...)
-        time_vals = normalized_data[TIME_KEY][:, 1:].unsqueeze(-1)
+        logger.debug(f"Pre-allocating tensors for {self.total_samples:,} samples...")
+        self.input_tensors = torch.empty((self.total_samples, num_input_features), dtype=DTYPE)
+        self.target_tensors = torch.empty((self.total_samples, num_target_features), dtype=DTYPE)
+
+        # Fill tensors efficiently using vectorized operations
+        logger.debug("Filling pre-allocated tensors...")
+        for i in range(num_profiles):
+            start_idx = i * num_samples_per_profile
+            end_idx = start_idx + num_samples_per_profile
+            
+            # Extract data for this profile
+            initial_species = torch.stack([normalized_data[var][i, 0] for var in self.species_vars], dim=0)
+            global_vars = torch.tensor([normalized_data[var][i] for var in self.global_vars], dtype=DTYPE)
+            time_vals = normalized_data[TIME_KEY][i, 1:]
+            
+            # Fill input tensor using broadcasting
+            self.input_tensors[start_idx:end_idx, :len(self.species_vars)] = initial_species
+            self.input_tensors[start_idx:end_idx, len(self.species_vars):-1] = global_vars
+            self.input_tensors[start_idx:end_idx, -1] = time_vals
+            
+            # Fill target tensor
+            target_species = torch.stack(
+                [normalized_data[var][i, 1:] for var in self.target_var_order], dim=1
+            )
+            self.target_tensors[start_idx:end_idx, :] = target_species
         
-        # Assemble the input tensor block by block
-        # Shape: (num_profiles, num_samples_per_profile, num_input_features)
-        input_tensor_3d = torch.cat([initial_species_expanded, global_vars_expanded, time_vals], dim=2)
-
-        # Assemble the target tensor block
-        # Shape: (num_profiles, num_samples_per_profile, num_species_vars)
-        target_tensor_3d = torch.stack(
-            [normalized_data[var][:, 1:] for var in self.target_var_order], dim=2
-        )
-
-        # 4. Flatten tensors for easy indexing in __getitem__
-        # Final shape: (total_samples, num_features)
-        self.input_tensors = input_tensor_3d.reshape(self.total_samples, -1)
-        self.target_tensors = target_tensor_3d.reshape(self.total_samples, -1)
+        # Clean up normalized data
+        del normalized_data
+        gc.collect()
+        logger.debug(f"Tensor building complete. Time: {time.time() - start_time:.2f}s")
 
     def __len__(self) -> int:
         """Return total number of samples."""
@@ -144,8 +195,13 @@ class CachedChemicalDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
         """
-        Extremely fast lookup of a pre-built, pre-normalized sample.
-        This is now just a slicing operation.
+        Get a single sample (extremely fast - just tensor slicing).
+        
+        Args:
+            idx: Sample index
+            
+        Returns:
+            Tuple of (input tensor, target tensor)
         """
         if idx < 0 or idx >= self.total_samples:
             raise IndexError(f"Index {idx} out of range [0, {self.total_samples})")
@@ -155,16 +211,11 @@ class CachedChemicalDataset(Dataset):
 
 class ChemicalDataset(IterableDataset):
     """
-    Optimized PyTorch IterableDataset for chemical reaction profiles.
+    Memory-efficient streaming dataset for chemical reaction profiles.
     
-    Streams data by reading large chunks of profiles, shuffling them in memory,
-    and yielding individual samples. This avoids random disk I/O bottlenecks.
-    
-    Key features:
-    - Efficient chunk-based reading for HDF5
-    - Proper multi-worker support with HDF5
-    - Memory-aware chunking
-    - Robust error handling
+    This dataset reads data in chunks from HDF5, making it suitable for
+    large datasets that don't fit in memory. It supports multi-worker
+    loading with proper HDF5 file handle management.
     """
 
     def __init__(
@@ -176,10 +227,10 @@ class ChemicalDataset(IterableDataset):
         normalization_metadata: Dict[str, Any],
         *,
         profiles_per_chunk: int = 2048,
-        max_memory_gb: float = 2.0,  # Maximum memory per worker
+        max_memory_gb: float = 2.0,
     ) -> None:
         """
-        Initialize the dataset.
+        Initialize the streaming dataset.
         
         Args:
             h5_path: Path to HDF5 file
@@ -210,7 +261,6 @@ class ChemicalDataset(IterableDataset):
         # Define variable order
         self.input_var_order = self.species_vars + self.global_vars + [TIME_KEY]
         self.target_var_order = self.species_vars
-        
         self.all_vars = set(self.input_var_order)
 
         # Validate HDF5 structure and get metadata
@@ -223,7 +273,7 @@ class ChemicalDataset(IterableDataset):
         # Adjust chunk size based on available memory
         self._adjust_chunk_size()
 
-        # Setup vectorized normalization
+        # Setup vectorized normalization for efficiency
         self._setup_vectorized_normalization()
 
         logger.info(
@@ -233,16 +283,16 @@ class ChemicalDataset(IterableDataset):
 
     def _adjust_chunk_size(self) -> None:
         """Dynamically adjust chunk size based on memory constraints."""
-        # Estimate memory per profile (rough calculation)
+        # Estimate memory per profile
         num_vars = len(self.all_vars)
         bytes_per_element = 4  # float32
         elements_per_profile = num_vars * self.num_time_steps
         mb_per_profile = (elements_per_profile * bytes_per_element) / (1024 * 1024)
         
         if mb_per_profile == 0:
-            return # No memory usage, no adjustment needed
+            return
 
-        # Calculate maximum profiles that fit in memory
+        # Calculate maximum profiles that fit in memory limit
         max_profiles = int((self.max_memory_gb * 1024) / mb_per_profile)
         
         # Adjust chunk size if needed
@@ -255,13 +305,13 @@ class ChemicalDataset(IterableDataset):
             )
 
     def _setup_vectorized_normalization(self) -> None:
-        """Pre-compute normalization parameters for efficient operations."""
+        """Pre-compute normalization parameters for efficient batch operations."""
         self.norm_params = {"input": {}, "target": {}}
         
         for vector_type, var_order in [("input", self.input_var_order), ("target", self.target_var_order)]:
             n_vars = len(var_order)
             
-            # Initialize tensors for stats
+            # Initialize tensors for statistics
             means = torch.zeros(n_vars, dtype=DTYPE)
             stds = torch.ones(n_vars, dtype=DTYPE)
             log_means = torch.zeros(n_vars, dtype=DTYPE)
@@ -272,16 +322,16 @@ class ChemicalDataset(IterableDataset):
             methods = []
             var_to_idx = {var: i for i, var in enumerate(var_order)}
             
+            # Populate statistics for each variable
             for i, var in enumerate(var_order):
                 method = self.norm_metadata["normalization_methods"].get(var, "none")
                 methods.append(method)
                 
                 stats = self.norm_metadata["per_key_stats"].get(var)
-                
                 if not stats or method == "none":
                     continue
                 
-                # Populate stats based on method
+                # Populate stats based on normalization method
                 if method == "standard":
                     means[i] = stats.get("mean", 0.0)
                     stds[i] = stats.get("std", 1.0)
@@ -292,7 +342,7 @@ class ChemicalDataset(IterableDataset):
                     mins[i] = stats.get("min", 0.0)
                     maxs[i] = stats.get("max", 1.0)
             
-            # Create masks for each method for vectorized application
+            # Create masks for vectorized application
             methods_np = np.array(methods)
             masks = {
                 method: torch.from_numpy(methods_np == method)
@@ -313,10 +363,12 @@ class ChemicalDataset(IterableDataset):
 
     def _get_h5_handle(self) -> h5py.File:
         """
-        Opens an HDF5 file handle, specific to each DataLoader worker.
+        Get HDF5 file handle with proper multi-worker support.
         
-        This is crucial for multi-worker support with HDF5.
-        Each worker must have its own file handle to avoid conflicts.
+        Each worker maintains its own file handle to avoid conflicts.
+        
+        Returns:
+            HDF5 file handle
         """
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else -1
@@ -327,7 +379,6 @@ class ChemicalDataset(IterableDataset):
                 self.h5_file_handle.close()
             
             # Open with SWMR mode for multi-process safety
-            # libver='latest' enables better concurrent access
             try:
                 self.h5_file_handle = h5py.File(
                     self.h5_path, 'r', 
@@ -335,7 +386,7 @@ class ChemicalDataset(IterableDataset):
                     libver='latest'
                 )
             except (OSError, TypeError):
-                # Fallback for systems that don't support SWMR or older h5py
+                # Fallback for systems that don't support SWMR
                 self.h5_file_handle = h5py.File(self.h5_path, 'r')
                 
             self.worker_id = worker_id
@@ -346,7 +397,7 @@ class ChemicalDataset(IterableDataset):
         return self.h5_file_handle
 
     def _validate_h5_structure(self) -> None:
-        """Validates HDF5 structure and extracts metadata."""
+        """Validate HDF5 file structure and extract metadata."""
         with h5py.File(self.h5_path, 'r') as hf:
             if TIME_KEY not in hf:
                 raise ValueError(f"HDF5 file must contain dataset '{TIME_KEY}'.")
@@ -358,7 +409,7 @@ class ChemicalDataset(IterableDataset):
                     f"Profiles must have at least {MIN_TIME_STEPS} time steps, got {num_time_steps}."
                 )
             
-            # Validate that all required variables exist
+            # Validate that required variables exist
             missing_vars = self.all_vars - set(hf.keys())
             if missing_vars:
                 logger.warning(f"Variables not found in HDF5: {missing_vars}")
@@ -369,13 +420,13 @@ class ChemicalDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[Tuple[Tensor, Tensor]]:
         """
-        Main iterator method for the IterableDataset.
+        Main iterator for streaming data.
         
-        Handles:
-        - Multi-worker data splitting
-        - Chunk-based reading for efficiency
-        - In-memory shuffling
-        - Robust error handling
+        Handles multi-worker data splitting, chunk-based reading,
+        and in-memory shuffling for randomness.
+        
+        Yields:
+            Tuple of (input tensor, target tensor) for each sample
         """
         # Handle multi-worker data loading
         worker_info = torch.utils.data.get_worker_info()
@@ -408,7 +459,6 @@ class ChemicalDataset(IterableDataset):
         )
         
         # Shuffle indices for this epoch
-        # Use worker_id as part of seed for different shuffling per worker
         epoch_seed = random.randint(0, 2**31)
         random.seed(epoch_seed + worker_id)
         random.shuffle(worker_indices)
@@ -436,7 +486,7 @@ class ChemicalDataset(IterableDataset):
                     f"Worker {worker_id} error processing chunk "
                     f"{chunk_start}-{chunk_end}: {e}"
                 )
-                # Continue with next chunk instead of failing completely
+                # Continue with next chunk instead of failing
                 continue
 
     def _read_chunk_data(
@@ -445,7 +495,14 @@ class ChemicalDataset(IterableDataset):
         """
         Efficiently read a chunk of data from HDF5.
         
-        Uses sorted fancy indexing for optimal HDF5 performance.
+        Uses sorted indexing for optimal HDF5 performance.
+        
+        Args:
+            h5_file: HDF5 file handle
+            chunk_indices: List of profile indices to read
+            
+        Returns:
+            Dictionary of numpy arrays with chunk data
         """
         # Sort indices for efficient HDF5 access
         sorted_indices = sorted(chunk_indices)
@@ -459,7 +516,7 @@ class ChemicalDataset(IterableDataset):
                 continue
             
             try:
-                # Read data in sorted order (most efficient for HDF5)
+                # Read data in sorted order
                 data = h5_file[var][sorted_indices]
                 
                 # Reorder to match original chunk order
@@ -480,7 +537,16 @@ class ChemicalDataset(IterableDataset):
     def _generate_samples_from_chunk(
         self, chunk_data: Dict[str, np.ndarray], chunk_indices: List[int]
     ) -> Iterator[Tuple[Tensor, Tensor]]:
-        """Generate shuffled samples from a chunk of data."""
+        """
+        Generate shuffled samples from a chunk of data.
+        
+        Args:
+            chunk_data: Dictionary of numpy arrays
+            chunk_indices: List of profile indices in chunk
+            
+        Yields:
+            Tuple of (input tensor, target tensor) for each sample
+        """
         # Create flat index for all samples in chunk
         chunk_samples = []
         for i, profile_idx in enumerate(chunk_indices):
@@ -502,7 +568,7 @@ class ChemicalDataset(IterableDataset):
                 raw_input = self._build_raw_input(profile_data, time_idx)
                 raw_target = self._build_raw_target(profile_data, time_idx)
                 
-                # Normalize
+                # Normalize using vectorized operations
                 input_vector = self._normalize_vector_optimized(raw_input, "input")
                 target_vector = self._normalize_vector_optimized(raw_target, "target")
                 
@@ -517,7 +583,16 @@ class ChemicalDataset(IterableDataset):
                 continue
 
     def _normalize_vector_optimized(self, raw_vector: np.ndarray, vector_type: str) -> Tensor:
-        """Highly optimized vectorized normalization with proper error handling."""
+        """
+        Apply normalization using pre-computed parameters for efficiency.
+        
+        Args:
+            raw_vector: Raw numpy array
+            vector_type: "input" or "target"
+            
+        Returns:
+            Normalized tensor
+        """
         tensor = torch.from_numpy(raw_vector).to(dtype=DTYPE)
         params = self.norm_params[vector_type]
         
@@ -531,13 +606,14 @@ class ChemicalDataset(IterableDataset):
             
             if "log-standard" in params["masks"]:
                 mask = params["masks"]["log-standard"]
-                safe_tensor = torch.clamp(tensor[mask], min=1e-30)
+                # Use larger epsilon for numerical stability
+                safe_tensor = torch.clamp(tensor[mask], min=1e-8)
                 log_tensor = torch.log10(safe_tensor)
                 normalized[mask] = (log_tensor - params["log_means"][mask]) / params["log_stds"][mask]
 
             if "log-min-max" in params["masks"]:
                 mask = params["masks"]["log-min-max"]
-                safe_tensor = torch.clamp(tensor[mask], min=1e-30)
+                safe_tensor = torch.clamp(tensor[mask], min=1e-8)
                 log_tensor = torch.log10(safe_tensor)
                 denom = params["maxs"][mask] - params["mins"][mask]
                 denom = torch.clamp(denom, min=1e-6)  # Prevent division by zero
@@ -564,7 +640,16 @@ class ChemicalDataset(IterableDataset):
         return normalized
 
     def _build_raw_input(self, profile: Dict[str, np.ndarray], query_time_idx: int) -> np.ndarray:
-        """Constructs the raw input vector with proper error handling."""
+        """
+        Construct raw input vector for a specific time point.
+        
+        Args:
+            profile: Dictionary of profile data
+            query_time_idx: Time index to query
+            
+        Returns:
+            Raw input array
+        """
         input_data = []
         
         # Species at initial time (t=0)
@@ -598,7 +683,16 @@ class ChemicalDataset(IterableDataset):
         return np.array(input_data, dtype=np.float32)
 
     def _build_raw_target(self, profile: Dict[str, np.ndarray], query_time_idx: int) -> np.ndarray:
-        """Constructs the raw target vector with proper error handling."""
+        """
+        Construct raw target vector for a specific time point.
+        
+        Args:
+            profile: Dictionary of profile data
+            query_time_idx: Time index
+            
+        Returns:
+            Raw target array
+        """
         target_data = []
         
         # Species at query time
@@ -637,6 +731,7 @@ def create_dataset(
     cache_dataset: bool = False,
     profiles_per_chunk: int = 2048,
     max_memory_gb: float = 2.0,
+    raw_data_for_caching: Optional[Dict[str, np.ndarray]] = None,
 ) -> Union[CachedChemicalDataset, ChemicalDataset]:
     """
     Factory function to create either cached or streaming dataset.
@@ -650,6 +745,7 @@ def create_dataset(
         cache_dataset: Whether to cache entire dataset in memory
         profiles_per_chunk: Number of profiles to read at once (for streaming)
         max_memory_gb: Maximum memory to use per worker (for streaming)
+        raw_data_for_caching: Optional pre-loaded data for CachedChemicalDataset
         
     Returns:
         Either CachedChemicalDataset or ChemicalDataset instance
@@ -662,6 +758,7 @@ def create_dataset(
             species_variables=species_variables,
             global_variables=global_variables,
             normalization_metadata=normalization_metadata,
+            raw_data_for_caching=raw_data_for_caching,
         )
     else:
         logger.info("Creating streaming dataset...")
@@ -678,9 +775,15 @@ def create_dataset(
 
 def collate_fn(batch: List[Tuple[Tensor, Tensor]]) -> Tuple[Dict[str, Tensor], Tensor]:
     """
-    Optimized collate function with validation.
+    Collate function with validation and error handling.
     
     Filters out invalid samples and provides informative warnings.
+    
+    Args:
+        batch: List of (input, target) tuples
+        
+    Returns:
+        Tuple of (input dict, target tensor)
     """
     # Filter valid samples
     valid_batch = []
@@ -693,6 +796,7 @@ def collate_fn(batch: List[Tuple[Tensor, Tensor]]) -> Tuple[Dict[str, Tensor], T
             continue
         
         inputs, targets = sample
+        # Check for finite values
         if torch.isfinite(inputs).all() and torch.isfinite(targets).all():
             valid_batch.append(sample)
         else:

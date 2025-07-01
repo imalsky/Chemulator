@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-model.py
+model.py - SIREN neural network model for chemical evolution prediction.
+
+This module implements a Sinusoidal Representation Network (SIREN) with 
+Feature-wise Linear Modulation (FiLM) for conditional predictions.
 """
 from __future__ import annotations
 
@@ -13,121 +16,42 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint
 
 # --- Constants ---
 DEFAULT_TIME_EMBEDDING_DIM = 32
 DEFAULT_CONDITION_DIM = 128
-DEFAULT_DROPOUT = 0.1
 DEFAULT_OMEGA_0 = 30.0
 MATMUL_PRECISION = "high"
-SIREN_INIT_SCALE = 0.1
+SIREN_INIT_SCALE = 1.0
 
 logger = logging.getLogger(__name__)
 torch.set_float32_matmul_precision(MATMUL_PRECISION)
-
-# --- Activation Functions ---
-def get_activation(name: str) -> nn.Module:
-    """Return activation function by name."""
-    activations = {
-        "relu": nn.ReLU(),
-        "gelu": nn.GELU(),
-        "silu": nn.SiLU(),
-        "elu": nn.ELU(),
-        "leaky_relu": nn.LeakyReLU(0.1),
-        "tanh": nn.Tanh(),
-        "softsign": nn.Softsign(),
-    }
-    if name.lower() not in activations:
-        raise ValueError(f"Unknown activation: {name}")
-    return activations[name.lower()]
-
-
-# --- Weight Initialization ---
-def init_weights(module: nn.Module, init_type: str = "xavier_uniform") -> None:
-    """Initialize network weights using specified method."""
-    if isinstance(module, (nn.Linear, nn.Conv1d)):
-        if init_type == "xavier_uniform":
-            nn.init.xavier_uniform_(module.weight)
-        elif init_type == "xavier_normal":
-            nn.init.xavier_normal_(module.weight)
-        elif init_type == "kaiming_uniform":
-            nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
-        elif init_type == "kaiming_normal":
-            nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
-        elif init_type == "orthogonal":
-            nn.init.orthogonal_(module.weight)
-        elif init_type == "truncated_normal":
-            # Truncated normal for better stability
-            nn.init.trunc_normal_(module.weight, std=0.02)
-        
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-
-
-# --- FNO Helper Module (FIX) ---
-class SpectralConv1d(nn.Module):
-    """1D Fourier layer. It does FFT, linear transform, and Inverse FFT."""
-    def __init__(self, in_channels: int, out_channels: int, modes: int):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes = modes
-
-        scale = (1 / (in_channels * out_channels))
-        self.weights = nn.Parameter(scale * torch.randn(in_channels, out_channels, self.modes, dtype=torch.cfloat))
-
-    def forward(self, x: Tensor) -> Tensor:
-        batchsize = x.shape[0]
-
-        # Compute Fourier coeff
-        x_ft = torch.fft.rfft(x)
-
-        # Multiply relevant Fourier modes
-        out_ft = torch.zeros(batchsize, self.out_channels, x.size(-1)//2 + 1, device=x.device, dtype=torch.cfloat)
-        out_ft[:, :, :self.modes] = torch.einsum("bix,iox->box", x_ft[:, :, :self.modes], self.weights)
-
-        # Return to physical space
-        x = torch.fft.irfft(out_ft, n=x.size(-1))
-        return x
-
-class FNOBlock(nn.Module):
-    """A single block of the Fourier Neural Operator."""
-    def __init__(self, channels: int, modes: int, activation: str, dropout: float):
-        super().__init__()
-        self.spectral_conv = SpectralConv1d(channels, channels, modes)
-        self.spatial_conv = nn.Conv1d(channels, channels, 1)
-        self.norm = nn.LayerNorm(channels)
-        self.activation = get_activation(activation)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x_res = x
-        x1 = self.spectral_conv(x)
-        x2 = self.spatial_conv(x)
-        x = x1 + x2
-        x = self.dropout(x)
-
-        x = x + x_res
-        
-        # Normalize the combined result.
-        # Transpose for LayerNorm, then transpose back
-        x = self.norm(x.transpose(1, 2)).transpose(1, 2)
-        
-        return self.activation(x)
 
 
 # --- Core Helper Modules ---
 
 class TimeEmbedding(nn.Module):
-    """Sinusoidal time embedding with learnable scaling and normalization."""
+    """
+    Sinusoidal time embedding with learnable scaling and normalization.
+    
+    Creates position embeddings similar to those used in Transformers,
+    allowing the model to understand temporal relationships.
+    """
     
     def __init__(self, dim: int, learnable_scale: bool = True, max_period: float = 10000.0) -> None:
+        """
+        Initialize time embedding module.
+        
+        Args:
+            dim: Dimension of the embedding
+            learnable_scale: Whether to use learnable scale and shift parameters
+            max_period: Maximum period for sinusoidal encoding
+        """
         super().__init__()
         self.dim = dim
         self.max_period = max_period
         
-        # Pre-compute frequency components
+        # Pre-compute frequency components for efficiency
         half_dim = self.dim // 2
         denominator = max(half_dim - 1.0, 1.0)
         freqs = torch.arange(0, half_dim).float() / denominator
@@ -142,6 +66,15 @@ class TimeEmbedding(nn.Module):
             self.register_buffer('shift', torch.zeros(1))
 
     def forward(self, t: Tensor) -> Tensor:
+        """
+        Apply sinusoidal encoding to time values.
+        
+        Args:
+            t: Time tensor of shape (batch,) or (batch, 1)
+            
+        Returns:
+            Time embeddings of shape (batch, dim)
+        """
         if t.dim() == 1:
             t = t.unsqueeze(-1)
         
@@ -153,6 +86,7 @@ class TimeEmbedding(nn.Module):
         emb = t_scaled * self.inv_freq
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         
+        # Handle odd dimensions
         if self.dim % 2 == 1:
             emb = F.pad(emb, (0, 1), "constant", 0.0)
         
@@ -163,15 +97,29 @@ class TimeEmbedding(nn.Module):
 
 
 class FiLMLayer(nn.Module):
-    """Feature-wise Linear Modulation with stability improvements."""
+    """
+    Feature-wise Linear Modulation (FiLM) layer.
+    
+    FiLM allows the network to modulate features based on conditioning information,
+    enabling the model to adapt its behavior based on global conditions.
+    """
     
     def __init__(self, condition_dim: int, feature_dim: int, 
                  use_norm: bool = True, residual: bool = True) -> None:
+        """
+        Initialize FiLM layer.
+        
+        Args:
+            condition_dim: Dimension of conditioning vector
+            feature_dim: Dimension of features to modulate
+            use_norm: Whether to normalize features before modulation
+            residual: Whether to use residual connection
+        """
         super().__init__()
         self.use_norm = use_norm
         self.residual = residual
         
-        # Generate gamma and beta parameters with better initialization
+        # Generate gamma (scale) and beta (shift) parameters
         self.generator = nn.Sequential(
             nn.Linear(condition_dim, feature_dim * 2),
             nn.LayerNorm(feature_dim * 2),
@@ -179,8 +127,8 @@ class FiLMLayer(nn.Module):
             nn.Linear(feature_dim * 2, feature_dim * 2)
         )
         
-        # Initialize last layer to near-zero for stability
-        nn.init.trunc_normal_(self.generator[-1].weight, std=0.01)
+        # Initialize last layer to be near-identity transform at the beginning
+        nn.init.zeros_(self.generator[-1].weight)
         nn.init.zeros_(self.generator[-1].bias)
         
         if use_norm:
@@ -189,452 +137,198 @@ class FiLMLayer(nn.Module):
             self.norm = nn.Identity()
     
     def forward(self, features: Tensor, condition: Tensor) -> Tensor:
-        if self.use_norm:
-            features = self.norm(features)
+        """
+        Apply feature-wise modulation.
         
+        Args:
+            features: Features to modulate (batch, feature_dim)
+            condition: Conditioning vector (batch, condition_dim)
+            
+        Returns:
+            Modulated features (batch, feature_dim)
+        """
+        if self.use_norm:
+            features_normed = self.norm(features)
+        else:
+            features_normed = features
+        
+        # Generate modulation parameters
         params = self.generator(condition)
         gamma, beta = torch.chunk(params, 2, dim=-1)
         
-        # Constrain gamma to prevent extreme scaling
-        gamma = torch.tanh(gamma) * 0.5 + 1.0  # Range: [0.5, 1.5]
-        beta = torch.tanh(beta) * 0.1  # Range: [-0.1, 0.1]
-        
-        modulated = gamma * features + beta
+        # Apply affine transformation: (1 + gamma) * features + beta
+        modulated = (1 + gamma) * features_normed + beta
         
         if self.residual:
-            return 0.9 * features + 0.1 * modulated
+            return features + modulated
         else:
             return modulated
 
 
-class ResidualBlock(nn.Module):
-    """Residual block with pre-activation and gradient checkpointing support."""
-    
-    def __init__(self, dim: int, dropout: float = DEFAULT_DROPOUT,
-                 activation: str = "silu", stochastic_depth: float = 0.0,
-                 use_checkpoint: bool = False) -> None:
-        super().__init__()
-        self.stochastic_depth = stochastic_depth
-        self.use_checkpoint = use_checkpoint
-        
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim * 4),
-            get_activation(activation),
-            nn.Dropout(dropout),
-            nn.Linear(dim * 4, dim),
-            nn.Dropout(dropout)
-        )
-    
-    def _forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
-    
-    def forward(self, x: Tensor) -> Tensor:
-        # Stochastic depth (drop path)
-        if self.training and self.stochastic_depth > 0:
-            if torch.rand(1).item() < self.stochastic_depth:
-                return x
-        
-        # Use gradient checkpointing if enabled
-        if self.use_checkpoint and self.training:
-            return x + checkpoint(self._forward, x)
-        else:
-            return x + self._forward(x)
-
-
 # --- SIREN-Specific Modules ---
 class SineLayer(nn.Module):
-    """SIREN sine activation layer with improved initialization and stability."""
+    """
+    SIREN sine activation layer with improved initialization and numerical stability.
     
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 is_first: bool = False, omega_0: float = DEFAULT_OMEGA_0,
-                 use_erf_approx: bool = False) -> None:
+    This layer implements the sine activation function with proper weight initialization
+    as described in the SIREN paper (Sitzmann et al., 2020).
+    """
+    
+    def __init__(self, in_features: int,
+                 out_features: int,
+                 bias: bool = True,
+                 is_first: bool = False,
+                 omega_0: float = DEFAULT_OMEGA_0) -> None:
+        """
+        Initialize SIREN sine layer.
+        
+        Args:
+            in_features: Number of input features
+            out_features: Number of output features
+            bias: Whether to use bias
+            is_first: Whether this is the first layer (affects initialization)
+            omega_0: Frequency scaling factor
+        """
         super().__init__()
         self.omega_0 = omega_0
         self.is_first = is_first
-        self.use_erf_approx = use_erf_approx
         self.linear = nn.Linear(in_features, out_features, bias=bias)
         self._init_weights()
     
     def _init_weights(self) -> None:
+        """Initialize weights according to SIREN paper recommendations."""
         with torch.no_grad():
             if self.is_first:
                 # More conservative initialization for first layer
-                bound = SIREN_INIT_SCALE / self.linear.in_features
+                bound = 1.0 / self.linear.in_features
                 self.linear.weight.uniform_(-bound, bound)
             else:
                 # Account for sine activation variance
                 bound = math.sqrt(6.0 / self.linear.in_features) / self.omega_0
-                # Apply additional safety scaling
-                bound *= SIREN_INIT_SCALE
                 self.linear.weight.uniform_(-bound, bound)
             
             if self.linear.bias is not None:
-                # Initialize bias to small values
-                fan_in = self.linear.in_features
-                bound = 1 / math.sqrt(fan_in) * 0.1
-                self.linear.bias.uniform_(-bound, bound)
-    
-    def forward(self, x: Tensor) -> Tensor:
-        # Linear transformation
-        out = self.linear(x)
-        
-        if self.use_erf_approx:
-            # Use erf as a smooth approximation to sine for very large inputs
-            # This prevents numerical issues with sin of large values
-            scaled = self.omega_0 * out
-            mask = scaled.abs() > 10
-            result = torch.sin(scaled)
-            if mask.any():
-                # For large values, use a bounded smooth function
-                result[mask] = torch.erf(scaled[mask] / 10) * 0.9
-            return result
-        else:
-            return torch.sin(self.omega_0 * out)
-
-
-# --- Main Model Architectures ---
-
-class FiLM_MLP(nn.Module):
-    """MLP predictor with FiLM conditioning and modern improvements."""
-    
-    def __init__(
-        self, num_species: int, num_global_vars: int, hidden_dims: List[int],
-        dropout: float, use_time_embedding: bool, time_embedding_dim: int,
-        condition_dim: int, use_residual: bool, activation: str = "silu",
-        use_layer_norm: bool = True, init_type: str = "xavier_uniform",
-        stochastic_depth: float = 0.0, use_checkpoint: bool = False, **kwargs
-    ) -> None:
-        super().__init__()
-        self.num_species = num_species
-        self.use_time_embedding = use_time_embedding
-        
-        # Time embedding
-        self.time_embed = TimeEmbedding(
-            time_embedding_dim, learnable_scale=True
-        ) if use_time_embedding else None
-        
-        # Conditioning network with normalization
-        condition_input_dim = num_global_vars + (
-            time_embedding_dim if use_time_embedding else 1
-        )
-        self.condition_input_norm = nn.LayerNorm(condition_input_dim)
-        self.conditioning_net = nn.Sequential(
-            nn.Linear(condition_input_dim, condition_dim),
-            nn.LayerNorm(condition_dim),
-            get_activation(activation),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(condition_dim, condition_dim),
-            nn.LayerNorm(condition_dim),
-            get_activation(activation),
-            nn.Linear(condition_dim, condition_dim)
-        )
-        
-        # Input projection with layer norm
-        self.input_norm = nn.LayerNorm(num_species) if use_layer_norm else nn.Identity()
-        self.input_proj = nn.Linear(num_species, hidden_dims[0])
-        self.film_layer = FiLMLayer(condition_dim, hidden_dims[0], use_norm=True, residual=True)
-        
-        # Main body with residual blocks
-        layers = nn.ModuleList()
-        in_dim = hidden_dims[0]
-        
-        for i, out_dim in enumerate(hidden_dims):
-            if use_residual and in_dim == out_dim:
-                # Stochastic depth increases with depth
-                sd_prob = stochastic_depth * (i / len(hidden_dims))
-                layers.append(ResidualBlock(
-                    in_dim, dropout, activation, sd_prob, use_checkpoint
-                ))
-            else:
-                # Dimension change block
-                layers.append(nn.Sequential(
-                    nn.LayerNorm(in_dim) if use_layer_norm else nn.Identity(),
-                    nn.Linear(in_dim, out_dim),
-                    get_activation(activation),
-                    nn.Dropout(dropout)
-                ))
-            in_dim = out_dim
-        
-        self.mlp_body = layers
-        
-        # Output projection with residual
-        self.output_norm = nn.LayerNorm(hidden_dims[-1])
-        self.output_proj = nn.Sequential(
-            nn.Linear(hidden_dims[-1], hidden_dims[-1] // 2),
-            nn.LayerNorm(hidden_dims[-1] // 2),
-            get_activation(activation),
-            nn.Linear(hidden_dims[-1] // 2, num_species)
-        )
-        
-        # Output scaling for stability
-        self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
-        
-        # Initialize weights
-        self.apply(lambda m: init_weights(m, init_type))
+                nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: Tensor) -> Tensor:
-        # Split input
-        initial_species = x[:, :self.num_species]
-        global_and_time = x[:, self.num_species:]
+        """
+        Apply sine activation after linear transformation.
         
-        # Process conditioning with normalization
-        if self.use_time_embedding and self.time_embed is not None:
-            time_emb = self.time_embed(global_and_time[:, -1])
-            condition_input = torch.cat([global_and_time[:, :-1], time_emb], dim=-1)
-        else:
-            condition_input = global_and_time
-        
-        condition_input = self.condition_input_norm(condition_input)
-        condition_vector = self.conditioning_net(condition_input)
-        
-        # Process species through network
-        hidden = self.input_norm(initial_species)
-        hidden = self.input_proj(hidden)
-        hidden = self.film_layer(hidden, condition_vector)
-        
-        # Main processing
-        for layer in self.mlp_body:
-            hidden = layer(hidden)
-        
-        # Output with controlled scaling
-        hidden = self.output_norm(hidden)
-        delta = self.output_proj(hidden) * self.output_scale
-        
-        # Residual connection
-        return initial_species + delta
+        Args:
+            x: Input tensor
+            
+        Returns:
+            sin(omega_0 * (Wx + b))
+        """
+        return torch.sin(self.omega_0 * self.linear(x))
 
 
 class FiLM_SIREN(nn.Module):
-    """SIREN model with FiLM conditioning and improved stability."""
+    """
+    SIREN model with FiLM conditioning for chemical evolution prediction.
+    
+    This model combines the expressiveness of SIREN's periodic activations
+    with FiLM's conditional modulation for accurate chemical species prediction
+    under varying conditions.
+    """
     
     def __init__(
         self, num_species: int, num_global_vars: int, hidden_dims: List[int],
         use_time_embedding: bool, time_embedding_dim: int, condition_dim: int,
-        w0_initial: float, w0_hidden: float, use_batch_norm: bool = False,
-        final_activation: bool = True, use_erf_approx: bool = True, **kwargs
+        w0_initial: float, w0_hidden: float, final_activation: bool = True, **kwargs
     ) -> None:
+        """
+        Initialize FiLM-SIREN model.
+        
+        Args:
+            num_species: Number of chemical species
+            num_global_vars: Number of global variables (e.g., temperature, pressure)
+            hidden_dims: List of hidden layer dimensions
+            use_time_embedding: Whether to use sinusoidal time embedding
+            time_embedding_dim: Dimension of time embedding
+            condition_dim: Dimension of conditioning vector
+            w0_initial: Omega_0 for first SIREN layer
+            w0_hidden: Omega_0 for hidden SIREN layers
+            final_activation: Whether to apply tanh to final output
+            **kwargs: Additional unused arguments for compatibility
+        """
         super().__init__()
         self.num_species = num_species
         self.use_time_embedding = use_time_embedding
         
-        # Time embedding
+        # Time embedding module
         self.time_embed = TimeEmbedding(
             time_embedding_dim, learnable_scale=True
         ) if use_time_embedding else None
         
-        # Conditioning network with stability improvements
-        condition_input_dim = num_global_vars + (
-            time_embedding_dim if use_time_embedding else 1
-        )
-        self.condition_input_norm = nn.LayerNorm(condition_input_dim)
+        # Conditioning network - processes global variables and time
+        time_dim = time_embedding_dim if use_time_embedding else 1
+        condition_input_dim = num_global_vars + time_dim
         self.conditioning_net = nn.Sequential(
+            nn.LayerNorm(condition_input_dim),
             nn.Linear(condition_input_dim, condition_dim),
-            nn.LayerNorm(condition_dim),
             nn.SiLU(),
             nn.Linear(condition_dim, condition_dim)
         )
         
-        # Input projection with normalization
-        self.input_norm = nn.LayerNorm(num_species)
+        # Input projection and FiLM modulation
         self.input_proj = nn.Linear(num_species, hidden_dims[0])
-        self.film_layer = FiLMLayer(condition_dim, hidden_dims[0], residual=True)
+        self.film_layer = FiLMLayer(condition_dim, hidden_dims[0], use_norm=False, residual=False)
         
-        # SIREN layers with stability improvements
-        siren_layers = nn.ModuleList()
+        # SIREN layers
+        siren_layers = []
         in_dim = hidden_dims[0]
         
         for i, out_dim in enumerate(hidden_dims):
             is_first = (i == 0)
             omega = w0_initial if is_first else w0_hidden
-            
-            layer = [SineLayer(
-                in_dim, out_dim, is_first=is_first, 
-                omega_0=omega, use_erf_approx=use_erf_approx
-            )]
-            
-            # Optional batch norm
-            if use_batch_norm and not is_first:
-                layer.append(nn.BatchNorm1d(out_dim))
-            
-            siren_layers.append(nn.Sequential(*layer))
+            siren_layers.append(SineLayer(in_dim, out_dim, is_first=is_first, omega_0=omega))
             in_dim = out_dim
         
-        self.net = siren_layers
+        self.net = nn.Sequential(*siren_layers)
         
-        # Output with stability
-        self.output_norm = nn.LayerNorm(in_dim)
+        # Output layer
+        self.output_linear = nn.Linear(in_dim, num_species)
         if final_activation:
-            self.output_linear = nn.Sequential(
-                nn.Linear(in_dim, num_species),
-                nn.Tanh()
-            )
-            self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
+            self.final_activation = nn.Tanh()
         else:
-            self.output_linear = nn.Linear(in_dim, num_species)
-            self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
+            self.final_activation = nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
-        # Split input
+        """
+        Forward pass through the model.
+        
+        Args:
+            x: Input tensor of shape (batch, num_species + num_global_vars + 1)
+               where the last dimension contains:
+               - initial species concentrations
+               - global variables (temperature, pressure, etc.)
+               - time value
+               
+        Returns:
+            Predicted species concentrations at the query time
+        """
+        # Split input into components
         initial_species = x[:, :self.num_species]
         global_and_time = x[:, self.num_species:]
         
-        # Process conditioning with normalization
+        # Process conditioning information
         if self.use_time_embedding and self.time_embed is not None:
             time_emb = self.time_embed(global_and_time[:, -1])
             condition_input = torch.cat([global_and_time[:, :-1], time_emb], dim=-1)
         else:
             condition_input = global_and_time
         
-        condition_input = self.condition_input_norm(condition_input)
         condition_vector = self.conditioning_net(condition_input)
         
-        # Process through SIREN with normalization
-        coords = self.input_norm(initial_species)
-        coords = self.input_proj(coords)
+        # Process through SIREN with FiLM modulation
+        coords = self.input_proj(initial_species)
         coords = self.film_layer(coords, condition_vector)
+        coords = self.net(coords)
+        delta = self.output_linear(coords)
+        delta = self.final_activation(delta)
         
-        for layer in self.net:
-            coords = layer(coords)
-        
-        # Output with controlled scaling
-        coords = self.output_norm(coords)
-        delta = self.output_linear(coords) * self.output_scale
-        
-        return initial_species + delta
-
-
-class FiLM_FNO(nn.Module):
-    """Fourier Neural Operator with FiLM conditioning for chemical kinetics."""
-    
-    def __init__(
-        self, num_species: int, 
-        num_global_vars: int,
-        hidden_dims: List[int],
-        dropout: float,
-        use_time_embedding: bool,
-        time_embedding_dim: int,
-        condition_dim: int, 
-        fno_spectral_modes: int, 
-        fno_seq_length: int,
-        compression: float = 0.5, 
-        activation: str = "gelu", **kwargs
-    ) -> None:
-        super().__init__()
-        self.num_species = num_species
-        self.use_time_embedding = use_time_embedding
-        self.seq_length = fno_seq_length
-        
-        # Time embedding
-        self.time_embed = TimeEmbedding(
-            time_embedding_dim, learnable_scale=True
-        ) if use_time_embedding else None
-        
-        # Conditioning network
-        condition_input_dim = num_global_vars + (
-            time_embedding_dim if use_time_embedding else 1
-        )
-        self.condition_input_norm = nn.LayerNorm(condition_input_dim)
-        self.conditioning_net = nn.Sequential(
-            nn.Linear(condition_input_dim, condition_dim),
-            nn.LayerNorm(condition_dim),
-            get_activation(activation),
-            nn.Linear(condition_dim, condition_dim)
-        )
-        
-        # Lifting layer - expand to function space
-        self.lifting = nn.Sequential(
-            nn.Linear(num_species + condition_dim, hidden_dims[0]),
-            nn.LayerNorm(hidden_dims[0]),
-            get_activation(activation)
-        )
-        
-        # Position encoding for creating function representation
-        self.register_buffer(
-            'pos_encoding',
-            self._create_position_encoding(self.seq_length, hidden_dims[0])
-        )
-        
-        # FNO blocks
-        self.fno_blocks = nn.ModuleList()
-        in_channels = hidden_dims[0]
-        
-        for out_channels in hidden_dims:
-            if in_channels != out_channels:
-                # Channel adjustment layer
-                self.fno_blocks.append(nn.Conv1d(in_channels, out_channels, 1))
-                in_channels = out_channels
-            
-            # FNO block
-            self.fno_blocks.append(
-                FNOBlock(out_channels, fno_spectral_modes, activation, dropout)
-            )
-        
-        # Calculate the intermediate dimension for the projection bottleneck
-        projection_dim = max(1, int(hidden_dims[-1] * compression))
-        
-        # Projection back to species space with stability
-        self.projection = nn.Sequential(
-            nn.Conv1d(hidden_dims[-1], projection_dim, 1),
-            nn.BatchNorm1d(projection_dim),
-            get_activation(activation),
-            nn.Dropout(dropout),
-            nn.Conv1d(projection_dim, num_species, 1)
-        )
-        
-        # Output scaling
-        self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
-
-    def _create_position_encoding(self, length: int, d_model: int) -> Tensor:
-        """Create sinusoidal position encoding."""
-        position = torch.arange(length).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
-        )
-        
-        pe = torch.zeros(length, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        
-        return pe.unsqueeze(0)  # (1, length, d_model)
-
-    def forward(self, x: Tensor) -> Tensor:
-        # Split input
-        initial_species = x[:, :self.num_species]
-        global_and_time = x[:, self.num_species:]
-        batch_size = x.shape[0]
-        
-        # Process conditioning
-        if self.use_time_embedding and self.time_embed is not None:
-            time_emb = self.time_embed(global_and_time[:, -1])
-            condition_input = torch.cat([global_and_time[:, :-1], time_emb], dim=-1)
-        else:
-            condition_input = global_and_time
-        
-        condition_input = self.condition_input_norm(condition_input)
-        condition_vector = self.conditioning_net(condition_input)
-        
-        # Combine species and conditioning
-        combined = torch.cat([initial_species, condition_vector], dim=-1)
-        
-        # Lift to function space
-        lifted = self.lifting(combined)  # (batch, channels)
-        
-        # Create function representation by expanding and adding position encoding
-        func_repr = lifted.unsqueeze(-1).expand(-1, -1, self.seq_length)
-        pos_enc = self.pos_encoding.permute(0, 2, 1).expand(batch_size, -1, -1)
-        func_repr = func_repr + pos_enc
-        
-        # Process through FNO blocks
-        for block in self.fno_blocks:
-            func_repr = block(func_repr)
-        
-        # Project back and pool
-        output = self.projection(func_repr)
-        
-        # Global average pooling to get single prediction
-        delta = output.mean(dim=-1) * self.output_scale
-        
+        # Residual connection - predict change from initial state
         return initial_species + delta
 
 
@@ -644,86 +338,50 @@ def create_prediction_model(
     config: Dict[str, Any],
     device: Optional[Union[str, torch.device]] = None
 ) -> nn.Module:
-    """Factory function to create and initialize prediction models."""
+    """
+    Factory function to create and initialize the SIREN prediction model.
+    
+    Args:
+        config: Configuration dictionary containing model parameters
+        device: Optional device to place model on
+        
+    Returns:
+        Initialized SIREN model
+    """
     model_params = config["model_hyperparameters"]
     data_spec = config["data_specification"]
-    model_type = model_params.get("model_type", "mlp").lower()
     
-    logger.info(f"Creating model of type: '{model_type}'")
+    # Verify model type is SIREN
+    model_type = model_params.get("model_type", "siren").lower()
+    if model_type != "siren":
+        logger.warning(f"Model type '{model_type}' requested but only SIREN is implemented. Using SIREN.")
     
-    # Base arguments for all models
-    base_args = {
+    logger.info("Creating SIREN model")
+    
+    # Model arguments
+    model_args = {
         "num_species": len(data_spec["species_variables"]),
         "num_global_vars": len(data_spec["global_variables"]),
         "hidden_dims": model_params["hidden_dims"],
         "use_time_embedding": model_params.get("use_time_embedding", True),
         "time_embedding_dim": model_params.get("time_embedding_dim", DEFAULT_TIME_EMBEDDING_DIM),
         "condition_dim": model_params.get("condition_dim", DEFAULT_CONDITION_DIM),
+        "w0_initial": model_params.get("siren_w0_initial", DEFAULT_OMEGA_0),
+        "w0_hidden": model_params.get("siren_w0_hidden", DEFAULT_OMEGA_0),
+        "final_activation": model_params.get("final_activation", True),
     }
     
-    # Model-specific arguments
-    model_class: type[nn.Module]
-    
-    if model_type == "mlp":
-        model_class = FiLM_MLP
-        base_args.update({
-            "dropout": model_params.get("dropout", DEFAULT_DROPOUT),
-            "use_residual": model_params.get("use_residual", True),
-            "activation": model_params.get("activation", "silu"),
-            "use_layer_norm": model_params.get("use_layer_norm", True),
-            "init_type": model_params.get("init_type", "xavier_uniform"),
-            "stochastic_depth": model_params.get("stochastic_depth", 0.0),
-            "use_checkpoint": model_params.get("use_gradient_checkpointing", False),
-        })
-        
-    elif model_type == "siren":
-        model_class = FiLM_SIREN
-        base_args.update({
-            "w0_initial": model_params.get("siren_w0_initial", DEFAULT_OMEGA_0),
-            "w0_hidden": model_params.get("siren_w0_hidden", DEFAULT_OMEGA_0),
-            "use_batch_norm": model_params.get("use_batch_norm", False),
-            "final_activation": model_params.get("final_activation", True),
-            "use_erf_approx": model_params.get("siren_use_erf_approx", True),
-        })
-        
-    elif model_type == "fno":
-        model_class = FiLM_FNO
-        fno_seq_length = model_params.get("fno_seq_length", 32)
-        fno_spectral_modes = model_params.get("fno_spectral_modes", 16)
-        
-        # Validate modes
-        max_modes = fno_seq_length // 2
-        if fno_spectral_modes > max_modes:
-            logger.warning(
-                f"FNO modes ({fno_spectral_modes}) > Nyquist limit ({max_modes}). "
-                f"Clamping to {max_modes}."
-            )
-            fno_spectral_modes = max_modes
-        
-        base_args.update({
-            "dropout": model_params.get("dropout", DEFAULT_DROPOUT),
-            "fno_spectral_modes": fno_spectral_modes,
-            "fno_seq_length": fno_seq_length,
-            "compression": model_params.get("fno_compression", 0.5),
-            "activation": model_params.get("activation", "gelu"),
-        })
-    else:
-        raise ValueError(
-            f"Unsupported model_type '{model_type}'. "
-            f"Choose from: ['mlp', 'siren', 'fno']."
-        )
-    
     # Create model
-    model = model_class(**base_args)
+    model = FiLM_SIREN(**model_args)
     
     # Log model info
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(
-        f"{model_class.__name__} created with {trainable_params:,} trainable parameters."
+        f"FiLM_SIREN created with {trainable_params:,} trainable parameters."
     )
-    logger.debug(f"Model config: {base_args}")
+    logger.debug(f"Model config: {model_args}")
     
-    # Move to device
+    # Move to device if specified
     if device:
         model.to(torch.device(device))
         logger.info(f"Model moved to device: {device}")
@@ -737,14 +395,22 @@ def export_model_jit(
     save_path: Union[str, Path],
     optimize: bool = True
 ) -> None:
-    """Export model as TorchScript JIT module."""
+    """
+    Export model as TorchScript JIT module for optimized inference.
+    
+    Args:
+        model: Model to export
+        example_input: Example input tensor for tracing
+        save_path: Path to save the exported model
+        optimize: Whether to apply TorchScript optimizations
+    """
     save_path = Path(save_path)
     
-    # Set eval mode
+    # Set eval mode for inference
     model.eval()
     
     with torch.no_grad():
-        # Script the model
+        # Try scripting first, fall back to tracing if needed
         try:
             scripted_model = torch.jit.script(model)
             logger.info("Model successfully scripted.")
@@ -752,23 +418,21 @@ def export_model_jit(
             logger.warning(f"JIT script failed: {e}. Trying trace...")
             scripted_model = torch.jit.trace(model, example_input)
         
-        # Optimize if requested
+        # Apply optimizations if requested
         if optimize:
             scripted_model = torch.jit.optimize_for_inference(scripted_model)
         
-        # Verify output matches
+        # Verify output matches original model
         test_output = scripted_model(example_input)
         original_output = model(example_input)
         
-        if not torch.allclose(test_output, original_output, rtol=1e-5):
+        # Use relaxed tolerance for JIT comparison
+        if not torch.allclose(test_output, original_output, rtol=1e-4, atol=1e-5):
             logger.warning("JIT output differs from original model!")
     
-    # Save
+    # Save the exported model
     scripted_model.save(str(save_path))
     logger.info(f"JIT model saved to: {save_path}")
 
 
-__all__ = [
-    "FiLM_MLP", "FiLM_SIREN", "FiLM_FNO",
-    "create_prediction_model", "export_model_jit"
-]
+__all__ = ["FiLM_SIREN", "create_prediction_model", "export_model_jit"]

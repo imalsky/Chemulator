@@ -8,9 +8,11 @@ import copy
 import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+import gc
 
+import h5py
 import optuna
-from optuna import Study, Trial
+from optuna import Trial
 from optuna.exceptions import TrialPruned
 from optuna.trial import FrozenTrial
 
@@ -18,6 +20,7 @@ from hardware import setup_device
 from train import ModelTrainer
 from utils import save_json
 from normalizer import DataNormalizer
+from dataset import create_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +42,9 @@ def _suggest_hyperparams(trial: Trial, base_cfg: Dict[str, Any]) -> Dict[str, An
     """
     cfg = copy.deepcopy(base_cfg)
     search_space = cfg.get("optuna_hyperparam_search_space", {})
-    model_params = cfg["model_hyperparameters"]
-    train_params = cfg["training_hyperparameters"]
+    # Use .get() for safer access
+    model_params = cfg.setdefault("model_hyperparameters", {})
+    train_params = cfg.setdefault("training_hyperparameters", {})
 
     # Suggest network architecture
     arch_space = search_space.get("architecture", {})
@@ -63,10 +67,6 @@ def _suggest_hyperparams(trial: Trial, base_cfg: Dict[str, Any]) -> Dict[str, An
 
     # Suggest independent hyperparameters
     for name, params in search_space.get("hyperparameters", {}).items():
-        # Skip removed features
-        if name in ("use_ema", "ema_decay", "optimizer"):
-            continue
-            
         suggested_val = None
         
         if params["type"] == "categorical":
@@ -88,9 +88,9 @@ def _suggest_hyperparams(trial: Trial, base_cfg: Dict[str, Any]) -> Dict[str, An
 
         if suggested_val is not None:
             # Place the parameter in the correct section
-            if name in train_params:
+            if name in base_cfg.get("training_hyperparameters", {}):
                 train_params[name] = suggested_val
-            elif name in model_params:
+            elif name in base_cfg.get("model_hyperparameters", {}):
                 model_params[name] = suggested_val
             else:
                 cfg[name] = suggested_val
@@ -109,8 +109,10 @@ def _reconstruct_config_from_trial(
     cfg = copy.deepcopy(base_cfg)
     params = trial.params
     search_space = cfg.get("optuna_hyperparam_search_space", {})
-    model_params = cfg["model_hyperparameters"]
-    train_params = cfg["training_hyperparameters"]
+    
+    # Use .setdefault() to ensure keys exist
+    model_params = cfg.setdefault("model_hyperparameters", {})
+    train_params = cfg.setdefault("training_hyperparameters", {})
 
     # Reconstruct architecture
     arch_space = search_space.get("architecture", {})
@@ -128,12 +130,11 @@ def _reconstruct_config_from_trial(
             continue
 
         # Place parameter in correct section
-        if name in train_params:
+        if name in base_cfg.get("training_hyperparameters", {}):
             train_params[name] = value
-        elif name in model_params:
+        elif name in base_cfg.get("model_hyperparameters", {}):
             model_params[name] = value
         else:
-            # Check if it's a valid hyperparameter
             if name in search_space.get("hyperparameters", {}):
                 cfg[name] = value
     
@@ -160,12 +161,63 @@ def run_hyperparameter_search(
     Returns:
         Best configuration found, or None if no trials succeeded
     """
-    # Pre-calculate normalization stats ONCE for efficiency
-    logger.info("Pre-calculating normalization statistics for the entire tuning study...")
+    # Pre-calculate normalization stats and optionally pre-load datasets ONCE
+    logger.info("Preparing data for the entire tuning study...")
     device = setup_device()
     normalizer = DataNormalizer(config_data=base_config)
-    pre_calculated_norm_metadata = normalizer.calculate_stats(h5_path, splits['train'])
-    logger.info("Normalization statistics pre-calculation complete.")
+    
+    # Calculate normalization stats ONLY on the training set to prevent data leakage.
+    pre_calculated_norm_metadata, raw_train_data = normalizer.calculate_stats(h5_path, splits['train'])
+    
+    preloaded_datasets = {}
+    should_cache = base_config.get("miscellaneous_settings", {}).get("cache_dataset", False)
+    
+    if should_cache:
+        logger.info("Pre-loading all datasets into memory for tuning...")
+        ds_kwargs = {
+            "h5_path": h5_path,
+            "species_variables": base_config["data_specification"]["species_variables"],
+            "global_variables": base_config["data_specification"]["global_variables"],
+            "normalization_metadata": pre_calculated_norm_metadata,
+            "cache_dataset": True,
+        }
+        
+        # Pass raw_data_for_caching only to the training set creator
+        preloaded_datasets['train'] = create_dataset(
+            indices=splits['train'], raw_data_for_caching=raw_train_data, **ds_kwargs
+        )
+        
+        logger.info("Efficiently loading raw validation and test data for caching...")
+        with h5py.File(h5_path, 'r') as hf:
+            all_vars = base_config["data_specification"]["all_variables"]
+            
+            # Load validation data
+            raw_val_data = {
+                var: hf[var][splits['validation']]
+                for var in all_vars if var in hf
+            }
+            preloaded_datasets['validation'] = create_dataset(
+                indices=splits['validation'], raw_data_for_caching=raw_val_data, **ds_kwargs
+            )
+
+            # Load test data
+            raw_test_data = {
+                var: hf[var][splits['test']]
+                for var in all_vars if var in hf
+            }
+            preloaded_datasets['test'] = create_dataset(
+                indices=splits['test'], raw_data_for_caching=raw_test_data, **ds_kwargs
+            )
+            
+            # Clean up temporary raw data holders
+            del raw_val_data, raw_test_data
+
+        del raw_train_data
+        gc.collect()
+        logger.info("All datasets are pre-loaded and cached.")
+    else:
+        logger.info("Normalization statistics pre-calculation complete.")
+
 
     def objective(trial: Trial) -> float:
         """
@@ -185,17 +237,23 @@ def run_hyperparameter_search(
         save_json(trial_cfg, trial_dir / "run_config.json")
         
         try:
-            # Create trainer with pre-calculated normalization
-            trainer = ModelTrainer(
-                config=trial_cfg,
-                device=device,
-                save_dir=trial_dir,
-                h5_path=h5_path,
-                splits=splits,
-                collate_fn=collate_fn,
-                optuna_trial=trial,
-                norm_metadata=pre_calculated_norm_metadata,  # Pass pre-calculated stats
-            )
+            # Create trainer, passing pre-loaded data if available
+            trainer_kwargs = {
+                "config": trial_cfg,
+                "device": device,
+                "save_dir": trial_dir,
+                "h5_path": h5_path,
+                "splits": splits,
+                "collate_fn": collate_fn,
+                "optuna_trial": trial,
+                "norm_metadata": pre_calculated_norm_metadata,
+            }
+            if preloaded_datasets:
+                trainer_kwargs["preloaded_train_ds"] = preloaded_datasets['train']
+                trainer_kwargs["preloaded_val_ds"] = preloaded_datasets['validation']
+                trainer_kwargs["preloaded_test_ds"] = preloaded_datasets['test']
+            
+            trainer = ModelTrainer(**trainer_kwargs)
             
             # Train and return best validation loss
             best_val_loss = trainer.train()
@@ -236,19 +294,17 @@ def run_hyperparameter_search(
     # Run optimization
     try:
         # Extract relevant arguments for optimize()
-        optimize_kwargs = {}
-        if "n_trials" in optuna_cfg:
-            optimize_kwargs["n_trials"] = optuna_cfg["n_trials"]
-        if "timeout" in optuna_cfg:
-            optimize_kwargs["timeout"] = optuna_cfg["timeout"]
-        if "callbacks" in optuna_cfg:
-            optimize_kwargs["callbacks"] = optuna_cfg["callbacks"]
-        if "catch" in optuna_cfg:
-            optimize_kwargs["catch"] = optuna_cfg["catch"]
-        if "show_progress_bar" in optuna_cfg:
-            optimize_kwargs["show_progress_bar"] = optuna_cfg["show_progress_bar"]
+        optimize_kwargs = {
+            "n_trials": optuna_cfg.get("n_trials"),
+            "timeout": optuna_cfg.get("timeout"),
+            "callbacks": optuna_cfg.get("callbacks"),
+            "catch": (),
+            "show_progress_bar": optuna_cfg.get("show_progress_bar", DEFAULT_SHOW_PROGRESS_BAR)
+        }
+        # Filter out None values
+        optimize_kwargs = {k: v for k, v in optimize_kwargs.items() if v is not None}
         
-        logger.info(f"Starting hyperparameter search with {optimize_kwargs.get('n_trials', 'unlimited')} trials...")
+        logger.info(f"Starting hyperparameter search with {optuna_cfg.get('n_trials', 'unlimited')} trials...")
         study.optimize(objective, **optimize_kwargs)
         
     except KeyboardInterrupt:
