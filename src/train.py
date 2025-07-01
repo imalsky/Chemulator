@@ -134,9 +134,7 @@ class ModelTrainer:
             "invalid_batch_threshold", DEFAULT_INVALID_BATCH_THRESHOLD
         )
         self.log_gradient_norms = self.misc_cfg.get("log_gradient_norms", True)
-        self.save_checkpoint_interval = self.misc_cfg.get(
-            "save_checkpoint_every_n_epochs", 10
-        )
+        self.save_checkpoint_interval = self.misc_cfg.get("save_checkpoint_every_n_epochs", 10)
         
         # Dataset caching configuration
         self.cache_dataset = self.misc_cfg.get("cache_dataset", False)

@@ -299,6 +299,9 @@ class DataNormalizer:
         """
         Compute statistics for quantile-based normalization methods with stability checks.
         
+        This method includes a fallback to subsampling if the input tensor is too large
+        for the `torch.quantile` operation on the target device.
+        
         Args:
             values: Tensor of values for quantile computation
             key: Variable key name
@@ -308,8 +311,33 @@ class DataNormalizer:
             Dictionary of computed statistics
         """
         stats: Dict[str, float] = {}
+
+        def _robust_quantile_computation(tensor: Tensor, q_values: Union[float, Tensor]) -> Tensor:
+            """Internal helper to compute quantiles with a fallback to subsampling."""
+            try:
+                return torch.quantile(tensor, q_values)
+            except RuntimeError as e:
+                error_msg = str(e).lower()
+                if "too large" in error_msg or "out of memory" in error_msg:
+                    fallback_subsample_size = 10_000_000
+                    
+                    if tensor.numel() <= fallback_subsample_size:
+                        logger.error(f"Quantile computation failed for '{key}' on an already small tensor ({tensor.numel()}).")
+                        raise e
+
+                    logger.warning(
+                        f"Quantile computation failed for '{key}' on tensor of size {tensor.numel():,}. "
+                        f"Retrying with a random subsample of {fallback_subsample_size:,}."
+                    )
+                    perm = torch.randperm(tensor.numel(), device=tensor.device)[:fallback_subsample_size]
+                    subsampled_tensor = tensor.flatten()[perm]
+                    return torch.quantile(subsampled_tensor, q_values)
+                else:
+                    raise e
+        
         if method == "iqr":
-            q_vals = torch.quantile(values, torch.tensor([0.25, 0.5, 0.75], dtype=DTYPE, device=values.device))
+            q_tensor = torch.tensor([0.25, 0.5, 0.75], dtype=DTYPE, device=values.device)
+            q_vals = _robust_quantile_computation(values, q_tensor)
             q1, med, q3 = q_vals[0].item(), q_vals[1].item(), q_vals[2].item()
             iqr = q3 - q1
             stats.update({"median": med, "iqr": max(iqr, 1e-6)})
@@ -321,7 +349,7 @@ class DataNormalizer:
             
         elif method == "symlog":
             percentile = self.norm_cfg.get("symlog_percentile", DEFAULT_SYMLOG_PERCENTILE)
-            thr = torch.quantile(torch.abs(values), percentile).item()
+            thr = _robust_quantile_computation(torch.abs(values), percentile).item()
             thr = max(thr, EPSILON)
             
             abs_v = torch.abs(values)
