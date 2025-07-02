@@ -101,51 +101,90 @@ class DataNormalizer:
         if not train_indices:
             raise ValueError("Cannot calculate statistics from empty training indices.")
         
+        # Verify HDF5 file exists and is readable
+        if not h5_path.exists():
+            raise FileNotFoundError(f"HDF5 file not found: {h5_path}")
+        
+        # Sort indices for efficient HDF5 access
         sorted_train_indices = sorted(train_indices)
+        
+        # Create mapping from index value to its position in the original list
+        # This allows us to place data back in the correct order
+        index_to_orig_pos = {idx: pos for pos, idx in enumerate(train_indices)}
         
         # This will hold the final, pre-allocated numpy arrays
         final_raw_data = {}
         accumulators = None
         
-        with h5py.File(h5_path, 'r', swmr=True, libver='latest') as hf:
-            available_keys = self.keys_to_process.intersection(hf.keys())
-            if len(available_keys) != len(self.keys_to_process):
-                missing = self.keys_to_process - available_keys
-                logger.warning(f"Keys not found in HDF5 and will be skipped: {missing}")
-            
-            accumulators = self._initialize_accumulators(available_keys)
+        try:
+            with h5py.File(h5_path, 'r', swmr=True, libver='latest') as hf:
+                available_keys = self.keys_to_process.intersection(hf.keys())
+                if len(available_keys) != len(self.keys_to_process):
+                    missing = self.keys_to_process - available_keys
+                    logger.warning(f"Keys not found in HDF5 and will be skipped: {missing}")
+                
+                if not available_keys:
+                    raise ValueError(f"No requested keys found in HDF5 file. Requested: {self.keys_to_process}, Available in HDF5: {set(hf.keys())}")
+                
+                # Verify that we have at least some keys to process
+                logger.info(f"Processing {len(available_keys)} variables: {sorted(available_keys)}")
+                
+                accumulators = self._initialize_accumulators(available_keys)
 
-            logger.info("Pre-allocating memory for raw data caching...")
-            for key in available_keys:
-                dataset_shape = hf[key].shape
-                # The final shape is (num_train_indices, ...other_dims)
-                final_shape = (len(train_indices),) + dataset_shape[1:]
-                final_raw_data[key] = np.empty(final_shape, dtype=hf[key].dtype)
-            
-            logger.info("Reading training data and calculating stats in chunks...")
-            start_time = time.time()
-            
-            num_chunks = (len(sorted_train_indices) + STATS_CHUNK_SIZE - 1) // STATS_CHUNK_SIZE
-            current_position = 0
-            for i in tqdm(range(0, len(sorted_train_indices), STATS_CHUNK_SIZE), desc="Calculating Stats", total=num_chunks):
-                chunk_indices = sorted_train_indices[i:i + STATS_CHUNK_SIZE]
+                logger.info("Pre-allocating memory for raw data caching...")
                 
-                batch_of_tensors = {}
+                # Validate indices are within bounds
                 for key in available_keys:
-                    data_chunk_np = hf[key][chunk_indices]
+                    dataset_shape = hf[key].shape
+                    max_index = max(train_indices)
+                    if max_index >= dataset_shape[0]:
+                        raise ValueError(
+                            f"Index {max_index} out of bounds for dataset '{key}' "
+                            f"with shape {dataset_shape}"
+                        )
                     
-                    chunk_size = data_chunk_np.shape[0]
-                    final_raw_data[key][current_position : current_position + chunk_size] = data_chunk_np
-                    
-                    batch_of_tensors[key] = torch.from_numpy(data_chunk_np)
+                    # Pre-allocate array
+                    final_shape = (len(train_indices),) + dataset_shape[1:]
+                    final_raw_data[key] = np.empty(final_shape, dtype=hf[key].dtype)
                 
-                # Update current position for the next insertion
-                current_position += len(chunk_indices)
+                logger.info("Reading training data and calculating stats in chunks...")
+                start_time = time.time()
                 
-                self._update_accumulators_with_batch(batch_of_tensors, accumulators)
-            
-            load_time = time.time() - start_time
-            logger.info(f"Finished reading data and calculating chunked stats in {load_time:.2f}s.")
+                # Process data in chunks for efficiency
+                with tqdm(total=len(sorted_train_indices), desc="Calculating Stats") as pbar:
+                    for chunk_start in range(0, len(sorted_train_indices), STATS_CHUNK_SIZE):
+                        chunk_end = min(chunk_start + STATS_CHUNK_SIZE, len(sorted_train_indices))
+                        chunk_indices = sorted_train_indices[chunk_start:chunk_end]
+                        
+                        if not chunk_indices:
+                            continue
+                        
+                        batch_of_tensors = {}
+                        for key in available_keys:
+                            try:
+                                # Read data for this chunk of indices
+                                data_chunk_np = hf[key][chunk_indices]
+                                
+                                # Place data in correct positions in final array
+                                for i, idx in enumerate(chunk_indices):
+                                    orig_pos = index_to_orig_pos[idx]
+                                    final_raw_data[key][orig_pos] = data_chunk_np[i]
+                                
+                                batch_of_tensors[key] = torch.from_numpy(data_chunk_np)
+                            except Exception as e:
+                                logger.error(f"Error reading key '{key}' at indices {chunk_indices[:5]}... : {e}")
+                                raise
+                        
+                        self._update_accumulators_with_batch(batch_of_tensors, accumulators)
+                        pbar.update(len(chunk_indices))
+                
+                load_time = time.time() - start_time
+                logger.info(f"Finished reading data and calculating chunked stats in {load_time:.2f}s.")
+
+        except Exception as e:
+            logger.error(f"Error during statistics calculation: {repr(e)}", exc_info=True)
+            # Re-raise with more context
+            raise RuntimeError(f"Failed to calculate statistics: {repr(e)}") from e
 
         computed_stats = self._finalize_stats(accumulators)
         metadata = {"normalization_methods": self.key_methods, "per_key_stats": computed_stats}

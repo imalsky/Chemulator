@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import gc
 import logging
+import multiprocessing
 import random
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import h5py
 import optuna
 import torch
 from optuna.exceptions import TrialPruned
@@ -194,7 +196,6 @@ class ModelTrainer:
             logger.info(f"Auto-configured num_workers: {num_workers} (CPU-bound training)")
             return num_workers
 
-        import multiprocessing
         cpu_count = multiprocessing.cpu_count()
         
         # For GPU training, balance between data loading and GPU utilization
@@ -252,6 +253,10 @@ class ModelTrainer:
         """
         Calculate normalization statistics and create datasets.
         
+        This method is optimized to efficiently load all raw data for caching
+        when `cache_dataset` is true, preventing slow re-reads from disk for
+        each data split.
+
         Args:
             h5_path: Path to HDF5 file
             splits: Dictionary with train/val/test indices
@@ -295,18 +300,48 @@ class ModelTrainer:
             "max_memory_gb": max_memory_gb,
         }
         
-        # Use raw data for training set if caching
-        self.train_ds = create_dataset(
-            indices=train_indices, 
-            raw_data_for_caching=raw_train_data if self.cache_dataset else None,
-            **ds_kwargs
-        )
-        self.val_ds = create_dataset(indices=val_indices, **ds_kwargs)
-        self.test_ds = create_dataset(indices=test_indices, **ds_kwargs)
-        
-        # Clean up raw data
-        del raw_train_data
-        gc.collect()
+        if self.cache_dataset:
+            # Use raw data for training set if caching
+            self.train_ds = create_dataset(
+                indices=train_indices, 
+                raw_data_for_caching=raw_train_data,
+                **ds_kwargs
+            )
+            # Clean up immediately to save memory
+            del raw_train_data
+            gc.collect()
+
+            # Efficiently load validation and test data for caching
+            logger.info("Efficiently loading raw validation and test data for caching...")
+            with h5py.File(h5_path, 'r') as hf:
+                all_vars = self.data_spec["all_variables"]
+                
+                # Load validation data
+                raw_val_data = {
+                    var: hf[var][val_indices]
+                    for var in all_vars if var in hf
+                }
+                self.val_ds = create_dataset(
+                    indices=val_indices, raw_data_for_caching=raw_val_data, **ds_kwargs
+                )
+                del raw_val_data
+
+                # Load test data
+                raw_test_data = {
+                    var: hf[var][test_indices]
+                    for var in all_vars if var in hf
+                }
+                self.test_ds = create_dataset(
+                    indices=test_indices, raw_data_for_caching=raw_test_data, **ds_kwargs
+                )
+                del raw_test_data
+        else:
+            # Not caching, so create streaming datasets
+            del raw_train_data
+            gc.collect()
+            self.train_ds = create_dataset(indices=train_indices, **ds_kwargs)
+            self.val_ds = create_dataset(indices=val_indices, **ds_kwargs)
+            self.test_ds = create_dataset(indices=test_indices, **ds_kwargs)
 
         # Log dataset sizes
         train_samples = len(self.train_ds) if hasattr(self.train_ds, '__len__') else self.train_ds.total_samples
@@ -568,8 +603,7 @@ class ModelTrainer:
 
                 with torch.set_grad_enabled(is_train_phase):
                     # Forward pass with optional mixed precision
-                    #with torch.cuda.amp.autocast(enabled=self.use_amp):
-                    with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
                         preds = self.model(inputs)
                         loss = self.criterion(preds, targets)
                     
