@@ -308,6 +308,13 @@ class FiLM_SIREN(nn.Module):
         Returns:
             Predicted species concentrations at the query time
         """
+        # --- FIX STARTS HERE ---
+        # Clone the input tensor to prevent CUDAGraphs from accessing
+        # memory that has been overwritten by the DataLoader. This is the
+        # most robust fix for this class of errors.
+        x = x.clone()
+        # --- FIX ENDS HERE ---
+        
         # Split input into components
         initial_species = x[:, :self.num_species]
         global_and_time = x[:, self.num_species:]

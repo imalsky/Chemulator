@@ -78,7 +78,7 @@ class CachedChemicalDataset(Dataset):
             logger.info("Using pre-loaded raw data for caching.")
             self._build_tensors(raw_data_for_caching)
         else:
-            logger.info(f"Reading raw data from {self.h5_path} for caching.")
+            logger.info(f"Loading raw data from {self.h5_path} for caching...")
             self._load_and_build_tensors()
 
         load_time = time.time() - start_time
@@ -90,8 +90,13 @@ class CachedChemicalDataset(Dataset):
         )
 
     def _load_and_build_tensors(self) -> None:
-        """Load data from HDF5 and build cached tensors."""
+        """Load data from HDF5 and build cached tensors with optimized chunk reading."""
         raw_data = {}
+        
+        # Sort indices for more efficient HDF5 access
+        sorted_indices = sorted(self.indices)
+        index_mapping = {sorted_idx: orig_idx for orig_idx, sorted_idx in enumerate(sorted(enumerate(self.indices), key=lambda x: x[1]))}
+        
         with h5py.File(self.h5_path, 'r') as hf:
             if TIME_KEY not in hf:
                 raise ValueError(f"HDF5 file must contain dataset '{TIME_KEY}'.")
@@ -99,9 +104,33 @@ class CachedChemicalDataset(Dataset):
             num_time_steps = hf[TIME_KEY].shape[1]
             all_vars_to_load = set(self.input_var_order) | set(self.target_var_order)
             
+            # Load data in chunks for better HDF5 performance
+            chunk_size = min(1000, len(sorted_indices))  # Optimal chunk size for HDF5
+            
             for var in all_vars_to_load:
                 if var in hf:
-                    raw_data[var] = hf[var][self.indices]
+                    logger.debug(f"Loading variable '{var}'...")
+                    dataset = hf[var]
+                    
+                    # Pre-allocate array in original index order
+                    if var in self.global_vars:
+                        shape = (len(self.indices),)
+                    else:
+                        shape = (len(self.indices), num_time_steps)
+                    
+                    data_array = np.empty(shape, dtype=np.float32)
+                    
+                    # Load data in sorted chunks
+                    for i in range(0, len(sorted_indices), chunk_size):
+                        chunk_sorted_indices = sorted_indices[i:i + chunk_size]
+                        chunk_data = dataset[chunk_sorted_indices]
+                        
+                        # Reorder to match original indices
+                        for j, sorted_idx in enumerate(chunk_sorted_indices):
+                            orig_pos = index_mapping[i + j]
+                            data_array[orig_pos] = chunk_data[j]
+                    
+                    raw_data[var] = data_array
                 else:
                     logger.warning(f"Variable '{var}' not in HDF5, using zeros.")
                     if var in self.global_vars:
@@ -495,7 +524,7 @@ class ChemicalDataset(IterableDataset):
         """
         Efficiently read a chunk of data from HDF5.
         
-        Uses sorted indexing for optimal HDF5 performance.
+        Uses sorted indexing and contiguous reads for optimal HDF5 performance.
         
         Args:
             h5_file: HDF5 file handle
@@ -510,14 +539,60 @@ class ChemicalDataset(IterableDataset):
         
         chunk_data = {}
         
+        # Group consecutive indices for more efficient reading
+        def group_consecutive(indices):
+            """Group consecutive indices into ranges."""
+            if not indices:
+                return []
+            
+            groups = []
+            start = indices[0]
+            end = indices[0]
+            
+            for idx in indices[1:]:
+                if idx == end + 1:
+                    end = idx
+                else:
+                    groups.append((start, end + 1))
+                    start = end = idx
+            
+            groups.append((start, end + 1))
+            return groups
+        
+        consecutive_groups = group_consecutive(sorted_indices)
+        
         for var in self.all_vars:
             if var not in h5_file:
                 logger.debug(f"Variable '{var}' not in HDF5, skipping")
                 continue
             
             try:
-                # Read data in sorted order
-                data = h5_file[var][sorted_indices]
+                dataset = h5_file[var]
+                
+                # Pre-allocate array
+                if var in self.global_vars:
+                    shape = (len(chunk_indices),)
+                else:
+                    shape = (len(chunk_indices), dataset.shape[1])
+                
+                data = np.empty(shape, dtype=np.float32)
+                
+                # Read data in consecutive groups
+                for start, end in consecutive_groups:
+                    # Get indices within this group
+                    group_indices = sorted_indices[sorted_indices.index(start):sorted_indices.index(end-1)+1]
+                    
+                    # Read contiguous block
+                    if len(group_indices) == end - start:
+                        # Truly consecutive - single read
+                        group_data = dataset[start:end]
+                    else:
+                        # Some gaps - use fancy indexing
+                        group_data = dataset[group_indices]
+                    
+                    # Place in correct positions
+                    for i, idx in enumerate(group_indices):
+                        data[index_map[idx]] = group_data[i]
                 
                 # Reorder to match original chunk order
                 reordered_data = np.empty_like(data)
@@ -529,9 +604,6 @@ class ChemicalDataset(IterableDataset):
             except Exception as e:
                 logger.error(f"Error reading variable '{var}': {e}")
                 raise IOError(f"Failed to read HDF5 variable '{var}'. Halting to prevent data corruption.") from e
-                # Return zeros as fallback
-                #shape = (len(chunk_indices),) + h5_file[var].shape[1:]
-                #chunk_data[var] = np.zeros(shape, dtype=np.float32)
         
         return chunk_data
 
