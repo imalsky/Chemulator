@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-utils.py - Optimized helper functions for configuration, logging, and data handling.
+utils.py - Helper functions for configuration, logging, and data handling.
 
 This module provides utility functions for:
 - Configuration file loading and validation
@@ -33,7 +33,6 @@ except ImportError:
 
 # Constants
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s - %(message)s"
-DEFAULT_SEED = 42
 UTF8_ENCODING = "utf-8"
 UTF8_SIG_ENCODING = "utf-8-sig"
 
@@ -159,7 +158,44 @@ def validate_config(config: Dict[str, Any]) -> None:
     if dropout is not None and not (0.0 <= dropout < 1.0):
         raise ValueError("'dropout' in 'model_hyperparameters' must be a float in the range [0.0, 1.0).")
 
+    # Validate variable list consistency
+    species_vars = set(data_spec.get("species_variables", []))
+    global_vars = set(data_spec.get("global_variables", []))
+    all_vars = set(data_spec.get("all_variables", []))
 
+    # Check for accidental overlap between species and global variables
+    if not species_vars.isdisjoint(global_vars):
+        overlap = species_vars.intersection(global_vars)
+        raise ValueError(f"Variables cannot be in both 'species_variables' and 'global_variables': {overlap}")
+
+    assigned_vars = species_vars | global_vars
+
+    # Check that all specified species and global variables are in the master list
+    if not assigned_vars.issubset(all_vars):
+        missing_from_all = assigned_vars - all_vars
+        raise ValueError(
+            f"Variables from species/global lists are missing from 'all_variables': {missing_from_all}"
+        )
+
+    # Find and log any variables in all_variables that are not explicitly categorized
+    unassigned_vars = all_vars - assigned_vars
+    if unassigned_vars:
+        logger.info(
+            f"The following variables in 'all_variables' are not categorized as species/global "
+            f"and will use the default normalization method: {sorted(list(unassigned_vars))}"
+        )
+    
+    # Validate numerical constants if present
+    num_constants = config.get("numerical_constants", {})
+    if num_constants:
+        epsilon = num_constants.get("epsilon", 1e-10)
+        if not isinstance(epsilon, (int, float)) or epsilon <= 0:
+            raise ValueError("'epsilon' in 'numerical_constants' must be a positive number.")
+        
+        clamp = num_constants.get("normalized_value_clamp", 10.0)
+        if not isinstance(clamp, (int, float)) or clamp <= 0:
+            raise ValueError("'normalized_value_clamp' in 'numerical_constants' must be a positive number.")
+    
 def ensure_dirs(*paths: Union[str, Path]) -> bool:
     """
     Create one or more directories if they don't exist.
@@ -235,7 +271,7 @@ def save_json(data: Dict[str, Any], path: Union[str, Path]) -> bool:
         return False
 
 
-def seed_everything(seed: int = DEFAULT_SEED) -> None:
+def seed_everything(seed: int) -> None:
     """
     Set random seeds for reproducibility across all libraries.
     
@@ -264,7 +300,7 @@ def generate_dataset_splits(
     h5_path: Path, 
     val_frac: float = 0.15, 
     test_frac: float = 0.15,
-    random_seed: int = DEFAULT_SEED
+    random_seed: int = 42
 ) -> Dict[str, List[int]]:
     """
     Generate train/validation/test splits from HDF5 dataset.
@@ -377,61 +413,54 @@ def get_config_str(config: Dict[str, Any], section: str, key: str, op_desc: str)
 def load_or_generate_splits(
     config: Dict[str, Any], 
     data_root_dir: Path, 
-    h5_path: Path
+    h5_path: Path,
+    model_save_dir: Path
 ) -> Tuple[Dict[str, List[int]], Path]:
     """
     Load existing dataset splits or generate new ones.
     
-    This function first attempts to load splits from a specified file.
-    If that fails, it generates new splits based on configuration parameters.
+    This function generates splits and saves them directly to the model directory.
     
     Args:
         config: Configuration dictionary
-        data_root_dir: Root directory for data files
+        data_root_dir: Root directory for data files (not used, kept for compatibility)
         h5_path: Path to HDF5 dataset
+        model_save_dir: Directory where the model will be saved
         
     Returns:
         Tuple of (splits dictionary, path to splits file)
     """
-    splits_path = None
+    # Always save splits in the model directory
+    splits_path = model_save_dir / "dataset_splits.json"
     
-    # Try to load existing splits
-    try:
-        splits_filename = get_config_str(
-            config, "data_paths_config", "dataset_splits_filename", "dataset splits"
-        )
-        splits_path = data_root_dir / splits_filename
-        
-        logger.info(f"Attempting to load dataset splits from: {splits_path}")
-        
-        # Verify file exists before trying to load
-        if not splits_path.exists():
-            raise FileNotFoundError(f"Splits file not found: {splits_path}")
-        
-        with open(splits_path, 'r', encoding=UTF8_ENCODING) as f:
-            splits = json.load(f)
-        
-        # Validate splits structure
-        required_keys = {"train", "validation", "test"}
-        if not required_keys.issubset(splits.keys()):
-            raise ValueError(f"Splits file must contain keys: {required_keys}")
-        
-        # Validate that splits contain valid indices
-        for key in required_keys:
-            if not isinstance(splits[key], list) or not splits[key]:
-                raise ValueError(f"Split '{key}' must be a non-empty list")
-        
-        logger.info(f"Successfully loaded dataset splits from {splits_path}")
-        logger.info(
-            f"Split sizes: {len(splits['train'])} train, "
-            f"{len(splits['validation'])} val, {len(splits['test'])} test."
-        )
-        return splits, splits_path
+    # Check if splits already exist in the model directory
+    if splits_path.exists():
+        try:
+            logger.info(f"Loading existing dataset splits from: {splits_path}")
+            with open(splits_path, 'r', encoding=UTF8_ENCODING) as f:
+                splits = json.load(f)
+            
+            # Validate splits structure
+            required_keys = {"train", "validation", "test"}
+            if not required_keys.issubset(splits.keys()):
+                raise ValueError(f"Splits file must contain keys: {required_keys}")
+            
+            # Validate that splits contain valid indices
+            for key in required_keys:
+                if not isinstance(splits[key], list) or not splits[key]:
+                    raise ValueError(f"Split '{key}' must be a non-empty list")
+            
+            logger.info(
+                f"Successfully loaded dataset splits. "
+                f"Split sizes: {len(splits['train'])} train, "
+                f"{len(splits['validation'])} val, {len(splits['test'])} test."
+            )
+            return splits, splits_path
+            
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.warning(f"Existing splits file invalid: {e}. Regenerating...")
     
-    except (KeyError, ValueError, FileNotFoundError, json.JSONDecodeError) as e:
-        logger.info(f"Could not load specified splits file. Reason: {e}. Will generate new splits.")
-    
-    # Generate new splits if loading failed
+    # Generate new splits
     logger.info("Generating new dataset splits...")
     
     # Get split parameters from config
@@ -440,7 +469,8 @@ def load_or_generate_splits(
     test_frac = train_params.get("test_frac", 0.15)
     
     misc_settings = config.get("miscellaneous_settings", {})
-    random_seed = misc_settings.get("random_seed", DEFAULT_SEED)
+    num_constants = config.get("numerical_constants", {})
+    random_seed = misc_settings.get("random_seed", num_constants.get("default_seed", 42))
     
     # Generate splits
     splits = generate_dataset_splits(
@@ -450,14 +480,13 @@ def load_or_generate_splits(
         random_seed=random_seed
     )
     
-    # Save generated splits
-    new_splits_path = h5_path.with_name(h5_path.stem + "_splits_generated.json")
-    if save_json(splits, new_splits_path):
-        logger.info(f"Saved newly generated splits to {new_splits_path}")
+    # Save generated splits to model directory
+    if save_json(splits, splits_path):
+        logger.info(f"Saved generated splits to {splits_path}")
     else:
         logger.warning("Failed to save generated splits to file")
     
-    return splits, new_splits_path
+    return splits, splits_path
 
 
 __all__ = [

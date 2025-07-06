@@ -1,21 +1,19 @@
 // =========================================================================================
-// ==                 OPTIMIZED SIREN CONFIGURATION WITH AUTO-DETECTION                   ==
+// ==              SIMPLIFIED SIREN CONFIGURATION FOR STREAMING TRAINING                  ==
 // =========================================================================================
-// This configuration is optimized for SIREN models with automatic hardware detection.
-// Updated to fix issues and add missing options.
+// This configuration requires manual hardware-specific tuning by the user.
 
 {
   // ════════════════════════════════════════════════════════════════
   // ║                1. DATA & OUTPUT PATHS CONFIGURATION          ║
   // ════════════════════════════════════════════════════════════════
   "data_paths_config": {
-    "hdf5_dataset_filename": "chem_data/Xi_chem_data.h5",
-    "dataset_splits_filename": "chem_data/Xi_chem_data_splits.json"
+    "hdf5_dataset_filename": "chem_data/data.h5",
+    "dataset_splits_filename": "Xi_chem_data_splits.json"
   },
   
   "output_paths_config": {
-    "fixed_model_foldername": "trained_model_siren",
-    "tuning_results_foldername": "tuning_runs_siren"
+    "fixed_model_foldername": "trained_model_siren"
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -30,11 +28,11 @@
     ],
     
     // Global conditions (temperature, pressure)
-    "global_variables": ["P", "T"],
+    "global_variables": ["P_init", "T_init"],
     
     // All variables for normalization (must include all variables in HDF5)
     "all_variables": [
-      "P", "T", "t_time",
+      "P_init", "T_init", "t_time",
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
@@ -46,23 +44,35 @@
   // ══════════════════════════════════════════════════════════════════
   "normalization": {
     // Default method for all variables not specified in key_methods
-    // Options: "standard", "log-standard", "log-min-max", "iqr", 
-    //          "max-out", "scaled_signed_offset_log", "symlog", 
-    //          "signed-log", "bool", "none"
-    "default_method": "log-min-max",
+    // Setting to "error" will raise an exception for unspecified variables
+    "default_method": "error",
     
     // Override normalization for specific variables
     "key_methods": { 
-      "T": "standard",              // Temperature - usually linear scale
-      "P": "log-standard",          // Pressure - often log scale
-      "t_time": "log-min-max"       // Time - log scale bounded [0,1]
+      // Global variables
+      "T_init": "standard",              // Temperature - linear scale
+      "P_init": "log-min-max",          // Pressure - log scale
+      "t_time": "log-min-max",                // Time - symlog for wide range [1e-2, 1e8]
+      
+      "C2H2_evolution" : "log-min-max",
+      "CH4_evolution"  : "log-min-max",
+      "CO2_evolution"  : "log-min-max",
+      "CO_evolution"   : "log-min-max",
+      "H2O_evolution"  : "log-min-max",
+      "H2_evolution"   : "log-min-max",
+      "HCN_evolution"  : "log-min-max",
+      "H_evolution"    : "log-min-max",
+      "N2_evolution"   : "log-min-max",
+      "NH3_evolution"  : "log-min-max",
+      "OH_evolution"   : "log-min-max",
+      "O_evolution"    : "log-min-max"
     },
     
     // Percentile for symlog normalization threshold
-    "symlog_percentile": 0.2,
+    "symlog_percentile": 0.5,
     
     // Memory limit for quantile-based methods (IQR, symlog)
-    "quantile_max_values_in_memory": 50000000
+    "quantile_max_values_in_memory": 10000000
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -72,28 +82,22 @@
     // Model architecture - only SIREN is implemented
     "model_type": "siren",
     
-    // Network architecture - optimized for chemical kinetics
-    "hidden_dims": [256, 512, 512, 256],
+    // Network architecture
+    "hidden_dims": [384, 384, 384],
     
     // Dropout (not typically used with SIREN)
-    "dropout": 0.025,
+    "dropout": 0.0,
     
     // Time embedding configuration
     "use_time_embedding": true,
-    "time_embedding_dim": 32,
+    "time_embedding_dim": 64,
     
     // Conditioning dimension for FiLM modulation
-    "condition_dim": 64,
+    "condition_dim": 128,
     
     // SIREN-specific parameters
-    "siren_w0_initial": 10.0,      // Initial layer frequency (reduced for stability)
-    "siren_w0_hidden": 1.0,        // Hidden layer frequency
-    
-    // Output activation
-    "final_activation": false,       // Apply tanh to bound outputs
-    
-    // Memory optimization
-    "use_gradient_checkpointing": false  // Enable if GPU memory < 16GB
+    "siren_w0_initial": 50.0,      // Initial layer frequency
+    "siren_w0_hidden": 5.0         // Hidden layer frequency
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -103,24 +107,25 @@
     // Data split configuration
     "val_frac": 0.15,              // 15% for validation
     "test_frac": 0.15,             // 15% for test
-    "data_fraction": 1.0,          // Use full dataset (reduce for debugging)
+    "frac_of_data": 1.0,          // use 1% of each split
+
     
     // Training duration
     "epochs": 100,
     "early_stopping_patience": 20,
     "min_delta": 1e-6,
     
-    // Batch configuration - AUTO for hardware optimization
-    "batch_size": "auto",                    // Auto-detect based on GPU memory
-    "gradient_accumulation_steps": "auto",   // Auto-target effective batch ~16k
+    // Batch configuration - Adjust based on your hardware
+    "batch_size": 1024,                      
+    "gradient_accumulation_steps": 1,     
+    "max_steps_per_epoch": 50000,  
     
     // Optimizer settings (AdamW)
-    "learning_rate": 1e-4,         // Conservative for SIREN stability
-    "weight_decay": 1e-5,          // L2 regularization
+    "learning_rate": 1e-4,         
+    "weight_decay": 1e-5,          
     
     // Learning rate scheduling
     "scheduler_choice": "cosine",   // "cosine" or "plateau"
-    "warmup_epochs": 5,            // Linear warmup period
     
     // ReduceLROnPlateau parameters (if used)
     "patience": 10,                // Epochs without improvement
@@ -132,108 +137,43 @@
     "cosine_T_mult": 2,           // Period multiplier after restart
     
     // Loss function configuration
-    "loss_function": "mse",        // "mse" or "huber"
+    "loss_function": "huber",        // "mse" or "huber"
     "huber_delta": 0.5,           // Delta for Huber loss (if used)
     
     // Training stability
     "gradient_clip_val": 1.0,      // Max gradient norm
     
-    // Mixed precision training
-    "use_amp": false,            // Enable on capable GPUs (compute capability >= 7.0)
+    // Mixed precision training - Set based on your GPU
+    "use_amp": false,              
     
     // Batch validation thresholds
     "max_invalid_batches": 100,    // Stop if too many NaN/inf losses
-    "invalid_batch_threshold": 0.5  // Fraction of invalid batches to tolerate
+    "invalid_batch_threshold": 0.1  // Fraction of invalid batches to tolerate
   },
 
   // ════════════════════════════════════════════════════════════════
-  // ║              6. OPTUNA HYPERPARAMETER SEARCH                   ║
+  // ║                 6. NUMERICAL CONSTANTS                          ║
   // ════════════════════════════════════════════════════════════════
-  "optuna_settings": {
-    "study_name": "siren-kinetics-stable-v3",
-    "n_trials": 200,
-    "timeout": null,              // No timeout (use n_trials instead)
-    "pruner_warmup_steps": 10,    // Steps before pruning can occur
-    "pruner_startup_trials": 10,  // Trials before pruning starts
-    "show_progress_bar": true,
-    "callbacks": null             // No custom callbacks
-  },
-  
-  "optuna_hyperparam_search_space": {
-    // Network architecture search
-    "architecture": {
-      "num_hidden_layers": {"low": 2, "high": 5},
-      "hidden_dim": {"choices": [128, 256, 384, 512]}
-    },
+  "numerical_constants": {
+    // Small value to prevent log(0) and division by zero
+    "epsilon": 1e-37,
     
-    // Hyperparameter search ranges
-    "hyperparameters": {
-      // Optimizer parameters
-      "learning_rate": {
-        "type": "float",
-        "low": 1e-5,
-        "high": 5e-4,
-        "log": true
-      },
-      "weight_decay": {
-        "type": "float",
-        "low": 1e-7,
-        "high": 1e-4,
-        "log": true
-      },
-      
-      // SIREN-specific parameters
-      "siren_w0_initial": {
-        "type": "float",
-        "low": 1.0,
-        "high": 30.0,
-        "log": false
-      },
-      "siren_w0_hidden": {
-        "type": "float",
-        "low": 0.5,
-        "high": 2.0,
-        "log": false
-      },
-      
-      // Model architecture parameters
-      "condition_dim": {
-        "type": "categorical",
-        "choices": [32, 64, 128]
-      },
-      "time_embedding_dim": {
-        "type": "categorical",
-        "choices": [16, 32, 64]
-      },
-      
-      // Training parameters
-      "warmup_epochs": {
-        "type": "int",
-        "low": 0,
-        "high": 10
-      },
-      "batch_size": {
-        "type": "categorical",
-        "choices": [512, 1024, 2048, 4096]
-      },
-      
-      // Loss function parameters
-      "loss_function": {
-        "type": "categorical",
-        "choices": ["mse", "huber"]
-      },
-      "huber_delta": {
-        "type": "float",
-        "low": 0.1,
-        "high": 1.0
-      },
-      
-      // Scheduler selection
-      "scheduler_choice": {
-        "type": "categorical",
-        "choices": ["cosine", "plateau"]
-      }
-    }
+    // Clamp range for normalized values to prevent extreme outliers
+    "normalized_value_clamp": 100.0,
+    
+    // Minimum allowed standard deviation to prevent division issues
+    "min_std": 1e-10,
+    
+    // Minimum time steps required per profile
+    "min_time_steps": 10,
+
+    
+    // Default values moved from hardcoded constants
+    "default_seed": 42,
+    "default_time_embedding_dim": 64,
+    "default_condition_dim": 64,
+    "default_omega_0": 15.0,
+    "siren_init_scale": 1.0
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -243,29 +183,26 @@
     // Reproducibility
     "random_seed": 42,
     
-    // DataLoader configuration - AUTO optimized
-    "num_dataloader_workers": "auto",     // Auto-detect based on CPU cores and dataset type
+    // DataLoader configuration - Adjust based on your system
+    "num_dataloader_workers": 24,          
     
     // Memory management for streaming datasets
-    "profiles_per_chunk": "auto",         // Auto-set based on available memory
-    "max_memory_per_worker_gb": "auto",   // Auto-set to safe default (2GB)
+    "profiles_per_chunk": 20480,           
+    // Chunk sizes for data processing
+    "default_chunk_size": 20480,
+    "stats_chunk_size": 20480,
     
-    // Dataset caching strategy
-    "cache_dataset": "auto",              // Auto-decide based on dataset size vs RAM
     
-    // PyTorch 2.0 compilation (if available)
-    "use_torch_compile": "auto",          // Enable on compatible GPUs
-    "torch_compile_mode": "reduce-overhead",  // "default", "reduce-overhead", or "max-autotune"
-    
-    // Model export
-    "export_jit_model": true,             // Export TorchScript model after training
+    // PyTorch 2.0 compilation - Set based on your hardware
+    "use_torch_compile": true,           
+    "torch_compile_mode": "default", 
+    "save_jit_model": true,
     
     // Training monitoring
-    "show_epoch_progress": true,          // Show progress bar during epochs
-    "log_gradient_norms": true,           // Log gradient norms for stability monitoring
-    "save_checkpoint_every_n_epochs": 10, // Periodic checkpointing
+    "show_epoch_progress": true,          
+    "log_gradient_norms": true,           
     
     // Debugging options (disable for production)
-    "detect_anomaly": false               // Enable to debug NaN/inf issues (slows training)
+    "detect_anomaly": false               
   }
 }
