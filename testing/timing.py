@@ -20,7 +20,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import os
 
+plt.style.use('science.mplstyle')
 
 # ─────────────────── model utils ───────────────────
 def load_ts(path: Path) -> torch.jit.ScriptModule:
@@ -78,18 +80,22 @@ def bench(model, dim_in: int, batches: list[int], workers: int, iters=100, warm=
 
 
 # ─────────────── plotting util ────────────────
-def plot(r):
+def plot(base_dir, r):
     f,(a,b)=plt.subplots(1,2,figsize=(11,4))
-    a.loglog(r["bs"],r["lat_ms"],'o-'); a.set(xlabel="batch",ylabel="ms",title="latency"); a.grid(True,which="both",alpha=.3)
-    b.loglog(r["bs"],r["thr"],'s-'); b.set(xlabel="batch",ylabel="samples/s",title="throughput"); b.grid(True,which="both",alpha=.3)
-    plt.tight_layout(); plt.savefig("cpu_bench.png",dpi=140); plt.show()
+    a.loglog(r["bs"],r["lat_ms"],'o-', linewidth=2)
+    a.set(xlabel="batch",ylabel="Miliseconds for batch")
+    b.loglog(r["bs"],1e6/np.asarray(r["thr"]),'o-', linewidth=2)
+    b.set(xlabel="batch",ylabel="µs/sample",title="throughput")
+    
+    plt.tight_layout()
+    plt.savefig(base_dir/"figures/cpu_bench.png",dpi=250)
 
 
 # ─────────────────── main ──────────────────────
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-dir", default="../data/trained_model_siren_v3")
-    ap.add_argument("--max-batch", type=int, default=2**14)
+    ap.add_argument("--model", default="trained_model_siren_v3")
+    ap.add_argument("--max-batch", type=int, default=2**12)
     ap.add_argument("--threads", type=int, default=4, help="intra-op threads per op")
     ap.add_argument("--workers", type=int, default=8, help="Python threads that call the model")
     args = ap.parse_args()
@@ -97,17 +103,27 @@ def main():
     if args.threads:
         torch.set_num_threads(args.threads)
         torch.set_num_interop_threads(1)  # leave inter-op to us
+    
+    base_dir = Path(__file__).parent.parent / "data" / args.model
 
-    cfg = json.load(open(Path(args.model_dir)/"run_config.json"))
+
+    config_path = base_dir / "run_config.json"
+
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
     d_in = len(cfg["data_specification"]["species_variables"])+len(cfg["data_specification"]["global_variables"])+1
-    batches = [1];  # 1,2,4,...<=max_batch
+    batches = [1]
     while batches[-1] < args.max_batch: batches.append(batches[-1]*2)
     batches[-1]=min(batches[-1],args.max_batch)
 
-    model = load_ts(Path(args.model_dir))
+    model = load_ts(base_dir)
     res = bench(model, d_in, batches, args.workers)
     json.dump(res, open("cpu_bench.json","w"), indent=2)
-    plot(res)
+
+    os.makedirs(base_dir/"figures", exist_ok=True)
+
+    plot(base_dir, res)
 
 
 if __name__ == "__main__":
