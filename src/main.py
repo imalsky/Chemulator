@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-main.py - Optimized main entry point with auto-configuration support
+main.py - Simplified main entry point for training pipeline
+
+This module serves as the main entry point for the chemical kinetics
+prediction model training pipeline. It handles configuration loading,
+environment setup, and orchestrates the training process.
 """
 from __future__ import annotations
 
@@ -15,8 +19,7 @@ from typing import Any, Dict
 import torch
 
 from dataset import collate_fn
-from hardware import setup_device, auto_configure_training_params
-from hyperparams import run_hyperparameter_search
+from hardware import setup_device
 from train import ModelTrainer
 from utils import (
     ensure_dirs,
@@ -31,7 +34,6 @@ from utils import (
 # --- Constants ---
 DEFAULT_CONFIG_PATH = Path("inputs/config.jsonc")
 DEFAULT_DATA_DIR_PATH = Path("data")
-DEFAULT_RANDOM_SEED = 42
 LOG_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -41,9 +43,9 @@ DATA_PATHS_SECTION = "data_paths_config"
 OUTPUT_PATHS_SECTION = "output_paths_config"
 HDF5_DATASET_KEY = "hdf5_dataset_filename"
 FIXED_MODEL_KEY = "fixed_model_foldername"
-TUNING_RESULTS_KEY = "tuning_results_foldername"
 MISC_SECTION = "miscellaneous_settings"
 RANDOM_SEED_KEY = "random_seed"
+NUM_CONSTANTS_SECTION = "numerical_constants"
 
 # --- Global PyTorch & Warning Settings ---
 torch.set_float32_matmul_precision("high")
@@ -58,7 +60,19 @@ class PipelineError(Exception):
 
 
 def _get_h5_path(config: Dict[str, Any], data_root_dir: Path) -> Path:
-    """Get and validate HDF5 dataset path."""
+    """
+    Get and validate HDF5 dataset path.
+    
+    Args:
+        config: Configuration dictionary
+        data_root_dir: Root directory for data files
+        
+    Returns:
+        Path to HDF5 file
+        
+    Raises:
+        PipelineError: If HDF5 file not found
+    """
     h5_filename = get_config_str(config, DATA_PATHS_SECTION, HDF5_DATASET_KEY, "HDF5 data loading")
     h5_path = data_root_dir / h5_filename
     
@@ -68,26 +82,29 @@ def _get_h5_path(config: Dict[str, Any], data_root_dir: Path) -> Path:
     return h5_path
 
 
-def _run_fixed_training(config: Dict[str, Any], data_root_dir: Path) -> None:
-    """Runs training with a single, fixed configuration."""
-    logger.info("Starting model training with fixed configuration...")
+def _run_training(config: Dict[str, Any], data_root_dir: Path) -> None:
+    """
+    Runs training with the given configuration.
+    
+    Args:
+        config: Configuration dictionary
+        data_root_dir: Root directory for data files
+        
+    Raises:
+        PipelineError: If training fails
+    """
+    logger.info("Starting model training...")
     
     # Get HDF5 path
     h5_path = _get_h5_path(config, data_root_dir)
     
-    # Auto-configure parameters if 'auto' is present
-    config = auto_configure_training_params(config, h5_path)
-    
-    model_folder = get_config_str(config, OUTPUT_PATHS_SECTION, FIXED_MODEL_KEY, "fixed training")
+    model_folder = get_config_str(config, OUTPUT_PATHS_SECTION, FIXED_MODEL_KEY, "model training")
     model_save_dir = data_root_dir / model_folder
     # Directory will be created by save_json if needed
     save_json(config, model_save_dir / "run_config.json")
     
-    # Load or generate splits
-    splits, splits_path = load_or_generate_splits(config, data_root_dir, h5_path)
-    
-    # Save splits info to model directory
-    save_json({"splits_file": str(splits_path.resolve())}, model_save_dir / "splits_info.json")
+    # Load or generate splits - now passing model_save_dir
+    splits, splits_path = load_or_generate_splits(config, data_root_dir, h5_path, model_save_dir)
     
     try:
         trainer = ModelTrainer(
@@ -99,73 +116,40 @@ def _run_fixed_training(config: Dict[str, Any], data_root_dir: Path) -> None:
             collate_fn=collate_fn
         )
         trainer.train()
-        logger.info("Fixed configuration training completed successfully.")
+        logger.info("Training completed successfully.")
     except Exception as e:
-        raise PipelineError(f"Fixed model training failed: {e}") from e
-
-
-def _run_hyperparameter_tuning(config: Dict[str, Any], data_root_dir: Path) -> None:
-    """Manages the Optuna hyperparameter tuning process."""
-    logger.info("Starting hyperparameter search...")
-    
-    # Get HDF5 path
-    h5_path = _get_h5_path(config, data_root_dir)
-    
-    # Auto-configure base parameters if 'auto' is present
-    config = auto_configure_training_params(config, h5_path)
-    
-    # Load or generate splits
-    splits, splits_path = load_or_generate_splits(config, data_root_dir, h5_path)
-    
-    # Save splits info to tuning directory
-    tuning_folder = get_config_str(config, OUTPUT_PATHS_SECTION, TUNING_RESULTS_KEY, "tuning results")
-    tuning_dir = data_root_dir / tuning_folder
-    # Directory will be created by save_json if needed
-    save_json({"splits_file": str(splits_path.resolve())}, tuning_dir / "splits_info.json")
-
-    try:
-        best_config = run_hyperparameter_search(
-            base_config=config,
-            data_root_dir=data_root_dir,
-            h5_path=h5_path,
-            splits=splits,
-            collate_fn=collate_fn,
-        )
-        if best_config is None:
-            raise PipelineError("Hyperparameter search returned no valid configuration.")
-        logger.info("Hyperparameter tuning completed successfully.")
-    except Exception as e:
-        raise PipelineError(f"Hyperparameter tuning failed: {e}") from e
+        raise PipelineError(f"Model training failed: {e}") from e
 
 
 def _parse_command_line_arguments() -> argparse.Namespace:
-    """Parses command-line arguments."""
+    """
+    Parses command-line arguments.
+    
+    Returns:
+        Parsed command line arguments
+    """
     parser = argparse.ArgumentParser(
-        description="Chemical reaction predictor training pipeline (Optimized).",
+        description="Chemical reaction predictor training pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
         "--config", type=Path, default=DEFAULT_CONFIG_PATH, 
-        help="Path to the main configuration file."
+        help="Path to the configuration file."
     )
     parser.add_argument(
         "--data-dir", type=Path, default=DEFAULT_DATA_DIR_PATH, 
         help="Path to the root data directory."
     )
-    action_group = parser.add_mutually_exclusive_group(required=True)
-    action_group.add_argument(
-        "--train", action="store_true", 
-        help="Train a model with a fixed configuration."
-    )
-    action_group.add_argument(
-        "--tune", action="store_true", 
-        help="Run Optuna hyperparameter search."
-    )
     return parser.parse_args()
 
 
 def main() -> int:
-    """Main entry point for the pipeline."""
+    """
+    Main entry point for the pipeline.
+    
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
     args = _parse_command_line_arguments()
     
     # Ensure root data directory exists before setting up logging
@@ -174,17 +158,17 @@ def main() -> int:
     setup_logging(log_file=log_file)
     
     try:
-        logger.info(f"Pipeline started with action: {'--train' if args.train else '--tune'}")
+        logger.info("Pipeline started")
         logger.info(f"Using config: {args.config.resolve()}")
         config = load_config(args.config)
         
-        seed = config.get(MISC_SECTION, {}).get(RANDOM_SEED_KEY, DEFAULT_RANDOM_SEED)
+        # Get seed from config with proper fallback chain
+        num_constants = config.get(NUM_CONSTANTS_SECTION, {})
+        default_seed = num_constants.get("default_seed", 42)
+        seed = config.get(MISC_SECTION, {}).get(RANDOM_SEED_KEY, default_seed)
         seed_everything(seed)
         
-        if args.train:
-            _run_fixed_training(config, args.data_dir)
-        elif args.tune:
-            _run_hyperparameter_tuning(config, args.data_dir)
+        _run_training(config, args.data_dir)
         
         logger.info("Pipeline process completed successfully.")
         return EXIT_SUCCESS

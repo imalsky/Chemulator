@@ -9,20 +9,16 @@ from __future__ import annotations
 
 import logging
 import math
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from pathlib import Path
 
-# --- Constants ---
-DEFAULT_TIME_EMBEDDING_DIM = 32
-DEFAULT_CONDITION_DIM = 128
-DEFAULT_OMEGA_0 = 30.0
+# Constants
 MATMUL_PRECISION = "high"
-SIREN_INIT_SCALE = 1.0
 
 logger = logging.getLogger(__name__)
 torch.set_float32_matmul_precision(MATMUL_PRECISION)
@@ -123,7 +119,7 @@ class FiLMLayer(nn.Module):
         self.generator = nn.Sequential(
             nn.Linear(condition_dim, feature_dim * 2),
             nn.LayerNorm(feature_dim * 2),
-            nn.SiLU(),
+            nn.GELU(),
             nn.Linear(feature_dim * 2, feature_dim * 2)
         )
         
@@ -176,9 +172,11 @@ class SineLayer(nn.Module):
     
     def __init__(self, in_features: int,
                  out_features: int,
+                 omega_0: float,
+                 *,
                  bias: bool = True,
                  is_first: bool = False,
-                 omega_0: float = DEFAULT_OMEGA_0) -> None:
+                 siren_init_scale: float = 1.0) -> None:
         """
         Initialize SIREN sine layer.
         
@@ -188,10 +186,12 @@ class SineLayer(nn.Module):
             bias: Whether to use bias
             is_first: Whether this is the first layer (affects initialization)
             omega_0: Frequency scaling factor
+            siren_init_scale: Scale factor for initialization
         """
         super().__init__()
         self.omega_0 = omega_0
         self.is_first = is_first
+        self.siren_init_scale = siren_init_scale
         self.linear = nn.Linear(in_features, out_features, bias=bias)
         self._init_weights()
     
@@ -200,7 +200,7 @@ class SineLayer(nn.Module):
         with torch.no_grad():
             if self.is_first:
                 # More conservative initialization for first layer
-                bound = 1.0 / self.linear.in_features
+                bound = self.siren_init_scale / self.linear.in_features
                 self.linear.weight.uniform_(-bound, bound)
             else:
                 # Account for sine activation variance
@@ -235,7 +235,7 @@ class FiLM_SIREN(nn.Module):
     def __init__(
         self, num_species: int, num_global_vars: int, hidden_dims: List[int],
         use_time_embedding: bool, time_embedding_dim: int, condition_dim: int,
-        w0_initial: float, w0_hidden: float, final_activation: bool = True, **kwargs
+        w0_initial: float, w0_hidden: float, siren_init_scale: float, **kwargs
     ) -> None:
         """
         Initialize FiLM-SIREN model.
@@ -249,50 +249,48 @@ class FiLM_SIREN(nn.Module):
             condition_dim: Dimension of conditioning vector
             w0_initial: Omega_0 for first SIREN layer
             w0_hidden: Omega_0 for hidden SIREN layers
-            final_activation: Whether to apply tanh to final output
+            siren_init_scale: Scale factor for SIREN initialization
             **kwargs: Additional unused arguments for compatibility
         """
         super().__init__()
         self.num_species = num_species
         self.use_time_embedding = use_time_embedding
+        self.time_embedding_dim = time_embedding_dim if use_time_embedding else 1
         
-        # Time embedding module
+        # Time embedding module - always create it for JIT compatibility
         self.time_embed = TimeEmbedding(
-            time_embedding_dim, learnable_scale=True
-        ) if use_time_embedding else None
+            self.time_embedding_dim, learnable_scale=True
+        )
         
         # Conditioning network - processes global variables and time
-        time_dim = time_embedding_dim if use_time_embedding else 1
-        condition_input_dim = num_global_vars + time_dim
+        condition_input_dim = num_global_vars + self.time_embedding_dim
         self.conditioning_net = nn.Sequential(
             nn.LayerNorm(condition_input_dim),
             nn.Linear(condition_input_dim, condition_dim),
-            nn.SiLU(),
+            nn.GELU(),
             nn.Linear(condition_dim, condition_dim)
         )
         
-        # Input projection and FiLM modulation
-        self.input_proj = nn.Linear(num_species, hidden_dims[0])
-        self.film_layer = FiLMLayer(condition_dim, hidden_dims[0], use_norm=False, residual=False)
+        # FiLM modulation for initial species coordinates
+        self.film_layer = FiLMLayer(condition_dim, num_species, use_norm=False, residual=False)
         
         # SIREN layers
         siren_layers = []
-        in_dim = hidden_dims[0]
+        in_dim = num_species
         
         for i, out_dim in enumerate(hidden_dims):
             is_first = (i == 0)
             omega = w0_initial if is_first else w0_hidden
-            siren_layers.append(SineLayer(in_dim, out_dim, is_first=is_first, omega_0=omega))
+            siren_layers.append(SineLayer(
+                in_dim, out_dim, is_first=is_first, 
+                omega_0=omega, siren_init_scale=siren_init_scale
+            ))
             in_dim = out_dim
         
         self.net = nn.Sequential(*siren_layers)
         
         # Output layer
         self.output_linear = nn.Linear(in_dim, num_species)
-        if final_activation:
-            self.final_activation = nn.Tanh()
-        else:
-            self.final_activation = nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -308,36 +306,29 @@ class FiLM_SIREN(nn.Module):
         Returns:
             Predicted species concentrations at the query time
         """
-        # --- FIX STARTS HERE ---
-        # Clone the input tensor to prevent CUDAGraphs from accessing
-        # memory that has been overwritten by the DataLoader. This is the
-        # most robust fix for this class of errors.
-        x = x.clone()
-        # --- FIX ENDS HERE ---
-        
         # Split input into components
         initial_species = x[:, :self.num_species]
         global_and_time = x[:, self.num_species:]
         
         # Process conditioning information
-        if self.use_time_embedding and self.time_embed is not None:
-            time_emb = self.time_embed(global_and_time[:, -1])
-            condition_input = torch.cat([global_and_time[:, :-1], time_emb], dim=-1)
-        else:
-            condition_input = global_and_time
+        # Extract time value (last element)
+        time_raw = global_and_time[:, -1]
+        time_emb = self.time_embed(time_raw)
         
+        # If not using time embedding, just use raw time value expanded to match dimension
+        if not self.use_time_embedding:
+            time_emb = time_raw.unsqueeze(-1).expand(-1, self.time_embedding_dim)
+        
+        condition_input = torch.cat([global_and_time[:, :-1], time_emb], dim=-1)
         condition_vector = self.conditioning_net(condition_input)
         
         # Process through SIREN with FiLM modulation
-        coords = self.input_proj(initial_species)
-        coords = self.film_layer(coords, condition_vector)
+        coords = self.film_layer(initial_species, condition_vector)
         coords = self.net(coords)
         delta = self.output_linear(coords)
-        delta = self.final_activation(delta)
         
-        # Residual connection - predict change from initial state
-        return initial_species + delta
-
+        prediction = initial_species.clone() + delta
+        return torch.clamp_min(prediction, 0.0)
 
 # --- Factory Function ---
 
@@ -357,6 +348,7 @@ def create_prediction_model(
     """
     model_params = config["model_hyperparameters"]
     data_spec = config["data_specification"]
+    num_constants = config.get("numerical_constants", {})
     
     # Verify model type is SIREN
     model_type = model_params.get("model_type", "siren").lower()
@@ -365,17 +357,23 @@ def create_prediction_model(
     
     logger.info("Creating SIREN model")
     
+    # Get constants from config with fallbacks
+    default_time_embedding_dim = num_constants.get("default_time_embedding_dim", 64)
+    default_condition_dim = num_constants.get("default_condition_dim", 64)
+    default_omega_0 = num_constants.get("default_omega_0", 15.0)
+    siren_init_scale = num_constants.get("siren_init_scale", 1.0)
+    
     # Model arguments
     model_args = {
         "num_species": len(data_spec["species_variables"]),
         "num_global_vars": len(data_spec["global_variables"]),
         "hidden_dims": model_params["hidden_dims"],
         "use_time_embedding": model_params.get("use_time_embedding", True),
-        "time_embedding_dim": model_params.get("time_embedding_dim", DEFAULT_TIME_EMBEDDING_DIM),
-        "condition_dim": model_params.get("condition_dim", DEFAULT_CONDITION_DIM),
-        "w0_initial": model_params.get("siren_w0_initial", DEFAULT_OMEGA_0),
-        "w0_hidden": model_params.get("siren_w0_hidden", DEFAULT_OMEGA_0),
-        "final_activation": model_params.get("final_activation", True),
+        "time_embedding_dim": model_params.get("time_embedding_dim", default_time_embedding_dim),
+        "condition_dim": model_params.get("condition_dim", default_condition_dim),
+        "w0_initial": model_params.get("siren_w0_initial", default_omega_0),
+        "w0_hidden": model_params.get("siren_w0_hidden", default_omega_0),
+        "siren_init_scale": siren_init_scale,
     }
     
     # Create model
@@ -417,17 +415,20 @@ def export_model_jit(
     model.eval()
     
     with torch.no_grad():
-        # Try scripting first, fall back to tracing if needed
+        # Use tracing for SIREN models
         try:
-            scripted_model = torch.jit.script(model)
-            logger.info("Model successfully scripted.")
+            scripted_model = torch.jit.trace(model, example_input, strict=False)
+            logger.info("Model successfully traced.")
         except Exception as e:
-            logger.warning(f"JIT script failed: {e}. Trying trace...")
-            scripted_model = torch.jit.trace(model, example_input)
+            logger.error(f"JIT trace failed: {e}. Model export skipped.")
+            return
         
         # Apply optimizations if requested
         if optimize:
-            scripted_model = torch.jit.optimize_for_inference(scripted_model)
+            try:
+                scripted_model = torch.jit.optimize_for_inference(scripted_model)
+            except Exception as e:
+                logger.warning(f"JIT optimization failed: {e}. Saving unoptimized model.")
         
         # Verify output matches original model
         test_output = scripted_model(example_input)
@@ -438,8 +439,11 @@ def export_model_jit(
             logger.warning("JIT output differs from original model!")
     
     # Save the exported model
-    scripted_model.save(str(save_path))
-    logger.info(f"JIT model saved to: {save_path}")
+    try:
+        scripted_model.save(str(save_path))
+        logger.info(f"JIT model saved to: {save_path}")
+    except Exception as e:
+        logger.error(f"Failed to save JIT model: {e}")
 
 
 __all__ = ["FiLM_SIREN", "create_prediction_model", "export_model_jit"]
