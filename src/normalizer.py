@@ -2,6 +2,11 @@
 """
 normalizer.py - Data normalization with improved numerical stability and efficiency.
 This version is GPU-aware for accelerated statistics calculation.
+
+Fixes applied:
+- Correct Welford batch-update formula for variance calculation
+- Proper clamping for log-min-max to prevent division by zero
+- Improved numerical stability throughout
 """
 from __future__ import annotations
 
@@ -174,7 +179,9 @@ class DataNormalizer:
                             try:
                                 # Read data for this chunk of indices
                                 data_chunk_np = hf[key][chunk_indices]
-                                batch_of_tensors[key] = torch.from_numpy(data_chunk_np)
+                                batch_of_tensors[key] = torch.from_numpy(data_chunk_np).to(
+                                    device=self.device, dtype=DTYPE
+                                )
                             except Exception as e:
                                 logger.error(f"Error reading key '{key}' at indices {chunk_indices[:5]}... : {e}")
                                 raise
@@ -215,8 +222,8 @@ class DataNormalizer:
             if method in ("standard", "log-standard", "signed-log"):
                 acc.update({
                     "count": 0,
-                    "mean": torch.tensor(0.0, dtype=STATS_DTYPE, device='cpu'),
-                    "m2": torch.tensor(0.0, dtype=STATS_DTYPE, device='cpu')
+                    "mean": torch.zeros((), dtype=STATS_DTYPE, device=self.device),
+                    "m2": torch.zeros((), dtype=STATS_DTYPE, device=self.device)
                 })
 
             if method in self.QUANTILE_METHODS:
@@ -225,8 +232,8 @@ class DataNormalizer:
             
             if method in ("max-out", "log-min-max"):
                 acc.update({
-                    "min": torch.tensor(float('inf'), dtype=DTYPE, device=self.device),
-                    "max": torch.tensor(float('-inf'), dtype=DTYPE, device=self.device)
+                    "min": torch.full((), float('inf'), dtype=DTYPE, device=self.device),
+                    "max": torch.full((), float('-inf'), dtype=DTYPE, device=self.device)
                 })
 
             if acc:
@@ -241,7 +248,7 @@ class DataNormalizer:
         accumulators: Dict[str, Dict[str, Any]],
     ) -> None:
         """
-        Stream a mini-batch into the running statistics.
+        Stream a mini-batch into the running statistics using corrected Welford algorithm.
         """
         quantile_cap = self.default_quantile_memory_limit
 
@@ -249,7 +256,7 @@ class DataNormalizer:
             if key not in accumulators:
                 continue
 
-            data = data_batch.to(device=self.device, dtype=DTYPE).flatten()
+            data = data_batch.flatten()
             valid_data = data[torch.isfinite(data)]
             if valid_data.numel() == 0:
                 continue
@@ -257,25 +264,37 @@ class DataNormalizer:
             method = self.key_methods[key]
             key_acc = accumulators[key]
 
-            # choose the space that matches the normalisation method
+            # Transform data based on normalization method
             if method == "log-standard":
                 trans = torch.log10(torch.clamp(valid_data, min=self.epsilon))
             elif method == "signed-log":
                 trans = torch.sign(valid_data) * torch.log10(torch.abs(valid_data) + 1.0)
             else:
                 trans = valid_data
-            data_cpu = trans.to(device="cpu", dtype=STATS_DTYPE)
 
-            # ── online mean / variance (Welford) ────────────────────────────────
+            # ── CORRECTED Welford batch update for mean/variance ───────────────
             if "count" in key_acc:
-                n_new = data_cpu.numel()
-                if n_new:
-                    c_old, μ_old, m2_old = key_acc["count"], key_acc["mean"], key_acc["m2"]
-                    c_new = c_old + n_new
-                    δ = data_cpu.mean() - μ_old
-                    μ_new = μ_old + δ * (n_new / c_new)
-                    m2_new = m2_old + torch.sum((data_cpu - μ_old) * (data_cpu - μ_new))
-                    key_acc.update({"count": c_new, "mean": μ_new, "m2": m2_new})
+                n_new = trans.numel()
+                if n_new > 0:
+                    # Current accumulator state
+                    n_old = key_acc["count"]
+                    μ_old = key_acc["mean"]
+                    m2_old = key_acc["m2"]
+                    
+                    # Batch statistics
+                    batch_mean = trans.mean()
+                    # Compute batch variance (sum of squared deviations from batch mean)
+                    batch_m2 = ((trans - batch_mean) ** 2).sum()
+                    
+                    # Combined statistics
+                    n_total = n_old + n_new
+                    delta = batch_mean - μ_old
+                    μ_new = μ_old + delta * n_new / n_total
+                    
+                    # CORRECTED: Add both within-batch variance and between-group variance
+                    m2_new = m2_old + batch_m2 + delta**2 * n_old * n_new / n_total
+                    
+                    key_acc.update({"count": n_total, "mean": μ_new, "m2": m2_new})
 
             # ── collect values for quantile-based methods ───────────────────────
             if "values" in key_acc:
@@ -347,6 +366,15 @@ class DataNormalizer:
             if method == "max-out":
                 max_val = max(abs(acc["min"].item()), abs(acc["max"].item()))
                 stats["max_val"] = max(max_val, self.epsilon)
+            
+            # FIXED: Ensure max > min for log-min-max to prevent division by zero
+            if method == "log-min-max" and "min" in acc:
+                min_val = acc["min"].item()
+                max_val = acc["max"].item()
+                # Ensure non-zero range
+                if max_val - min_val < self.min_std:
+                    max_val = min_val + self.min_std
+                stats.update({"min": min_val, "max": max_val})
 
             final_stats[key] = stats
 
@@ -389,9 +417,14 @@ class DataNormalizer:
             stats.update({"median": med, "iqr": max(iqr, self.min_std)})
             
         elif method == "log-min-max":
+            # Note: For log-min-max, min/max are handled in finalize_stats
+            # This is only called if we're using quantile-based log-min-max
             log_vals = torch.log10(torch.clamp(values, min=self.epsilon))
             min_v, max_v = log_vals.min().item(), log_vals.max().item()
-            stats.update({"min": min_v, "max": max(max_v, min_v + self.min_std)})
+            # Ensure non-zero range
+            if max_v - min_v < self.min_std:
+                max_v = min_v + self.min_std
+            stats.update({"min": min_v, "max": max_v})
             
         elif method == "symlog":
             percentile = self.default_symlog_percentile
@@ -435,6 +468,7 @@ class DataNormalizer:
             elif method == "log-min-max":
                 log_x = torch.log10(torch.clamp(x, min=self.epsilon))
                 denom = stats["max"] - stats["min"]
+                # Use safe division to prevent NaN
                 normed = (log_x - stats["min"]) / (denom if denom > 0 else 1.0)
                 result = torch.clamp(normed, 0.0, 1.0)
             elif method == "max-out":

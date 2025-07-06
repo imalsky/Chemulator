@@ -148,10 +148,31 @@ def validate_config(config: Dict[str, Any]) -> None:
     if not isinstance(model_params.get("hidden_dims"), list) or not model_params.get("hidden_dims"):
         raise ValueError("Config key 'hidden_dims' in 'model_hyperparameters' must be a non-empty list.")
     
-    # Validate model type (should be SIREN)
+    # Validate model type (SIREN and FNO are both supported)
     model_type = model_params.get("model_type", "siren").lower()
-    if model_type != "siren":
-        logger.warning(f"Model type '{model_type}' specified, but only SIREN is implemented.")
+    supported_models = ["siren", "fno"]
+    if model_type not in supported_models:
+        raise ValueError(
+            f"Model type '{model_type}' is not supported. "
+            f"Supported types are: {', '.join(supported_models)}"
+        )
+    
+    # Log which model type is configured
+    logger.info(f"Configuration specifies model type: '{model_type}'")
+    
+    # Validate model-specific parameters
+    if model_type == "siren":
+        # Check SIREN-specific parameters
+        if "condition_dim" not in model_params:
+            logger.warning("'condition_dim' not specified for SIREN model, will use default from numerical_constants")
+        if "siren_w0_initial" not in model_params:
+            logger.warning("'siren_w0_initial' not specified for SIREN model, will use default from numerical_constants")
+    elif model_type == "fno":
+        # Check FNO-specific parameters
+        if "fno_fourier_features" not in model_params:
+            logger.warning("'fno_fourier_features' not specified for FNO model, will use default 256")
+        if "fno_spectral_modes" not in model_params:
+            logger.warning("'fno_spectral_modes' not specified for FNO model, will use default 16")
     
     # Validate numeric parameters
     dropout = model_params.get("dropout")

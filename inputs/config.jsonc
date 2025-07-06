@@ -1,7 +1,8 @@
 // =========================================================================================
-// ==              SIMPLIFIED SIREN CONFIGURATION FOR STREAMING TRAINING                  ==
+// ==              UNIFIED CONFIGURATION FOR SIREN AND FNO MODELS                        ==
 // =========================================================================================
-// This configuration requires manual hardware-specific tuning by the user.
+// This configuration supports both SIREN and FNO architectures for chemical kinetics prediction.
+// Select the model type in the "model_hyperparameters" section.
 
 {
   // ════════════════════════════════════════════════════════════════
@@ -13,7 +14,7 @@
   },
   
   "output_paths_config": {
-    "fixed_model_foldername": "trained_model_siren"
+    "fixed_model_foldername": "trained_model"  // Will be appended with model type
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -52,8 +53,9 @@
       // Global variables
       "T_init": "standard",              // Temperature - linear scale
       "P_init": "log-min-max",          // Pressure - log scale
-      "t_time": "log-min-max",                // Time - symlog for wide range [1e-2, 1e8]
+      "t_time": "log-min-max",          // Time - log scale for wide range
       
+      // Species variables - all use log-min-max for concentration ranges
       "C2H2_evolution" : "log-min-max",
       "CH4_evolution"  : "log-min-max",
       "CO2_evolution"  : "log-min-max",
@@ -76,28 +78,50 @@
   },
 
   // ════════════════════════════════════════════════════════════════
-  // ║              4. MODEL HYPERPARAMETERS (SIREN)                ║
+  // ║                    4. MODEL HYPERPARAMETERS                    ║
   // ════════════════════════════════════════════════════════════════
   "model_hyperparameters": {
-    // Model architecture - only SIREN is implemented
-    "model_type": "siren",
+    // ╔═══════════════════════════════════════════════════════════╗
+    // ║  MODEL SELECTION: Choose "siren" or "fno"                ║
+    // ╚═══════════════════════════════════════════════════════════╝
+    "model_type": "fno",  // Options: "siren" or "fno"
     
-    // Network architecture
+    // ┌───────────────────────────────────────────────────────────┐
+    // │                   Common Parameters                       │
+    // └───────────────────────────────────────────────────────────┘
+    // Network architecture - shared by both models
     "hidden_dims": [384, 384, 384],
     
-    // Dropout (not typically used with SIREN)
-    "dropout": 0.0,
-    
-    // Time embedding configuration
+    // Time embedding configuration - shared by both models
     "use_time_embedding": true,
     "time_embedding_dim": 64,
     
-    // Conditioning dimension for FiLM modulation
+    // ┌───────────────────────────────────────────────────────────┐
+    // │              SIREN-Specific Parameters                    │
+    // └───────────────────────────────────────────────────────────┘
+    // Conditioning dimension for FiLM modulation (SIREN only)
     "condition_dim": 128,
     
-    // SIREN-specific parameters
+    // SIREN frequency parameters
     "siren_w0_initial": 50.0,      // Initial layer frequency
-    "siren_w0_hidden": 5.0         // Hidden layer frequency
+    "siren_w0_hidden": 5.0,        // Hidden layer frequency
+    
+    // ┌───────────────────────────────────────────────────────────┐
+    // │                FNO-Specific Parameters                    │
+    // └───────────────────────────────────────────────────────────┘
+    // Random Fourier features (FNO only)
+    "fno_fourier_features": 256,   // Number of Fourier features
+    "fno_fourier_scale": 1.0,      // Scale for Fourier frequencies
+    
+    // Spectral convolution parameters (FNO only)
+    "fno_spectral_modes": 16,      // Number of Fourier modes to keep
+    "fno_seq_length": 32,          // Length of temporary sequences
+    
+    // Dropout for FNO (typically higher than SIREN)
+    "dropout": 0.0,                // Only used by FNO
+    
+    // Output activation for FNO
+    "output_activation": "softplus" // Options: "sigmoid", "softplus", "none"
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -107,8 +131,7 @@
     // Data split configuration
     "val_frac": 0.15,              // 15% for validation
     "test_frac": 0.15,             // 15% for test
-    "frac_of_data": 1.0,          // use 1% of each split
-
+    "frac_of_data": 1.0,          // Use full dataset
     
     // Training duration
     "epochs": 100,
@@ -138,7 +161,7 @@
     
     // Loss function configuration
     "loss_function": "huber",        // "mse" or "huber"
-    "huber_delta": 0.5,           // Delta for Huber loss (if used)
+    "huber_delta": 0.25,           // Delta for Huber loss (if used)
     
     // Training stability
     "gradient_clip_val": 1.0,      // Max gradient norm
@@ -166,7 +189,6 @@
     
     // Minimum time steps required per profile
     "min_time_steps": 10,
-
     
     // Default values moved from hardcoded constants
     "default_seed": 42,
@@ -184,14 +206,13 @@
     "random_seed": 42,
     
     // DataLoader configuration - Adjust based on your system
-    "num_dataloader_workers": 24,          
+    "num_dataloader_workers": 8,          
     
     // Memory management for streaming datasets
-    "profiles_per_chunk": 20480,           
+    "profiles_per_chunk": 2048,           
     // Chunk sizes for data processing
-    "default_chunk_size": 20480,
-    "stats_chunk_size": 20480,
-    
+    "default_chunk_size": 2048,
+    "stats_chunk_size": 2048,
     
     // PyTorch 2.0 compilation - Set based on your hardware
     "use_torch_compile": true,           

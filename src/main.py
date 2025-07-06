@@ -81,7 +81,6 @@ def _get_h5_path(config: Dict[str, Any], data_root_dir: Path) -> Path:
     
     return h5_path
 
-
 def _run_training(config: Dict[str, Any], data_root_dir: Path) -> None:
     """
     Runs training with the given configuration.
@@ -98,7 +97,13 @@ def _run_training(config: Dict[str, Any], data_root_dir: Path) -> None:
     # Get HDF5 path
     h5_path = _get_h5_path(config, data_root_dir)
     
-    model_folder = get_config_str(config, OUTPUT_PATHS_SECTION, FIXED_MODEL_KEY, "model training")
+    # Get base model folder name from config
+    base_model_folder = get_config_str(config, OUTPUT_PATHS_SECTION, FIXED_MODEL_KEY, "model training")
+    
+    # Append model type to folder name
+    model_type = config["model_hyperparameters"].get("model_type", "siren").lower()
+    model_folder = f"{base_model_folder}_{model_type}"
+    
     model_save_dir = data_root_dir / model_folder
     # Directory will be created by save_json if needed
     save_json(config, model_save_dir / "run_config.json")

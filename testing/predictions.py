@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
+import os
 
 def load_jit_model(model_dir):
     """Load JIT model and metadata."""
@@ -88,14 +89,17 @@ def predict_profile(model, config, norm_meta, h5_file, prof):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", default="../data/trained_model_siren_v3", help="Model directory")
+    parser.add_argument("--model-dir", default="trained_model_siren_v3", help="Model directory")
     parser.add_argument("--data-file", default="../data/chem_data/data.h5", help="HDF5 data file")
     parser.add_argument("--prof", type=int, default=0, help="Test profile index")
     args = parser.parse_args()
     
     # Load model
-    model, config, norm_meta, test_indices = load_jit_model(args.model_dir)
+    dir = Path(__file__).parent.parent / "data" / args.model_dir
+
+    model, config, norm_meta, test_indices = load_jit_model(dir)
     species = config["data_specification"]["species_variables"]
+
     
     # Get predictions
     with h5py.File(args.data_file, 'r') as hf:
@@ -123,7 +127,8 @@ def main():
         ax.legend()
     
     plt.tight_layout()
-    plt.savefig('predictions.png', dpi=150)
+    os.makedirs(dir/"figures", exist_ok=True)
+    plt.savefig(dir/'figures/predictions.png', dpi=150)
 
 if __name__ == "__main__":
     main()
