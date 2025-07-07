@@ -442,12 +442,25 @@ class DataNormalizer:
         return stats
 
     # ---------------------------------------------------------------------------
-    # Normalise / denormalise
+    # Normalise / denormalise (now static methods)
     # ---------------------------------------------------------------------------
 
-    def normalize_tensor(self, x: Tensor, method: str, stats: Dict[str, Any]) -> Tensor:
+    @staticmethod
+    def normalize_tensor(x: Tensor, method: str, stats: Dict[str, Any], 
+                        epsilon: float = 1e-10, 
+                        normalized_value_clamp: float = 10.0) -> Tensor:
         """
         Apply normalization to a tensor with numerical stability and clamping.
+        
+        Args:
+            x: Input tensor
+            method: Normalization method
+            stats: Statistics dictionary
+            epsilon: Small value to prevent numerical issues
+            normalized_value_clamp: Clamp range for normalized values
+            
+        Returns:
+            Normalized tensor
         """
         x = x.to(DTYPE)
         
@@ -460,13 +473,13 @@ class DataNormalizer:
             if method == "standard":
                 result = (x - stats["mean"]) / stats["std"]
             elif method == "log-standard":
-                x_safe = torch.log10(torch.clamp(x, min=self.epsilon))
+                x_safe = torch.log10(torch.clamp(x, min=epsilon))
                 result = (x_safe - stats["log_mean"]) / stats["log_std"]
             elif method == "signed-log":
                 y = torch.sign(x) * torch.log10(torch.abs(x) + 1.0)
                 result = (y - stats["mean"]) / stats["std"]
             elif method == "log-min-max":
-                log_x = torch.log10(torch.clamp(x, min=self.epsilon))
+                log_x = torch.log10(torch.clamp(x, min=epsilon))
                 denom = stats["max"] - stats["min"]
                 # Use safe division to prevent NaN
                 normed = (log_x - stats["min"]) / (denom if denom > 0 else 1.0)
@@ -490,13 +503,22 @@ class DataNormalizer:
             return x
 
         if method in ("standard", "log-standard", "signed-log", "iqr"):
-            result = torch.clamp(result, -self.normalized_value_clamp, self.normalized_value_clamp)
+            result = torch.clamp(result, -normalized_value_clamp, normalized_value_clamp)
         
         return result
 
-    def denormalize_tensor(self, x: Tensor, method: str, stats: Dict[str, Any]) -> Tensor:
+    @staticmethod
+    def denormalize_tensor(x: Tensor, method: str, stats: Dict[str, Any]) -> Tensor:
         """
         Apply inverse normalization to recover original scale values.
+        
+        Args:
+            x: Normalized tensor
+            method: Normalization method
+            stats: Statistics dictionary
+            
+        Returns:
+            Denormalized tensor
         """
         x = x.to(DTYPE)
         if method in ("none", "bool"):
@@ -565,9 +587,7 @@ class DataNormalizer:
         else:
             tensor_v = torch.as_tensor(v, dtype=DTYPE)
 
-        # Create a temporary normalizer instance to access the config
-        temp_normalizer = DataNormalizer(config_data={"numerical_constants": {"epsilon": 1e-10}})
-        denorm_tensor = temp_normalizer.denormalize_tensor(tensor_v, method, stats)
+        denorm_tensor = DataNormalizer.denormalize_tensor(tensor_v, method, stats)
 
         if is_scalar:
             return denorm_tensor.item()

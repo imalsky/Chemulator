@@ -89,7 +89,7 @@ def predict_profile(model, config, norm_meta, h5_file, prof):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", default="trained_model_siren_v3", help="Model directory")
+    parser.add_argument("--model-dir", default="trained_model_resnet", help="Model directory")
     parser.add_argument("--data-file", default="../data/chem_data/data.h5", help="HDF5 data file")
     parser.add_argument("--prof", type=int, default=0, help="Test profile index")
     args = parser.parse_args()
