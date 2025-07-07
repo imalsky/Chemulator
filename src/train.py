@@ -178,7 +178,7 @@ class ModelTrainer:
             "persistent_workers": hw_settings.get("persistent_workers", False) and num_workers > 0,
         }
         if num_workers > 0:
-            dl_kwargs["prefetch_factor"] = 4        
+            dl_kwargs["prefetch_factor"] = 2        
 
         # Use the same settings for val/test, but drop prefetch_factor if workers==0
         train_kwargs = dl_kwargs.copy()
@@ -581,7 +581,7 @@ class ModelTrainer:
             export_model.load_state_dict(model_to_save.state_dict())
             export_model.eval()
 
-            # build a  single example input  from the current batch's shapes
+            # build a  single example input from the current batch's shapes
             with torch.no_grad():
                 dummy_input = torch.zeros_like(next(iter(self.val_loader))[0]["x"][:1]).to("cpu")
 

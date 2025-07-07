@@ -6,16 +6,16 @@ in chunks for memory-efficient training.
 """
 from __future__ import annotations
 
-import h5py
+import h5py # type: ignore
 import logging
 import numpy as np
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, Iterator
 
-import torch
-from torch import Tensor
-from torch.utils.data import IterableDataset
+import torch # type: ignore
+from torch import Tensor # type: ignore
+from torch.utils.data import IterableDataset # type: ignore
 
 from normalizer import DataNormalizer
 
@@ -130,9 +130,6 @@ class ChemicalDataset(IterableDataset):
         prevents KeyErrors when new keys appear in the HDF5 file.
         """
         self.norm_params: Dict[str, Dict[str, Any]] = {"input": {}, "target": {}}
-        
-        # Create a temporary normalizer instance to access normalize_tensor method
-        self.normalizer = DataNormalizer(config_data=self.config)
 
         for vector_type, var_order in [
             ("input", self.input_var_order),
@@ -344,18 +341,70 @@ class ChemicalDataset(IterableDataset):
         vector_type = "input" if var_order == self.input_var_order else "target"
         params = self.norm_params[vector_type]
         
+        means, stds, methods = params["means"], params["stds"], params["methods"]
         normalized = tensor.clone()
-        methods = params["methods"]
         
+        # Create boolean masks for each normalization method
+        # This is more efficient than iterating through each element
+        method_names = ["standard", "log-standard", "log-min-max", "max-out", 
+                       "iqr", "signed-log", "symlog", "none", "bool"]
+        
+        # Vectorized operations for common methods
+        std_mask = torch.tensor([m == "standard" for m in methods], dtype=torch.bool)
+        if std_mask.any():
+            normalized[std_mask] = (tensor[std_mask] - means[std_mask]) / stds[std_mask]
+        
+        log_std_mask = torch.tensor([m == "log-standard" for m in methods], dtype=torch.bool)
+        if log_std_mask.any():
+            log_vals = torch.log10(torch.clamp(tensor[log_std_mask], min=self.epsilon))
+            normalized[log_std_mask] = (log_vals - means[log_std_mask]) / stds[log_std_mask]
+        
+        log_minmax_mask = torch.tensor([m == "log-min-max" for m in methods], dtype=torch.bool)
+        if log_minmax_mask.any():
+            log_vals = torch.log10(torch.clamp(tensor[log_minmax_mask], min=self.epsilon))
+            # For log-min-max: means[i] = min, stds[i] = max - min
+            normed = (log_vals - means[log_minmax_mask]) / stds[log_minmax_mask]
+            normalized[log_minmax_mask] = torch.clamp(normed, 0.0, 1.0)
+        
+        maxout_mask = torch.tensor([m == "max-out" for m in methods], dtype=torch.bool)
+        if maxout_mask.any():
+            normalized[maxout_mask] = tensor[maxout_mask] / stds[maxout_mask]
+        
+        iqr_mask = torch.tensor([m == "iqr" for m in methods], dtype=torch.bool)
+        if iqr_mask.any():
+            normalized[iqr_mask] = (tensor[iqr_mask] - means[iqr_mask]) / stds[iqr_mask]
+        
+        signed_log_mask = torch.tensor([m == "signed-log" for m in methods], dtype=torch.bool)
+        if signed_log_mask.any():
+            y = torch.sign(tensor[signed_log_mask]) * torch.log10(torch.abs(tensor[signed_log_mask]) + 1.0)
+            normalized[signed_log_mask] = (y - means[signed_log_mask]) / stds[signed_log_mask]
+        
+        # Handle complex methods (symlog) that need per-element processing
+        complex_methods = {"symlog"}
         for i, method in enumerate(methods):
-            var_name = var_order[i]
-            stats = params["stats_dict"].get(var_name, {})
-            
-            # Use the normalizer's normalize_tensor method for consistency
-            if method != "none" and stats:
-                normalized[i] = self.normalizer.normalize_tensor(
-                    tensor[i].unsqueeze(0), method, stats
-                ).squeeze(0)
+            if method in complex_methods:
+                var_name = var_order[i]
+                stats = params["stats_dict"].get(var_name, {})
+                if stats and method == "symlog":
+                    thr, sf = stats["threshold"], stats["scale_factor"]
+                    abs_x = torch.abs(tensor[i])
+                    if abs_x <= thr:
+                        normalized[i] = tensor[i] / thr / sf
+                    else:
+                        normalized[i] = torch.sign(tensor[i]) * (torch.log10(abs_x / thr) + 1.0) / sf
+                    normalized[i] = torch.clamp(normalized[i], -1.0, 1.0)
+        
+        # Apply clamping for methods that need it
+        clamp_mask = torch.tensor(
+            [m in ("standard", "log-standard", "signed-log", "iqr") for m in methods], 
+            dtype=torch.bool
+        )
+        if clamp_mask.any():
+            normalized[clamp_mask] = torch.clamp(
+                normalized[clamp_mask], 
+                -self.normalized_value_clamp, 
+                self.normalized_value_clamp
+            )
         
         return normalized
 

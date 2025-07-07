@@ -4,7 +4,7 @@ model.py - Neural network models for chemical evolution prediction.
 
 This module implements two architectures:
 1. SIREN (Sinusoidal Representation Network) with FiLM conditioning
-2. FNO (Fourier Neural Operator) for learning operators in frequency domain
+2. A deep residual MLP for robust vector-to-vector regression.
 
 Both models predict chemical species concentrations at arbitrary time points
 given initial conditions and are fully JIT-compatible.
@@ -233,7 +233,7 @@ class SineLayer(nn.Module):
 
 
 # =============================================================================
-# FNO-Specific Modules
+# MLP/ResNet-Specific Modules
 # =============================================================================
 
 class FourierFeatures(nn.Module):
@@ -263,117 +263,34 @@ class FourierFeatures(nn.Module):
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 
-class SpectralConv1d(nn.Module):
+class FeedForwardBlock(nn.Module):
     """
-    1D Spectral convolution layer. Performs convolution in the Fourier domain
-    by multiplying the lower-frequency modes with learnable complex weights.
-    
-    This implementation maintains JIT compatibility by storing weights as
-    separate real and imaginary parts.
+    A standard feed-forward block (MLP block) for vector processing.
+    This is the core building block of the ChemicalResNet model.
     """
-    def __init__(self, in_channels: int, out_channels: int, modes: int):
+    def __init__(self, channels: int, mlp_ratio: float = 2.0, dropout: float = 0.1):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes = modes
-
-        # Learnable weights for the first `modes` frequencies
-        # Store as separate real and imaginary parts for gradient compatibility
-        scale = 1 / (in_channels * out_channels)
-        self.weights_real = nn.Parameter(scale * torch.randn(in_channels, out_channels, self.modes))
-        self.weights_imag = nn.Parameter(scale * torch.randn(in_channels, out_channels, self.modes))
-        self._init_spectral_weights()
-
-    def _init_spectral_weights(self):
-        """Custom initialization for stability."""
-        with torch.no_grad():
-            self.weights_real.data *= 0.1
-            self.weights_imag.data *= 0.1
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Apply spectral convolution.
-        
-        Args:
-            x: Input tensor of shape (batch, channels, seq_len)
-            
-        Returns:
-            Output tensor of shape (batch, channels, seq_len)
-        """
-        batch_size = x.shape[0]
-
-        # Compute 1D Real FFT
-        x_ft = torch.fft.rfft(x, dim=-1)
-
-        # Initialize output tensor in Fourier domain
-        out_ft = torch.zeros(batch_size, self.out_channels, x_ft.size(-1),
-                             dtype=torch.cfloat, device=x.device)
-
-        # Combine real and imaginary parts into complex weights
-        weights = torch.complex(self.weights_real, self.weights_imag)
-        
-        # Apply learnable weights to the low-frequency modes
-        if x_ft.size(-1) >= self.modes:
-            out_ft[..., :self.modes] = torch.einsum("bix,iox->box", x_ft[..., :self.modes], weights)
-
-        # Compute Inverse Real FFT to return to the signal domain
-        x_out = torch.fft.irfft(out_ft, n=x.size(-1), dim=-1)
-        return x_out
-
-
-class FNOBlock(nn.Module):
-    """
-    An FNO-inspired block. Expands a feature vector into a temporary sequence,
-    applies spectral convolution, and combines with a linear skip connection.
-    """
-    def __init__(self, channels: int, modes: int, seq_length: int, dropout: float = 0.1):
-        super().__init__()
-        self.seq_length = seq_length
-        self.conv = SpectralConv1d(channels, channels, modes)
-        self.w = nn.Linear(channels, channels)  # Linear path (acts like a 1x1 conv)
+        hidden_channels = int(channels * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(channels, hidden_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, channels),
+            nn.Dropout(dropout)
+        )
         self.norm = nn.LayerNorm(channels)
-        self.dropout = nn.Dropout(dropout)
-        
-        # Create a persistent positional encoding buffer
-        self._create_positional_encoding()
-
-    def _create_positional_encoding(self):
-        """Create sinusoidal positional encoding for the sequence."""
-        pos = torch.linspace(0, 1, self.seq_length)
-        # Use multiple frequencies for richer encoding
-        freqs = torch.arange(1, 5, dtype=torch.float32)
-        pos_enc = torch.sin(2 * math.pi * pos.unsqueeze(0) * freqs.unsqueeze(1)).mean(0)
-        # Shape: [1, 1, seq_length]
-        self.register_buffer('pos_encoding', pos_enc.unsqueeze(0).unsqueeze(0))
 
     def forward(self, x: Tensor) -> Tensor:
         """
-        Apply FNO block transformation.
+        Apply feed-forward transformation with residual connection.
         
         Args:
-            x: Input tensor of shape (batch_size, channels)
+            x: Input tensor of shape (batch, channels)
             
         Returns:
-            Output tensor of shape (batch_size, channels)
+            Output tensor of shape (batch, channels)
         """
-        # 1. Expand feature vector into a temporary sequence
-        x_seq = x.unsqueeze(-1).expand(-1, -1, self.seq_length)
-        # Add positional encoding to give the FFT a non-constant signal
-        x_seq = x_seq + 0.1 * self.pos_encoding
-
-        # 2. Path 1: Spectral Convolution
-        out_spectral = self.conv(x_seq)
-        out_spectral = out_spectral.mean(dim=-1)  # [B, C, S] -> [B, C]
-
-        # 3. Path 2: Linear skip connection
-        out_linear = self.w(x)  # [B, C]
-
-        # 4. Combine, normalize, and activate
-        out = self.norm(out_spectral + out_linear)
-        out = F.gelu(out)
-        out = self.dropout(out)
-
-        return out
+        return self.norm(x + self.net(x))
 
 
 # =============================================================================
@@ -487,24 +404,23 @@ class FiLM_SIREN(nn.Module):
         return torch.clamp_min(prediction, 0.0)
 
 
-class ChemicalFNO(nn.Module):
+class ChemicalResNet(nn.Module):
     """
-    FNO-inspired model for predicting chemical state evolution.
+    A deep residual MLP for predicting chemical state evolution.
     
-    This model uses Fourier Neural Operator principles to learn mappings
-    in the frequency domain, which can be particularly effective for
-    problems with periodic or oscillatory behavior.
+    This model uses Fourier features and feed-forward blocks for
+    vector-to-vector regression, suitable for chemical kinetics problems.
     """
     
     def __init__(
         self, num_species: int, num_global_vars: int, hidden_dims: List[int],
         use_time_embedding: bool, time_embedding_dim: int,
-        fno_fourier_features: int = 256, fno_fourier_scale: float = 1.0,
-        fno_spectral_modes: int = 16, fno_seq_length: int = 32,
-        dropout: float = 0.1, output_activation: str = "softplus", **kwargs
+        fourier_features: int = 256, fourier_scale: float = 1.0,
+        mlp_ratio: float = 2.0, dropout: float = 0.1, 
+        output_activation: str = "softplus", **kwargs
     ):
         """
-        Initialize ChemicalFNO model.
+        Initialize ChemicalResNet model.
         
         Args:
             num_species: Number of chemical species
@@ -512,10 +428,9 @@ class ChemicalFNO(nn.Module):
             hidden_dims: List of hidden layer dimensions
             use_time_embedding: Whether to use sinusoidal time embedding
             time_embedding_dim: Dimension of time embedding
-            fno_fourier_features: Number of random Fourier features
-            fno_fourier_scale: Scale for Fourier feature frequencies
-            fno_spectral_modes: Number of Fourier modes to keep
-            fno_seq_length: Length of temporary sequences in FNO blocks
+            fourier_features: Number of random Fourier features
+            fourier_scale: Scale for Fourier feature frequencies
+            mlp_ratio: Expansion ratio for MLP blocks
             dropout: Dropout rate
             output_activation: Output activation function
             **kwargs: Additional unused arguments for compatibility
@@ -535,33 +450,31 @@ class ChemicalFNO(nn.Module):
         
         # Fourier feature embedding
         self.fourier_embed = FourierFeatures(
-            input_dim, fno_fourier_features, scale=fno_fourier_scale
+            input_dim, fourier_features, scale=fourier_scale
         )
         
         # Lifting layer to project to hidden dimension
         self.lifting = nn.Sequential(
-            nn.Linear(input_dim + fno_fourier_features, hidden_dims[0]),
+            nn.Linear(input_dim + fourier_features, hidden_dims[0]),
             nn.LayerNorm(hidden_dims[0]),
             nn.GELU(),
             nn.Dropout(dropout)
         )
         
-        # FNO blocks
-        self.fno_blocks = nn.ModuleList()
-        for i in range(len(hidden_dims)):
-            if i > 0 and hidden_dims[i] != hidden_dims[i-1]:
-                # Dimension change block
-                self.fno_blocks.append(nn.Sequential(
-                    nn.Linear(hidden_dims[i-1], hidden_dims[i]),
-                    nn.LayerNorm(hidden_dims[i]),
-                    nn.GELU(),
-                    nn.Dropout(dropout)
-                ))
-            else:
-                # Standard FNO block
-                dim = hidden_dims[i]
-                valid_modes = min(fno_spectral_modes, fno_seq_length // 2)
-                self.fno_blocks.append(FNOBlock(dim, valid_modes, fno_seq_length, dropout))
+        # Processing blocks (corrected architecture)
+        self.processing_blocks = nn.ModuleList()
+        current_dim = hidden_dims[0]
+        for h_dim in hidden_dims:
+            if h_dim != current_dim:
+                # Dimension change layer
+                self.processing_blocks.append(
+                    nn.Linear(current_dim, h_dim)
+                )
+                current_dim = h_dim
+            # Add feed-forward block
+            self.processing_blocks.append(
+                FeedForwardBlock(h_dim, mlp_ratio, dropout)
+            )
         
         # Projection to output
         self.projection = nn.Sequential(
@@ -625,12 +538,9 @@ class ChemicalFNO(nn.Module):
         # Lift to hidden dimension
         hidden = self.lifting(x_enhanced)
         
-        # Apply FNO blocks with residual connections
-        for block in self.fno_blocks:
-            if isinstance(block, FNOBlock):
-                hidden = hidden + block(hidden)  # Residual connection
-            else:
-                hidden = block(hidden)  # Dimension change block
+        # Apply processing blocks
+        for block in self.processing_blocks:
+            hidden = block(hidden)
         
         # Project to output
         output_delta = self.projection(hidden)
@@ -658,7 +568,7 @@ def create_prediction_model(
         device: Optional device to place model on
         
     Returns:
-        Initialized model (SIREN or FNO based on config)
+        Initialized model (SIREN or ResNet based on config)
     """
     model_params = config["model_hyperparameters"]
     data_spec = config["data_specification"]
@@ -700,36 +610,23 @@ def create_prediction_model(
         
         model = FiLM_SIREN(**model_args)
         
-    elif model_type == "fno":
-        logger.info("Creating FNO model")
-        
-        # Get FNO-specific parameters
-        fno_seq_length = model_params.get("fno_seq_length", 32)
-        fno_spectral_modes = model_params.get("fno_spectral_modes", 16)
-        
-        # Ensure spectral modes are valid for the given sequence length
-        if fno_spectral_modes > fno_seq_length // 2:
-            logger.warning(
-                f"fno_spectral_modes ({fno_spectral_modes}) is too high for "
-                f"fno_seq_length ({fno_seq_length}). Capping to {fno_seq_length // 2}"
-            )
-            fno_spectral_modes = fno_seq_length // 2
+    elif model_type == "resnet":
+        logger.info("Creating ChemicalResNet model")
         
         model_args = {
             **common_args,
-            "fno_fourier_features": model_params.get("fno_fourier_features", 256),
-            "fno_fourier_scale": model_params.get("fno_fourier_scale", 1.0),
-            "fno_spectral_modes": fno_spectral_modes,
-            "fno_seq_length": fno_seq_length,
+            "fourier_features": model_params.get("fourier_features", 256),
+            "fourier_scale": model_params.get("fourier_scale", 1.0),
+            "mlp_ratio": model_params.get("mlp_ratio", 2.0),
             "dropout": model_params.get("dropout", 0.1),
             "output_activation": model_params.get("output_activation", "softplus"),
         }
         
-        model = ChemicalFNO(**model_args)
+        model = ChemicalResNet(**model_args)
         
     else:
         raise ValueError(
-            f"Unknown model type '{model_type}'. Supported types: 'siren', 'fno'"
+            f"Unknown model type '{model_type}'. Supported types: 'siren', 'resnet'"
         )
     
     # Log model info
@@ -771,7 +668,7 @@ def export_model_jit(
     model.eval()
     
     with torch.no_grad():
-        # Use tracing for both SIREN and FNO models
+        # Use tracing for both SIREN and ResNet models
         try:
             scripted_model = torch.jit.trace(model, example_input, strict=False)
             logger.info("Model successfully traced.")
@@ -802,4 +699,4 @@ def export_model_jit(
         logger.error(f"Failed to save JIT model: {e}")
 
 
-__all__ = ["FiLM_SIREN", "ChemicalFNO", "create_prediction_model", "export_model_jit"]
+__all__ = ["FiLM_SIREN", "ChemicalResNet", "create_prediction_model", "export_model_jit"]

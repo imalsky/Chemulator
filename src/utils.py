@@ -150,7 +150,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     
     # Validate model type (SIREN and FNO are both supported)
     model_type = model_params.get("model_type", "siren").lower()
-    supported_models = ["siren", "fno"]
+    supported_models = ["siren", "resnet"]
     if model_type not in supported_models:
         raise ValueError(
             f"Model type '{model_type}' is not supported. "

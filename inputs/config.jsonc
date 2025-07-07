@@ -1,7 +1,7 @@
 // =========================================================================================
-// ==              UNIFIED CONFIGURATION FOR SIREN AND FNO MODELS                        ==
+// ==              UNIFIED CONFIGURATION FOR SIREN AND ResNet MODELS                       ==
 // =========================================================================================
-// This configuration supports both SIREN and FNO architectures for chemical kinetics prediction.
+// This configuration supports both SIREN and ResNet architectures for chemical kinetics prediction.
 // Select the model type in the "model_hyperparameters" section.
 
 {
@@ -82,15 +82,15 @@
   // ════════════════════════════════════════════════════════════════
   "model_hyperparameters": {
     // ╔═══════════════════════════════════════════════════════════╗
-    // ║  MODEL SELECTION: Choose "siren" or "fno"                ║
+    // ║  MODEL SELECTION: Choose "siren" or "resnet"              ║
     // ╚═══════════════════════════════════════════════════════════╝
-    "model_type": "fno",  // Options: "siren" or "fno"
+    "model_type": "resnet",  // Options: "siren" or "resnet"
     
     // ┌───────────────────────────────────────────────────────────┐
     // │                   Common Parameters                       │
     // └───────────────────────────────────────────────────────────┘
     // Network architecture - shared by both models
-    "hidden_dims": [384, 384, 384],
+    "hidden_dims": [256, 256, 256, 256],
     
     // Time embedding configuration - shared by both models
     "use_time_embedding": true,
@@ -107,21 +107,22 @@
     "siren_w0_hidden": 5.0,        // Hidden layer frequency
     
     // ┌───────────────────────────────────────────────────────────┐
-    // │                FNO-Specific Parameters                    │
+    // │             ResNet-Specific Parameters                    │
     // └───────────────────────────────────────────────────────────┘
-    // Random Fourier features (FNO only)
-    "fno_fourier_features": 256,   // Number of Fourier features
-    "fno_fourier_scale": 1.0,      // Scale for Fourier frequencies
+    // Random Fourier features (ResNet only)
+    "fourier_features": 256,   // Number of Fourier features
+    "fourier_scale": 1.0,      // Scale for Fourier frequencies
     
-    // Spectral convolution parameters (FNO only)
-    "fno_spectral_modes": 16,      // Number of Fourier modes to keep
-    "fno_seq_length": 32,          // Length of temporary sequences
+    // MLP block expansion ratio (ResNet only)
+    "mlp_ratio": 2.0,
     
-    // Dropout for FNO (typically higher than SIREN)
-    "dropout": 0.0,                // Only used by FNO
+    // Dropout for ResNet (typically higher than SIREN)
+    "dropout": 0.0,                // Only used by ResNet
     
-    // Output activation for FNO
-    "output_activation": "softplus" // Options: "sigmoid", "softplus", "none"
+    // Output activation for ResNet
+    // Options: "sigmoid", "softplus", "none"
+    // Really recommend leaving it at none for some reason right now
+    "output_activation": "none" 
   },
 
   // ════════════════════════════════════════════════════════════════
@@ -131,7 +132,7 @@
     // Data split configuration
     "val_frac": 0.15,              // 15% for validation
     "test_frac": 0.15,             // 15% for test
-    "frac_of_data": 1.0,          // Use full dataset
+    "frac_of_data": 1.0,          // Use a fraction of the dataset for quick tests
     
     // Training duration
     "epochs": 100,
