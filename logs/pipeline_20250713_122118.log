@@ -1,0 +1,18 @@
+2025-07-13 12:21:18 | INFO     | utils.utils - Logging system initialized
+2025-07-13 12:21:18 | INFO     | __main__ - ================================================================================
+2025-07-13 12:21:18 | INFO     | __main__ - Chemical Kinetics Neural Network Pipeline
+2025-07-13 12:21:18 | INFO     | __main__ - Configuration: config/config.jsonc
+2025-07-13 12:21:18 | INFO     | utils.utils - Random seed set to 42
+2025-07-13 12:21:18 | INFO     | utils.hardware - Using Apple Silicon MPS device
+2025-07-13 12:21:18 | WARNING  | utils.hardware - MPS backend has limited operator support
+2025-07-13 12:21:18 | WARNING  | utils.hardware - torch.compile is disabled for MPS devices
+2025-07-13 12:21:18 | WARNING  | utils.hardware - Disabling torch.compile for MPS device due to compatibility issues
+2025-07-13 12:21:18 | INFO     | __main__ - Pipeline initialized with NPY shard format for high-performance data loading
+2025-07-13 12:21:18 | INFO     | __main__ - Starting direct NPY shard creation from raw files...
+2025-07-13 12:21:18 | INFO     | data.preprocessor - Processing 9 raw data files directly to NPY shards...
+2025-07-13 12:21:18 | INFO     | data.preprocessor - Pre-normalization ENABLED - shards will contain normalized data
+2025-07-13 12:21:18 | INFO     | data.preprocessor - Scanning files with 4 workers…
+2025-07-13 12:21:37 | INFO     | data.preprocessor - Found 2,016,000 profiles × 100 timesteps
+2025-07-13 12:21:37 | INFO     | data.preprocessor - Split sizes - Train: 1,411,200, Val: 302,400, Test: 302,400
+2025-07-13 12:21:37 | INFO     | data.preprocessor - Creating NPY shards directly from raw files...
+2025-07-13 12:21:37 | INFO     | data.preprocessor - Loading normalization statistics for pre-normalized shards...

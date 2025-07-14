@@ -1,0 +1,13 @@
+2025-07-13 14:15:13 | INFO     | utils.utils - Logging system initialized
+2025-07-13 14:15:13 | INFO     | __main__ - ================================================================================
+2025-07-13 14:15:13 | INFO     | __main__ - Chemical Kinetics Neural Network Pipeline
+2025-07-13 14:15:13 | INFO     | __main__ - Configuration: config/config.jsonc
+2025-07-13 14:15:13 | INFO     | utils.utils - Random seed set to 42
+2025-07-13 14:15:13 | INFO     | utils.hardware - Using Apple Silicon MPS device
+2025-07-13 14:15:13 | WARNING  | utils.hardware - MPS backend has limited operator support
+2025-07-13 14:15:13 | WARNING  | utils.hardware - torch.compile is disabled for MPS devices
+2025-07-13 14:15:13 | WARNING  | utils.hardware - Disabling torch.compile for MPS device due to compatibility issues
+2025-07-13 14:15:13 | INFO     | __main__ - Pipeline initialized with NPY shard format for high-performance data loading
+2025-07-13 14:15:13 | INFO     | __main__ - Starting direct NPY shard creation from raw files with normalization...
+2025-07-13 14:15:13 | INFO     | data.normalizer - Using fixed reservoir size 1,000,000 for symlog quantile estimation
+2025-07-13 14:15:13 | INFO     | data.preprocessor - Processing file 1/9: data/raw/run8001-result.h5

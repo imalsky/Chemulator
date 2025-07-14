@@ -1,0 +1,114 @@
+{
+  // ─────────────────────────────── Paths ───────────────────────────────
+  "paths": {
+    "raw_data_files": [
+      "data/raw/run8001-result.h5", "data/raw/run8002-result.h5",
+      "data/raw/run8003-result.h5", "data/raw/run8004-result.h5",
+      "data/raw/run8005-result.h5", "data/raw/run8006-result.h5",
+      "data/raw/run8007-result.h5", "data/raw/run8008-result.h5",
+      "data/raw/run8009-result.h5"
+    ],
+    "processed_data_dir": "data/processed",   // Fallback; prefer $NPY_SHARD_DIR
+    "model_save_dir":     "data/models",
+    "log_dir":            "logs"
+  },
+
+  // ─────────────────────────────── Data ────────────────────────────────
+  "data": {
+    "species_variables": [
+      "C2H2_evolution","CH4_evolution","CO2_evolution","CO_evolution",
+      "H2O_evolution","H2_evolution","HCN_evolution","H_evolution",
+      "N2_evolution","NH3_evolution","OH_evolution","O_evolution"
+    ],
+    "global_variables": ["P_init", "T_init"],
+    "time_variable":    "t_time",
+    "chunk_size":       65536,               // Increased for better I/O efficiency
+    "shard_size":       1000000              // Reduced from 10M for better cache efficiency
+  },
+
+  // ───────────────────────── Normalisation ─────────────────────────────
+  "normalization": {
+    "default_method": "log-min-max",
+    "methods": {
+      "T_init": "standard",
+      "P_init": "log-min-max",
+      "t_time": "log-min-max"
+    },
+    "symlog_percentile": 0.5
+  },
+
+  // ───────────────────────────── Model ─────────────────────────────────
+  "model": {
+    "type":              "deeponet",
+    "branch_layers":     [1024, 1024, 1024, 1024],
+    "trunk_layers":      [256, 256, 256, 256],
+    "basis_dim":         128,
+    "activation":        "gelu",
+    "output_scale":      1.0,
+    "use_residual":      true,
+    "hidden_dims":       [512, 512, 512, 512],
+    "use_time_embedding": true,
+    "time_embedding_dim": 256,
+    "dropout":           0.0
+  },
+
+  // ─────────────────────────── Training ────────────────────────────────
+  "training": {
+    "val_fraction":  0.15,
+    "test_fraction": 0.15,
+    "use_fraction":  1.0,
+
+    "epochs": 200,
+
+    // OPTIMIZED: Smaller micro-batch with gradient accumulation for better streaming
+    "batch_size": 4096,  // Reduced for better memory access patterns
+    "gradient_accumulation_steps": 4,  // Increased to maintain effective batch size
+
+    // Loader optimized for pre-normalized data
+    "num_workers": 16,  // Increased for better parallelism
+    "pin_memory":  true,
+    "persistent_workers": true,
+    "prefetch_factor": 8,  // Increased prefetch
+    "drop_last": true,
+
+    "learning_rate": 1e-3,
+    "weight_decay":  1e-5,
+    "gradient_clip": 1.0,
+
+    "scheduler": "cosine",
+    "scheduler_params": { "T_0": 5, "T_mult": 2, "eta_min": 1e-7},
+
+    "loss": "huber",
+    "huber_delta": 0.25,
+
+    "use_amp":  true,
+    "amp_dtype": "bfloat16",
+
+    "early_stopping_patience": 20,
+    "min_delta": 1e-6,
+
+    "log_interval": 1,
+    "save_interval": 10
+  },
+
+  // ───────────────────────────── System ───────────────────────────────
+  "system": {
+    "seed": 42,
+
+    "use_torch_compile": true,
+    "use_npy_shards": true,
+
+    "compile_mode":          "default",
+    "compile_fullgraph":     false,
+    "compile_dynamic_shapes": false,
+
+    "save_jit_model": true,
+    "detect_anomaly": false,
+
+    "cudnn_benchmark": true,
+    "tf32": true,
+
+    "empty_cache_interval": 50,
+    "gradient_checkpointing": false
+  }
+}

@@ -1,0 +1,134 @@
+2025-07-12 18:56:17 | INFO     | utils.utils - Logging system initialized
+2025-07-12 18:56:17 | INFO     | __main__ - ================================================================================
+2025-07-12 18:56:17 | INFO     | __main__ - Chemical Kinetics Neural Network Pipeline
+2025-07-12 18:56:17 | INFO     | __main__ - Configuration: config/config.jsonc
+2025-07-12 18:56:17 | INFO     | utils.utils - Random seed set to 42
+2025-07-12 18:56:17 | INFO     | utils.hardware - Using Apple Silicon MPS device
+2025-07-12 18:56:17 | WARNING  | utils.hardware - MPS backend has limited operator support
+2025-07-12 18:56:17 | WARNING  | utils.hardware - torch.compile is disabled for MPS devices
+2025-07-12 18:56:17 | WARNING  | utils.hardware - Disabling torch.compile for MPS device due to compatibility issues
+2025-07-12 18:56:17 | INFO     | __main__ - Pipeline initialized with NPY shard format for high-performance data loading
+2025-07-12 18:56:17 | INFO     | __main__ - Starting direct NPY shard creation from raw files...
+2025-07-12 18:56:17 | INFO     | data.preprocessor - Processing 9 raw data files directly to NPY shards...
+2025-07-12 18:56:17 | INFO     | data.preprocessor - Scanning files with 4 workers…
+2025-07-12 18:56:36 | INFO     | data.preprocessor - Found 2,016,000 profiles × 100 timesteps
+2025-07-12 18:56:37 | INFO     | data.preprocessor - Split sizes - Train: 1,411,200, Val: 302,400, Test: 302,400
+2025-07-12 18:56:37 | INFO     | data.preprocessor - Creating NPY shards directly from raw files...
+2025-07-12 19:09:07 | INFO     | data.preprocessor - Processed 5/9 files (55.6%), 110,839,509 samples written
+2025-07-12 19:13:40 | INFO     | data.preprocessor - Processed 9/9 files (100.0%), 199,505,097 samples written
+2025-07-12 19:13:46 | INFO     | data.preprocessor - Saved 139,653,063 train sample indices
+2025-07-12 19:13:46 | INFO     | data.preprocessor - Saved 29,925,720 validation sample indices
+2025-07-12 19:13:47 | INFO     | data.preprocessor - Saved 29,926,314 test sample indices
+2025-07-12 19:13:47 | INFO     | data.preprocessor - NPY shard creation complete – 199,505,097 samples in 1030.5s (193605 samples/s)
+2025-07-12 19:13:49 | INFO     | data.preprocessor - Created metadata file: data/processed/dataset.h5
+2025-07-12 19:13:51 | INFO     | __main__ - Computing normalization statistics...
+2025-07-12 19:13:51 | INFO     | data.dataset - Train split: 139,653,063 samples (indices mmap-loaded)
+2025-07-12 19:13:51 | INFO     | data.dataset - NPYDataset ready: 139,653,063 samples, 20 shards, normalized=False
+2025-07-12 19:13:51 | INFO     | data.normalizer - Calculating statistics from 139,653,063 samples in NPY dataset
+2025-07-12 19:14:21 | INFO     | data.normalizer - Progress: 1.3% (1,840,000/139,653,063 samples)
+2025-07-12 19:14:51 | INFO     | data.normalizer - Progress: 2.6% (3,590,000/139,653,063 samples)
+2025-07-12 19:15:21 | INFO     | data.normalizer - Progress: 3.8% (5,370,000/139,653,063 samples)
+2025-07-12 19:15:51 | INFO     | data.normalizer - Progress: 5.2% (7,220,000/139,653,063 samples)
+2025-07-12 19:16:21 | INFO     | data.normalizer - Progress: 6.5% (9,120,000/139,653,063 samples)
+2025-07-12 19:16:51 | INFO     | data.normalizer - Progress: 7.9% (11,050,000/139,653,063 samples)
+2025-07-12 19:17:21 | INFO     | data.normalizer - Progress: 9.3% (12,930,000/139,653,063 samples)
+2025-07-12 19:17:51 | INFO     | data.normalizer - Progress: 10.6% (14,860,000/139,653,063 samples)
+2025-07-12 19:18:22 | INFO     | data.normalizer - Progress: 12.0% (16,800,000/139,653,063 samples)
+2025-07-12 19:18:52 | INFO     | data.normalizer - Progress: 13.4% (18,670,000/139,653,063 samples)
+2025-07-12 19:19:22 | INFO     | data.normalizer - Progress: 14.7% (20,480,000/139,653,063 samples)
+2025-07-12 19:19:52 | INFO     | data.normalizer - Progress: 16.0% (22,320,000/139,653,063 samples)
+2025-07-12 19:20:22 | INFO     | data.normalizer - Progress: 17.3% (24,160,000/139,653,063 samples)
+2025-07-12 19:20:52 | INFO     | data.normalizer - Progress: 18.7% (26,060,000/139,653,063 samples)
+2025-07-12 19:21:22 | INFO     | data.normalizer - Progress: 20.0% (27,910,000/139,653,063 samples)
+2025-07-12 19:21:52 | INFO     | data.normalizer - Progress: 21.4% (29,870,000/139,653,063 samples)
+2025-07-12 19:22:22 | INFO     | data.normalizer - Progress: 22.8% (31,860,000/139,653,063 samples)
+2025-07-12 19:22:53 | INFO     | data.normalizer - Progress: 24.2% (33,850,000/139,653,063 samples)
+2025-07-12 19:23:23 | INFO     | data.normalizer - Progress: 25.6% (35,810,000/139,653,063 samples)
+2025-07-12 19:23:53 | INFO     | data.normalizer - Progress: 27.0% (37,750,000/139,653,063 samples)
+2025-07-12 19:24:23 | INFO     | data.normalizer - Progress: 28.4% (39,710,000/139,653,063 samples)
+2025-07-12 19:24:53 | INFO     | data.normalizer - Progress: 29.8% (41,660,000/139,653,063 samples)
+2025-07-12 19:25:23 | INFO     | data.normalizer - Progress: 31.2% (43,640,000/139,653,063 samples)
+2025-07-12 19:25:53 | INFO     | data.normalizer - Progress: 32.7% (45,620,000/139,653,063 samples)
+2025-07-12 19:26:24 | INFO     | data.normalizer - Progress: 34.1% (47,590,000/139,653,063 samples)
+2025-07-12 19:26:54 | INFO     | data.normalizer - Progress: 35.5% (49,550,000/139,653,063 samples)
+2025-07-12 19:27:24 | INFO     | data.normalizer - Progress: 36.9% (51,530,000/139,653,063 samples)
+2025-07-12 19:27:54 | INFO     | data.normalizer - Progress: 38.3% (53,520,000/139,653,063 samples)
+2025-07-12 19:28:24 | INFO     | data.normalizer - Progress: 39.7% (55,510,000/139,653,063 samples)
+2025-07-12 19:28:54 | INFO     | data.normalizer - Progress: 41.1% (57,410,000/139,653,063 samples)
+2025-07-12 19:29:24 | INFO     | data.normalizer - Progress: 42.5% (59,380,000/139,653,063 samples)
+2025-07-12 19:29:55 | INFO     | data.normalizer - Progress: 43.9% (61,360,000/139,653,063 samples)
+2025-07-12 19:30:25 | INFO     | data.normalizer - Progress: 45.4% (63,340,000/139,653,063 samples)
+2025-07-12 19:30:55 | INFO     | data.normalizer - Progress: 46.8% (65,310,000/139,653,063 samples)
+2025-07-12 19:31:25 | INFO     | data.normalizer - Progress: 48.2% (67,300,000/139,653,063 samples)
+2025-07-12 19:31:56 | INFO     | data.normalizer - Progress: 49.6% (69,290,000/139,653,063 samples)
+2025-07-12 19:32:26 | INFO     | data.normalizer - Progress: 51.0% (71,270,000/139,653,063 samples)
+2025-07-12 19:32:56 | INFO     | data.normalizer - Progress: 52.4% (73,240,000/139,653,063 samples)
+2025-07-12 19:33:26 | INFO     | data.normalizer - Progress: 53.9% (75,210,000/139,653,063 samples)
+2025-07-12 19:33:56 | INFO     | data.normalizer - Progress: 55.3% (77,180,000/139,653,063 samples)
+2025-07-12 19:34:26 | INFO     | data.normalizer - Progress: 56.7% (79,170,000/139,653,063 samples)
+2025-07-12 19:34:57 | INFO     | data.normalizer - Progress: 58.1% (81,170,000/139,653,063 samples)
+2025-07-12 19:35:27 | INFO     | data.normalizer - Progress: 59.5% (83,160,000/139,653,063 samples)
+2025-07-12 19:35:57 | INFO     | data.normalizer - Progress: 61.0% (85,150,000/139,653,063 samples)
+2025-07-12 19:36:27 | INFO     | data.normalizer - Progress: 62.4% (87,120,000/139,653,063 samples)
+2025-07-12 19:36:57 | INFO     | data.normalizer - Progress: 63.8% (89,090,000/139,653,063 samples)
+2025-07-12 19:37:27 | INFO     | data.normalizer - Progress: 65.2% (91,050,000/139,653,063 samples)
+2025-07-12 19:37:58 | INFO     | data.normalizer - Progress: 66.6% (93,040,000/139,653,063 samples)
+2025-07-12 19:38:28 | INFO     | data.normalizer - Progress: 68.1% (95,040,000/139,653,063 samples)
+2025-07-12 19:38:58 | INFO     | data.normalizer - Progress: 69.5% (97,030,000/139,653,063 samples)
+2025-07-12 19:39:29 | INFO     | data.normalizer - Progress: 70.9% (99,030,000/139,653,063 samples)
+2025-07-12 19:39:59 | INFO     | data.normalizer - Progress: 72.3% (101,010,000/139,653,063 samples)
+2025-07-12 19:40:29 | INFO     | data.normalizer - Progress: 73.7% (102,950,000/139,653,063 samples)
+2025-07-12 19:40:59 | INFO     | data.normalizer - Progress: 75.1% (104,910,000/139,653,063 samples)
+2025-07-12 19:41:29 | INFO     | data.normalizer - Progress: 76.5% (106,830,000/139,653,063 samples)
+2025-07-12 19:42:00 | INFO     | data.normalizer - Progress: 77.9% (108,810,000/139,653,063 samples)
+2025-07-12 19:42:30 | INFO     | data.normalizer - Progress: 79.3% (110,750,000/139,653,063 samples)
+2025-07-12 19:43:00 | INFO     | data.normalizer - Progress: 80.7% (112,710,000/139,653,063 samples)
+2025-07-12 19:43:30 | INFO     | data.normalizer - Progress: 82.1% (114,690,000/139,653,063 samples)
+2025-07-12 19:44:00 | INFO     | data.normalizer - Progress: 83.5% (116,650,000/139,653,063 samples)
+2025-07-12 19:44:30 | INFO     | data.normalizer - Progress: 84.9% (118,600,000/139,653,063 samples)
+2025-07-12 19:45:00 | INFO     | data.normalizer - Progress: 86.3% (120,580,000/139,653,063 samples)
+2025-07-12 19:45:30 | INFO     | data.normalizer - Progress: 87.7% (122,540,000/139,653,063 samples)
+2025-07-12 19:46:00 | INFO     | data.normalizer - Progress: 89.1% (124,490,000/139,653,063 samples)
+2025-07-12 19:46:30 | INFO     | data.normalizer - Progress: 90.5% (126,430,000/139,653,063 samples)
+2025-07-12 19:47:01 | INFO     | data.normalizer - Progress: 91.9% (128,380,000/139,653,063 samples)
+2025-07-12 19:47:31 | INFO     | data.normalizer - Progress: 93.3% (130,360,000/139,653,063 samples)
+2025-07-12 19:48:01 | INFO     | data.normalizer - Progress: 94.7% (132,320,000/139,653,063 samples)
+2025-07-12 19:48:31 | INFO     | data.normalizer - Progress: 96.1% (134,270,000/139,653,063 samples)
+2025-07-12 19:49:01 | INFO     | data.normalizer - Progress: 97.6% (136,250,000/139,653,063 samples)
+2025-07-12 19:49:31 | INFO     | data.normalizer - Progress: 99.0% (138,210,000/139,653,063 samples)
+2025-07-12 19:49:53 | INFO     | data.normalizer - Statistics calculated in 2161.9s
+2025-07-12 19:49:53 | INFO     | __main__ - Pre-processing complete.
+2025-07-12 19:49:54 | INFO     | __main__ - Starting model training...
+2025-07-12 19:49:54 | INFO     | __main__ - Model: DEEPONET
+2025-07-12 19:49:54 | INFO     | __main__ - Parameters: 5,044,878
+2025-07-12 19:49:54 | INFO     | __main__ - Creating NPY shard datasets for high-performance loading...
+2025-07-12 19:49:54 | INFO     | data.dataset - Train split: 139,653,063 samples (indices mmap-loaded)
+2025-07-12 19:49:54 | INFO     | data.dataset - NPYDataset ready: 139,653,063 samples, 20 shards, normalized=False
+2025-07-12 19:49:54 | INFO     | data.dataset - Validation split: 29,925,720 samples (indices mmap-loaded)
+2025-07-12 19:49:54 | INFO     | data.dataset - NPYDataset ready: 29,925,720 samples, 20 shards, normalized=False
+2025-07-12 19:49:54 | INFO     | data.dataset - Test split: 29,926,314 samples (indices mmap-loaded)
+2025-07-12 19:49:54 | INFO     | data.dataset - NPYDataset ready: 29,926,314 samples, 20 shards, normalized=False
+2025-07-12 19:49:54 | INFO     | __main__ - NPY Dataset info: {'format': 'npy_shards', 'n_shards': 20, 'samples_per_shard': 10000000, 'total_samples': 139653063, 'split': 'train', 'normalized': False}
+2025-07-12 19:49:54 | INFO     | data.dataset - DataLoader created with 24 workers, prefetch_factor=4
+2025-07-12 19:49:54 | INFO     | data.dataset - DataLoader created with 24 workers, prefetch_factor=4
+2025-07-12 19:49:54 | INFO     | data.dataset - DataLoader created with 24 workers, prefetch_factor=4
+2025-07-12 19:49:54 | INFO     | training.trainer - Reducing DataLoader workers from 24 ➔ 6
+2025-07-12 19:49:55 | INFO     | training.trainer - Optimizer: AdamW with lr=5.00e-04, weight_decay=1.00e-05
+2025-07-12 19:49:55 | INFO     | training.trainer - Scheduler: cosine
+2025-07-12 19:49:55 | INFO     | training.trainer - Loss function: huber
+2025-07-12 19:49:55 | WARNING  | training.trainer - MPS doesn't support bfloat16, using float16 instead
+2025-07-12 19:49:55 | INFO     | training.trainer - GradScaler disabled on MPS (not supported)
+2025-07-12 19:49:55 | INFO     | training.trainer - AMP enabled with dtype=float16 on mps device
+2025-07-12 19:49:55 | INFO     | training.trainer - Starting training...
+2025-07-12 19:49:55 | INFO     | training.trainer - Train batches: 1065
+2025-07-12 19:49:55 | INFO     | training.trainer - Val batches: 228
+2025-07-12 19:50:47 | INFO     | training.trainer - Epoch 001   0.1%  Loss nan
+2025-07-12 19:51:27 | INFO     | training.trainer - Epoch 001   0.7%  Loss nan
+2025-07-12 19:52:09 | INFO     | training.trainer - Epoch 001   1.2%  Loss nan
+2025-07-12 19:52:55 | INFO     | training.trainer - Epoch 001   1.8%  Loss nan
+2025-07-12 19:53:29 | INFO     | training.trainer - Epoch 001   2.3%  Loss nan
+2025-07-12 19:54:08 | INFO     | training.trainer - Epoch 001   2.9%  Loss nan
+2025-07-12 19:54:52 | INFO     | training.trainer - Epoch 001   3.5%  Loss nan
+2025-07-12 19:55:33 | INFO     | training.trainer - Epoch 001   4.0%  Loss nan
+2025-07-12 19:56:11 | INFO     | training.trainer - Epoch 001   4.6%  Loss nan
+2025-07-12 19:57:00 | INFO     | training.trainer - Epoch 001   5.2%  Loss nan
