@@ -1,0 +1,50 @@
+2025-07-12 14:52:41 | INFO     | utils.utils - Logging system initialized
+2025-07-12 14:52:41 | INFO     | __main__ - ================================================================================
+2025-07-12 14:52:41 | INFO     | __main__ - Chemical Kinetics Neural Network Pipeline
+2025-07-12 14:52:41 | INFO     | __main__ - Configuration: config/config.jsonc
+2025-07-12 14:52:41 | INFO     | utils.utils - Random seed set to 42
+2025-07-12 14:52:41 | INFO     | utils.hardware - Using Apple Silicon MPS device
+2025-07-12 14:52:41 | WARNING  | utils.hardware - MPS backend has limited operator support
+2025-07-12 14:52:41 | WARNING  | utils.hardware - torch.compile is disabled for MPS devices
+2025-07-12 14:52:41 | WARNING  | utils.hardware - Disabling torch.compile for MPS device due to compatibility issues
+2025-07-12 14:52:41 | INFO     | __main__ - NPY shard format enabled for high-performance data loading
+2025-07-12 14:52:41 | INFO     | __main__ - Converting HDF5 to NPY shards for optimized loading...
+2025-07-12 14:52:41 | INFO     | data.preprocessor - Converting HDF5 → NPY shards
+  input : data/processed/dataset.h5
+  output: data/processed/npy_shards
+2025-07-12 14:52:41 | INFO     | data.preprocessor -        train: 139,653,063 samples
+2025-07-12 14:52:41 | INFO     | data.preprocessor -   validation: 29,925,720 samples
+2025-07-12 14:52:41 | INFO     | data.preprocessor -         test: 29,926,314 samples
+2025-07-12 14:52:41 | ERROR    | __main__ - Pipeline failed: Unable to synchronously get dataspace (identifier is not of specified type)
+Traceback (most recent call last):
+  File "/Users/imalsky/Desktop/Test/src/main.py", line 341, in run
+    self.preprocess_data()
+  File "/Users/imalsky/Desktop/Test/src/main.py", line 224, in preprocess_data
+    shard_info = pre.convert_h5_to_npy_shards(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/imalsky/Desktop/Test/src/data/preprocessor.py", line 250, in convert_h5_to_npy_shards
+    mmap_arr[i - start : j - start] = samples[i:j]
+                                      ~~~~~~~^^^^^
+  File "h5py/_objects.pyx", line 56, in h5py._objects.with_phil.wrapper
+  File "h5py/_objects.pyx", line 57, in h5py._objects.with_phil.wrapper
+  File "/opt/homebrew/Caskroom/miniforge/base/envs/nn/lib/python3.12/site-packages/h5py/_hl/dataset.py", line 818, in __getitem__
+    if self._fast_read_ok and (new_dtype is None):
+       ^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniforge/base/envs/nn/lib/python3.12/site-packages/h5py/_hl/base.py", line 535, in __get__
+    value = obj.__dict__[self.func.__name__] = self.func(obj)
+                                               ^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniforge/base/envs/nn/lib/python3.12/site-packages/h5py/_hl/dataset.py", line 800, in _fast_read_ok
+    self._extent_type == h5s.SIMPLE
+    ^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Caskroom/miniforge/base/envs/nn/lib/python3.12/site-packages/h5py/_hl/base.py", line 535, in __get__
+    value = obj.__dict__[self.func.__name__] = self.func(obj)
+                                               ^^^^^^^^^^^^^^
+  File "h5py/_objects.pyx", line 56, in h5py._objects.with_phil.wrapper
+  File "h5py/_objects.pyx", line 57, in h5py._objects.with_phil.wrapper
+  File "/opt/homebrew/Caskroom/miniforge/base/envs/nn/lib/python3.12/site-packages/h5py/_hl/dataset.py", line 679, in _extent_type
+    return self.id.get_space().get_simple_extent_type()
+           ^^^^^^^^^^^^^^^^^^^
+  File "h5py/_objects.pyx", line 56, in h5py._objects.with_phil.wrapper
+  File "h5py/_objects.pyx", line 57, in h5py._objects.with_phil.wrapper
+  File "h5py/h5d.pyx", line 374, in h5py.h5d.DatasetID.get_space
+RuntimeError: Unable to synchronously get dataspace (identifier is not of specified type)

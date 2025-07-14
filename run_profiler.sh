@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-gpu=32   # Number of CPU cores
 #SBATCH --gpus=1            # Request 1 GPU
 #SBATCH --mem=79G           # Memory (RAM) requested
-#SBATCH -t 00:10:00         # 10-minute wall time provides a safe buffer
+#SBATCH -t 00:10:00         # MODIFIED: 10-minute wall time provides a safe buffer
 #SBATCH --mail-type=all     # Send email at begin and end of job
 #SBATCH --mail-user=isaac.n.malsky@jpl.nasa.gov
 
@@ -53,7 +53,7 @@ nvidia-smi
 echo "--- Starting Profiling with Nsight Systems ---"
 echo "Profiling will start after a 60-second delay and run for 180 seconds."
 
-# The 'nsys profile' command controls the runtime.
+# MODIFIED: The 'nsys profile' command now controls the runtime.
 # --delay=60: Wait 60s for the script to initialize (data loading, torch.compile) before profiling.
 # --duration=180: Profile for 180s (3 minutes), then gracefully stop the script and write the report.
 # --trace=...: Captures GPU, NVTX (PyTorch markers), and OS runtime (file IO) activity.

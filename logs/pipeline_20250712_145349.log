@@ -1,0 +1,52 @@
+2025-07-12 14:53:49 | INFO     | utils.utils - Logging system initialized
+2025-07-12 14:53:49 | INFO     | __main__ - ================================================================================
+2025-07-12 14:53:49 | INFO     | __main__ - Chemical Kinetics Neural Network Pipeline
+2025-07-12 14:53:49 | INFO     | __main__ - Configuration: config/config.jsonc
+2025-07-12 14:53:49 | INFO     | utils.utils - Random seed set to 42
+2025-07-12 14:53:49 | INFO     | utils.hardware - Using Apple Silicon MPS device
+2025-07-12 14:53:49 | WARNING  | utils.hardware - MPS backend has limited operator support
+2025-07-12 14:53:49 | WARNING  | utils.hardware - torch.compile is disabled for MPS devices
+2025-07-12 14:53:49 | WARNING  | utils.hardware - Disabling torch.compile for MPS device due to compatibility issues
+2025-07-12 14:53:49 | INFO     | __main__ - NPY shard format enabled for high-performance data loading
+2025-07-12 14:53:49 | INFO     | __main__ - Converting HDF5 to NPY shards for optimized loading...
+2025-07-12 14:53:49 | INFO     | data.preprocessor - Converting HDF5 → NPY shards
+  input : data/processed/dataset.h5
+  output: data/processed/npy_shards
+2025-07-12 14:53:49 | INFO     | data.preprocessor -        train: 139,653,063 samples
+2025-07-12 14:53:49 | INFO     | data.preprocessor -   validation: 29,925,720 samples
+2025-07-12 14:53:49 | INFO     | data.preprocessor -         test: 29,926,314 samples
+2025-07-12 14:53:50 | INFO     | data.preprocessor -   shard 1/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:53:51 | INFO     | data.preprocessor -   shard 2/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:53:52 | INFO     | data.preprocessor -   shard 3/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:53:53 | INFO     | data.preprocessor -   shard 4/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:53:54 | INFO     | data.preprocessor -   shard 5/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:53:55 | INFO     | data.preprocessor -   shard 6/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:53:56 | INFO     | data.preprocessor -   shard 7/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:53:57 | INFO     | data.preprocessor -   shard 8/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:53:57 | INFO     | data.preprocessor -   shard 9/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:53:58 | INFO     | data.preprocessor -   shard 10/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:53:59 | INFO     | data.preprocessor -   shard 11/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:54:00 | INFO     | data.preprocessor -   shard 12/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:54:01 | INFO     | data.preprocessor -   shard 13/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:54:02 | INFO     | data.preprocessor -   shard 14/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:54:02 | INFO     | data.preprocessor -   shard 15/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:54:03 | INFO     | data.preprocessor -   shard 16/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:54:04 | INFO     | data.preprocessor -   shard 17/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:54:05 | INFO     | data.preprocessor -   shard 18/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:54:06 | INFO     | data.preprocessor -   shard 19/20  10,000,000 rows  1,080.0 MB
+2025-07-12 14:54:06 | INFO     | data.preprocessor -   shard 20/20  9,505,097 rows  1,026.6 MB
+2025-07-12 14:54:06 | INFO     | data.preprocessor - NPY-shard export finished in 16.9s (1,276 MB/s)
+2025-07-12 14:54:06 | INFO     | __main__ - NPY shard conversion complete
+2025-07-12 14:54:06 | INFO     | __main__ - Starting model training...
+2025-07-12 14:54:07 | INFO     | __main__ - Model: DEEPONET
+2025-07-12 14:54:07 | INFO     | __main__ - Parameters: 1,555,854
+2025-07-12 14:54:07 | INFO     | __main__ - Creating datasets...
+2025-07-12 14:54:07 | INFO     | __main__ - Using NPY shard datasets for high-performance loading
+2025-07-12 14:54:07 | ERROR    | __main__ - Pipeline failed: NPYDataset.__init__() got an unexpected keyword argument 'data_file'
+Traceback (most recent call last):
+  File "/Users/imalsky/Desktop/Test/src/main.py", line 344, in run
+    self.train_model()
+  File "/Users/imalsky/Desktop/Test/src/main.py", line 270, in train_model
+    train_dataset = DatasetClass(
+                    ^^^^^^^^^^^^^
+TypeError: NPYDataset.__init__() got an unexpected keyword argument 'data_file'
