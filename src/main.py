@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Main entry point for chemical kinetics neural network training.
-Uses direct HDF5 to NPY shard conversion for optimal performance.
+Supports both standard training and hyperparameter optimization with Optuna.
+Uses chunked HDF5 format for efficient data storage and loading.
 """
 
 import json
@@ -13,10 +14,16 @@ from typing import Dict, Any, Optional
 import os
 import hashlib
 import warnings
+import platform
 
-if "KMP_DUPLICATE_LIB_OK" not in os.environ:
-    warnings.warn("Setting KMP_DUPLICATE_LIB_OK=TRUE to allow multiple OpenMP libraries.")
+# Check for OpenMP library conflicts on macOS
+if platform.system() == "Darwin" and "KMP_DUPLICATE_LIB_OK" not in os.environ:
+    # Only set this on macOS where the issue commonly occurs
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    warnings.warn(
+        "Setting KMP_DUPLICATE_LIB_OK=TRUE for macOS compatibility. "
+        "This may mask underlying library conflicts."
+    )
 
 import torch
 import numpy as np
@@ -31,15 +38,13 @@ from utils.utils import (
     save_json
 )
 from data.preprocessor import DataPreprocessor
-from data.dataset import NPYDataset, create_dataloader
-from data.device_prefetch import DevicePrefetchLoader
+from data.dataset import HDF5Dataset
 from models.model import create_model
 from training.trainer import Trainer
 
-
-# Suppress warnings
-warnings.filterwarnings("ignore", ".*torch.compile.*")
-warnings.filterwarnings("ignore", ".*flash attention.*")
+# Only suppress specific known warnings
+warnings.filterwarnings("ignore", message=".*torch.compile.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*flash attention.*", category=UserWarning)
 
 
 def compute_config_hash(config: Dict[str, Any]) -> str:
@@ -49,8 +54,8 @@ def compute_config_hash(config: Dict[str, Any]) -> str:
     # Extract all parts that affect data preprocessing
     relevant_config = {
         "raw_data_files": sorted(config["paths"]["raw_data_files"]),  # Sort for consistency
-        "data": config["data"],  # Includes chunk_size
-        "normalization": config["normalization"],  # Includes default_method
+        "data": config["data"],
+        "normalization": config["normalization"],
         "training": {
             "val_fraction": config["training"]["val_fraction"],
             "test_fraction": config["training"]["test_fraction"],
@@ -68,7 +73,7 @@ def compute_config_hash(config: Dict[str, Any]) -> str:
 class ChemicalKineticsPipeline:
     """
     Complete training pipeline for chemical kinetics prediction.
-    Uses direct HDF5 to NPY shard conversion for optimal performance.
+    Uses chunked HDF5 format for optimal performance.
     """
     
     def __init__(self, config_path: Path):
@@ -96,7 +101,7 @@ class ChemicalKineticsPipeline:
         self.device = setup_device()
         optimize_hardware(self.config["system"], self.device)
         
-        self.logger.info("Pipeline initialized with NPY shard format for high-performance data loading")
+        self.logger.info("Pipeline initialized with chunked HDF5 format for high-performance data loading")
         
     def setup_paths(self):
         """Create directory structure and setup paths."""
@@ -109,41 +114,35 @@ class ChemicalKineticsPipeline:
         
         # Convert to Path objects
         self.raw_data_files = [Path(f) for f in paths["raw_data_files"]]
-
-        # If the job script sets $NPY_SHARD_DIR use that, otherwise fall back
-        self.processed_dir = Path(os.getenv("NPY_SHARD_DIR", paths["processed_data_dir"]))
+        
+        # Use environment variable if set, otherwise use config
+        self.processed_dir = Path(os.getenv("PROCESSED_DATA_DIR", paths["processed_data_dir"]))
         self.log_dir = Path(paths["log_dir"])
         
         # Create directories
         ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
         
         # Define processed data paths
+        self.processed_hdf5_file = self.processed_dir / paths.get("processed_hdf5_file", "preprocessed_data.h5")
         self.normalization_file = self.processed_dir / "normalization.json"
         self.config_hash_file = self.processed_dir / "config_hash.txt"
         
     def preprocess_data(self) -> bool:
         """
-        Pre-process raw files directly to NPY shards.
-        Always applies normalization during shard creation.
+        Pre-process raw files to normalized chunked HDF5.
         """
         cfg_hash = compute_config_hash(self.config)
-        # Check if NPY shards already exist
-        npy_index_file = self.processed_dir / "shard_index.json"
-        train_indices_file = self.processed_dir / "train_indices.npy"
-        val_indices_file = self.processed_dir / "val_indices.npy"
-        test_indices_file = self.processed_dir / "test_indices.npy"
+        
+        # Check if preprocessed data already exists
         cache_ok = (
-            npy_index_file.exists()
+            self.processed_hdf5_file.exists()
             and self.normalization_file.exists()
-            and train_indices_file.exists()
-            and val_indices_file.exists()
-            and test_indices_file.exists()
             and self.config_hash_file.exists()
             and self.config_hash_file.read_text().strip() == cfg_hash
         )
         
         if cache_ok:
-            self.logger.info("Using cached NPY shards and normalization data.")
+            self.logger.info("Using cached HDF5 data and normalization.")
             return False
         
         # Check raw files exist
@@ -151,8 +150,8 @@ class ChemicalKineticsPipeline:
         if missing:
             raise FileNotFoundError(f"Missing raw data files: {missing}")
         
-        # Process directly to NPY shards with integrated normalization
-        self.logger.info("Starting direct NPY shard creation from raw files with normalization...")
+        # Process to HDF5 with integrated normalization
+        self.logger.info("Starting HDF5 creation from raw files with normalization...")
         
         preprocessor = DataPreprocessor(
             raw_files=self.raw_data_files,
@@ -160,18 +159,18 @@ class ChemicalKineticsPipeline:
             config=self.config
         )
         
-        dataset_info = preprocessor.process_to_npy_shards()  # Now includes stats and norm
+        dataset_info = preprocessor.process_to_hdf5()
+        
+        # Check for errors
+        if "error" in dataset_info:
+            self.logger.error(f"Preprocessing failed: {dataset_info['error']}")
+            sys.exit(1)
         
         # Check if any data was processed
-        total_samples = len(dataset_info["train_indices"]) + len(dataset_info["val_indices"]) + len(dataset_info["test_indices"])
+        total_samples = dataset_info["total_samples"]
         if total_samples == 0:
             self.logger.error("No valid data processed from raw files. Exiting.")
             sys.exit(1)
-        
-        # Save splits as .npy files
-        np.save(train_indices_file, np.array(dataset_info["train_indices"], dtype=np.int64))
-        np.save(val_indices_file, np.array(dataset_info["val_indices"], dtype=np.int64))
-        np.save(test_indices_file, np.array(dataset_info["test_indices"], dtype=np.int64))
         
         # Save config hash
         self.config_hash_file.write_text(cfg_hash)
@@ -190,12 +189,6 @@ class ChemicalKineticsPipeline:
         with open(self.normalization_file, 'r') as f:
             norm_stats = json.load(f)
         
-        # Load splits
-        splits = {}
-        splits["train"] = np.load(self.processed_dir / "train_indices.npy")
-        splits["validation"] = np.load(self.processed_dir / "val_indices.npy")
-        splits["test"] = np.load(self.processed_dir / "test_indices.npy")
-        
         # Create model
         model = create_model(self.config, self.device)
         
@@ -205,38 +198,32 @@ class ChemicalKineticsPipeline:
         self.logger.info(f"Parameters: {total_params:,}")
         
         # Create datasets
-        self.logger.info("Creating NPY shard datasets for high-performance loading...")
+        self.logger.info("Creating HDF5 datasets for high-performance loading...")
         
-        # Assume all data is normalized during preprocessing - zero runtime normalization overhead
-        self.logger.info("Using pre-normalized shards")
-        
-        train_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            indices=splits["train"],
+        train_dataset = HDF5Dataset(
+            hdf5_path=self.processed_hdf5_file,
+            split_name="train",
             config=self.config,
-            device=self.device,
-            split_name="train"
+            device=self.device
         )
         
-        val_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            indices=splits["validation"],
+        val_dataset = HDF5Dataset(
+            hdf5_path=self.processed_hdf5_file,
+            split_name="validation",
             config=self.config,
-            device=self.device,
-            split_name="validation"
+            device=self.device
         )
         
-        test_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            indices=splits["test"],
+        test_dataset = HDF5Dataset(
+            hdf5_path=self.processed_hdf5_file,
+            split_name="test",
             config=self.config,
-            device=self.device,
-            split_name="test"
+            device=self.device
         )
         
         # Log dataset info
         train_info = train_dataset.get_batch_info()
-        self.logger.info(f"NPY Dataset info: {train_info}")
+        self.logger.info(f"HDF5 Dataset info: {train_info}")
         
         # Initialize trainer
         trainer = Trainer(
@@ -265,23 +252,70 @@ class ChemicalKineticsPipeline:
             "test_loss": test_loss,
             "model_path": str(self.run_save_dir / "best_model.pt"),
             "training_time": trainer.total_training_time,
-            "data_format": "npy_shards"
+            "data_format": "hdf5_chunked"
         }
         
         save_json(results, self.run_save_dir / "results.json")
     
-    def run(self):
-        """Execute the complete pipeline."""
+    def optimize_hyperparameters(self):
+        """Run hyperparameter optimization using Optuna."""
+        if not self.config["optuna"]["enabled"]:
+            self.logger.info("Optuna optimization not enabled in config")
+            return
+        
+        # Import here to avoid dependency if not using Optuna
+        try:
+            from optuna_optimization import OptunaOptimizer
+        except ImportError:
+            self.logger.error("Optuna not installed. Install with: pip install optuna")
+            sys.exit(1)
+        
+        self.logger.info("Starting hyperparameter optimization with Optuna...")
+        
+        # Ensure data is preprocessed
+        self.preprocess_data()
+        
+        # Create optimizer
+        optimizer = OptunaOptimizer(
+            base_config=self.config,
+            preprocessed_hdf5_path=self.processed_hdf5_file,
+            save_dir=self.run_save_dir,
+            device=self.device
+        )
+        
+        # Run optimization
+        study = optimizer.optimize()
+        
+        # Train final model with best parameters
+        self.logger.info("Training final model with best hyperparameters...")
+        
+        # Load best config
+        best_config_path = self.run_save_dir / "optuna_study" / "best_config.json"
+        self.config = load_json_config(best_config_path)
+        
+        # Train with best config
+        self.train_model()
+    
+    def run(self, mode: str = "train"):
+        """
+        Execute the pipeline.
+        
+        Args:
+            mode: "train" for standard training, "optimize" for hyperparameter optimization
+        """
         try:
             # Step 1: Preprocess data (if needed)
             self.preprocess_data()
             
-            # Step 2: Train model
-            self.train_model()
+            # Step 2: Train or optimize
+            if mode == "optimize":
+                self.optimize_hyperparameters()
+            else:
+                self.train_model()
             
             self.logger.info("="*80)
             self.logger.info("Pipeline completed successfully!")
-            self.logger.info(f"Trained model and results saved in: {self.run_save_dir}")
+            self.logger.info(f"Results saved in: {self.run_save_dir}")
             
         except Exception as e:
             self.logger.error(f"Pipeline failed: {e}", exc_info=True)
@@ -299,6 +333,13 @@ def main():
         type=Path,
         default=Path("config/config.jsonc"),
         help="Path to configuration file (default: config/config.jsonc)"
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["train", "optimize"],
+        default="train",
+        help="Mode: train (standard training) or optimize (hyperparameter optimization)"
     )
     
     args = parser.parse_args()
@@ -319,7 +360,7 @@ def main():
     
     # Run pipeline
     pipeline = ChemicalKineticsPipeline(args.config)
-    pipeline.run()
+    pipeline.run(mode=args.mode)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,109 @@
+2025-07-16 16:23:45 | INFO     | utils.utils - Logging system initialized
+2025-07-16 16:23:45 | INFO     | __main__ - ================================================================================
+2025-07-16 16:23:45 | INFO     | __main__ - Chemical Kinetics Neural Network Pipeline
+2025-07-16 16:23:45 | INFO     | __main__ - Configuration: config/config.jsonc
+2025-07-16 16:23:45 | INFO     | utils.utils - Random seed set to 42
+2025-07-16 16:23:45 | INFO     | utils.hardware - Using Apple Silicon MPS device
+2025-07-16 16:23:45 | WARNING  | utils.hardware - MPS backend has limited operator support
+2025-07-16 16:23:45 | WARNING  | utils.hardware - torch.compile is disabled for MPS devices
+2025-07-16 16:23:45 | WARNING  | utils.hardware - Disabling torch.compile for MPS device due to compatibility issues
+2025-07-16 16:23:45 | INFO     | __main__ - Pipeline initialized with chunked HDF5 format for high-performance data loading
+2025-07-16 16:23:45 | INFO     | __main__ - Starting HDF5 creation from raw files with normalization...
+2025-07-16 16:23:45 | INFO     | data.preprocessor - ────────────────────────────────────────────────────────────────────────────────
+2025-07-16 16:23:45 | INFO     | data.preprocessor - Stage 1 – collecting normalisation statistics
+2025-07-16 16:23:45 | INFO     | data.normalizer - Using fixed reservoir size 1,000,000 for symlog quantile estimation
+2025-07-16 16:23:45 | INFO     | data.preprocessor - Processing stats from data/raw/run8001-result.h5
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable C2H2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable CH4_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable CO2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable CO_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable H2O_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable H2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable HCN_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable H_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable N2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable NH3_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable OH_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable O_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable t_time has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable C2H2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable CH4_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable CO2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable CO_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable H2O_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable H2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable HCN_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable H_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable N2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable NH3_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable OH_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable O_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable t_time has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable C2H2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable CH4_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable CO2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable CO_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable H2O_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable H2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable HCN_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable H_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable N2_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable NH3_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable OH_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable O_evolution has 100 non-finite values
+2025-07-16 16:23:55 | WARNING  | data.preprocessor - Variable t_time has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable C2H2_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable CH4_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable CO2_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable CO_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable H2O_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable H2_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable HCN_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable H_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable N2_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable NH3_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable OH_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable O_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable t_time has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable C2H2_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable CH4_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable CO2_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable CO_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable H2O_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable H2_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable HCN_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable H_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable N2_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable NH3_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable OH_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable O_evolution has 100 non-finite values
+2025-07-16 16:23:56 | WARNING  | data.preprocessor - Variable t_time has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable C2H2_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable CH4_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable CO2_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable CO_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable H2O_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable H2_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable HCN_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable H_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable N2_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable NH3_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable OH_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable O_evolution has 100 non-finite values
+2025-07-16 16:23:57 | WARNING  | data.preprocessor - Variable t_time has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable C2H2_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable CH4_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable CO2_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable CO_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable H2O_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable H2_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable HCN_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable H_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable N2_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable NH3_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable OH_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable O_evolution has 100 non-finite values
+2025-07-16 16:24:20 | WARNING  | data.preprocessor - Variable t_time has 100 non-finite values
+2025-07-16 16:24:26 | WARNING  | data.preprocessor - Species C2H2_evolution has 3 values below threshold 1e-25 (min value: 1.97e-26)
+2025-07-16 16:24:26 | WARNING  | data.preprocessor - Species C2H2_evolution has 2 values below threshold 1e-25 (min value: 8.24e-26)
+2025-07-16 16:24:27 | WARNING  | data.preprocessor - Species C2H2_evolution has 4 values below threshold 1e-25 (min value: 4.02e-26)

@@ -26,8 +26,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
-from data.dataset import NPYDataset, create_dataloader
-from models.model import export_jit_model
+from data.dataset import HDF5Dataset, create_dataloader
+from models.model import export_model  # Updated to modern export
 from data.device_prefetch import DevicePrefetchLoader
 
 
@@ -48,9 +48,9 @@ class Trainer:
     def __init__(               
         self,
         model: nn.Module,
-        train_dataset: NPYDataset,
-        val_dataset: NPYDataset,
-        test_dataset: NPYDataset,
+        train_dataset: HDF5Dataset,
+        val_dataset: HDF5Dataset,
+        test_dataset: HDF5Dataset,
         config: Dict[str, Any],
         save_dir: Path,
         device: torch.device,
@@ -312,36 +312,45 @@ class Trainer:
     
     def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
         """
-        One training epoch with optional gradient accumulation.
-        Keeps only an exponential-moving-average of gradient norms
-        to avoid unbounded memory growth.
+        One training epoch with gradient accumulation.
+        Ensures all batches contribute to gradient updates.
         """
         self.model.train()
         total_loss, total_samples = 0.0, 0
-        grad_norm_ema            = 0.0
-        ema_decay                = 0.98  # Exponential moving average decay for grad norm
-        accumulation_steps       = self.train_config["gradient_accumulation_steps"]
-        last_log_time            = time.time()
+        grad_norm_ema = 0.0
+        ema_decay = 0.98
+        accumulation_steps = self.train_config["gradient_accumulation_steps"]
+        last_log_time = time.time()
+        accumulated_loss = 0.0
+        accumulated_batches = 0
 
         if self._cuda_graphs_enabled and hasattr(self, "cudagraph_mark_step"):
             self.cudagraph_mark_step()
 
         for batch_idx, (inputs, targets) in enumerate(self.train_loader):
-            inputs  = inputs.to(self.device, non_blocking=True)
+            inputs = inputs.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
             with autocast(enabled=self.use_amp, device_type=self.device.type, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
-                loss    = self.criterion(outputs, targets) / accumulation_steps
+                loss = self.criterion(outputs, targets) / accumulation_steps
 
             (self.scaler.scale(loss) if self.scaler else loss).backward()
+            accumulated_loss += loss.item() * accumulation_steps
+            accumulated_batches += 1
 
-            if (batch_idx + 1) % accumulation_steps == 0:
+            # Perform optimizer step at accumulation boundary or last batch
+            is_accumulation_boundary = (batch_idx + 1) % accumulation_steps == 0
+            is_last_batch = (batch_idx + 1) == len(self.train_loader)
+            
+            if is_accumulation_boundary or is_last_batch:
                 if self.scaler:
                     self.scaler.unscale_(self.optimizer)
 
-                grad = nn.utils.clip_grad_norm_(self.model.parameters(),
-                                                self.train_config["gradient_clip"])
+                grad = nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.train_config["gradient_clip"]
+                )
                 grad_norm_ema = ema_decay * grad_norm_ema + (1 - ema_decay) * float(grad)
 
                 if self.scaler:
@@ -351,39 +360,50 @@ class Trainer:
                     self.optimizer.step()
 
                 self.optimizer.zero_grad(set_to_none=True)
-                if self.scheduler_step_on_batch:
+                
+                # Only step scheduler on full accumulation boundaries
+                if self.scheduler_step_on_batch and is_accumulation_boundary:
                     self.scheduler.step()
+                    
                 self.global_step += 1
 
                 if self._cuda_graphs_enabled and hasattr(self, "cudagraph_mark_step"):
                     self.cudagraph_mark_step()
 
-            # bookkeeping
-            batch_loss     = loss.item() * accumulation_steps
-            total_loss    += batch_loss * inputs.size(0)
+                # Reset accumulation tracking
+                accumulated_loss = 0.0
+                accumulated_batches = 0
+
+            # Track total loss
+            batch_loss = loss.item() * accumulation_steps
+            total_loss += batch_loss * inputs.size(0)
             total_samples += inputs.size(0)
 
+            # Progress logging
             if time.time() - last_log_time > LOGGING_INTERVAL_SECONDS:
                 pct = 100.0 * (batch_idx + 1) / len(self.train_loader)
-                self.logger.info(f"Epoch {self.current_epoch:03d} "
-                                f"{pct:5.1f}%  Loss {batch_loss:.4e}")
+                self.logger.info(
+                    f"Epoch {self.current_epoch:03d} "
+                    f"{pct:5.1f}%  Loss {batch_loss:.4e}"
+                )
                 last_log_time = time.time()
 
-            # Clear cache periodically to prevent OOM
+            # Memory management for large batches
             if self.device.type == 'cuda' and (batch_idx + 1) % self.empty_cache_interval == 0:
                 torch.cuda.empty_cache()
 
         avg_loss = total_loss / total_samples if total_samples else float("inf")
-        metrics  = {
+        metrics = {
             "grad_norm_ema": grad_norm_ema,
             "learning_rate": self.optimizer.param_groups[0]["lr"],
         }
+        
         return avg_loss, metrics
     
     @torch.no_grad()
     def _run_eval_loop(self, loader: DataLoader, enable_logging: bool = True) -> Tuple[float, Dict[str, float]]:
         """
-        Run evaluation loop on any dataset.
+        Run evaluation loop on any dataset with proper empty loader handling.
         
         Args:
             loader: DataLoader to evaluate
@@ -392,6 +412,11 @@ class Trainer:
         Returns:
             Tuple of (average loss, metrics dict)
         """
+        # Check for empty loader
+        if len(loader) == 0:
+            self.logger.error("Evaluation DataLoader is empty!")
+            raise ValueError("Cannot evaluate on empty DataLoader. Check data splits and filtering.")
+        
         self.model.eval()
         
         total_loss = 0.0
@@ -432,13 +457,14 @@ class Trainer:
         if enable_logging:
             self.logger.info(f"Evaluation completed in {elapsed_total:.1f}s")
         
-        if total_samples > 0:
-            avg_loss = total_loss / total_samples
-        else:
-            avg_loss = float('inf')
+        if total_samples == 0:
+            self.logger.error("No samples processed during evaluation!")
+            raise ValueError("Evaluation processed zero samples. Check batch processing.")
+            
+        avg_loss = total_loss / total_samples
             
         return avg_loss, {}
-    
+        
     def _validate(self) -> Tuple[float, Dict[str, float]]:
         """Validate the model during training."""
         return self._run_eval_loop(self.val_loader, enable_logging=True)
@@ -475,17 +501,17 @@ class Trainer:
         torch.save(checkpoint, path)
         self.logger.info(f"Saved best model (epoch {self.current_epoch})")
         
-        # Also export JIT model if requested
+        # Also export model if requested
         if self.system_config.get("save_jit_model", False):
-            self._export_jit_model()
+            self._export_model()
     
-    def _export_jit_model(self):
-        """Export model as TorchScript with improved error handling."""
+    def _export_model(self):
+        """Export model using modern torch.export with improved error handling."""
         try:
             if len(self.val_loader) == 0:
-                self.logger.warning("Validation loader is empty, trying train loader for JIT export")
+                self.logger.warning("Validation loader is empty, trying train loader for export")
                 if len(self.train_loader) == 0:
-                    self.logger.warning("Train loader is also empty, skipping JIT export")
+                    self.logger.warning("Train loader is also empty, skipping export")
                     return
                 loader_to_use = self.train_loader
             else:
@@ -494,16 +520,16 @@ class Trainer:
             example_batch = next(iter(loader_to_use))
             example_input = example_batch[0][:1].to(self.device)  # Single sample
             
-            jit_path = self.save_dir / "best_model_jit.pt"
-            export_jit_model(self.model, example_input, jit_path)
+            export_path = self.save_dir / "best_model_exported.pt"
+            export_model(self.model, example_input, export_path)
             
-            example_path = self.save_dir / "jit_example_input.pt"
+            example_path = self.save_dir / "export_example_input.pt"
             torch.save(example_input, example_path)
-            self.logger.info(f"Saved JIT example input to {example_path}")
+            self.logger.info(f"Saved export example input to {example_path}")
             
         except Exception as e:
-            self.logger.warning(f"JIT export failed: {e}")
-            self.logger.info("Model saved in standard format, JIT export can be done manually later")
+            self.logger.warning(f"Model export failed: {e}")
+            self.logger.info("Model saved in standard format, export can be done manually later")
     
     def _log_epoch(        
         self,
@@ -519,7 +545,7 @@ class Trainer:
         msg = (f"Epoch {self.current_epoch:03d} | "
                f"Train {train_loss:.4e} | Val {val_loss:.4e} | "
                f"LR {train_metrics['learning_rate']:.2e} | "
-               f"Grad {grad_norm:.2f} | Time {epoch_time:.1f}s")
+               f"Grad {grad_norm:.3e} | Time {epoch_time:.1f}s")
         if improvement > 0:
             msg += f" | ▲ {improvement:.4e}"
         self.logger.info(msg)
