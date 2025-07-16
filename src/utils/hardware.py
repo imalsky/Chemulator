@@ -202,6 +202,7 @@ def optimize_dataloader_settings(
 ) -> Dict[str, Any]:
     """
     Get optimized DataLoader settings based on hardware.
+    Fixed prefetch_factor logic to prevent PyTorch errors.
     
     Args:
         batch_size: Batch size for training
@@ -216,7 +217,7 @@ def optimize_dataloader_settings(
         "num_workers": 0,
         "pin_memory": False,
         "persistent_workers": False,
-        "prefetch_factor": None  # Will be set based on device
+        "prefetch_factor": None  # Must be None when num_workers=0
     }
     
     if device_type == "cuda":
@@ -231,25 +232,22 @@ def optimize_dataloader_settings(
         else:
             settings["num_workers"] = num_workers
         
-        # Enable persistent workers to avoid recreation overhead
+        # Set prefetch_factor only when num_workers > 0
         if settings["num_workers"] > 0:
             settings["persistent_workers"] = True
-            # Set prefetch factor within PyTorch limits
+            # Ensure prefetch_factor is within valid range [2, 16]
             settings["prefetch_factor"] = min(
-                max(DEFAULT_PREFETCH_FACTOR, settings["num_workers"] // 2),
-                MAX_PREFETCH_FACTOR
+                MAX_PREFETCH_FACTOR,
+                max(MIN_PREFETCH_FACTOR, settings["num_workers"] // 2)
             )
-        else:
-            # When num_workers is 0, prefetch_factor must be None
-            settings["prefetch_factor"] = None
+        # prefetch_factor remains None when num_workers=0
             
     elif device_type == "mps":
         # MPS doesn't work well with multiprocessing
-        settings["num_workers"] = MPS_WORKERS
+        settings["num_workers"] = MPS_WORKERS  # 0
         settings["pin_memory"] = False
         settings["persistent_workers"] = False
-        # No prefetch when no workers
-        settings["prefetch_factor"] = None
+        # prefetch_factor must be None when num_workers=0
         
     elif device_type == "cpu":
         # For CPU, use fewer workers to avoid overhead
@@ -258,11 +256,19 @@ def optimize_dataloader_settings(
         else:
             settings["num_workers"] = num_workers
             
-        # Set prefetch factor for CPU workers
+        # Set prefetch_factor only for CPU workers > 0
         if settings["num_workers"] > 0:
             settings["persistent_workers"] = True
             settings["prefetch_factor"] = MIN_PREFETCH_FACTOR
-        else:
-            settings["prefetch_factor"] = None
+        # prefetch_factor remains None when num_workers=0
+    
+    # Log configuration for debugging
+    logger = logging.getLogger(__name__)
+    logger.debug(
+        f"DataLoader settings for {device_type}: "
+        f"workers={settings['num_workers']}, "
+        f"prefetch={settings['prefetch_factor']}, "
+        f"pin_memory={settings['pin_memory']}"
+    )
     
     return settings

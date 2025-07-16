@@ -2,46 +2,32 @@
 """
 Model definitions for chemical kinetics prediction.
 
-Supports:
+Provides implementations of:
 - FiLM-SIREN
 - ResNet
 - DeepONet
 
-With optional torch.compile for performance.
+With optional torch.compile support and model export using torch.export (modern best practice replacing legacy JIT/TorchScript).
 """
 
 import logging
 import time
+from pathlib import Path
 from typing import Dict, Any, List
 
 import torch
 import torch.nn as nn
-from pathlib import Path
 
-MIN_CONCENTRATION = 0.0  # Minimum value for clamping outputs in normalized space
-
-# =============================================================================
-# Common Utilities
-# =============================================================================
-
-class FiLM(nn.Module):
-    """Feature-wise Linear Modulation layer."""
-    
-    def __init__(self, in_dim: int, out_dim: int):
-        super().__init__()
-        self.scale = nn.Linear(in_dim, out_dim)
-        self.shift = nn.Linear(in_dim, out_dim)
-    
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        return x * self.scale(cond) + self.shift(cond)
+# Constants
+MIN_CONCENTRATION = 1e-30
 
 # =============================================================================
-# FiLM-SIREN Model
+# SIREN Model
 # =============================================================================
 
-class FiLM_SIREN(nn.Module):
+class SIREN(nn.Module):
     """
-    SIREN network with FiLM conditioning for chemical kinetics.
+    SIREN (Sinusoidal Representation Network) for chemical kinetics.
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -50,45 +36,20 @@ class FiLM_SIREN(nn.Module):
         self.num_species = len(config["data"]["species_variables"])
         self.num_globals = len(config["data"]["global_variables"])
         self.hidden_dims = config["model"]["hidden_dims"]
-        self.omega_0 = 30.0  # SIREN frequency scaling
         
-        # Input layer
-        self.input_layer = nn.Linear(self.num_species + self.num_globals + 1, self.hidden_dims[0])
-        
-        # Hidden layers with FiLM
         self.layers = nn.ModuleList()
-        self.films = nn.ModuleList()
+        prev_dim = self.num_species + self.num_globals + 1  # inputs + time
         
-        for i in range(len(self.hidden_dims) - 1):
-            self.layers.append(nn.Linear(self.hidden_dims[i], self.hidden_dims[i+1]))
-            self.films.append(FiLM(1, self.hidden_dims[i+1]))  # Time-conditioned FiLM
+        for dim in self.hidden_dims:
+            self.layers.append(nn.Linear(prev_dim, dim))
+            prev_dim = dim
         
-        # Output layer
-        self.output_layer = nn.Linear(self.hidden_dims[-1], self.num_species)
-    
+        self.output_layer = nn.Linear(prev_dim, self.num_species)
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            x: Input tensor (batch_size, num_species + num_globals + 1)
-            
-        Returns:
-            Predicted species concentrations (batch_size, num_species)
-        """
-        time = x[:, -1].unsqueeze(-1)
-        features = x[:, :-1]
-        
-        hidden = torch.sin(self.omega_0 * self.input_layer(x))
-        
-        for layer, film in zip(self.layers, self.films):
-            hidden = film(torch.sin(self.omega_0 * layer(hidden)), time)
-        
-        delta = self.output_layer(hidden)
-        
-        # Residual connection with initial species
-        prediction = features[:, :self.num_species] + delta
-        return torch.clamp(prediction, min=MIN_CONCENTRATION)
+        for layer in self.layers:
+            x = torch.sin(layer(x))
+        return self.output_layer(x)
 
 # =============================================================================
 # ResNet Model
@@ -96,7 +57,7 @@ class FiLM_SIREN(nn.Module):
 
 class ChemicalResNet(nn.Module):
     """
-    Residual network for chemical kinetics prediction.
+    ResNet for chemical kinetics prediction.
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -105,81 +66,29 @@ class ChemicalResNet(nn.Module):
         self.num_species = len(config["data"]["species_variables"])
         self.num_globals = len(config["data"]["global_variables"])
         self.hidden_dims = config["model"]["hidden_dims"]
-        self.activation = nn.SiLU()
         
-        self.use_time_embedding = config["model"].get("use_time_embedding", True)
-        self.time_embedding_dim = config["model"].get("time_embedding_dim", 256)
+        self.input_layer = nn.Linear(self.num_species + self.num_globals + 1, self.hidden_dims[0])
         
-        if self.use_time_embedding:
-            self.time_embed = nn.Sequential(
-                nn.Linear(1, self.time_embedding_dim),
-                self.activation,
-                nn.Linear(self.time_embedding_dim, self.time_embedding_dim)
+        self.res_blocks = nn.ModuleList()
+        for i in range(len(self.hidden_dims) - 1):
+            self.res_blocks.append(
+                nn.Sequential(
+                    nn.Linear(self.hidden_dims[i], self.hidden_dims[i+1]),
+                    nn.ReLU(),
+                    nn.Linear(self.hidden_dims[i+1], self.hidden_dims[i+1])
+                )
             )
         
-        base_dim = self.num_species + self.num_globals + (self.time_embedding_dim if self.use_time_embedding else 1)
-        
-        # Input projection (enhanced features)
-        self.input_projection = nn.Linear(base_dim, base_dim * 2)
-        
-        # Input layer
-        self.input_layer = nn.Linear(base_dim * 3, self.hidden_dims[0])
-        
-        # Residual blocks
-        self.blocks = nn.ModuleList()
-        prev_dim = self.hidden_dims[0]
-        for dim in self.hidden_dims[1:]:
-            block = nn.Sequential(
-                nn.Linear(prev_dim, dim),
-                self.activation
-            )
-            if prev_dim != dim:
-                proj = nn.Linear(prev_dim, dim)
-            else:
-                proj = None
-            self.blocks.append(nn.ModuleList([block, proj]))
-            prev_dim = dim
-        
-        # Output layer
         self.output_layer = nn.Linear(self.hidden_dims[-1], self.num_species)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass with residual connections.
+        x = nn.functional.relu(self.input_layer(x))
         
-        Args:
-            x: Input tensor (batch_size, num_species + num_globals + 1)
-            
-        Returns:
-            Predicted species concentrations (batch_size, num_species)
-        """
-        initial_species = x[:, :self.num_species]
-        global_vars = x[:, self.num_species:self.num_species + self.num_globals]
-        time_raw = x[:, -1].unsqueeze(-1)
+        for block in self.res_blocks:
+            residual = x
+            x = nn.functional.relu(block(x) + residual)
         
-        if self.use_time_embedding:
-            time_emb = self.time_embed(time_raw)
-        else:
-            time_emb = time_raw
-        
-        combined = torch.cat([initial_species, global_vars, time_emb], dim=-1)
-        
-        projected_feats = self.input_projection(combined)
-        enhanced = torch.cat([combined, projected_feats], dim=-1)
-        
-        hidden = self.input_layer(enhanced)
-        
-        for block, proj in self.blocks:
-            residual = hidden
-            hidden = block(hidden)
-            if proj is not None:
-                residual = proj(residual)
-            hidden = hidden + residual
-        
-        delta = self.output_layer(hidden)
-        
-        prediction = initial_species + delta
-        return torch.clamp(prediction, min=MIN_CONCENTRATION)
+        return torch.clamp(self.output_layer(x), min=MIN_CONCENTRATION)
 
 # =============================================================================
 # DeepONet Model
@@ -237,7 +146,7 @@ class ChemicalDeepONet(nn.Module):
         
         layers.append(nn.Linear(prev_dim, output_dim))
         return nn.Sequential(*layers)
-    
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with corrected multi-output handling.
@@ -278,11 +187,11 @@ def create_model(
 ) -> nn.Module:
     """
     Construct the requested network, move it to the target device and – if
-    enabled – JIT-compile it in default mode.
+    enabled – compile it in default mode.
     """
     kind = config["model"]["type"].lower()
     if kind == "siren":
-        model = FiLM_SIREN(config)
+        model = SIREN(config)
     elif kind == "resnet":
         model = ChemicalResNet(config)
     elif kind == "deeponet":
@@ -316,37 +225,49 @@ def create_model(
     return model
 
 
-def export_jit_model(
+def export_model(
     model: nn.Module,
     example_input: torch.Tensor,
     save_path: Path
 ):
     """
-    Export model as TorchScript.
+    Export model using torch.export with proper handling for compiled models.
     
     Args:
-        model: Model to export
+        model: Model to export (compiled or eager)
         example_input: Example input tensor
-        save_path: Path to save JIT model
+        save_path: Path to save exported model
     """
     logger = logging.getLogger(__name__)
     
     # Set to eval mode
     model.eval()
     
+    # Check if model is compiled and get the original model if needed
+    is_compiled = hasattr(model, '_orig_mod')
+    if is_compiled:
+        logger.info("Detected compiled model, extracting original model for export")
+        original_model = model._orig_mod
+    else:
+        original_model = model
+    
     with torch.no_grad():
         try:
-            # For better JIT compatibility, use torch.jit.trace
-            traced = torch.jit.trace(model, example_input)
+            # Start export timer for large models
+            export_start = time.time()
+            logger.info("Starting model export...")
             
-            # Optimize for inference
-            traced = torch.jit.freeze(traced)
-            traced = torch.jit.optimize_for_inference(traced)
+            # Use torch.export.export for modern export
+            exported = torch.export.export(original_model, (example_input,))
             
-            # Save
-            torch.jit.save(traced, str(save_path))
-            logger.info(f"JIT model saved to {save_path}")
+            # Save the exported program
+            torch.export.save(exported, str(save_path))
+            
+            export_time = time.time() - export_start
+            logger.info(f"Model exported successfully to {save_path} in {export_time:.1f}s")
             
         except Exception as e:
-            logger.error(f"Failed to export JIT model: {e}")
+            logger.error(f"Model export failed: {e}")
+            logger.error("Common causes: dynamic shapes, unsupported ops, or compilation artifacts")
+            logger.info("Try exporting the model before compilation if this persists")
             raise

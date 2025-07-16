@@ -13,6 +13,8 @@ from typing import Dict, List, Any, Optional
 
 import numpy as np
 import torch
+import time
+
 
 # Normalization constants
 DEFAULT_EPSILON = 1e-37
@@ -113,76 +115,119 @@ class DataNormalizer:
             self._perform_update_accumulators(data, accumulators, n_timesteps)
 
     def _perform_update_accumulators(
-        self,
-        data: np.ndarray,
-        accumulators: Dict[str, Dict[str, Any]],
-        n_timesteps: int
-    ):
-        """Helper for core update logic, separable for profiling."""
-        for var, acc in accumulators.items():
-            var_idx = acc["index"]
-            method = acc["method"]
-            
-            # Extract variable data (3D assumed)
-            if var in self.global_vars:
-                # Globals: constant, repeat n_timesteps times per profile for consistent counting
-                per_profile = data[:, 0, var_idx]  # shape (n_profiles,)
-                var_data = np.repeat(per_profile, n_timesteps)  # shape (n_profiles * n_timesteps,)
-            else:
-                # Species/time: varying
-                var_data = data[:, :, var_idx].flatten()  # shape (n_profiles * n_timesteps,)
-            
-            var_data = var_data.astype(np.float64)
-            
-            # Filter out invalid values
-            valid_mask = np.isfinite(var_data)
-            var_data = var_data[valid_mask]
-            
-            if len(var_data) == 0:
-                continue
-            
-            # Apply transformations based on method
-            if method in ["log-standard", "log-min-max"]:
-                var_data = np.log10(np.maximum(var_data, self.epsilon))
-            
-            # Calculate statistics for this chunk
-            n_b = len(var_data)
-            mean_b = np.mean(var_data, dtype=np.float64)
-            
-            # Min/max
-            acc["min"] = min(acc["min"], float(np.min(var_data)))
-            acc["max"] = max(acc["max"], float(np.max(var_data)))
-            
-            # Update mean and variance using Chan et al.'s parallel algorithm
-            if acc["count"] == 0:
-                acc["count"] = n_b
-                acc["mean"] = float(mean_b)
-                if n_b > 1:
-                    acc["m2"] = float(np.sum((var_data - mean_b) ** 2, dtype=np.float64))
-            else:
-                n_a = acc["count"]
-                mean_a = acc["mean"]
-                m2_a = acc["m2"]
+            self,
+            data: np.ndarray,
+            accumulators: Dict[str, Dict[str, Any]],
+            n_timesteps: int
+        ):
+            """Helper for core update logic, separable for profiling."""
+            n_profiles, n_t_check, _ = data.shape
+            if n_t_check != n_timesteps:
+                raise ValueError(f"Mismatched timesteps: expected {n_timesteps}, got {n_t_check}")
+
+            if n_timesteps > 10000:
+                start_time = time.time()
+                self.logger.info(f"Starting accumulator update for large group ({n_timesteps:,} timesteps)")
+
+            for var, acc in accumulators.items():
+                var_idx = acc["index"]
+                method = acc["method"]
                 
-                n_ab = n_a + n_b
-                
-                delta = mean_b - mean_a
-                mean_ab = mean_a + delta * n_b / n_ab
-                
-                if n_b > 1:
-                    m2_b = float(np.sum((var_data - mean_b) ** 2, dtype=np.float64))
-                else:
+                if var in self.global_vars:
+                    # Globals are constant, use scalar value for efficiency
+                    value = data[0, 0, var_idx]
+                    value = float(value)  # Ensure scalar
+                    n_b = n_profiles * n_timesteps
+                    # Apply transformation if needed
+                    if method in ["log-standard", "log-min-max"]:
+                        value = np.log10(np.maximum(value, self.epsilon))
+                    
+                    mean_b = value
                     m2_b = 0.0
-                
-                m2_ab = m2_a + m2_b + delta * delta * n_a * n_b / n_ab
-                
-                acc["count"] = n_ab
-                acc["mean"] = float(mean_ab)
-                acc["m2"] = float(m2_ab)
+                    min_b = max_b = value
+                    
+                    # Filter invalid (though globals usually valid)
+                    if not np.isfinite(value):
+                        continue
+                    
+                    # Update min/max
+                    acc["min"] = min(acc["min"], value)
+                    acc["max"] = max(acc["max"], value)
+                    
+                    # Chan update
+                    if acc["count"] == 0:
+                        acc["count"] = n_b
+                        acc["mean"] = mean_b
+                        acc["m2"] = 0.0
+                    else:
+                        n_a = acc["count"]
+                        mean_a = acc["mean"]
+                        m2_a = acc["m2"]
+                        
+                        delta = mean_b - mean_a
+                        n_ab = n_a + n_b
+                        mean_ab = mean_a + delta * n_b / n_ab
+                        m2_ab = m2_a + delta**2 * n_a * n_b / n_ab  # m2_b=0
+                        
+                        acc["count"] = n_ab
+                        acc["mean"] = float(mean_ab)
+                        acc["m2"] = float(m2_ab)
+                    
+                    # Reservoir for symlog (add once since constant)
+                    if acc["reservoir"] is not None:
+                        acc["reservoir"].add_samples(np.array([value]))
+                else:
+                    # Species/time: original logic
+                    var_data = data[:, :, var_idx].flatten().astype(np.float64)
+                    
+                    valid_mask = np.isfinite(var_data)
+                    var_data = var_data[valid_mask]
+                    
+                    if len(var_data) == 0:
+                        continue
+                    
+                    if method in ["log-standard", "log-min-max"]:
+                        var_data = np.log10(np.maximum(var_data, self.epsilon))
+                    
+                    n_b = len(var_data)
+                    mean_b = np.mean(var_data, dtype=np.float64)
+                    
+                    acc["min"] = min(acc["min"], float(np.min(var_data)))
+                    acc["max"] = max(acc["max"], float(np.max(var_data)))
+                    
+                    # Chan update
+                    if acc["count"] == 0:
+                        acc["count"] = n_b
+                        acc["mean"] = float(mean_b)
+                        if n_b > 1:
+                            acc["m2"] = float(np.sum((var_data - mean_b)**2, dtype=np.float64))
+                        else:
+                            acc["m2"] = 0.0
+                    else:
+                        n_a = acc["count"]
+                        mean_a = acc["mean"]
+                        m2_a = acc["m2"]
+                        
+                        delta = mean_b - mean_a
+                        mean_ab = mean_a + delta * n_b / (n_a + n_b)
+                        
+                        if n_b > 1:
+                            m2_b = float(np.sum((var_data - mean_b)**2, dtype=np.float64))
+                        else:
+                            m2_b = 0.0
+                        
+                        m2_ab = m2_a + m2_b + delta**2 * n_a * n_b / (n_a + n_b)
+                        
+                        acc["count"] = n_a + n_b
+                        acc["mean"] = float(mean_ab)
+                        acc["m2"] = float(m2_ab)
+                    
+                    if method == "symlog" and acc["reservoir"]:
+                        acc["reservoir"].add_samples(var_data)
             
-            # Efficient quantile sampling for symlog
-            if method == "symlog" and acc["reservoir"] is not None:
-                acc["reservoir"].add_samples(var_data)
+            if n_timesteps > 10000:
+                end_time = time.time()
+                self.logger.info(f"Accumulator update completed in {end_time - start_time:.2f} seconds")
     
     def _finalize_statistics(self, accumulators: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         """Finalize statistics from accumulators."""
@@ -258,32 +303,72 @@ class DataNormalizer:
 
 
 class ReservoirSampler:
-    """Efficient reservoir sampling for quantile estimation with proper seeding."""
+    """
+    Efficient reservoir sampling for quantile estimation.
+    Memory-bounded implementation suitable for large datasets.
+    """
     
     def __init__(self, capacity: int, seed: int):
+        # Validate capacity to prevent memory issues
+        if capacity > 10_000_000:  # 10M samples max
+            logging.getLogger(__name__).warning(
+                f"Reservoir capacity {capacity} is very large, capping at 10M samples"
+            )
+            capacity = 10_000_000
+            
         self.capacity = capacity
         self.reservoir = []
         self.count = 0
         # Initialize RNG with fixed seed for reproducibility
         self.rng = np.random.RandomState(seed)
+        
+        # Pre-allocate for efficiency if capacity is known
+        if capacity <= 1_000_000:
+            self.reservoir = [0.0] * capacity
+            self.size = 0
+        else:
+            self.reservoir = []
+            self.size = 0
     
     def add_samples(self, samples: np.ndarray):
-        """Add samples to the reservoir."""
+        """Add samples to the reservoir with memory-efficient batching."""
+        # Process in chunks for very large sample arrays
+        chunk_size = 100_000
+        
+        if len(samples) > chunk_size:
+            for i in range(0, len(samples), chunk_size):
+                chunk = samples[i:i + chunk_size]
+                self._add_chunk(chunk)
+        else:
+            self._add_chunk(samples)
+    
+    def _add_chunk(self, samples: np.ndarray):
+        """Add a chunk of samples to the reservoir."""
         for sample in samples:
             self.count += 1
-            if len(self.reservoir) < self.capacity:
-                self.reservoir.append(float(sample))
+            
+            if self.size < self.capacity:
+                # Fill reservoir
+                if isinstance(self.reservoir, list) and len(self.reservoir) == self.capacity:
+                    # Pre-allocated list
+                    self.reservoir[self.size] = float(sample)
+                else:
+                    # Dynamic list
+                    self.reservoir.append(float(sample))
+                self.size += 1
             else:
+                # Randomly replace
                 j = self.rng.randint(0, self.count)
                 if j < self.capacity:
                     self.reservoir[j] = float(sample)
     
-    @property
-    def size(self) -> int:
-        return len(self.reservoir)
-    
     def get_samples(self) -> np.ndarray:
-        return np.array(self.reservoir, dtype=np.float64)
+        """Get reservoir samples as numpy array."""
+        if isinstance(self.reservoir, list) and self.size < len(self.reservoir):
+            # Pre-allocated list not fully filled
+            return np.array(self.reservoir[:self.size], dtype=np.float64)
+        else:
+            return np.array(self.reservoir, dtype=np.float64)
 
 
 class NormalizationHelper:
@@ -587,20 +672,39 @@ class NormalizationHelper:
             log_part
         ) / scale
 
-        return torch.clamp(result, -1.0, 1.0)
+        return torch.clamp(result, -self.clamp_value, self.clamp_value)
 
     def _symlog_inverse(self, data: torch.Tensor, threshold: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         """
-        Apply inverse symlog transformation with overflow protection.
+        Apply inverse symlog transformation with robust overflow protection.
+        Prevents numerical overflow for extreme values on A100 GPUs.
         """
         scaled_data = data * scale
         abs_scaled = torch.abs(scaled_data)
         sign_scaled = torch.sign(scaled_data)
 
+        # Linear region: |scaled_data| <= 1
         linear_part = scaled_data * threshold
-        exponent = torch.clamp(abs_scaled - 1.0, max=FLOAT32_MAX_EXPONENT)
-        log_part = sign_scaled * threshold * torch.pow(10.0, exponent)
+        
+        # Log region: |scaled_data| > 1
+        # Clamp exponent to prevent overflow
+        exponent = abs_scaled - 1.0
+        max_safe_exponent = FLOAT32_MAX_EXPONENT - 1  # Leave margin for safety
+        
+        # Log extreme values that would overflow
+        extreme_mask = exponent > max_safe_exponent
+        if extreme_mask.any():
+            self.logger.warning(
+                f"Clamping {extreme_mask.sum().item()} extreme values to prevent overflow "
+                f"(max exponent: {exponent.max().item():.2f})"
+            )
+        
+        clamped_exponent = torch.clamp(exponent, max=max_safe_exponent)
+        
+        # Compute log part with clamped exponent
+        log_part = sign_scaled * threshold * torch.pow(10.0, clamped_exponent)
 
+        # Combine linear and log regions
         result = torch.where(
             abs_scaled <= 1.0,
             linear_part,

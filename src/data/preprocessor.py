@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
 Preprocessor for chemical kinetics data.
-Converts raw HDF5 files directly to normalized NPY shards.
+Converts raw HDF5 files to normalized chunked HDF5 with train/val/test splits.
 """
 
-import json
 import logging
-import math
+import sys
 import random
 import time
 import re
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any, Tuple
 
 import h5py
 import numpy as np
@@ -20,9 +19,11 @@ from utils.utils import save_json
 
 from .normalizer import DataNormalizer, NormalizationHelper
 
+DEFAULT_TOSS = 1e-25
+
 class DataPreprocessor:
     """
-    Preprocess raw HDF5 files to normalized NPY shards.
+    Preprocess raw HDF5 files to normalized chunked HDF5 with splits.
     """
     
     def __init__(
@@ -47,8 +48,12 @@ class DataPreprocessor:
         self.n_species = len(self.species_vars)
         self.n_globals = len(self.global_vars)
         
-        self.shard_size = self.data_config["shard_size"]
         self.chunk_size = self.data_config["chunk_size"]
+        self.compression = self.data_config.get("compression", "gzip")
+        self.compression_level = self.data_config.get("compression_level", 4)
+        
+        # Output HDF5 path
+        self.output_hdf5 = self.output_dir / config["paths"].get("processed_hdf5_file", "preprocessed_data.h5")
         
         # Initialize summary counters
         self.total_groups = 0
@@ -57,47 +62,34 @@ class DataPreprocessor:
         self.skipped_pattern = 0
         self.skipped_nonfinite = 0
         self.total_nonfinite_values = 0
-
-        self._init_shard_index()  # Initialize shard_index structure
     
-    def _init_shard_index(self) -> None:
-        """Initialize an empty shard-index structure."""
-        self.shard_index: Dict[str, Any] = {
-            "format": "npy_shards_v1",
-            "n_species": self.n_species,
-            "n_globals": self.n_globals,
-            "samples_per_shard": self.shard_size,
-            "n_shards": 0,
-            "total_samples": 0,
-            "shards": [],
-            "split_files": {
-                "train": "train_indices.npy",
-                "validation": "val_indices.npy",
-                "test": "test_indices.npy"
-            }
-        }
-    
-    def process_to_npy_shards(self) -> Dict[str, Any]:
+    def process_to_hdf5(self) -> Dict[str, Any]:
         """
         Two-stage pipeline:
-          1. Single streaming sweep to accumulate statistics and count rows.
-          2. Second streaming sweep to write normalised NPY shards.
+        1. Single streaming sweep to accumulate statistics and count rows.
+        2. Second streaming sweep to write normalized HDF5 with splits.
 
         Returns:
-            Dictionary with train_indices, val_indices, test_indices, and misc metadata.
+            Dictionary with dataset metadata and split information.
+            
+        Raises:
+            SystemExit: If no valid data is found
         """
-        self.logger.info("─" * 78)
+        self.logger.info("─" * 80)
         self.logger.info("Stage 1 – collecting normalisation statistics")
 
         ########################
         # Pass 1 – statistics  #
         ########################
-        pass1_start = time.perf_counter()
+        pass1_start = time.time()
         max_timesteps = 0
-        accumulators  = self._initialize_accumulators()
+        total_samples = 0
+        accumulators = self._initialize_accumulators()
 
         for raw_file in self.raw_files:
             file_start = time.time()
+            self.logger.info(f"Processing stats from {raw_file}")
+            
             with h5py.File(raw_file, "r") as f:
                 for gname in f.keys():
                     self.total_groups += 1  # Track all attempted groups
@@ -109,8 +101,11 @@ class DataPreprocessor:
                     n_t = grp[self.time_var].shape[0]
                     if n_t > 10000:
                         self.logger.debug(f"Processing large group {gname} with {n_t:,} timesteps")
+                    
                     max_timesteps = max(max_timesteps, n_t)
-                    profile_np    = self._group_to_profile(grp, gname, n_t)
+                    total_samples += (n_t - 1)  # Exclude t=0
+                    
+                    profile_np = self._group_to_profile(grp, gname, n_t)
                     # Reshape to 3D (n_profiles=1, n_t, n_vars) for normalizer compatibility
                     profile_3d = profile_np.reshape(1, n_t, self.n_vars)
                     self.normalizer._update_accumulators(
@@ -120,86 +115,180 @@ class DataPreprocessor:
             file_time = time.time() - file_start
             self.logger.info(f"Processed stats for file {raw_file} in {file_time:.1f}s")
         
-        pass1_time = time.perf_counter() - pass1_start
+        pass1_time = time.time() - pass1_start
         self.logger.info(f"Stage 1 completed in {pass1_time:.1f}s")
+        self.logger.info(f"Total samples to process: {total_samples:,}")
 
+        if total_samples == 0:
+            self.logger.error("No valid samples found in data!")
+            self.logger.error("Check that:")
+            self.logger.error("1. Raw data files contain expected variables")
+            self.logger.error("2. Data values are within acceptable ranges")
+            self.logger.error("3. Group names match expected pattern")
+            sys.exit(1)  # Exit with error instead of returning error dict
+
+        # Continue with rest of processing...
         norm_stats = self.normalizer._finalize_statistics(accumulators)
         save_json(norm_stats, self.output_dir / "normalization.json")
 
         ########################
-        # Pass 2 – shard write #
+        # Pass 2 – HDF5 write  #
         ########################
-        self.logger.info("Stage 2 – writing normalised shards")
-        pass2_start = time.perf_counter()
-        helper       = NormalizationHelper(
+        self.logger.info("Stage 2 – writing normalized HDF5 with splits")
+        pass2_start = time.time()
+        
+        helper = NormalizationHelper(
             norm_stats, torch.device("cpu"),
             self.species_vars, self.global_vars, self.time_var, self.config
         )
-        shard_id     = 0
-        shard_rows   = []
-        splits       = {"train": [], "validation": [], "test": []}
-        val_f, test_f = self.config["training"]["val_fraction"], self.config["training"]["test_fraction"]
-        global_idx   = 0
-
-        for raw_file in self.raw_files:
-            file_start = time.time()
-            with h5py.File(raw_file, "r") as f:
-                for gname in f.keys():
-
-                    grp = f[gname]
-                    if not self._accept_group(grp, gname):
-                        continue
-
-                    n_t   = grp[self.time_var].shape[0]
-                    if n_t > 10000:
-                        self.logger.debug(f"Processing large group {gname} with {n_t:,} timesteps")
-                    profile = self._group_to_profile(grp, gname, n_t)
-                    profile_tensor = torch.from_numpy(profile)
-                    normalized_profile = helper.normalize_profile(profile_tensor).numpy()
-                    samples = self._group_to_samples(normalized_profile, n_t)   # List[np.ndarray]
-                    shard_rows.extend(samples)
-
-                    # flush?
-                    while len(shard_rows) >= self.shard_size:
-                        rows, shard_rows = shard_rows[:self.shard_size], shard_rows[self.shard_size:]
-                        self._write_shard(
-                            shard_id, rows, self.shard_index
-                        )
-                        shard_id += 1
-
-                    # split bookkeeping
-                    for _ in range(n_t - 1):
-                        r = random.random()
-                        tgt = ("test"        if r < test_f else
-                               "validation"  if r < test_f + val_f else
-                               "train")
-                        splits[tgt].append(global_idx)
-                        global_idx += 1
-            
-            file_time = time.time() - file_start
-            self.logger.info(f"Sharded file {raw_file} in {file_time:.1f}s")
-
-        # final partial shard
-        if shard_rows:
-            self._write_shard(shard_id, shard_rows, self.shard_index)
-
-        # Update total_samples
-        self.shard_index["total_samples"] = global_idx
-        with open(self.output_dir / "shard_index.json", "w") as f:
-            json.dump(self.shard_index, f, indent=2)
         
-        pass2_time = time.perf_counter() - pass2_start
+        # Calculate split sizes
+        val_f = self.config["training"]["val_fraction"]
+        test_f = self.config["training"]["test_fraction"]
+        
+        # Create output HDF5 file
+        self.logger.info(f"Creating HDF5 file: {self.output_hdf5}")
+        
+        with h5py.File(self.output_hdf5, 'w') as out_f:
+            # Create split groups
+            splits = {
+                "train": self._create_split_group(out_f, "train", self.chunk_size),
+                "validation": self._create_split_group(out_f, "validation", self.chunk_size),
+                "test": self._create_split_group(out_f, "test", self.chunk_size)
+            }
+            
+            # Add global metadata
+            out_f.attrs['n_species'] = self.n_species
+            out_f.attrs['n_globals'] = self.n_globals
+            out_f.attrs['format_version'] = "1.0"
+            out_f.attrs['created'] = time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Process all files and write to splits
+            split_indices = {"train": 0, "validation": 0, "test": 0}
+            global_idx = 0
+            
+            for raw_file in self.raw_files:
+                file_start = time.time()
+                self.logger.info(f"Processing {raw_file} to HDF5")
+                
+                with h5py.File(raw_file, "r") as f:
+                    for gname in f.keys():
+                        grp = f[gname]
+                        if not self._accept_group(grp, gname):
+                            continue
+
+                        n_t = grp[self.time_var].shape[0]
+                        if n_t > 10000:
+                            group_start = time.time()
+                            self.logger.debug(f"Starting processing for large group {gname} with {n_t:,} timesteps")
+                        
+                        # Get and normalize profile
+                        profile = self._group_to_profile(grp, gname, n_t)
+                        profile_tensor = torch.from_numpy(profile)
+                        normalized_profile = helper.normalize_profile(profile_tensor).numpy()
+                        
+                        # Convert to samples
+                        inputs_arr, targets_arr = self._profile_to_samples(normalized_profile, n_t)
+                        num_samples = len(inputs_arr)
+                        
+                        # Assign split for the entire profile
+                        r = random.random()
+                        if r < test_f:
+                            split_name = "test"
+                        elif r < test_f + val_f:
+                            split_name = "validation"
+                        else:
+                            split_name = "train"
+                        
+                        # Write directly to HDF5
+                        if num_samples > 0:
+                            start_idx = split_indices[split_name]
+                            end_idx = start_idx + num_samples
+                            
+                            splits[split_name]["inputs"][start_idx:end_idx] = inputs_arr
+                            splits[split_name]["targets"][start_idx:end_idx] = targets_arr
+                            
+                            split_indices[split_name] = end_idx
+                            global_idx += num_samples
+                        
+                        if n_t > 10000:
+                            group_time = time.time() - group_start
+                            self.logger.debug(f"Completed processing for large group {gname} in {group_time:.1f}s")
+                
+                file_time = time.time() - file_start
+                self.logger.info(f"Processed file {raw_file} in {file_time:.1f}s")
+            
+            # Resize datasets to actual sizes and update metadata
+            for split_name, split_data in splits.items():
+                actual_size = split_indices[split_name]
+                split_data["inputs"].resize((actual_size, self.n_species + self.n_globals + 1))
+                split_data["targets"].resize((actual_size, self.n_species))
+                split_data["group"].attrs['n_samples'] = actual_size
+                
+                self.logger.info(f"{split_name} split: {actual_size:,} samples")
+        
+        pass2_time = time.time() - pass2_start
         self.logger.info(f"Stage 2 completed in {pass2_time:.1f}s")
-
-        # Log skipped summary
+        
+        # Log summary
         skipped_total = self.skipped_fraction + self.skipped_missing + self.skipped_pattern + self.skipped_nonfinite
-        self.logger.info(f"Preprocessing summary: Total groups attempted: {self.total_groups}, "
-                         f"Processed: {self.total_groups - skipped_total}, "
-                         f"Skipped: {skipped_total} ({skipped_total / self.total_groups * 100 if self.total_groups else 0:.1f}%) "
-                         f"[fraction: {self.skipped_fraction}, missing keys: {self.skipped_missing}, "
-                         f"pattern mismatch: {self.skipped_pattern}, non-finite (groups: {self.skipped_nonfinite}, values: {self.total_nonfinite_values})]")
-
-        return {f"{k}_indices": v for k, v in splits.items()}
+        self.logger.info(
+            f"Preprocessing summary: Total groups attempted: {self.total_groups}, "
+            f"Processed: {self.total_groups - skipped_total}, "
+            f"Skipped: {skipped_total} ({skipped_total / self.total_groups * 100 if self.total_groups else 0:.1f}%) "
+            f"[fraction: {self.skipped_fraction}, missing keys: {self.skipped_missing}, "
+            f"pattern mismatch: {self.skipped_pattern}, non-finite: {self.skipped_nonfinite}]"
+        )
+        
+        # Return metadata
+        return {
+            "output_file": str(self.output_hdf5),
+            "total_samples": global_idx,
+            "splits": {
+                split_name: split_indices[split_name] 
+                for split_name in ["train", "validation", "test"]
+            },
+            "normalization_file": str(self.output_dir / "normalization.json")
+        }
+    
+    def _create_split_group(self, hdf5_file: h5py.File, split_name: str, chunk_size: int) -> Dict[str, Any]:
+        """Create a split group in the HDF5 file with chunked datasets."""
+        grp = hdf5_file.create_group(split_name)
+        
+        # Create datasets with chunking and compression
+        # Start with a reasonable size, will resize later
+        initial_size = 1000000
+        
+        inputs_dset = grp.create_dataset(
+            "inputs",
+            shape=(initial_size, self.n_species + self.n_globals + 1),
+            maxshape=(None, self.n_species + self.n_globals + 1),
+            dtype=np.float32,
+            chunks=(chunk_size, self.n_species + self.n_globals + 1),
+            compression=self.compression,
+            compression_opts=self.compression_level
+        )
+        
+        targets_dset = grp.create_dataset(
+            "targets", 
+            shape=(initial_size, self.n_species),
+            maxshape=(None, self.n_species),
+            dtype=np.float32,
+            chunks=(chunk_size, self.n_species),
+            compression=self.compression,
+            compression_opts=self.compression_level
+        )
+        
+        # Add metadata
+        grp.attrs['n_species'] = self.n_species
+        grp.attrs['n_globals'] = self.n_globals
+        grp.attrs['n_samples'] = 0  # Will be updated
+        
+        return {
+            "group": grp,
+            "inputs": inputs_dset,
+            "targets": targets_dset
+        }
     
     def _initialize_accumulators(self):
         """Initialize accumulators for stats collection."""
@@ -212,8 +301,13 @@ class DataPreprocessor:
             self.skipped_fraction += 1
             return False
         
+        # Check all required variables exist
         required_keys = set(self.species_vars + [self.time_var])
-        if not required_keys.issubset(group.keys()):
+        missing_vars = required_keys - set(group.keys())
+        if missing_vars:
+            if not hasattr(self, '_warned_missing_vars'):
+                self._warned_missing_vars = True
+                self.logger.error(f"Missing variables in HDF5: {missing_vars}")
             self.skipped_missing += 1
             return False
         
@@ -231,8 +325,12 @@ class DataPreprocessor:
     def _group_to_profile(self, group: h5py.Group, gname: str, n_t: int) -> np.ndarray:
         """Extract profile from group using chunked reading to handle large n_t."""
         match = re.match(r"run_T_(?P<T_init>[\d.eE+-]+)_P_(?P<P_init>[\d.eE+-]+)_SEED_\d+", gname)
-        T_init = float(match.group('T_init'))
-        P_init = float(match.group('P_init'))
+        try:
+            T_init = float(match.group('T_init'))
+            P_init = float(match.group('P_init'))
+        except (ValueError, TypeError) as e:
+            self.logger.warning(f"Invalid T_init or P_init in group {gname}: {e}")
+            raise ValueError(f"Cannot parse initial conditions from {gname}")
         
         profile = np.zeros((n_t, self.n_vars), dtype=np.float32)
         
@@ -242,6 +340,7 @@ class DataPreprocessor:
             chunk_size = end - start
             if chunk_size > 10000:
                 self.logger.debug(f"Loading chunk {start}-{end} for group {gname}")
+            
             for i, var in enumerate(self.var_order):
                 if var in self.species_vars or var == self.time_var:
                     profile[start:end, i] = group[var][start:end]
@@ -252,68 +351,70 @@ class DataPreprocessor:
         
         return profile
     
-    def _group_to_samples(self, normalized_profile: np.ndarray, n_t: int) -> List[np.ndarray]:
-        """Flatten normalized profile to samples (exclude t=0) using vectorized operations."""
+    def _profile_to_samples(self, normalized_profile: np.ndarray, n_t: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Convert normalized profile to input and target arrays.
+        Raises error if insufficient timesteps instead of returning empty arrays.
+        """
         if n_t <= 1:
-            return []
+            self.logger.error(f"Insufficient timesteps for training: n_t={n_t}. Need at least 2 timesteps.")
+            raise ValueError(f"Cannot create training samples from {n_t} timesteps. Need at least 2.")
+        
+        # Log processing for large profiles
+        if n_t > 10000:
+            self.logger.info(f"Converting profile with {n_t:,} timesteps to {n_t-1:,} training samples")
         
         # Initial species (repeat for all samples)
         init_species = np.repeat(normalized_profile[0, :self.n_species][np.newaxis, :], n_t - 1, axis=0)
         
-        # Globals (from t=1 to end, assumed constant but take per t for generality)
+        # Globals (from t=1 to end)
         globals_t = normalized_profile[1:, self.n_species:self.n_species + self.n_globals]
         
         # Time (from t=1 to end)
         time_t = normalized_profile[1:, -1][:, np.newaxis]
         
+        # Inputs: init_species + globals_t + time_t
+        inputs_arr = np.concatenate([init_species, globals_t, time_t], axis=1)
+        
         # Targets (species from t=1 to end)
-        targets = normalized_profile[1:, :self.n_species]
+        targets_arr = normalized_profile[1:, :self.n_species]
         
-        # Concatenate along columns
-        samples_array = np.concatenate([init_species, globals_t, time_t, targets], axis=1)
+        return inputs_arr, targets_arr
         
-        # Convert to list of arrays (for extend compatibility)
-        return [row for row in samples_array]
-    
-    def _write_shard(
-        self, 
-        shard_idx: int, 
-        data: List[np.ndarray], 
-        shard_index: Dict[str, Any]
-    ) -> None:
-        """
-        Write a single NPY shard (data already normalized).
-        """
-        shard_path = self.output_dir / f"shard_{shard_idx:04d}.npy"
-        shard_array = np.array(data, dtype=np.float32)
-        
-        np.save(shard_path, shard_array)
-        
-        file_size = shard_path.stat().st_size
-        shard_info = {
-            "shard_idx": shard_idx,
-            "filename": shard_path.name,
-            "start_idx": shard_idx * shard_index["samples_per_shard"],
-            "end_idx": shard_idx * shard_index["samples_per_shard"] + len(data),
-            "n_samples": len(data),
-            "file_size": int(file_size)
-        }
-        shard_index["shards"].append(shard_info)
-        shard_index["n_shards"] += 1  # Increment shard count
-        
-        self.logger.debug(
-            f"Wrote shard {shard_idx}: {len(data):,} samples, {file_size/1e6:.1f} MB"
-        )
-    
     def _validate_group(self, group: h5py.Group) -> bool:
-        """Return False if any NaN/Inf is found, accumulating full count."""
+        """
+        Validate group data and log rejection reasons.
+        Returns False if any NaN/Inf is found or if any species value is 
+        below threshold.
+        """
         required_keys = self.species_vars + [self.time_var]
         is_valid = True
+        n_t = group[self.time_var].shape[0]
+        chunk_size = self.chunk_size
+        min_threshold = DEFAULT_TOSS
+        
         for key in required_keys:
-            data = group[key][:]
-            bad_mask = ~np.isfinite(data)
-            bad_count = int(bad_mask.sum())
-            if bad_count:
-                self.total_nonfinite_values += bad_count
+            bad_count = 0  # For non-finites
+            below_threshold_count = 0  # For values below threshold
+            
+            for start in range(0, n_t, chunk_size):
+                end = min(start + chunk_size, n_t)
+                data_chunk = group[key][start:end]
+                
+                # Check for non-finites
+                bad_mask = ~np.isfinite(data_chunk)
+                bad_count += int(bad_mask.sum())
+                
+                # Check for species values below threshold
+                if key in self.species_vars:
+                    below_mask = data_chunk < min_threshold
+                    below_threshold_count += int(below_mask.sum())
+                    
+                    if np.any(below_mask):
+                        is_valid = False
+            
+            self.total_nonfinite_values += bad_count
+            if bad_count > 0:
                 is_valid = False
+        
         return is_valid
