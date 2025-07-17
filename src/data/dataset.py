@@ -37,6 +37,11 @@ class HDF5Dataset(Dataset):
         self.split_name = split_name
         self.config = config
         self.device_type = device.type
+
+        # Setup for efficient access
+        self._file_handle = None
+        self._inputs_dset = None
+        self._targets_dset = None
         
         # Load metadata
         start_time = time.time()
@@ -58,13 +63,8 @@ class HDF5Dataset(Dataset):
             if 'inputs' not in split_group or 'targets' not in split_group:
                 raise ValueError(f"Missing 'inputs' or 'targets' dataset in {split_name} split")
         
-        # Setup for efficient access
-        self._file_handle = None
-        self._inputs_dset = None
-        self._targets_dset = None
-        
         # Cache configuration
-        self.cache_size = 32  # Number of chunks to cache
+        self.cache_size = 16384
         self._chunk_cache = {}
         self._cache_order = []
         
@@ -126,11 +126,10 @@ class HDF5Dataset(Dataset):
         Get a single sample with efficient HDF5 access.
         Optimized to avoid unnecessary copies for A100 GPU performance.
         """
+        self._ensure_file_open()
+        
         if idx >= self.n_samples:
             raise IndexError(f"Index {idx} out of range for split with {self.n_samples} samples")
-        
-        # Ensure file is open
-        self._ensure_file_open()
         
         # Get chunk index and local index
         chunk_size = self._inputs_dset.chunks[0] if self._inputs_dset.chunks else 4096
@@ -202,6 +201,24 @@ class HDF5Dataset(Dataset):
                 self._file_handle.close()
             except:
                 pass
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_file_handle'] = None
+        state['_inputs_dset'] = None
+        state['_targets_dset'] = None
+        state['_chunk_cache'] = {}  # Clear cache to avoid pickling large data
+        state['_cache_order'] = []
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._file_handle = None
+        self._inputs_dset = None
+        self._targets_dset = None
+        self._chunk_cache = {}
+        self._cache_order = []
+        self._ensure_file_open()
 
 
 def worker_init_fn(worker_id: int):

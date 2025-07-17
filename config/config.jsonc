@@ -112,14 +112,14 @@
 
     // ── global schedule ────────────────────────────────────────────
     "epochs": 100,
-    "batch_size": 4096,
-    "gradient_accumulation_steps": 4,
+    "batch_size": 8192,
+    "gradient_accumulation_steps": 2,
 
     // ── DataLoader knobs (overrides hardware auto‑tuning) ──────────
-    "num_workers": 16,
+    "num_workers": 1,
     "pin_memory": true,
     "persistent_workers": true,
-    "prefetch_factor": 4,   // set null to let code decide
+    "prefetch_factor": 4,
     "drop_last": true,
 
     // ── optimisation ───────────────────────────────────────────────
@@ -129,20 +129,20 @@
 
     // ── LR scheduler ───────────────────────────────────────────────
     // "plateau" | "cosine"
-    "scheduler": "cosine",
+    "scheduler": "plateau",
 
     //   • For "plateau": factor, patience, min_lr
     //   • For "cosine" : T_0 (epochs), T_mult, eta_min
     "scheduler_params": {
       // Plateau defaults
-      //factor": 0.5,
-      //"patience": 5,
-      //"min_lr": 1e-10
+      "factor": 0.5,
+      "patience": 5,
+      "min_lr": 1e-10
 
       //Cosine example:
-      "T_0": 20,
-      "T_mult": 2,
-      "eta_min": 1e-8
+      //"T_0": 20,
+      //"T_mult": 2,
+      //"eta_min": 1e-8
     },
 
     // ── loss ───────────────────────────────────────────────────────
@@ -165,7 +165,7 @@
   // ════════════════════════ 6. OPTUNA ═════════════════════════════
   // Hyperparameter search configuration
   "optuna": {
-    "enabled": true,              // Set to true to enable hyperparameter search
+    "enabled": false,              // Set to true to enable hyperparameter search
     "n_trials": 50,               // Number of trials to run
     "n_jobs": 4,                   // Number of parallel jobs
     "study_name": "chemulator_optimization",
@@ -231,7 +231,7 @@
       // Keep some parameters fixed
       "training.epochs": {
         "type": "fixed",
-        "value": 50  // Shorter for hyperparameter search
+        "value": 300  // Shorter for hyperparameter search
       }
     }
   },
