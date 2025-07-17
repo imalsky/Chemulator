@@ -26,7 +26,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
-from data.dataset import HDF5Dataset, create_dataloader
+from data.dataset import NPYDataset, create_dataloader
 from models.model import export_model  # Updated to modern export
 from data.device_prefetch import DevicePrefetchLoader
 
@@ -48,9 +48,9 @@ class Trainer:
     def __init__(               
         self,
         model: nn.Module,
-        train_dataset: HDF5Dataset,
-        val_dataset: HDF5Dataset,
-        test_dataset: HDF5Dataset,
+        train_dataset: NPYDataset,
+        val_dataset: NPYDataset,
+        test_dataset: NPYDataset,
         config: Dict[str, Any],
         save_dir: Path,
         device: torch.device,
@@ -61,8 +61,8 @@ class Trainer:
         self.config         = config
         self.save_dir       = save_dir
         self.device         = device
-        self.train_config   = config["training"]
-        self.system_config  = config["system"]
+        self.train_config   = self.config["training"]
+        self.system_config  = self.config["system"]
 
         # Data loaders
         base_train = create_dataloader(train_dataset, config, shuffle=True,  device=device)
@@ -414,8 +414,8 @@ class Trainer:
         """
         # Check for empty loader
         if len(loader) == 0:
-            self.logger.error("Evaluation DataLoader is empty!")
-            raise ValueError("Cannot evaluate on empty DataLoader. Check data splits and filtering.")
+            self.logger.warning("Evaluation DataLoader is empty! Returning inf loss.")
+            return float('inf'), {}
         
         self.model.eval()
         
@@ -458,8 +458,8 @@ class Trainer:
             self.logger.info(f"Evaluation completed in {elapsed_total:.1f}s")
         
         if total_samples == 0:
-            self.logger.error("No samples processed during evaluation!")
-            raise ValueError("Evaluation processed zero samples. Check batch processing.")
+            self.logger.warning("No samples processed during evaluation! Returning inf loss.")
+            return float('inf'), {}
             
         avg_loss = total_loss / total_samples
             
@@ -525,49 +525,46 @@ class Trainer:
             
             example_path = self.save_dir / "export_example_input.pt"
             torch.save(example_input, example_path)
-            self.logger.info(f"Saved export example input to {example_path}")
+            self.logger.info(f"Model exported to {export_path}")
             
         except Exception as e:
             self.logger.warning(f"Model export failed: {e}")
-            self.logger.info("Model saved in standard format, export can be done manually later")
     
-    def _log_epoch(        
+    def _log_epoch(
         self,
         train_loss: float,
         val_loss: float,
         train_metrics: Dict[str, float],
         val_metrics: Dict[str, float],
-        epoch_time: float,
+        epoch_time: float
     ):
-        improvement = self.best_val_loss - val_loss
-        grad_norm   = train_metrics.get("grad_norm_ema", 0.0)
-
-        msg = (f"Epoch {self.current_epoch:03d} | "
-               f"Train {train_loss:.4e} | Val {val_loss:.4e} | "
-               f"LR {train_metrics['learning_rate']:.2e} | "
-               f"Grad {grad_norm:.3e} | Time {epoch_time:.1f}s")
-        if improvement > 0:
-            msg += f" | ▲ {improvement:.4e}"
-        self.logger.info(msg)
-
-        self.training_history["epochs"].append(
-            {
-                "epoch": self.current_epoch,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "grad_norm": grad_norm,
-                "lr": train_metrics["learning_rate"],
-                "time_s": epoch_time,
-                "improvement": max(improvement, 0.0),
-            }
+        """Log epoch results."""
+        lr = self.optimizer.param_groups[0]["lr"]
+        
+        log_str = (
+            f"Epoch {self.current_epoch:03d}/{self.train_config['epochs']:03d} | "
+            f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
+            f"LR: {lr:.2e} | Time: {epoch_time:.1f}s"
         )
-
-        if len(self.training_history["epochs"]) > self.max_history_epochs:
-            self.training_history["epochs"] = self.training_history["epochs"][-self.max_history_epochs :]
-
+        
+        if "grad_norm_ema" in train_metrics:
+            log_str += f" | Grad Norm: {train_metrics['grad_norm_ema']:.2f}"
+        
+        self.logger.info(log_str)
+        
+        # Append to history
+        epoch_data = {
+            "epoch": self.current_epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "lr": lr,
+            "time": epoch_time,
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics
+        }
+        self.training_history["epochs"].append(epoch_data)
+        
+        # Periodic save
         if self.current_epoch % self.history_save_interval == 0:
-            try:
-                with open(self.log_file, "w") as f:
-                    json.dump(self.training_history, f, indent=2)
-            except Exception as exc:
-                self.logger.warning(f"Failed to save history: {exc}")
+            with open(self.log_file, 'w') as f:
+                json.dump(self.training_history, f, indent=2)

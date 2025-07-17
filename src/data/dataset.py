@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Optimized dataset for chemical kinetics data using HDF5 format.
-Uses chunked HDF5 files for efficient data loading with built-in compression.
+Optimized dataset for chemical kinetics data.
+Uses NPYDataset for high-performance memory-mapped data loading on pre-normalized shards.
 """
 
 import logging
@@ -9,216 +9,169 @@ import random
 import json
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
-import time
 
-import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
 
-class HDF5Dataset(Dataset):
+class NPYDataset(Dataset):
     """
-    High-performance dataset using chunked HDF5 format.
+    High-performance dataset using memory-mapped NPY shards.
     Assumes pre-normalized data for zero runtime overhead.
     """
 
     def __init__(
         self,
-        hdf5_path: Path,
-        split_name: str,  # "train", "validation", or "test"
+        shard_dir: Path,
+        indices: List[int],
         config: Dict[str, Any],
         device: torch.device,
+        split_name: Optional[str] = None,
     ):
+        self.shard_dir = Path(shard_dir)
         super().__init__()
+
         self.logger = logging.getLogger(__name__)
-        
-        self.hdf5_path = Path(hdf5_path)
-        self.split_name = split_name
         self.config = config
         self.device_type = device.type
+        self.split_name = split_name
 
-        # Setup for efficient access
-        self._file_handle = None
-        self._inputs_dset = None
-        self._targets_dset = None
-        
-        # Load metadata
-        start_time = time.time()
-        self.logger.info(f"Opening HDF5 file for {split_name} split...")
-        
-        with h5py.File(self.hdf5_path, 'r') as f:
-            # Get split group
-            if split_name not in f:
-                raise ValueError(f"Split '{split_name}' not found in HDF5 file")
-            
-            split_group = f[split_name]
-            
-            # Get metadata
-            self.n_samples = split_group.attrs['n_samples']
-            self.n_species = split_group.attrs['n_species']
-            self.n_globals = split_group.attrs['n_globals']
-            
-            # Verify data exists
-            if 'inputs' not in split_group or 'targets' not in split_group:
-                raise ValueError(f"Missing 'inputs' or 'targets' dataset in {split_name} split")
-        
-        # Cache configuration
-        self.cache_size = 16384
-        self._chunk_cache = {}
-        self._cache_order = []
-        
-        load_time = time.time() - start_time
-        self.logger.info(
-            f"HDF5Dataset ready: {split_name} split with {self.n_samples:,} samples "
-            f"(loaded metadata in {load_time:.2f}s)"
-        )
+        # Load shard index
+        with open(self.shard_dir / "shard_index.json") as jf:
+            self.shard_index = json.load(jf)
+        if self.shard_index.get("format") != "npy_shards_v1":
+            raise ValueError(f"{self.shard_dir}: unsupported shard format "
+                             f"{self.shard_index.get('format')}")
+
+        # Store frequently-used constants
+        self.n_species = self.shard_index["n_species"]
+        self.n_globals = self.shard_index["n_globals"]
+        data_cfg = self.config["data"]
+        self.species_vars = data_cfg["species_variables"]
+        self.global_vars = data_cfg["global_variables"]
+        self.time_var = data_cfg["time_variable"]
+
+        # Split handling - prioritize passed indices
+        if indices is not None:
+            self.sample_indices = np.asarray(indices, dtype=np.int64)
+            self.n_total_samples = int(self.sample_indices.shape[0])
+            self.logger.info(f"{split_name or 'custom'} split: {self.n_total_samples:,} samples (indices passed in)")
+        else:
+            split_file = (self.shard_dir /
+                          self.shard_index["split_files"].get(split_name or "", ""))
+            if split_file.exists():
+                self.sample_indices = np.load(split_file, mmap_mode="r")
+                self.n_total_samples = int(self.sample_indices.shape[0])
+                self.logger.info(f"{split_name.capitalize()} split: {self.n_total_samples:,} samples (indices mmap-loaded)")
+            else:
+                self.sample_indices = None
+                self.n_total_samples = int(self.shard_index["total_samples"])
+
+        # Worker-local cache using instance attributes (per-process after pickling)
+        self.samples_per_shard = int(self.shard_index["samples_per_shard"])
+        self._current_shard_idx = -1
+        self._current_shard_data = None
+        self._shard_cache = {}
+
+        self.logger.info(f"NPYDataset ready: {self.n_total_samples:,} samples, "
+                         f"{self.shard_index['n_shards']} shards (pre-normalized)")
     
-    def _ensure_file_open(self):
-        """Ensure HDF5 file is open with proper error handling."""
-        if self._file_handle is None:
-            try:
-                # Use SWMR mode for concurrent access safety
-                self._file_handle = h5py.File(self.hdf5_path, 'r', swmr=True)
-                
-                # Verify split exists
-                if self.split_name not in self._file_handle:
-                    raise ValueError(f"Split '{self.split_name}' not found in HDF5 file")
-                    
-                split_group = self._file_handle[self.split_name]
-                
-                # Verify datasets exist
-                if 'inputs' not in split_group:
-                    raise ValueError(f"'inputs' dataset missing in {self.split_name} split")
-                if 'targets' not in split_group:
-                    raise ValueError(f"'targets' dataset missing in {self.split_name} split")
-                    
-                self._inputs_dset = split_group['inputs']
-                self._targets_dset = split_group['targets']
-                
-                # Verify dataset shapes
-                if len(self._inputs_dset) != len(self._targets_dset):
-                    raise ValueError(
-                        f"Mismatched dataset sizes: inputs={len(self._inputs_dset)}, "
-                        f"targets={len(self._targets_dset)}"
-                    )
-                
-                # Log chunk info for debugging
-                self.logger.debug(
-                    f"HDF5 chunks - inputs: {self._inputs_dset.chunks}, "
-                    f"targets: {self._targets_dset.chunks}"
-                )
-                
-            except OSError as e:
-                self.logger.error(f"Failed to open HDF5 file: {self.hdf5_path}")
-                self.logger.error(f"Error: {e}")
-                raise RuntimeError(f"Cannot open HDF5 file: {e}")
-            except Exception as e:
-                self.logger.error(f"Unexpected error opening HDF5 file: {e}")
-                raise
+    def _get_shard_data(self, shard_idx: int) -> np.ndarray:
+        """
+        Get memory-mapped shard data with caching.
+        Uses instance attributes for multiprocess compatibility.
+        """
+        # Check if we already have this shard loaded
+        if shard_idx == self._current_shard_idx and self._current_shard_data is not None:
+            return self._current_shard_data
+        
+        # Check cache
+        if shard_idx in self._shard_cache:
+            self._current_shard_idx = shard_idx
+            self._current_shard_data = self._shard_cache[shard_idx]
+            return self._current_shard_data
+        
+        # Load new shard
+        shard_info = self.shard_index["shards"][shard_idx]
+        shard_path = self.shard_dir / shard_info["filename"]
+        
+        # Memory-map the file for zero-copy access
+        shard_data = np.load(shard_path, mmap_mode='r')
+        
+        # Cache management - keep more shards for better sequential access
+        max_cache_size = 8
+        self._shard_cache[shard_idx] = shard_data
+        if len(self._shard_cache) > max_cache_size:
+            # Remove least recently used shard
+            oldest_idx = min(self._shard_cache.keys())
+            if oldest_idx != shard_idx:
+                del self._shard_cache[oldest_idx]
+        
+        self._current_shard_idx = shard_idx
+        self._current_shard_data = shard_data
+        
+        return shard_data
+    
+    def _global_to_shard_idx(self, global_idx: int) -> Tuple[int, int]:
+        """
+        Convert global sample index to (shard_idx, local_idx).
+        """
+        samples_per_shard = self.shard_index["samples_per_shard"]
+        shard_idx = global_idx // samples_per_shard
+        local_idx = global_idx % samples_per_shard
+        return shard_idx, local_idx
     
     def __len__(self) -> int:
         """Return total number of samples."""
-        return self.n_samples
+        return self.n_total_samples
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Get a single sample with efficient HDF5 access.
-        Optimized to avoid unnecessary copies for A100 GPU performance.
+        Get a single sample with efficient memory-mapped access.
+        Assumes pre-normalized data - direct tensor creation.
         """
-        self._ensure_file_open()
-        
-        if idx >= self.n_samples:
-            raise IndexError(f"Index {idx} out of range for split with {self.n_samples} samples")
-        
-        # Get chunk index and local index
-        chunk_size = self._inputs_dset.chunks[0] if self._inputs_dset.chunks else 4096
-        chunk_idx = idx // chunk_size
-        local_idx = idx % chunk_size
-        
-        # Try to get from cache
-        if chunk_idx in self._chunk_cache:
-            inputs_chunk, targets_chunk = self._chunk_cache[chunk_idx]
-            # Update cache order (LRU)
-            self._cache_order.remove(chunk_idx)
-            self._cache_order.append(chunk_idx)
+        # Map to actual sample index if using split indices
+        if self.sample_indices is not None:
+            if idx >= len(self.sample_indices):
+                raise IndexError(f"Index {idx} out of range for split with {len(self.sample_indices)} samples")
+            global_idx = self.sample_indices[idx]
         else:
-            # Load chunk
-            chunk_start = chunk_idx * chunk_size
-            chunk_end = min(chunk_start + chunk_size, self.n_samples)
-            
-            # Read full chunk (more efficient than single row)
-            inputs_chunk = self._inputs_dset[chunk_start:chunk_end]
-            targets_chunk = self._targets_dset[chunk_start:chunk_end]
-            
-            # Add to cache
-            self._chunk_cache[chunk_idx] = (inputs_chunk, targets_chunk)
-            self._cache_order.append(chunk_idx)
-            
-            # Evict oldest chunk if cache is full
-            if len(self._chunk_cache) > self.cache_size:
-                oldest_chunk = self._cache_order.pop(0)
-                del self._chunk_cache[oldest_chunk]
+            global_idx = idx
         
-        # Extract the specific sample
-        input_arr = inputs_chunk[local_idx]
-        target_arr = targets_chunk[local_idx]
+        # Find which shard contains this sample
+        shard_idx, local_idx = self._global_to_shard_idx(global_idx)
         
-        # Convert to tensors efficiently
-        # For contiguous arrays, torch.from_numpy doesn't copy
-        if input_arr.flags['C_CONTIGUOUS']:
-            input_tensor = torch.from_numpy(input_arr)
-        else:
-            input_tensor = torch.from_numpy(np.ascontiguousarray(input_arr))
-            
-        if target_arr.flags['C_CONTIGUOUS']:
-            target_tensor = torch.from_numpy(target_arr)
-        else:
-            target_tensor = torch.from_numpy(np.ascontiguousarray(target_arr))
+        # Get shard data (memory-mapped)
+        shard_data = self._get_shard_data(shard_idx)
         
-        # Pin memory only for CUDA devices
-        if self.device_type == "cuda":
-            input_tensor = input_tensor.pin_memory()
-            target_tensor = target_tensor.pin_memory()
+        # Extract row (this is a view, not a copy)
+        row = shard_data[local_idx]
         
+        # Split into input and target
+        n_input = self.n_species + self.n_globals + 1
+        
+        # Direct tensor creation without any processing
+        input_arr = row[:n_input]
+        target_arr = row[n_input:]
+        
+        # Pin memory if target device is CUDA
+        pin = self.device_type == "cuda"
+        input_tensor = torch.from_numpy(input_arr.copy()).pin_memory() if pin else torch.from_numpy(input_arr.copy())
+        target_tensor = torch.from_numpy(target_arr.copy()).pin_memory() if pin else torch.from_numpy(target_arr.copy())
+
+
         return input_tensor, target_tensor
     
     def get_batch_info(self) -> Dict[str, Any]:
         """Get information about dataset structure for logging."""
         return {
-            "format": "hdf5_chunked",
-            "file": str(self.hdf5_path),
-            "split": self.split_name,
-            "n_samples": self.n_samples,
-            "n_species": self.n_species,
-            "n_globals": self.n_globals
+            "format": "npy_shards",
+            "n_shards": self.shard_index["n_shards"],
+            "samples_per_shard": self.shard_index["samples_per_shard"],
+            "total_samples": self.n_total_samples,
+            "split": self.split_name
         }
-    
-    def __del__(self):
-        """Clean up HDF5 file handle."""
-        if self._file_handle is not None:
-            try:
-                self._file_handle.close()
-            except:
-                pass
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state['_file_handle'] = None
-        state['_inputs_dset'] = None
-        state['_targets_dset'] = None
-        state['_chunk_cache'] = {}  # Clear cache to avoid pickling large data
-        state['_cache_order'] = []
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._file_handle = None
-        self._inputs_dset = None
-        self._targets_dset = None
-        self._chunk_cache = {}
-        self._cache_order = []
-        self._ensure_file_open()
 
 
 def worker_init_fn(worker_id: int):

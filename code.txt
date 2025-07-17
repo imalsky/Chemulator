@@ -917,9 +917,6 @@ class ChemicalKineticsPipeline:
             split_name="train"
         )
         
-        if len(train_dataset) == 0:
-            raise ValueError("Training dataset is empty. Check preprocessing and data splits.")
-        
         val_dataset = NPYDataset(
             shard_dir=self.processed_dir,
             indices=np.load(self.processed_dir / "val_indices.npy"),
@@ -928,9 +925,6 @@ class ChemicalKineticsPipeline:
             split_name="validation"
         )
         
-        if len(val_dataset) == 0:
-            self.logger.warning("Validation dataset is empty. Proceeding but results may be unreliable.")
-        
         test_dataset = NPYDataset(
             shard_dir=self.processed_dir,
             indices=np.load(self.processed_dir / "test_indices.npy"),
@@ -938,9 +932,6 @@ class ChemicalKineticsPipeline:
             device=self.device,
             split_name="test"
         )
-        
-        if len(test_dataset) == 0:
-            self.logger.warning("Test dataset is empty. Proceeding but cannot evaluate on test set.")
         
         # Log dataset info
         train_info = train_dataset.get_batch_info()
@@ -1151,8 +1142,8 @@ class Trainer:
         self.config         = config
         self.save_dir       = save_dir
         self.device         = device
-        self.train_config   = self.config["training"]
-        self.system_config  = self.config["system"]
+        self.train_config   = config["training"]
+        self.system_config  = config["system"]
 
         # Data loaders
         base_train = create_dataloader(train_dataset, config, shuffle=True,  device=device)
@@ -1504,8 +1495,8 @@ class Trainer:
         """
         # Check for empty loader
         if len(loader) == 0:
-            self.logger.warning("Evaluation DataLoader is empty! Returning inf loss.")
-            return float('inf'), {}
+            self.logger.error("Evaluation DataLoader is empty!")
+            raise ValueError("Cannot evaluate on empty DataLoader. Check data splits and filtering.")
         
         self.model.eval()
         
@@ -1548,8 +1539,8 @@ class Trainer:
             self.logger.info(f"Evaluation completed in {elapsed_total:.1f}s")
         
         if total_samples == 0:
-            self.logger.warning("No samples processed during evaluation! Returning inf loss.")
-            return float('inf'), {}
+            self.logger.error("No samples processed during evaluation!")
+            raise ValueError("Evaluation processed zero samples. Check batch processing.")
             
         avg_loss = total_loss / total_samples
             
@@ -1615,49 +1606,52 @@ class Trainer:
             
             example_path = self.save_dir / "export_example_input.pt"
             torch.save(example_input, example_path)
-            self.logger.info(f"Model exported to {export_path}")
+            self.logger.info(f"Saved export example input to {example_path}")
             
         except Exception as e:
             self.logger.warning(f"Model export failed: {e}")
+            self.logger.info("Model saved in standard format, export can be done manually later")
     
-    def _log_epoch(
+    def _log_epoch(        
         self,
         train_loss: float,
         val_loss: float,
         train_metrics: Dict[str, float],
         val_metrics: Dict[str, float],
-        epoch_time: float
+        epoch_time: float,
     ):
-        """Log epoch results."""
-        lr = self.optimizer.param_groups[0]["lr"]
-        
-        log_str = (
-            f"Epoch {self.current_epoch:03d}/{self.train_config['epochs']:03d} | "
-            f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
-            f"LR: {lr:.2e} | Time: {epoch_time:.1f}s"
+        improvement = self.best_val_loss - val_loss
+        grad_norm   = train_metrics.get("grad_norm_ema", 0.0)
+
+        msg = (f"Epoch {self.current_epoch:03d} | "
+               f"Train {train_loss:.4e} | Val {val_loss:.4e} | "
+               f"LR {train_metrics['learning_rate']:.2e} | "
+               f"Grad {grad_norm:.3e} | Time {epoch_time:.1f}s")
+        if improvement > 0:
+            msg += f" | ▲ {improvement:.4e}"
+        self.logger.info(msg)
+
+        self.training_history["epochs"].append(
+            {
+                "epoch": self.current_epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "grad_norm": grad_norm,
+                "lr": train_metrics["learning_rate"],
+                "time_s": epoch_time,
+                "improvement": max(improvement, 0.0),
+            }
         )
-        
-        if "grad_norm_ema" in train_metrics:
-            log_str += f" | Grad Norm: {train_metrics['grad_norm_ema']:.2f}"
-        
-        self.logger.info(log_str)
-        
-        # Append to history
-        epoch_data = {
-            "epoch": self.current_epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "lr": lr,
-            "time": epoch_time,
-            "train_metrics": train_metrics,
-            "val_metrics": val_metrics
-        }
-        self.training_history["epochs"].append(epoch_data)
-        
-        # Periodic save
+
+        if len(self.training_history["epochs"]) > self.max_history_epochs:
+            self.training_history["epochs"] = self.training_history["epochs"][-self.max_history_epochs :]
+
         if self.current_epoch % self.history_save_interval == 0:
-            with open(self.log_file, 'w') as f:
-                json.dump(self.training_history, f, indent=2)
+            try:
+                with open(self.log_file, "w") as f:
+                    json.dump(self.training_history, f, indent=2)
+            except Exception as exc:
+                self.logger.warning(f"Failed to save history: {exc}")
 
 ===== /Users/imalsky/Desktop/Chemulator/src/utils/utils.py =====
 #!/usr/bin/env python3
@@ -2812,7 +2806,7 @@ class DataPreprocessor:
             self.species_vars, self.global_vars, self.time_var, self.config
         )
         shard_id     = 0
-        shard_chunks   = []  # list of 2D np arrays
+        shard_rows   = []
         splits       = {"train": [], "validation": [], "test": []}
         val_f, test_f = self.config["training"]["val_fraction"], self.config["training"]["test_fraction"]
         global_idx   = 0
@@ -2838,37 +2832,16 @@ class DataPreprocessor:
                     normalized_profile = helper.normalize_profile(profile_tensor).numpy()
                     
                     # Convert to samples
-                    samples = self._group_to_samples(normalized_profile, n_t)   # 2D np.ndarray or None
-                    if samples is not None:
-                        shard_chunks.append(samples)
+                    samples = self._group_to_samples(normalized_profile, n_t)   # List[np.ndarray]
+                    shard_rows.extend(samples)
 
-                    # flush if needed
-                    current_size = sum(chunk.shape[0] for chunk in shard_chunks)
-                    while current_size >= self.shard_size:
-                        # Collect data for one shard
-                        to_write = []
-                        remaining = self.shard_size
-                        new_chunks = []
-                        for chunk in shard_chunks:
-                            if remaining == 0:
-                                new_chunks.append(chunk)
-                                continue
-                            if chunk.shape[0] <= remaining:
-                                to_write.append(chunk)
-                                remaining -= chunk.shape[0]
-                            else:
-                                to_write.append(chunk[:remaining])
-                                new_chunks.append(chunk[remaining:])
-                                remaining = 0
-                        shard_chunks = new_chunks
-
-                        write_data = np.concatenate(to_write, axis=0) if len(to_write) > 1 else to_write[0]
+                    # flush?
+                    while len(shard_rows) >= self.shard_size:
+                        rows, shard_rows = shard_rows[:self.shard_size], shard_rows[self.shard_size:]
                         self._write_shard(
-                            shard_id, write_data, self.shard_index
+                            shard_id, rows, self.shard_index
                         )
                         shard_id += 1
-
-                        current_size = sum(chunk.shape[0] for chunk in shard_chunks)
 
                     # split bookkeeping
                     for _ in range(n_t - 1):
@@ -2887,9 +2860,8 @@ class DataPreprocessor:
             self.logger.info(f"Sharded file {raw_file} in {file_time:.1f}s")
 
         # final partial shard
-        if shard_chunks:
-            write_data = np.concatenate(shard_chunks, axis=0) if len(shard_chunks) > 1 else shard_chunks[0]
-            self._write_shard(shard_id, write_data, self.shard_index)
+        if shard_rows:
+            self._write_shard(shard_id, shard_rows, self.shard_index)
 
         # Update total_samples
         self.shard_index["total_samples"] = global_idx
@@ -2999,10 +2971,10 @@ class DataPreprocessor:
         
         return profile
     
-    def _group_to_samples(self, normalized_profile: np.ndarray, n_t: int) -> np.ndarray:
+    def _group_to_samples(self, normalized_profile: np.ndarray, n_t: int) -> List[np.ndarray]:
         """Flatten normalized profile to samples (exclude t=0) using vectorized operations."""
         if n_t <= 1:
-            return None
+            return []
         
         # Log processing for large profiles
         if n_t > 10000:
@@ -3023,12 +2995,13 @@ class DataPreprocessor:
         # Concatenate along columns
         samples_array = np.concatenate([init_species, globals_t, time_t, targets], axis=1)
         
-        return samples_array
+        # Convert to list of arrays (for extend compatibility)
+        return [row for row in samples_array]
     
     def _write_shard(
         self,
         shard_idx: int,
-        data: np.ndarray,
+        data: List[np.ndarray],
         shard_index: Dict[str, Any]
     ) -> None:
         """
@@ -3039,7 +3012,8 @@ class DataPreprocessor:
         shard_path = self.output_dir / f"shard_{shard_idx:04d}.npy"
 
         # Serialize data to disk
-        np.save(shard_path, data)
+        shard_array = np.array(data, dtype=np.float32)
+        np.save(shard_path, shard_array)
 
         # Measure file size
         file_size = shard_path.stat().st_size
@@ -3049,7 +3023,7 @@ class DataPreprocessor:
             "total_samples",
             shard_idx * shard_index["samples_per_shard"]
         )
-        end_idx = start_idx + data.shape[0]
+        end_idx = start_idx + len(data)
 
         # Record shard metadata
         shard_info = {
@@ -3057,7 +3031,7 @@ class DataPreprocessor:
             "filename": shard_path.name,
             "start_idx": start_idx,
             "end_idx": end_idx,
-            "n_samples": data.shape[0],
+            "n_samples": len(data),
             "file_size": int(file_size),
         }
         shard_index["shards"].append(shard_info)
@@ -3069,7 +3043,7 @@ class DataPreprocessor:
         # Debug log
         shard_time = time.time() - shard_start
         self.logger.debug(
-            f"Wrote shard {shard_idx}: {data.shape[0]:,} samples, "
+            f"Wrote shard {shard_idx}: {len(data):,} samples, "
             f"{file_size/1e6:.1f} MB in {shard_time:.1f}s"
         )
     
