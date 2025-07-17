@@ -1,263 +1,259 @@
 {
-  // ════════════════════════════ 1. PATHS ════════════════════════════
-  // Directories & file lists used throughout the pipeline
-  "paths": {
-    // List of raw HDF5 files (absolute or relative). Order is irrelevant.
-    "raw_data_files": [
-      "data/raw/run8001-result.h5",
-      "data/raw/run8002-result.h5",
-      "data/raw/run8003-result.h5",
-      "data/raw/run8004-result.h5",
-      "data/raw/run8005-result.h5",
-      "data/raw/run8006-result.h5",
-      "data/raw/run8007-result.h5",
-      "data/raw/run8008-result.h5",
-      "data/raw/run8009-result.h5"
-    ],
+// ════════════════════════════ 1. PATHS ════════════════════════════
+// Directories & file lists used throughout the pipeline
+"paths": {
+// List of raw HDF5 files (absolute or relative). Order is irrelevant.
+"raw_data_files": [
+"data/raw/run8001-result.h5",
+"data/raw/run8002-result.h5",
+"data/raw/run8003-result.h5",
+"data/raw/run8004-result.h5",
+"data/raw/run8005-result.h5",
+"data/raw/run8006-result.h5",
+"data/raw/run8007-result.h5",
+"data/raw/run8008-result.h5",
+"data/raw/run8009-result.h5"
+],
 
-    // Where pre‑processed HDF5 file goes
-    "processed_data_dir": "data/processed",
-    
-    // Preprocessed HDF5 filename
-    "processed_hdf5_file": "preprocessed_data.h5",
+// Where pre‑processed NPY shards go
+"processed_data_dir": "data/processed",
 
-    // Parent dir for run‑specific model folders
-    "model_save_dir": "data/models",
+// Parent dir for run‑specific model folders
+"model_save_dir": "data/models",
 
-    // Central log directory (one file per run inside)
-    "log_dir": "logs"
-  },
+// Central log directory (one file per run inside)
+"log_dir": "logs"
+},
 
-  // ════════════════════════════ 2. DATA ════════════════════════════
-  // Dataset layout & processing settings
-  "data": {
-    "species_variables": [
-      "C2H2_evolution",
-      "CH4_evolution",
-      "CO2_evolution",
-      "CO_evolution",
-      "H2O_evolution",
-      "H2_evolution",
-      "HCN_evolution",
-      "H_evolution",
-      "N2_evolution",
-      "NH3_evolution",
-      "OH_evolution",
-      "O_evolution"
-    ],
-    "global_variables": ["P_init","T_init"],
+// ════════════════════════════ 2. DATA ════════════════════════════
+// Dataset layout & processing settings
+"data": {
+"species_variables": [
+"C2H2_evolution",
+"CH4_evolution",
+"CO2_evolution",
+"CO_evolution",
+"H2O_evolution",
+"H2_evolution",
+"HCN_evolution",
+"H_evolution",
+"N2_evolution",
+"NH3_evolution",
+"OH_evolution",
+"O_evolution"
+],
+"global_variables": ["P_init","T_init"],
 
-    // Name of the time column
-    "time_variable": "t_time",
+// Name of the time column
+"time_variable": "t_time",
 
-    // HDF5 read/write chunk (rows) – aligned with typical batch sizes
-    "chunk_size": 4096,
-    
-    // HDF5 compression settings
-    "compression": "gzip",
-    "compression_level": null
-  },
+// Read/write chunk (rows) – aligned with typical batch sizes
+"chunk_size": 4096,
 
-  // ═══════════════════════ 3. NORMALISATION ════════════════════════
-  // Preprocessing‑only; **never** used at run‑time inference
-  "normalization": {
-    // Fallback for any var not listed in "methods"
-    // Allowed: "standard" | "log-standard" | "log-min-max" | "symlog" | "none"
-    "default_method": "log-min-max",
+// NPY shard size (samples per shard file)
+"shard_size": 1000000
+},
 
-    // Per‑variable overrides (omit to inherit default_method)
-    "methods": {
-      "T_init": "standard",
-      "P_init": "log-min-max",
-      "t_time": "log-min-max"
-    },
+// ═══════════════════════ 3. NORMALISATION ════════════════════════
+// Preprocessing‑only; never used at run‑time inference
+"normalization": {
+// Fallback for any var not listed in "methods"
+// Allowed: "standard" | "log-standard" | "log-min-max" | "symlog" | "none"
+"default_method": "log-min-max",
 
-    // Numerical safety knobs – see DataNormalizer
-    "epsilon": 1e-37,          // floor added before log ops
-    "min_std": 1e-10,          // lower‑bound on σ to avoid divide‑by‑zero
-    "symlog_percentile": 0.1,  // threshold as |x|‑percentile for symlog
-    "clamp_value": 50.0        // post‑norm clipping limit
-  },
+// Per‑variable overrides (omit to inherit default_method)
+"methods": {
+"T_init": "standard",
+"P_init": "log-min-max",
+"t_time": "log-min-max"
+},
 
-  // ═══════════════════════════ 4. MODEL ════════════════════════════
-  // Architecture‑specific knobs.  **Unused keys are ignored**.
-  "model": {
-    // "siren" | "resnet" | "deeponet"
-    "type": "deeponet",
+// Numerical safety knobs – see DataNormalizer
+"epsilon": 1e-37,          // floor added before log ops
+"min_std": 1e-10,          // lower‑bound on σ to avoid divide‑by‑zero
+"symlog_percentile": 0.1,  // threshold as |x|‑percentile for symlog
+"clamp_value": 50.0        // post‑norm clipping limit
+},
 
-    // ── shared / optional ───────────────────────────────────────────
-    "activation": "gelu",          // "gelu" | "relu" | "tanh"
-    "dropout": 0.0,                // 0.0‑1.0 (only if you add dropout layers)
-    "use_time_embedding": false,   // (future feature)
-    "time_embedding_dim": 256,
-    "output_scale": 1.0,           // scalar multiplier on final layer
-    "use_residual": true,          // add Δy onto y₀ (DeepONet only)
+// ═══════════════════════════ 4. MODEL ════════════════════════════
+// Architecture‑specific knobs.  Unused keys are ignored.
+"model": {
+// "siren" | "resnet" | "deeponet"
+"type": "deeponet",
 
-    // ── SIREN / ResNet common ───────────────────────────────────────
-    "hidden_dims": [256, 256, 256],
+// ── shared / optional ───────────────────────────────────────────
+"activation": "gelu",          // "gelu" | "relu" | "tanh"
+"dropout": 0.0,                // 0.0‑1.0 (only if you add dropout layers)
+"use_time_embedding": false,   // (future feature)
+"time_embedding_dim": 256,
+"output_scale": 1.0,           // scalar multiplier on final layer
+"use_residual": true,          // add Δy onto y₀ (DeepONet only)
 
-    // ── DeepONet specific ───────────────────────────────────────────
-    "branch_layers": [256, 256, 256],
-    "trunk_layers":  [64, 64, 64],
-    "basis_dim": 64
-  },
+// ── SIREN / ResNet common ───────────────────────────────────────
+"hidden_dims": [256, 256, 256],
 
-  // ═════════════════════════ 5. TRAINING ═══════════════════════════
-  // Everything the Trainer consumes
-  "training": {
-    // ── dataset split ───────────────────────────────────────────────
-    "val_fraction":  0.15,   // 0‑1 – must leave ≥0 for train
-    "test_fraction": 0.15,   // 0‑1
-    "use_fraction":  1.0,    // subsample for quick tests
+// ── DeepONet specific ───────────────────────────────────────────
+"branch_layers": [256, 256, 256],
+"trunk_layers":  [64, 64, 64],
+"basis_dim": 64
+},
 
-    // ── global schedule ────────────────────────────────────────────
-    "epochs": 100,
-    "batch_size": 8192,
-    "gradient_accumulation_steps": 2,
+// ═════════════════════════ 5. TRAINING ═══════════════════════════
+// Everything the Trainer consumes
+"training": {
+// ── dataset split ───────────────────────────────────────────────
+"val_fraction":  0.15,   // 0‑1 – must leave ≥0 for train
+"test_fraction": 0.15,   // 0‑1
+"use_fraction":  0.1,    // subsample for quick tests
 
-    // ── DataLoader knobs (overrides hardware auto‑tuning) ──────────
-    "num_workers": 1,
-    "pin_memory": true,
-    "persistent_workers": true,
-    "prefetch_factor": 4,
-    "drop_last": true,
+// ── global schedule ────────────────────────────────────────────
+"epochs": 200,
+"batch_size": 8192,
+"gradient_accumulation_steps": 2,
 
-    // ── optimisation ───────────────────────────────────────────────
-    "learning_rate": 1e-4,
-    "weight_decay": 1e-5,
-    "gradient_clip": 1.0,
+// ── DataLoader knobs (overrides hardware auto‑tuning) ──────────
+"num_workers": 16,
+"pin_memory": true,
+"persistent_workers": true,
+"prefetch_factor": 4,
+"drop_last": true,
 
-    // ── LR scheduler ───────────────────────────────────────────────
-    // "plateau" | "cosine"
-    "scheduler": "plateau",
+// ── optimisation ───────────────────────────────────────────────
+"learning_rate": 1e-4,
+"weight_decay": 1e-5,
+"gradient_clip": 1.0,
 
-    //   • For "plateau": factor, patience, min_lr
-    //   • For "cosine" : T_0 (epochs), T_mult, eta_min
-    "scheduler_params": {
-      // Plateau defaults
-      "factor": 0.5,
-      "patience": 5,
-      "min_lr": 1e-10
+// ── LR scheduler ───────────────────────────────────────────────
+// "plateau" | "cosine"
+"scheduler": "plateau",
 
-      //Cosine example:
-      //"T_0": 20,
-      //"T_mult": 2,
-      //"eta_min": 1e-8
-    },
+//   • For "plateau": factor, patience, min_lr
+//   • For "cosine" : T_0 (epochs), T_mult, eta_min
+"scheduler_params": {
+// Plateau defaults
+"factor": 0.5,
+"patience": 5,
+"min_lr": 1e-10
 
-    // ── loss ───────────────────────────────────────────────────────
-    // "mse" | "huber"
-    "loss": "mse",
-    "huber_delta": 0.25,
+//Cosine example:
+//"T_0": 20,
+//"T_mult": 2,
+//"eta_min": 1e-8
+},
 
-    // ── mixed precision ────────────────────────────────────────────
-    "use_amp": true,
-    // "float16" (needs GradScaler on CUDA) | "bfloat16"
-    "amp_dtype": "bfloat16",
+// ── loss ───────────────────────────────────────────────────────
+// "mse" | "huber"
+"loss": "mse",
+"huber_delta": 0.25,
 
-    // ── early stopping & logging ───────────────────────────────────
-    "early_stopping_patience": 30,
-    "min_delta": 1e-10,        // improvement threshold
-    "log_interval": 10,        // batches
-    "save_interval": 20       // epochs
-  },
+// ── mixed precision ────────────────────────────────────────────
+"use_amp": true,
+// "float16" (needs GradScaler on CUDA) | "bfloat16"
+"amp_dtype": "bfloat16",
 
-  // ════════════════════════ 6. OPTUNA ═════════════════════════════
-  // Hyperparameter search configuration
-  "optuna": {
-    "enabled": false,              // Set to true to enable hyperparameter search
-    "n_trials": 50,               // Number of trials to run
-    "n_jobs": 4,                   // Number of parallel jobs
-    "study_name": "chemulator_optimization",
-    "direction": "minimize",       // minimize validation loss
-    "sampler": "TPE",             // TPE, Random, or Grid
-    "pruner": "HyperbandPruner",     // MedianPruner, HyperbandPruner, or None
-    
-    // Search spaces - each parameter can be:
-    // - {"type": "float", "low": min, "high": max, "log": true/false}
-    // - {"type": "int", "low": min, "high": max}
-    // - {"type": "categorical", "choices": [...]}
-    // - {"type": "fixed", "value": ...} (not searched)
-    "search_space": {
-      // Model architecture search
-      "model.basis_dim": {
-        "type": "categorical",
-        "choices": [32, 64, 128, 256]
-      },
-      "model.branch_layers": {
-        "type": "categorical", 
-        "choices": [
-          [128, 128, 128],
-          [256, 256, 256], 
-          [512, 256, 128],
-          [256, 256, 256, 256]
-        ]
-      },
-      "model.trunk_layers": {
-        "type": "categorical",
-        "choices": [
-          [32, 32, 32],
-          [64, 64, 64],
-          [128, 64, 32]
-        ]
-      },
-      "model.activation": {
-        "type": "categorical",
-        "choices": ["gelu", "tanh"]
-      },
-      
-      // Training hyperparameters
-      "training.learning_rate": {
-        "type": "float",
-        "low": 1e-5,
-        "high": 5e-4,
-        "log": true
-      },
-      "training.weight_decay": {
-        "type": "float", 
-        "low": 1e-7,
-        "high": 1e-3,
-        "log": true
-      },
-      "training.batch_size": {
-        "type": "categorical",
-        "choices": [1024, 2048, 4096, 8192]
-      },
-      "training.gradient_accumulation_steps": {
-        "type": "categorical",
-        "choices": [1, 2, 4, 8]
-      },
-      
-      // Keep some parameters fixed
-      "training.epochs": {
-        "type": "fixed",
-        "value": 300  // Shorter for hyperparameter search
-      }
-    }
-  },
+// ── early stopping & logging ───────────────────────────────────
+"early_stopping_patience": 30,
+"min_delta": 1e-10,        // improvement threshold
+"log_interval": 10,        // batches
+"save_interval": 20       // epochs
+},
 
-  // ═════════════════════════ 7. SYSTEM ════════════════════════════
-  "system": {
-    "seed": 42,                       // global RNG seed
+// ════════════════════════ 6. OPTUNA ═════════════════════════════
+// Hyperparameter search configuration
+"optuna": {
+"enabled": false,              // Set to true to enable hyperparameter search
+"n_trials": 50,               // Number of trials to run
+"n_jobs": 4,                   // Number of parallel jobs
+"study_name": "chemulator_optimization",
+"direction": "minimize",       // minimize validation loss
+"sampler": "TPE",             // TPE, Random, or Grid
+"pruner": "HyperbandPruner",     // MedianPruner, HyperbandPruner, or None
 
-    // torch.compile & friends
-    "use_torch_compile": true,
-    "compile_mode": "default",        // "default" | "max-autotune"
-    "compile_fullgraph": false,
-    "compile_dynamic_shapes": false,
+// Search spaces - each parameter can be:
+// - {"type": "float", "low": min, "high": max, "log": true/false}
+// - {"type": "int", "low": min, "high": max}
+// - {"type": "categorical", "choices": [...]}
+// - {"type": "fixed", "value": ...} (not searched)
+"search_space": {
+// Model architecture search
+"model.basis_dim": {
+"type": "categorical",
+"choices": [32, 64, 128, 256]
+},
+"model.branch_layers": {
+"type": "categorical",
+"choices": [
+[128, 128, 128],
+[256, 256, 256],
+[512, 256, 128],
+[256, 256, 256, 256]
+]
+},
+"model.trunk_layers": {
+"type": "categorical",
+"choices": [
+[32, 32, 32],
+[64, 64, 64],
+[128, 64, 32]
+]
+},
+"model.activation": {
+"type": "categorical",
+"choices": ["gelu", "tanh"]
+},
 
-    // Memory‑saving / correctness helpers
-    "gradient_checkpointing": true,
-    "detect_anomaly": false,
+// Training hyperparameters
+"training.learning_rate": {
+"type": "float",
+"low": 1e-5,
+"high": 5e-4,
+"log": true
+},
+"training.weight_decay": {
+"type": "float",
+"low": 1e-7,
+"high": 1e-3,
+"log": true
+},
+"training.batch_size": {
+"type": "categorical",
+"choices": [1024, 2048, 4096, 8192]
+},
+"training.gradient_accumulation_steps": {
+"type": "categorical",
+"choices": [1, 2, 4, 8]
+},
 
-    // Model export helpers
-    "use_torch_export": true,        
+// Keep some parameters fixed
+"training.epochs": {
+"type": "fixed",
+"value": 300  // Shorter for hyperparameter search
+}
+}
+},
 
-    // CUDA / cuDNN micro‑tuning
-    "cudnn_benchmark": true,
-    "tf32": true,                     // enable TF32 matmuls on Ampere+
+// ═════════════════════════ 7. SYSTEM ════════════════════════════
+"system": {
+"seed": 42,                       // global RNG seed
 
-    // Cache management inside training loop
-    "empty_cache_interval": 10000        // batches between torch.cuda.empty_cache()
-  }
+// torch.compile & friends
+"use_torch_compile": true,
+"compile_mode": "default",        // "default" | "max-autotune"
+"compile_fullgraph": false,
+"compile_dynamic_shapes": false,
+
+// Memory‑saving / correctness helpers
+"gradient_checkpointing": true,
+"detect_anomaly": false,
+
+// Model export helpers
+"use_torch_export": true,
+
+// CUDA / cuDNN micro‑tuning
+"cudnn_benchmark": true,
+"tf32": true,                     // enable TF32 matmuls on Ampere+
+
+// Cache management inside training loop
+"empty_cache_interval": 10000        // batches between torch.cuda.empty_cache()
+}
 }

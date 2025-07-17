@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Hyperparameter optimization using Optuna for chemical kinetics models.
@@ -19,7 +18,7 @@ import numpy as np
 
 from models.model import create_model
 from training.trainer import Trainer
-from data.dataset import HDF5Dataset, create_dataloader
+from data.dataset import NPYDataset, create_dataloader
 from utils.hardware import setup_device, optimize_hardware
 from utils.utils import seed_everything, save_json, load_json
 
@@ -32,12 +31,12 @@ class OptunaOptimizer:
     def __init__(
         self,
         base_config: Dict[str, Any],
-        preprocessed_hdf5_path: Path,
+        processed_dir: Path,
         save_dir: Path,
         device: torch.device
     ):
         self.base_config = base_config
-        self.hdf5_path = preprocessed_hdf5_path
+        self.processed_dir = processed_dir
         self.save_dir = save_dir
         self.device = device
         
@@ -51,7 +50,7 @@ class OptunaOptimizer:
         self.study_dir.mkdir(parents=True, exist_ok=True)
         
         # Load normalization stats for dataset creation
-        norm_path = preprocessed_hdf5_path.parent / "normalization.json"
+        norm_path = self.processed_dir / "normalization.json"
         if norm_path.exists():
             self.norm_stats = load_json(norm_path)
         else:
@@ -114,18 +113,20 @@ class OptunaOptimizer:
     
     def _create_datasets(self, config: Dict[str, Any]) -> tuple:
         """Create datasets for training."""
-        train_dataset = HDF5Dataset(
-            hdf5_path=self.hdf5_path,
-            split_name="train",
+        train_dataset = NPYDataset(
+            shard_dir=self.processed_dir,
+            indices=np.load(self.processed_dir / "train_indices.npy"),
             config=config,
-            device=self.device
+            device=self.device,
+            split_name="train"
         )
         
-        val_dataset = HDF5Dataset(
-            hdf5_path=self.hdf5_path,
-            split_name="validation",
+        val_dataset = NPYDataset(
+            shard_dir=self.processed_dir,
+            indices=np.load(self.processed_dir / "val_indices.npy"),
             config=config,
-            device=self.device
+            device=self.device,
+            split_name="validation"
         )
         
         # For hyperparameter search, we typically don't use test set

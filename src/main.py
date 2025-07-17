@@ -6,7 +6,7 @@ os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
 """
 Main entry point for chemical kinetics neural network training.
 Supports both standard training and hyperparameter optimization with Optuna.
-Uses chunked HDF5 format for efficient data storage and loading.
+Uses NPY shards for efficient data storage and loading.
 """
 
 import json
@@ -42,7 +42,7 @@ from utils.utils import (
     save_json
 )
 from data.preprocessor import DataPreprocessor
-from data.dataset import HDF5Dataset
+from data.dataset import NPYDataset
 from models.model import create_model
 from training.trainer import Trainer
 
@@ -77,7 +77,7 @@ def compute_config_hash(config: Dict[str, Any]) -> str:
 class ChemicalKineticsPipeline:
     """
     Complete training pipeline for chemical kinetics prediction.
-    Uses chunked HDF5 format for optimal performance.
+    Uses NPY shards for optimal performance.
     """
     
     def __init__(self, config_path: Path):
@@ -105,7 +105,7 @@ class ChemicalKineticsPipeline:
         self.device = setup_device()
         optimize_hardware(self.config["system"], self.device)
         
-        self.logger.info("Pipeline initialized with chunked HDF5 format for high-performance data loading")
+        self.logger.info("Pipeline initialized with NPY shards for high-performance data loading")
         
     def setup_paths(self):
         """Create directory structure and setup paths."""
@@ -127,35 +127,50 @@ class ChemicalKineticsPipeline:
         ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
         
         # Define processed data paths
-        self.processed_hdf5_file = self.processed_dir / paths.get("processed_hdf5_file", "preprocessed_data.h5")
         self.normalization_file = self.processed_dir / "normalization.json"
         self.config_hash_file = self.processed_dir / "config_hash.txt"
-        
+        self.shard_index_file = self.processed_dir / "shard_index.json"
+
     def preprocess_data(self) -> bool:
         """
-        Pre-process raw files to normalized chunked HDF5.
+        Pre-process raw files to normalized NPY shards.
         """
         cfg_hash = compute_config_hash(self.config)
         
-        # Check if preprocessed data already exists
+        # Expanded cache check: verify all required files
+        split_files = [
+            self.processed_dir / "train_indices.npy",
+            self.processed_dir / "val_indices.npy",
+            self.processed_dir / "test_indices.npy"
+        ]
+        
         cache_ok = (
-            self.processed_hdf5_file.exists()
+            self.shard_index_file.exists()
             and self.normalization_file.exists()
             and self.config_hash_file.exists()
+            and all(f.exists() for f in split_files)  # New: check split files
             and self.config_hash_file.read_text().strip() == cfg_hash
         )
         
         if cache_ok:
-            self.logger.info("Using cached HDF5 data and normalization.")
+            self.logger.info("Using cached NPY shards and normalization.")
             return False
+        
+        # If cache invalid or incomplete, log why and reprocess
+        if not cache_ok:
+            missing_files = [str(f) for f in [self.shard_index_file, self.normalization_file, self.config_hash_file] + split_files if not f.exists()]
+            if missing_files:
+                self.logger.warning(f"Cache incomplete: missing files {missing_files}. Reprocessing data.")
+            else:
+                self.logger.info("Config hash mismatch. Reprocessing data.")
         
         # Check raw files exist
         missing = [p for p in self.raw_data_files if not p.exists()]
         if missing:
             raise FileNotFoundError(f"Missing raw data files: {missing}")
         
-        # Process to HDF5 with integrated normalization
-        self.logger.info("Starting HDF5 creation from raw files with normalization...")
+        # Process to NPY shards with integrated normalization
+        self.logger.info("Starting NPY shard creation from raw files with normalization...")
         
         preprocessor = DataPreprocessor(
             raw_files=self.raw_data_files,
@@ -163,15 +178,10 @@ class ChemicalKineticsPipeline:
             config=self.config
         )
         
-        dataset_info = preprocessor.process_to_hdf5()
+        split_indices = preprocessor.process_to_npy_shards()
         
-        # Check for errors
-        if "error" in dataset_info:
-            self.logger.error(f"Preprocessing failed: {dataset_info['error']}")
-            sys.exit(1)
-        
-        # Check if any data was processed
-        total_samples = dataset_info["total_samples"]
+        # Check for errors or empty data
+        total_samples = sum(len(indices) for indices in split_indices.values())
         if total_samples == 0:
             self.logger.error("No valid data processed from raw files. Exiting.")
             sys.exit(1)
@@ -181,7 +191,7 @@ class ChemicalKineticsPipeline:
         
         self.logger.info("Pre-processing complete.")
         return True
-        
+
     def train_model(self):
         """Train the neural network model."""
         self.logger.info("Starting model training...")
@@ -202,32 +212,44 @@ class ChemicalKineticsPipeline:
         self.logger.info(f"Parameters: {total_params:,}")
         
         # Create datasets
-        self.logger.info("Creating HDF5 datasets for high-performance loading...")
+        self.logger.info("Creating NPY datasets for high-performance loading...")
         
-        train_dataset = HDF5Dataset(
-            hdf5_path=self.processed_hdf5_file,
-            split_name="train",
+        train_dataset = NPYDataset(
+            shard_dir=self.processed_dir,
+            indices=np.load(self.processed_dir / "train_indices.npy"),
             config=self.config,
-            device=self.device
+            device=self.device,
+            split_name="train"
         )
         
-        val_dataset = HDF5Dataset(
-            hdf5_path=self.processed_hdf5_file,
-            split_name="validation",
+        if len(train_dataset) == 0:
+            raise ValueError("Training dataset is empty. Check preprocessing and data splits.")
+        
+        val_dataset = NPYDataset(
+            shard_dir=self.processed_dir,
+            indices=np.load(self.processed_dir / "val_indices.npy"),
             config=self.config,
-            device=self.device
+            device=self.device,
+            split_name="validation"
         )
         
-        test_dataset = HDF5Dataset(
-            hdf5_path=self.processed_hdf5_file,
-            split_name="test",
+        if len(val_dataset) == 0:
+            self.logger.warning("Validation dataset is empty. Proceeding but results may be unreliable.")
+        
+        test_dataset = NPYDataset(
+            shard_dir=self.processed_dir,
+            indices=np.load(self.processed_dir / "test_indices.npy"),
             config=self.config,
-            device=self.device
+            device=self.device,
+            split_name="test"
         )
+        
+        if len(test_dataset) == 0:
+            self.logger.warning("Test dataset is empty. Proceeding but cannot evaluate on test set.")
         
         # Log dataset info
         train_info = train_dataset.get_batch_info()
-        self.logger.info(f"HDF5 Dataset info: {train_info}")
+        self.logger.info(f"NPY Dataset info: {train_info}")
         
         # Initialize trainer
         trainer = Trainer(
@@ -256,7 +278,7 @@ class ChemicalKineticsPipeline:
             "test_loss": test_loss,
             "model_path": str(self.run_save_dir / "best_model.pt"),
             "training_time": trainer.total_training_time,
-            "data_format": "hdf5_chunked"
+            "data_format": "npy_shards"
         }
         
         save_json(results, self.run_save_dir / "results.json")
@@ -282,7 +304,7 @@ class ChemicalKineticsPipeline:
         # Create optimizer
         optimizer = OptunaOptimizer(
             base_config=self.config,
-            preprocessed_hdf5_path=self.processed_hdf5_file,
+            processed_dir=self.processed_dir,
             save_dir=self.run_save_dir,
             device=self.device
         )
