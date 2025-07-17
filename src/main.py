@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+import os
+os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
+
 """
 Main entry point for chemical kinetics neural network training.
 Supports both standard training and hyperparameter optimization with Optuna.

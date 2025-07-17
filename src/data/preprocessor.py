@@ -205,8 +205,18 @@ class DataPreprocessor:
                             start_idx = split_indices[split_name]
                             end_idx = start_idx + num_samples
                             
-                            splits[split_name]["inputs"][start_idx:end_idx] = inputs_arr
-                            splits[split_name]["targets"][start_idx:end_idx] = targets_arr
+                            inputs_dset = splits[split_name]["inputs"]
+                            targets_dset = splits[split_name]["targets"]
+                            
+                            # Dynamically resize if necessary
+                            current_size = inputs_dset.shape[0]
+                            if end_idx > current_size:
+                                new_size = max(end_idx, current_size * 2)
+                                inputs_dset.resize((new_size, self.n_species + self.n_globals + 1))
+                                targets_dset.resize((new_size, self.n_species))
+                            
+                            inputs_dset[start_idx:end_idx] = inputs_arr
+                            targets_dset[start_idx:end_idx] = targets_arr
                             
                             split_indices[split_name] = end_idx
                             global_idx += num_samples
