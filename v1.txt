@@ -3,15 +3,15 @@
     "paths": {
         "raw_data_files": [
             "data/raw/run8001-result.h5",
-            "data/raw/run8002-result.h5",
-            "data/raw/run8003-result.h5",
-            "data/raw/run8004-result.h5",
-            "data/raw/run8005-result.h5",
-            "data/raw/run8006-result.h5",
-            "data/raw/run8007-result.h5",
-            "data/raw/run8008-result.h5",
-            "data/raw/run8009-result.h5",
-            "data/raw/run8010-result.h5"
+            //"data/raw/run8002-result.h5",
+            //"data/raw/run8003-result.h5",
+            //"data/raw/run8004-result.h5",
+            //"data/raw/run8005-result.h5",
+            //"data/raw/run8006-result.h5",
+            //"data/raw/run8007-result.h5",
+            //"data/raw/run8008-result.h5",
+            //"data/raw/run8009-result.h5",
+            //"data/raw/run8010-result.h5"
         ],
         "processed_data_dir": "data/processed",
         "model_save_dir": "data/models",
@@ -38,12 +38,10 @@
     },
     
     "preprocessing": {
-        // Larger shards for A100's memory capacity
-        "shard_size": 5000000,
+        "shard_size": 1000000,
         "min_species_threshold": 1e-25,
         "compression": null,
-        // More workers for faster preprocessing
-        "num_workers": 16
+        "num_workers": 4
     },
     
     "normalization": {
@@ -59,7 +57,8 @@
     },
     
     "model": {
-        // DeepONet typically performs better for this task
+        // deeponet can be absolute or delta
+        // siren can only be absolute
         "type": "deeponet",
         "activation": "gelu",
         "dropout": 0.0,
@@ -67,19 +66,21 @@
         "time_embedding_dim": 256,
         "output_scale": 1.0,
         
-        // Larger architecture for A100
-        "branch_layers": [512, 512, 512, 512],
-        "trunk_layers": [256, 256, 256],
-        "basis_dim": 128
+        "hidden_dims": [256, 256, 256],
+        
+        "branch_layers": [256, 256, 256],
+        "trunk_layers": [64, 64, 64],
+        "basis_dim": 64
     },
     
     "film": {
         "enabled": true,
-        "hidden_dims": [256, 256],
+        "hidden_dims": [128, 128],
         "activation": "gelu"
     },
     
     "prediction": {
+        // can also be delta
         "mode": "absolute",
         "output_clamp": 1e-30
     },
@@ -89,45 +90,41 @@
         "test_fraction": 0.15,
         "use_fraction": 1.0,
         
-        "epochs": 300,
-        // Large batch size for A100
-        "batch_size": 32768,
-        "gradient_accumulation_steps": 1,
-        // Increased cache for 80GB memory
-        "dataset_cache_shards": 256,
+        "epochs": 200,
+        "batch_size": 8192,
+        "gradient_accumulation_steps": 2,
+        "dataset_cache_shards": 64,
         
-        // Optimal workers for A100
-        "num_workers": 16,
+        "num_workers": 8,
         "pin_memory": true,
         "persistent_workers": true,
-        "prefetch_factor": 4,
+        "prefetch_factor": 2,
         "drop_last": true,
         
-        "learning_rate": 3e-4,
+        "learning_rate": 1e-4,
         "weight_decay": 1e-5,
         "gradient_clip": 1.0,
         "betas": [0.9, 0.999],
         "eps": 1e-8,
         
-        "scheduler": "cosine",
+        "scheduler": "plateau",
         "scheduler_params": {
-            "T_0": 10,
-            "T_mult": 2,
-            "eta_min": 1e-7
+            "factor": 0.5,
+            "patience": 5,
+            "min_lr": 1e-10
         },
         
-        "loss": "huber",
-        "huber_delta": 0.5,
+        "loss": "mse",
+        "huber_delta": 0.25,
         
-        // Use bfloat16 for A100
         "use_amp": true,
         "amp_dtype": "bfloat16",
         
-        "early_stopping_patience": 50,
+        "early_stopping_patience": 30,
         "min_delta": 1e-10,
-        "log_interval": 100,
-        "save_interval": 10,
-        "empty_cache_interval": 1000
+        "log_interval": 500,
+        "save_interval": 20,
+        "empty_cache_interval": 2000
     },
     
     "optuna": {
@@ -136,9 +133,8 @@
     
     "system": {
         "seed": 42,
-        // Torch compile is excellent on A100
         "use_torch_compile": true,
-        "compile_mode": "max-autotune",
+        "compile_mode": "default",
         "compile_fullgraph": false,
         "compile_dynamic_shapes": false,
         "cuda_graphs_enabled": false,
@@ -149,14 +145,11 @@
         "use_torch_export": true,
         "save_jit_model": false,
         
-        // A100 optimizations
         "cudnn_benchmark": true,
         "tf32": true,
-        // Use 90% of GPU memory
         "cuda_memory_fraction": 0.9,
         
-        // CPU threads (adjust based on your system)
-        "num_threads": 32,
+        "num_threads": null,
         "thread_ratio": 0.5
     }
 }
@@ -171,11 +164,12 @@ from pathlib import Path
 import numpy as np
 
 from utils.hardware import setup_device, optimize_hardware
-from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
+from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json
 from data.preprocessor import DataPreprocessor
 from data.dataset import NPYDataset
 from models.model import create_model
 from training.trainer import Trainer
+from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
 import hashlib
 import json
 
@@ -238,11 +232,7 @@ class ChemicalKineticsPipeline:
             "data": self.config["data"],
             "preprocessing": self.config["preprocessing"],
             "normalization": self.config["normalization"],
-            "training": {
-                "val_fraction": self.config["training"]["val_fraction"],
-                "test_fraction": self.config["training"]["test_fraction"],
-                "use_fraction": self.config["training"]["use_fraction"]
-            }
+            "training": self.config["training"]  # Includes fractions that affect splits
         }
         config_str = json.dumps(relevant_config, sort_keys=True)
         current_hash = hashlib.sha256(config_str.encode('utf-8')).hexdigest()
@@ -380,18 +370,6 @@ def main():
         default=Path("config/config.jsonc"),
         help="Path to configuration file"
     )
-    parser.add_argument(
-        "--trials",
-        type=int,
-        default=None,
-        help="Number of Optuna hyperparameter optimization trials (default: normal training)"
-    )
-    parser.add_argument(
-        "--study-name",
-        type=str,
-        default="chemical_kinetics_opt",
-        help="Name for Optuna study (used with --trials)"
-    )
     
     args = parser.parse_args()
     
@@ -400,331 +378,13 @@ def main():
         print(f"Error: Configuration file not found: {args.config}", file=sys.stderr)
         sys.exit(1)
     
-    # Run with or without hyperparameter optimization
-    if args.trials:
-        # Ensure optuna is installed
-        try:
-            import optuna
-        except ImportError:
-            print("Installing optuna...")
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "optuna"])
-        
-        # Import and run optimization
-        from hyperparameter_tuning import optimize
-        
-        print(f"Starting hyperparameter optimization with {args.trials} trials...")
-        study = optimize(
-            config_path=args.config,
-            n_trials=args.trials,
-            n_jobs=1,  # Always use 1 for GPU training
-            study_name=args.study_name
-        )
-        
-        # Print results
-        print("\n" + "="*60)
-        print("OPTIMIZATION COMPLETE")
-        print("="*60)
-        print(f"Best validation loss: {study.best_value:.6f}")
-        print(f"Best trial: {study.best_trial.number}")
-        print("\nBest parameters:")
-        for key, value in study.best_params.items():
-            print(f"  {key}: {value}")
-        
-        # Show trial statistics
-        completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-        pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
-        print(f"\nTrials: {completed} completed, {pruned} pruned")
-        print(f"\nBest configuration saved to: optuna_results/")
-        
-    else:
-        # Normal training
-        pipeline = ChemicalKineticsPipeline(args.config)
-        pipeline.run()
+    # Run pipeline
+    pipeline = ChemicalKineticsPipeline(args.config)
+    pipeline.run()
 
 
 if __name__ == "__main__":
     main()
-
-===== /Users/imalsky/Desktop/Chemulator/src/hyperparameter_tuning.py =====
-#!/usr/bin/env python3
-"""Hyperparameter tuning for chemical kinetics models using Optuna."""
-
-import copy
-import logging
-import time
-from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
-
-import numpy as np
-import optuna
-from optuna.samplers import TPESampler
-import torch
-
-from utils.hardware import setup_device, optimize_hardware
-from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json
-from data.dataset import NPYDataset
-from models.model import create_model
-from training.trainer import Trainer
-
-
-class OptunaPipeline:
-    """Reusable pipeline for Optuna trials with shared datasets."""
-    
-    def __init__(self, base_config_path: Path):
-        self.base_config = load_json_config(base_config_path)
-        self.device = setup_device()
-        self.logger = logging.getLogger(__name__)
-        
-        # Setup paths
-        self.processed_dir = Path(self.base_config["paths"]["processed_data_dir"])
-        self.model_save_root = Path(self.base_config["paths"]["model_save_dir"])
-        
-        # Load datasets once
-        self._load_datasets()
-        
-    def _load_datasets(self):
-        """Load datasets once for reuse across trials."""
-        self.logger.info("Loading datasets for Optuna optimization...")
-        
-        # Load indices
-        train_indices = np.load(self.processed_dir / "train_indices.npy")
-        val_indices = np.load(self.processed_dir / "val_indices.npy")
-        test_indices = np.load(self.processed_dir / "test_indices.npy")
-        
-        # Create datasets
-        self.train_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            indices=train_indices,
-            config=self.base_config,
-            device=self.device,
-            split_name="train"
-        )
-        
-        self.val_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            indices=val_indices,
-            config=self.base_config,
-            device=self.device,
-            split_name="validation"
-        ) if len(val_indices) > 0 else None
-        
-        self.test_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            indices=test_indices,
-            config=self.base_config,
-            device=self.device,
-            split_name="test"
-        ) if len(test_indices) > 0 else None
-        
-        self.logger.info(f"Datasets loaded: train={len(self.train_dataset)}, "
-                        f"val={len(self.val_dataset) if self.val_dataset else 0}, "
-                        f"test={len(self.test_dataset) if self.test_dataset else 0}")
-    
-    def run_trial(self, config: Dict[str, Any], trial: optuna.Trial) -> float:
-        """Run a single trial with the given config."""
-        # Create unique directory for this trial
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        trial_id = f"trial_{trial.number:04d}"
-        save_dir = self.model_save_root / f"optuna_{timestamp}_{trial_id}"
-        ensure_directories(save_dir)
-        
-        # Setup logging for this trial
-        log_file = save_dir / "trial.log"
-        trial_logger = logging.getLogger(f"trial_{trial.number}")
-        
-        try:
-            # Set random seed
-            seed_everything(config["system"]["seed"])
-            
-            # Apply hardware optimizations
-            optimize_hardware(config["system"], self.device)
-            
-            # Create model
-            model = create_model(config, self.device)
-            
-            # Log model info
-            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            trial_logger.info(f"Model parameters: {total_params:,}")
-            
-            # Create trainer with shared datasets
-            trainer = Trainer(
-                model=model,
-                train_dataset=self.train_dataset,
-                val_dataset=self.val_dataset,
-                test_dataset=self.test_dataset,
-                config=config,
-                save_dir=save_dir,
-                device=self.device
-            )
-            
-            # Train model with reduced epochs for hyperparameter search
-            original_epochs = config["training"]["epochs"]
-            config["training"]["epochs"] = min(50, original_epochs)  # Cap at 50 for search
-            
-            best_val_loss = trainer.train()
-            
-            # Save trial config
-            save_json(config, save_dir / "config.json")
-            
-            # Report intermediate values for pruning
-            for epoch_data in trainer.training_history["epochs"]:
-                trial.report(epoch_data["val_loss"], epoch_data["epoch"])
-                if trial.should_prune():
-                    raise optuna.TrialPruned()
-            
-            return best_val_loss
-            
-        except optuna.TrialPruned:
-            trial_logger.info(f"Trial {trial.number} pruned")
-            raise
-            
-        except Exception as e:
-            trial_logger.error(f"Trial {trial.number} failed: {e}", exc_info=True)
-            raise optuna.TrialPruned(f"Trial failed: {str(e)}")
-            
-        finally:
-            # Clean up GPU memory
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
-
-
-def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Suggest model architecture and training hyperparameters."""
-    config = copy.deepcopy(base_config)
-    
-    # Model type and prediction mode
-    model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
-    config["model"]["type"] = model_type
-    
-    # Prediction mode (SIREN only supports absolute)
-    if model_type == "deeponet":
-        config["prediction"]["mode"] = trial.suggest_categorical("prediction_mode", ["absolute", "delta"])
-    else:
-        config["prediction"]["mode"] = "absolute"
-    
-    # Common parameters
-    config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "relu", "silu"])
-    config["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.3, step=0.05)
-    
-    # Model-specific architecture
-    if model_type == "deeponet":
-        # Branch network
-        n_branch = trial.suggest_int("n_branch_layers", 2, 5)
-        branch_layers = [
-            trial.suggest_int(f"branch_layer_{i}", 64, 512, step=64) 
-            for i in range(n_branch)
-        ]
-        config["model"]["branch_layers"] = branch_layers
-        
-        # Trunk network
-        n_trunk = trial.suggest_int("n_trunk_layers", 2, 4)
-        trunk_layers = [
-            trial.suggest_int(f"trunk_layer_{i}", 32, 256, step=32) 
-            for i in range(n_trunk)
-        ]
-        config["model"]["trunk_layers"] = trunk_layers
-        config["model"]["basis_dim"] = trial.suggest_int("basis_dim", 32, 128, step=16)
-        
-    else:  # SIREN
-        n_layers = trial.suggest_int("n_hidden_layers", 3, 6)
-        hidden_dims = [
-            trial.suggest_int(f"hidden_dim_{i}", 128, 512, step=64) 
-            for i in range(n_layers)
-        ]
-        config["model"]["hidden_dims"] = hidden_dims
-        config["model"]["omega_0"] = trial.suggest_float("omega_0", 10.0, 50.0)
-    
-    # FiLM layers
-    if trial.suggest_categorical("use_film", [True, False]):
-        config["film"]["enabled"] = True
-        n_film = trial.suggest_int("film_n_layers", 1, 3)
-        film_dims = [
-            trial.suggest_int(f"film_layer_{i}", 64, 256, step=32) 
-            for i in range(n_film)
-        ]
-        config["film"]["hidden_dims"] = film_dims
-    else:
-        config["film"]["enabled"] = False
-    
-    # Training hyperparameters
-    config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
-    config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
-    config["training"]["batch_size"] = trial.suggest_int("batch_size", 2048, 16384, step=2048)
-    
-    # Loss function
-    loss_type = trial.suggest_categorical("loss", ["mse", "mae", "huber"])
-    config["training"]["loss"] = loss_type
-    if loss_type == "huber":
-        config["training"]["huber_delta"] = trial.suggest_float("huber_delta", 0.1, 1.0)
-    
-    # Scheduler
-    scheduler = trial.suggest_categorical("scheduler", ["plateau", "cosine", "none"])
-    config["training"]["scheduler"] = scheduler
-    if scheduler == "cosine":
-        config["training"]["scheduler_params"] = {
-            "T_0": trial.suggest_int("cosine_T_0", 1, 10),
-            "T_mult": trial.suggest_int("cosine_T_mult", 1, 2),
-        }
-    
-    return config
-
-
-def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1, 
-             study_name: str = "chemical_kinetics_opt", pruner: Optional[optuna.pruners.BasePruner] = None):
-    """Run Optuna optimization with dataset reuse."""
-    # Create pipeline with shared datasets
-    pipeline = OptunaPipeline(config_path)
-    
-    def objective(trial):
-        # Get suggested config
-        config = suggest_model_config(trial, pipeline.base_config)
-        
-        # Run trial with shared datasets
-        return pipeline.run_trial(config, trial)
-    
-    # Default pruner if not specified
-    if pruner is None:
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10)
-    
-    # Create study
-    study = optuna.create_study(
-        direction="minimize",
-        sampler=TPESampler(seed=42),
-        pruner=pruner,
-        study_name=study_name
-    )
-    
-    # Run optimization
-    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
-    
-    # Save results
-    results_dir = Path("optuna_results")
-    results_dir.mkdir(exist_ok=True)
-    
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    study_path = results_dir / f"{study_name}_{timestamp}.pkl"
-    
-    # Save study
-    import pickle
-    with open(study_path, "wb") as f:
-        pickle.dump(study, f)
-    
-    # Save best config
-    best_config = suggest_model_config(study.best_trial, pipeline.base_config)
-    best_results = {
-        "best_value": study.best_value,
-        "best_params": study.best_params,
-        "best_config": best_config,
-        "n_trials": len(study.trials),
-        "n_completed": len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
-        "n_pruned": len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]),
-        "study_file": str(study_path)
-    }
-    
-    save_json(best_results, results_dir / f"best_config_{timestamp}.json")
-    
-    return study
 
 ===== /Users/imalsky/Desktop/Chemulator/src/training/trainer.py =====
 #!/usr/bin/env python3
@@ -889,13 +549,6 @@ class Trainer:
 
         # ─── ReduceLROnPlateau ─────────────────────────────────────────────────────────
         if scheduler_type == "plateau":
-            # Only create plateau scheduler if we have validation data
-            if not self.has_validation:
-                self.logger.warning("Plateau scheduler requires validation data, falling back to no scheduler")
-                self.scheduler = None
-                self.scheduler_step_on_batch = False
-                return
-                
             self.scheduler = ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",
@@ -1008,7 +661,7 @@ class Trainer:
 
             # Update scheduler
             if self.scheduler and not self.scheduler_step_on_batch:
-                if isinstance(self.scheduler, ReduceLROnPlateau) and self.has_validation:
+                if isinstance(self.scheduler, ReduceLROnPlateau):
                     self.scheduler.step(val_loss)
                 else:
                     self.scheduler.step()
@@ -1018,14 +671,11 @@ class Trainer:
             self.total_training_time += epoch_time
             self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
 
-            # Save best model (only if we have validation data)
-            if self.has_validation and val_loss < (self.best_val_loss - self.min_delta):
+            # Save best model
+            if val_loss < (self.best_val_loss - self.min_delta):
                 self.best_val_loss = val_loss
                 self.best_epoch = epoch
                 self.patience_counter = 0
-                self._save_best_model()
-            elif not self.has_validation and epoch == 1:
-                # Save first epoch model if no validation
                 self._save_best_model()
             else:
                 self.patience_counter += 1
@@ -1096,10 +746,6 @@ class Trainer:
     
     def _validate(self) -> Tuple[float, Dict[str, float]]:
         """Evaluate the model on the validation set and return the average loss."""
-        # BUG FIX: Check if validation loader exists
-        if not self.has_validation or self.val_loader is None:
-            return float("inf"), {}
-            
         self.model.eval()
         total_loss, total_samples = 0.0, 0
 
@@ -1156,10 +802,9 @@ class Trainer:
         }
         self.training_history["epochs"].append(log_entry)
         
-        val_str = f"Val loss: {val_loss:.6f}" if self.has_validation else "Val loss: N/A"
         self.logger.info(
             f"Epoch {self.current_epoch}/{self.train_config['epochs']} "
-            f"Train loss: {train_loss:.6f} {val_str} "
+            f"Train loss: {train_loss:.6f} Val loss: {val_loss:.6f} "
             f"Time: {epoch_time:.1f}s LR: {log_entry['lr']:.2e}"
         )
     
@@ -1792,7 +1437,7 @@ import hashlib
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 
 import h5py
 import numpy as np
@@ -1879,7 +1524,7 @@ class DataPreprocessor:
         
         return norm_stats
     
-    def _process_file_statistics(self, raw_file: Path, accumulators: Dict[str, Any]):
+    def _process_file_statistics(self, raw_file, accumulators):
         """Process a single file for statistics collection."""
         groups_processed = 0
         
@@ -1936,8 +1581,6 @@ class DataPreprocessor:
         splits = {"train": [], "validation": [], "test": []}
 
         global_idx = 0
-        profiles_written = 0
-        profiles_skipped = 0
 
         # ─── iterate over raw HDF5 files ─────────────────────────────────────────
         for raw_file in self.raw_files:
@@ -1967,16 +1610,12 @@ class DataPreprocessor:
                     # convert to fixed‑alignment samples
                     samples = self._profile_to_samples(norm_prof, n_t)
                     if samples is None:
-                        profiles_skipped += 1
                         continue
 
-                    # BUG FIX: Only update indices for successfully written samples
-                    n_written = samples.shape[0]
-                    
-                    # Add samples to writer
                     shard_writer.add_samples(samples)
 
                     # ─ split bookkeeping ─────────────────────────────────────────
+                    n_written = samples.shape[0]            # **actual count**
                     split_h   = hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()
                     p         = int(split_h[:8], 16) / 0xFFFFFFFF
 
@@ -1989,15 +1628,11 @@ class DataPreprocessor:
                     start_idx = global_idx
                     global_idx += n_written
                     splits[split_key].extend(range(start_idx, global_idx))
-                    profiles_written += 1
 
         # ─── finalise ────────────────────────────────────────────────────────────
         shard_writer.flush()
         self.shard_index["total_samples"] = global_idx
         save_json(self.shard_index, self.output_dir / "shard_index.json")
-
-        # Log statistics
-        self.logger.info(f"Profiles written: {profiles_written}, skipped: {profiles_skipped}")
 
         for split_name, idxs in splits.items():
             if idxs:
@@ -2016,16 +1651,13 @@ class DataPreprocessor:
         
         # Check for minimum threshold violations and non-finite values
         for var in self.species_vars:
-            try:
-                var_data = group[var][:]
-                if not np.all(np.isfinite(var_data)) or np.any(var_data < self.min_threshold):
-                    return False
-            except Exception:
+            var_data = group[var][:]
+            if not np.all(np.isfinite(var_data)) or np.any(var_data < self.min_threshold):
                 return False
                 
         return True
     
-    def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> Optional[np.ndarray]:
+    def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> np.ndarray:
         """Extract profile data from group."""
         import re
         
@@ -2039,10 +1671,7 @@ class DataPreprocessor:
             if label in global_labels:
                 var = label + "_init"
                 if var in self.global_vars:
-                    try:
-                        globals_dict[var] = float(value)
-                    except ValueError:
-                        return None
+                    globals_dict[var] = float(value)
         
         # Check if all global_vars were found
         if set(globals_dict.keys()) != set(self.global_vars):
@@ -2052,18 +1681,15 @@ class DataPreprocessor:
         profile = np.empty((n_t, self.n_vars), dtype=np.float32)
         
         # Fill data
-        try:
-            for i, var in enumerate(self.var_order):
-                if var in self.species_vars or var == self.time_var:
-                    profile[:, i] = group[var][:].astype(np.float32)
-                elif var in self.global_vars:
-                    profile[:, i] = globals_dict[var]
-        except Exception:
-            return None
+        for i, var in enumerate(self.var_order):
+            if var in self.species_vars or var == self.time_var:
+                profile[:, i] = group[var][:].astype(np.float32)
+            elif var in self.global_vars:
+                profile[:, i] = globals_dict[var]
         
         return profile
     
-    def _profile_to_samples(self, normalized_profile: np.ndarray, n_t: int) -> Optional[np.ndarray]:
+    def _profile_to_samples(self, normalized_profile: np.ndarray, n_t: int) -> np.ndarray:
         """Convert profile to input-output samples with fixed time alignment."""
         if n_t <= 1:
             return None
@@ -2176,8 +1802,6 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
-import gc
-import psutil
 
 import numpy as np
 import torch
@@ -2211,138 +1835,95 @@ class NPYDataset(Dataset):
         self.sample_indices = indices
         self.n_total_samples = len(indices) if indices is not None else self.shard_index["total_samples"]
 
-        # Dynamic cache sizing based on available memory
-        self._setup_cache()
-        
-        # Pre-build shard lookup for efficiency
-        self._build_shard_lookup()
+        self._max_cache_size = self.config["training"].get("dataset_cache_shards", 4)
+        # Use an OrderedDict for LRU behavior
+        self._shard_cache = collections.OrderedDict()
 
         self.logger.info(
             f"NPYDataset initialized: {self.n_total_samples:,} samples, "
             f"cache size: {self._max_cache_size} shards"
-        )
-    
-    def _setup_cache(self):
-        """Setup cache with dynamic sizing based on available memory."""
-        # Get available memory
-        try:
-            available_memory = psutil.virtual_memory().available
-        except:
-            available_memory = 4 * 1024**3  # Default to 4GB if psutil fails
-        
-        # Estimate shard size
-        n_features = self.n_species * 2 + self.n_globals + 1
-        bytes_per_sample = n_features * 4  # float32
-        bytes_per_shard = self.samples_per_shard * bytes_per_sample
-        
-        # Use up to 25% of available memory for cache
-        max_cache_memory = available_memory * 0.25
-        self._max_cache_size = max(1, min(
-            int(max_cache_memory / bytes_per_shard),
-            self.config["training"].get("dataset_cache_shards", 4)
-        ))
-        
-        # Use an OrderedDict for LRU behavior
-        self._shard_cache = collections.OrderedDict()
-    
-    def _build_shard_lookup(self):
-        """Pre-build lookup table for shard indices."""
-        self._shard_starts = np.array([s["start_idx"] for s in self.shard_index["shards"]])
-        self._shard_ends = np.array([s["end_idx"] for s in self.shard_index["shards"]])
+)
         
     def _get_shard_data(self, shard_idx: int) -> np.ndarray:
-        """Get shard data with LRU caching and memory management."""
+        """Get shard data with LRU caching."""
         if shard_idx in self._shard_cache:
             # Move the accessed item to the end to mark it as most recently used
             self._shard_cache.move_to_end(shard_idx)
             return self._shard_cache[shard_idx]
 
-        # Load shard data
+        # --- This is the filled-in data loading logic ---
         shard_info = self.shard_index["shards"][shard_idx]
         shard_path = self.shard_dir / shard_info["filename"]
 
-        try:
-            if self.shard_index.get("compression") == "npz":
-                with np.load(shard_path) as npz_file:
-                    shard_data = npz_file['data'].copy()  # Copy to ensure it's in memory
-            else:
-                # Use memory-mapping for efficient read-only access to .npy files
-                shard_data = np.load(shard_path, mmap_mode='r')
-        except Exception as e:
-            self.logger.error(f"Failed to load shard {shard_idx} from {shard_path}: {e}")
-            raise
+        if self.shard_index.get("compression") == "npz":
+            with np.load(shard_path) as npz_file:
+                shard_data = npz_file['data']
+        else:
+            # Use memory-mapping for efficient read-only access to .npy files
+            shard_data = np.load(shard_path, mmap_mode='r')
 
         # Evict the least recently used item if the cache is full
         if len(self._shard_cache) >= self._max_cache_size:
             # popitem(last=False) removes the first item added (the LRU item)
-            evicted_key, evicted_data = self._shard_cache.popitem(last=False)
-            # For memory-mapped arrays, delete reference to close the file
-            del evicted_data
-            # Force garbage collection for large arrays
-            if self._max_cache_size < 10:
-                gc.collect()
+            self._shard_cache.popitem(last=False)
 
         # Add the newly loaded shard to the cache
         self._shard_cache[shard_idx] = shard_data
         
         return shard_data
     
-    def _find_shard_idx(self, global_idx: int) -> Tuple[int, int]:
-        """Find shard index and local index using vectorized search."""
-        # Vectorized search
-        valid_shards = (self._shard_starts <= global_idx) & (global_idx < self._shard_ends)
-        shard_indices = np.where(valid_shards)[0]
-        
-        if len(shard_indices) == 0:
-            raise IndexError(f"Sample index {global_idx} not found in any shard.")
-        
-        shard_idx = shard_indices[0]
-        local_idx = global_idx - self._shard_starts[shard_idx]
-        
-        return shard_idx, local_idx
-    
     def __len__(self) -> int:
         return self.n_total_samples
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get a single sample as a CPU tensor with improved error handling."""
-        # Validate index
-        if idx < 0 or idx >= self.n_total_samples:
-            raise IndexError(f"Index {idx} out of range [0, {self.n_total_samples})")
+        """Get a single sample as a CPU tensor."""
+        # Step 1: Get the true global index from the split-specific indices
+        global_idx = self.sample_indices[idx]
+
+        # Step 2: Find the correct shard and local index using binary search
+        # This is the robust way to handle variable-sized shards.
+        shard_idx = -1
+        shards = self.shard_index["shards"]
         
-        try:
-            # Step 1: Get the true global index from the split-specific indices
-            global_idx = self.sample_indices[idx]
+        # Binary search to find the shard containing the global_idx
+        low, high = 0, len(shards) - 1
+        while low <= high:
+            mid = (low + high) // 2
+            shard_info = shards[mid]
+            if shard_info["start_idx"] <= global_idx < shard_info["end_idx"]:
+                shard_idx = mid
+                break
+            elif global_idx < shard_info["start_idx"]:
+                high = mid - 1
+            else:
+                low = mid + 1
 
-            # Step 2: Find the correct shard and local index
-            shard_idx, local_idx = self._find_shard_idx(global_idx)
-            
-            # Step 3: Get the shard data using the LRU cache
-            shard_data = self._get_shard_data(shard_idx)
+        if shard_idx == -1:
+            raise IndexError(f"Sample index {global_idx} not found in any shard.")
 
-            # Validate local index
-            if local_idx >= shard_data.shape[0]:
-                raise IndexError(
-                    f"Local index {local_idx} out of bounds for shard {shard_idx} "
-                    f"with size {shard_data.shape[0]}"
-                )
-            
-            row = shard_data[local_idx]
-            
-            # Step 4: Extract input and target and convert to tensors
-            n_input = self.n_species + self.n_globals + 1
-            input_arr = row[:n_input]
-            target_arr = row[n_input:]
-            
-            # .copy() is important to avoid PyTorch errors with read-only memory-mapped arrays
-            input_tensor = torch.from_numpy(input_arr.copy())
-            target_tensor = torch.from_numpy(target_arr.copy())
-            
-            return input_tensor, target_tensor
-            
-        except Exception as e:
-            self.logger.error(f"Error accessing sample {idx} (global {global_idx}): {e}")
-            raise
+        # Calculate the local index within the found shard
+        shard_info = shards[shard_idx]
+        local_idx = global_idx - shard_info["start_idx"]
+        
+        # Step 3: Get the shard data using the LRU cache
+        shard_data = self._get_shard_data(shard_idx)
+
+        # Assert that the local index is valid for the loaded shard data
+        assert local_idx < shard_data.shape[0], \
+            f"Calculated local_idx {local_idx} is out of bounds for shard {shard_idx} with size {shard_data.shape[0]}"
+        
+        row = shard_data[local_idx]
+        
+        # Step 4: Extract input and target and convert to tensors
+        n_input = self.n_species + self.n_globals + 1
+        input_arr = row[:n_input]
+        target_arr = row[n_input:]
+        
+        # .copy() is important to avoid PyTorch errors with read-only memory-mapped arrays
+        input_tensor = torch.from_numpy(input_arr.copy())
+        target_tensor = torch.from_numpy(target_arr.copy())
+        
+        return input_tensor, target_tensor
 
 
 def create_dataloader(dataset: Dataset, config: Dict[str, Any], shuffle: bool = True,
@@ -2355,10 +1936,6 @@ def create_dataloader(dataset: Dataset, config: Dict[str, Any], shuffle: bool = 
     batch_size = train_cfg["batch_size"]
     
     num_workers = train_cfg.get("num_workers", 0)
-    
-    # Adjust workers based on dataset size
-    if len(dataset) < batch_size * 10:
-        num_workers = min(2, num_workers)  # Reduce workers for small datasets
     
     # Use pin_memory for faster CPU-to-GPU transfers, handled by the trainer.
     pin_memory = train_cfg.get("pin_memory", False) and device and device.type == "cuda"
@@ -2696,4 +2273,3 @@ class NormalizationHelper:
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
         return denormalized
-

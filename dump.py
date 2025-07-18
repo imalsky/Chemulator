@@ -36,7 +36,8 @@ def dump_files(root_dir: str, output_path: str, exts: tuple) -> None:
                 if not any(name.lower().endswith(ext.lower()) for ext in exts):
                     continue
                 file_abs = os.path.abspath(os.path.join(dirpath, name))
-                if file_abs == output_abs or os.path.islink(file_abs):
+                # Correctly skips the output file, symlinks, and itself
+                if file_abs == output_abs or os.path.islink(file_abs) or name == "dump.py":
                     continue
 
                 out.write(f"===== {file_abs} =====\n")

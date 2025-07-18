@@ -1,443 +1,382 @@
 #!/usr/bin/env python3
 """
-Preprocessor for chemical kinetics data.
-Converts raw HDF5 files directly to normalized NPY shards.
+Chemical kinetics data preprocessor.
 """
 
+import hashlib
 import logging
-import random
 import time
-import re
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 import h5py
 import numpy as np
 import torch
-from utils.utils import save_json
+
 
 from .normalizer import DataNormalizer, NormalizationHelper
+from utils.utils import save_json
 
-DEFAULT_TOSS = 1e-25  # Minimum threshold for species values
 
 class DataPreprocessor:
-    """
-    Preprocess raw HDF5 files to normalized NPY shards.
-    """
-    
-    def __init__(
-        self,
-        raw_files: List[Path],
-        output_dir: Path,
-        config: Dict[str, Any]
-    ):
-        self.raw_files = raw_files
-        self.output_dir = output_dir
+    """Preprocess HDF5 raw data to normalized NPY shards."""
+    def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
+        # Sort the raw_files list to ensure a deterministic processing order.
+        # This is critical for reproducible train/validation/test splits.
+        self.raw_files = sorted(raw_files)
+        self.output_dir = Path(output_dir)
         self.config = config
-        
         self.logger = logging.getLogger(__name__)
         
-        self.data_config = config["data"]
-        self.species_vars = self.data_config["species_variables"]
-        self.global_vars = self.data_config["global_variables"]
-        self.time_var = self.data_config["time_variable"]
+        # Data configuration
+        data_config = config["data"]
+        self.species_vars = data_config["species_variables"]
+        self.global_vars = data_config["global_variables"]
+        self.time_var = data_config["time_variable"]
         self.var_order = self.species_vars + self.global_vars + [self.time_var]
         
-        self.n_vars = len(self.var_order)
         self.n_species = len(self.species_vars)
         self.n_globals = len(self.global_vars)
+        self.n_vars = self.n_species + self.n_globals + 1
         
-        self.shard_size = self.data_config.get("shard_size", 1000000)  # Default if not specified
-        self.chunk_size = self.data_config["chunk_size"]
+        # Preprocessing config
+        preprocess_config = config["preprocessing"]
+        self.shard_size = preprocess_config["shard_size"]
+        self.min_threshold = preprocess_config["min_species_threshold"]
+        self.compression = preprocess_config.get("compression", None)
         
-        # Initialize summary counters
-        self.total_groups = 0
-        self.skipped_fraction = 0
-        self.skipped_missing = 0
-        self.skipped_pattern = 0
-        self.skipped_nonfinite = 0
-        self.total_nonfinite_values = 0
-
-        self._init_shard_index()  # Initialize shard_index structure
+        self._init_shard_index()
     
     def _init_shard_index(self) -> None:
-        """Initialize an empty shard-index structure."""
-        self.shard_index: Dict[str, Any] = {
-            "format": "npy_shards_v1",
+        """Initialize shard index structure."""
+        self.shard_index = {
             "n_species": self.n_species,
             "n_globals": self.n_globals,
             "samples_per_shard": self.shard_size,
             "n_shards": 0,
             "total_samples": 0,
+            "compression": self.compression,
             "shards": [],
             "split_files": {
                 "train": "train_indices.npy",
                 "validation": "val_indices.npy",
                 "test": "test_indices.npy"
-            }
+            },
         }
-    
+        
     def process_to_npy_shards(self) -> Dict[str, Any]:
-        """
-        Two-stage pipeline:
-          1. Single streaming sweep to accumulate statistics and count rows.
-          2. Second streaming sweep to write normalised NPY shards.
-
-        Returns:
-            Dictionary with train_indices, val_indices, test_indices, and misc metadata.
-        """
-        self.logger.info("─" * 80)
-        self.logger.info("Stage 1 – collecting normalisation statistics")
-
-        ########################
-        # Pass 1 – statistics  #
-        ########################
-        pass1_start = time.time()
-        max_timesteps = 0
-        accumulators  = self._initialize_accumulators()
-
-        for raw_file in self.raw_files:
-            file_start = time.time()
-            self.logger.info(f"Processing stats from {raw_file}")
-            
-            with h5py.File(raw_file, "r") as f:
-                for gname in f.keys():
-                    self.total_groups += 1  # Track all attempted groups
-
-                    grp = f[gname]
-                    if not self._accept_group(grp, gname):
-                        continue
-
-                    n_t = grp[self.time_var].shape[0]
-                    if n_t > 10000:
-                        self.logger.debug(f"Processing large group {gname} with {n_t:,} timesteps")
-                    
-                    max_timesteps = max(max_timesteps, n_t)
-                    profile_np    = self._group_to_profile(grp, gname, n_t)
-                    # Reshape to 3D (n_profiles=1, n_t, n_vars) for normalizer compatibility
-                    profile_3d = profile_np.reshape(1, n_t, self.n_vars)
-                    self.normalizer._update_accumulators(
-                        profile_3d, accumulators, n_t
-                    )
-            
-            file_time = time.time() - file_start
-            self.logger.info(f"Processed stats for file {raw_file} in {file_time:.1f}s")
+        """Two-pass processing: collect statistics then write normalized shards."""
+        start_time = time.time()
+        self.logger.info(f"Starting preprocessing with {len(self.raw_files)} files")
         
-        pass1_time = time.time() - pass1_start
-        self.logger.info(f"Stage 1 completed in {pass1_time:.1f}s")
-
+        # Pass 1: Collect statistics
+        self.logger.info("Pass 1: Collecting normalization statistics")
+        norm_stats = self._collect_statistics()
+        
+        # Pass 2: Write normalized shards
+        self.logger.info("Pass 2: Writing normalized NPY shards")
+        split_indices = self._write_normalized_shards(norm_stats)
+        
+        self.logger.info(f"Preprocessing completed in {time.time() - start_time:.1f}s")
+        return split_indices
+        
+    def _collect_statistics(self) -> Dict[str, Any]:
+        """First pass: collect normalization statistics."""
+        self.normalizer = DataNormalizer(self.config)
+        accumulators = self.normalizer._initialize_accumulators()
+        
+        for raw_file in self.raw_files:
+            self._process_file_statistics(raw_file, accumulators)
+        
+        # Finalize statistics
         norm_stats = self.normalizer._finalize_statistics(accumulators)
-        try:
-            save_json(norm_stats, self.output_dir / "normalization.json")
-        except OSError as e:
-            self.logger.error(f"Failed to write normalization.json: {e}")
-            raise
-
-        ########################
-        # Pass 2 – shard write #
-        ########################
-        self.logger.info("Stage 2 – writing normalised shards")
-        pass2_start = time.time()
+        save_json(norm_stats, self.output_dir / "normalization.json")
         
-        helper       = NormalizationHelper(
-            norm_stats, torch.device("cpu"),
-            self.species_vars, self.global_vars, self.time_var, self.config
+        return norm_stats
+    
+    def _process_file_statistics(self, raw_file: Path, accumulators: Dict[str, Any]):
+        """Process a single file for statistics collection."""
+        groups_processed = 0
+        
+        with h5py.File(raw_file, "r") as f:
+            for gname in f.keys():
+                grp = f[gname]
+                
+                use_fraction = self.config["training"]["use_fraction"]
+                if use_fraction < 1.0:
+                    gname_hash = hashlib.sha256(gname.encode('utf-8')).hexdigest()
+                    hash_float = int(gname_hash[:8], 16) / 0xFFFFFFFF
+                    if hash_float >= use_fraction:
+                        continue
+                
+                # Validate group
+                if not self._validate_group_simple(grp):
+                    continue
+                
+                # Extract profile data
+                n_t = grp[self.time_var].shape[0]
+                profile = self._extract_profile(grp, gname, n_t)
+                
+                if profile is None:
+                    continue
+                
+                # Update statistics
+                profile_3d = profile.reshape(1, n_t, self.n_vars)
+                self.normalizer._update_accumulators(profile_3d, accumulators, n_t)
+                groups_processed += 1
+        
+        self.logger.info(f"  Processed {groups_processed} groups from {raw_file.name}")
+        
+    def _write_normalized_shards(self, norm_stats: Dict[str, Any]) -> Dict[str, List[int]]:
+        """Second pass – write normalized data to NPY shards with fixed splitting."""
+        # ─── setup ────────────────────────────────────────────────────────────────
+        helper = NormalizationHelper(
+            norm_stats,
+            torch.device("cpu"),
+            self.species_vars,
+            self.global_vars,
+            self.time_var,
+            self.config,
         )
-        shard_id     = 0
-        shard_chunks   = []  # list of 2D np arrays
-        splits       = {"train": [], "validation": [], "test": []}
-        val_f, test_f = self.config["training"]["val_fraction"], self.config["training"]["test_fraction"]
-        global_idx   = 0
 
+        shard_writer = ShardWriter(
+            self.output_dir,
+            self.shard_size,
+            self.shard_index,
+            compression=self.compression,
+        )
+
+        val_f  = self.config["training"]["val_fraction"]
+        test_f = self.config["training"]["test_fraction"]
+        splits = {"train": [], "validation": [], "test": []}
+
+        global_idx = 0
+        profiles_written = 0
+        profiles_skipped = 0
+
+        # ─── iterate over raw HDF5 files ─────────────────────────────────────────
         for raw_file in self.raw_files:
-            file_start = time.time()
-            self.logger.info(f"Processing {raw_file} to shards")
-            
             with h5py.File(raw_file, "r") as f:
-                for gname in f.keys():
+                for gname in sorted(f.keys()):
                     grp = f[gname]
-                    if not self._accept_group(grp, gname):
+
+                    # deterministic subsampling – must match statistics‑pass logic
+                    use_fraction = self.config["training"]["use_fraction"]
+                    if use_fraction < 1.0:
+                        h = hashlib.sha256(gname.encode("utf-8")).hexdigest()
+                        if int(h[:8], 16) / 0xFFFFFFFF >= use_fraction:
+                            continue
+
+                    if not self._validate_group_simple(grp):
                         continue
 
-                    n_t = grp[self.time_var].shape[0]
-                    if n_t > 10000:
-                        group_start = time.time()
-                        self.logger.debug(f"Starting processing for large group {gname} with {n_t:,} timesteps")
+                    # extract & normalise
+                    n_t     = grp[self.time_var].shape[0]
+                    profile = self._extract_profile(grp, gname, n_t)
+                    if profile is None:
+                        continue
+
+                    profile_t = torch.from_numpy(profile)
+                    norm_prof = helper.normalize_profile(profile_t).numpy()
+
+                    # convert to fixed‑alignment samples
+                    samples = self._profile_to_samples(norm_prof, n_t)
+                    if samples is None:
+                        profiles_skipped += 1
+                        continue
+
+                    # BUG FIX: Only update indices for successfully written samples
+                    n_written = samples.shape[0]
                     
-                    # Get and normalize profile
-                    profile = self._group_to_profile(grp, gname, n_t)
-                    profile_tensor = torch.from_numpy(profile)
-                    normalized_profile = helper.normalize_profile(profile_tensor).numpy()
-                    
-                    # Convert to samples
-                    samples = self._group_to_samples(normalized_profile, n_t)   # 2D np.ndarray or None
-                    if samples is not None:
-                        shard_chunks.append(samples)
+                    # Add samples to writer
+                    shard_writer.add_samples(samples)
 
-                    # flush if needed
-                    current_size = sum(chunk.shape[0] for chunk in shard_chunks)
-                    while current_size >= self.shard_size:
-                        # Collect data for one shard
-                        to_write = []
-                        remaining = self.shard_size
-                        new_chunks = []
-                        for chunk in shard_chunks:
-                            if remaining == 0:
-                                new_chunks.append(chunk)
-                                continue
-                            if chunk.shape[0] <= remaining:
-                                to_write.append(chunk)
-                                remaining -= chunk.shape[0]
-                            else:
-                                to_write.append(chunk[:remaining])
-                                new_chunks.append(chunk[remaining:])
-                                remaining = 0
-                        shard_chunks = new_chunks
+                    # ─ split bookkeeping ─────────────────────────────────────────
+                    split_h   = hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()
+                    p         = int(split_h[:8], 16) / 0xFFFFFFFF
 
-                        write_data = np.concatenate(to_write, axis=0) if len(to_write) > 1 else to_write[0]
-                        self._write_shard(
-                            shard_id, write_data, self.shard_index
-                        )
-                        shard_id += 1
+                    split_key = (
+                        "test" if p < test_f
+                        else "validation" if p < test_f + val_f
+                        else "train"
+                    )
 
-                        current_size = sum(chunk.shape[0] for chunk in shard_chunks)
+                    start_idx = global_idx
+                    global_idx += n_written
+                    splits[split_key].extend(range(start_idx, global_idx))
+                    profiles_written += 1
 
-                    # split bookkeeping
-                    for _ in range(n_t - 1):
-                        r = random.random()
-                        tgt = ("test"        if r < test_f else
-                               "validation"  if r < test_f + val_f else
-                               "train")
-                        splits[tgt].append(global_idx)
-                        global_idx += 1
-                    
-                    if n_t > 10000:
-                        group_time = time.time() - group_start
-                        self.logger.debug(f"Completed processing for large group {gname} in {group_time:.1f}s")
-            
-            file_time = time.time() - file_start
-            self.logger.info(f"Sharded file {raw_file} in {file_time:.1f}s")
-
-        # final partial shard
-        if shard_chunks:
-            write_data = np.concatenate(shard_chunks, axis=0) if len(shard_chunks) > 1 else shard_chunks[0]
-            self._write_shard(shard_id, write_data, self.shard_index)
-
-        # Update total_samples
+        # ─── finalise ────────────────────────────────────────────────────────────
+        shard_writer.flush()
         self.shard_index["total_samples"] = global_idx
         save_json(self.shard_index, self.output_dir / "shard_index.json")
-        
-        pass2_time = time.time() - pass2_start
-        self.logger.info(f"Stage 2 completed in {pass2_time:.1f}s")
 
-        # Save split indices as NPY
-        # Use the split_files mapping so 'validation' → 'val_indices.npy'
-        for split_name, idx_list in splits.items():
-            idx_arr = np.array(idx_list, dtype=np.int64)
-            filename = self.shard_index["split_files"].get(
-                split_name,
-                f"{split_name}_indices.npy"
-            )
-            np.save(self.output_dir / filename, idx_arr)
-            self.logger.info(f"{split_name} split: {len(idx_list):,} samples (saved to {filename})")
+        # Log statistics
+        self.logger.info(f"Profiles written: {profiles_written}, skipped: {profiles_skipped}")
 
-        # Log skipped summary
-        skipped_total = self.skipped_fraction + self.skipped_missing + self.skipped_pattern + self.skipped_nonfinite
-        self.logger.info(f"Preprocessing summary: Total groups attempted: {self.total_groups}, "
-                         f"Processed: {self.total_groups - skipped_total}, "
-                         f"Skipped: {skipped_total} ({skipped_total / self.total_groups * 100 if self.total_groups else 0:.1f}%) "
-                         f"[fraction: {self.skipped_fraction}, missing keys: {self.skipped_missing}, "
-                         f"pattern mismatch: {self.skipped_pattern}, non-finite: {self.skipped_nonfinite}]")
+        for split_name, idxs in splits.items():
+            if idxs:
+                fname = self.shard_index["split_files"][split_name]
+                np.save(self.output_dir / fname, np.array(idxs, dtype=np.int64))
+                self.logger.info(f"{split_name} split: {len(idxs):,} samples")
 
-        if global_idx == 0:
-            self.logger.error("No valid data processed. Exiting with warning.")
-            raise SystemExit("Preprocessing failed: No valid data found in raw files. Check input data for issues like missing variables or non-finite values.")
-
-        return {f"{k}_indices": splits[k] for k in ["train", "validation", "test"]}
+        return splits
     
-    def _initialize_accumulators(self):
-        """
-        Initialize accumulators for stats collection.
-        First sweep to discover the true max_timesteps, then init normalizer.
-        """
-        # 1) Find true maximum timesteps across all groups
-        max_timesteps = 0
-        for raw_file in self.raw_files:
-            with h5py.File(raw_file, "r") as f:
-                for gname in f.keys():
-                    n_t = f[gname][self.time_var].shape[0]
-                    max_timesteps = max(max_timesteps, n_t)
-
-        # 2) Initialize normalizer now that we know max_timesteps
-        self.normalizer = DataNormalizer(
-            self.config,
-            actual_timesteps=max_timesteps
-        )
-        return self.normalizer._initialize_accumulators(max_timesteps)
-    
-    def _accept_group(self, group: h5py.Group, gname: str) -> bool:
-        """Combined acceptance check: validate + pattern match + use_fraction."""
-        if random.random() > self.config["training"]["use_fraction"]:
-            self.skipped_fraction += 1
+    def _validate_group_simple(self, group: h5py.Group) -> bool:
+        """Simplified validation - only check essentials."""
+        # Check required variables exist
+        required_vars = set(self.species_vars + [self.time_var])
+        if not required_vars.issubset(group.keys()):
             return False
         
-        # Check all required variables exist
-        required_keys = set(self.species_vars + [self.time_var])
-        missing_vars = required_keys - set(group.keys())
-        if missing_vars:
-            if not hasattr(self, '_warned_missing_vars'):
-                self._warned_missing_vars = True
-                self.logger.error(f"Missing variables in HDF5: {missing_vars}")
-            self.skipped_missing += 1
-            return False
-        
-        if not self._validate_group(group):
-            self.skipped_nonfinite += 1
-            return False
-        
-        match = re.match(r"run_T_(?P<T_init>[\d.eE+-]+)_P_(?P<P_init>[\d.eE+-]+)_SEED_\d+", gname)
-        if not match:
-            self.skipped_pattern += 1
-            return False
-        
+        # Check for minimum threshold violations and non-finite values
+        for var in self.species_vars:
+            try:
+                var_data = group[var][:]
+                if not np.all(np.isfinite(var_data)) or np.any(var_data < self.min_threshold):
+                    return False
+            except Exception:
+                return False
+                
         return True
     
-    def _group_to_profile(self, group: h5py.Group, gname: str, n_t: int) -> np.ndarray:
-        """Extract profile from group using chunked reading to handle large n_t."""
-        match = re.match(r"run_T_(?P<T_init>[\d.eE+-]+)_P_(?P<P_init>[\d.eE+-]+)_SEED_\d+", gname)
+    def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> Optional[np.ndarray]:
+        """Extract profile data from group."""
+        import re
+        
+        # Define labels from global_vars by stripping "_init"
+        global_labels = [var.replace("_init", "") for var in self.global_vars]
+        globals_dict = {}
+        
+        # Find all _label_value patterns before SEED
+        matches = re.findall(r"_(\w+)_([\d.eE+-]+)", gname)
+        for label, value in matches:
+            if label in global_labels:
+                var = label + "_init"
+                if var in self.global_vars:
+                    try:
+                        globals_dict[var] = float(value)
+                    except ValueError:
+                        return None
+        
+        # Check if all global_vars were found
+        if set(globals_dict.keys()) != set(self.global_vars):
+            return None
+        
+        # Pre-allocate buffer
+        profile = np.empty((n_t, self.n_vars), dtype=np.float32)
+        
+        # Fill data
         try:
-            T_init = float(match.group('T_init'))
-            P_init = float(match.group('P_init'))
-        except (ValueError, TypeError) as e:
-            self.logger.warning(f"Invalid T_init or P_init in group {gname}: {e}")
-            raise ValueError(f"Cannot parse initial conditions from {gname}")
-        
-        profile = np.zeros((n_t, self.n_vars), dtype=np.float32)
-        
-        # Chunked load for variables from HDF5
-        for start in range(0, n_t, self.chunk_size):
-            end = min(start + self.chunk_size, n_t)
-            chunk_size = end - start
-            if chunk_size > 10000:
-                self.logger.debug(f"Loading chunk {start}-{end} for group {gname}")
-            
             for i, var in enumerate(self.var_order):
                 if var in self.species_vars or var == self.time_var:
-                    profile[start:end, i] = group[var][start:end]
-                elif var == "T_init":
-                    profile[start:end, i] = T_init
-                elif var == "P_init":
-                    profile[start:end, i] = P_init
+                    profile[:, i] = group[var][:].astype(np.float32)
+                elif var in self.global_vars:
+                    profile[:, i] = globals_dict[var]
+        except Exception:
+            return None
         
         return profile
     
-    def _group_to_samples(self, normalized_profile: np.ndarray, n_t: int) -> np.ndarray:
-        """Flatten normalized profile to samples (exclude t=0) using vectorized operations."""
+    def _profile_to_samples(self, normalized_profile: np.ndarray, n_t: int) -> Optional[np.ndarray]:
+        """Convert profile to input-output samples with fixed time alignment."""
         if n_t <= 1:
             return None
         
-        # Log processing for large profiles
-        if n_t > 10000:
-            self.logger.info(f"Converting profile with {n_t:,} timesteps to {n_t-1:,} training samples")
+        n_samples = n_t - 1
+        n_features = self.n_species + self.n_globals + 1 + self.n_species
         
-        # Initial species (repeat for all samples)
-        init_species = np.repeat(normalized_profile[0, :self.n_species][np.newaxis, :], n_t - 1, axis=0)
+        samples = np.empty((n_samples, n_features), dtype=np.float32)
         
-        # Globals (from t=1 to end)
-        globals_t = normalized_profile[1:, self.n_species:self.n_species + self.n_globals]
+        # Initial species at t=0
+        samples[:, :self.n_species] = normalized_profile[0, :self.n_species]
         
-        # Time (from t=1 to end)
-        time_t = normalized_profile[1:, -1][:, np.newaxis]
+        # Initial globals at t=0
+        initial_globals = normalized_profile[0, self.n_species:self.n_species + self.n_globals]
+        samples[:, self.n_species:self.n_species + self.n_globals] = initial_globals
         
-        # Targets (species from t=1 to end)
-        targets = normalized_profile[1:, :self.n_species]
+        # Time at t+1
+        samples[:, self.n_species + self.n_globals] = normalized_profile[1:, -1]
         
-        # Concatenate along columns
-        samples_array = np.concatenate([init_species, globals_t, time_t, targets], axis=1)
+        # Target species at t+1
+        samples[:, -self.n_species:] = normalized_profile[1:, :self.n_species]
         
-        return samples_array
+        return samples
+
+
+class ShardWriter:
+    """Efficient shard writer with buffering."""
     
-    def _write_shard(
-        self,
-        shard_idx: int,
-        data: np.ndarray,
-        shard_index: Dict[str, Any]
-    ) -> None:
-        """
-        Write a single NPY shard (data already normalized).
-        Updates shard_index with correct start/end offsets.
-        """
-        shard_start = time.time()
-        shard_path = self.output_dir / f"shard_{shard_idx:04d}.npy"
-
-        # Serialize data to disk
-        np.save(shard_path, data)
-
-        # Measure file size
-        file_size = shard_path.stat().st_size
-
-        # Compute correct start/end indices from running total_samples
-        start_idx = shard_index.get(
-            "total_samples",
-            shard_idx * shard_index["samples_per_shard"]
-        )
-        end_idx = start_idx + data.shape[0]
-
-        # Record shard metadata
+    def __init__(self, output_dir: Path, shard_size: int, shard_index: Dict, compression: str = None):
+        self.output_dir = output_dir
+        self.shard_size = shard_size
+        self.shard_index = shard_index
+        self.compression = compression
+        
+        self.buffer = []
+        self.buffer_size = 0
+        self.shard_id = 0
+    
+    def add_samples(self, samples: np.ndarray):
+        """Add samples to buffer and flush if needed."""
+        self.buffer.append(samples)
+        self.buffer_size += samples.shape[0]
+        
+        while self.buffer_size >= self.shard_size:
+            self._write_shard()
+    
+    def flush(self):
+        """Write any remaining samples."""
+        if self.buffer_size > 0:
+            self._write_shard()
+    
+    def _write_shard(self):
+        """Write a single shard to disk."""
+        # Collect samples for one shard
+        shard_data = []
+        remaining = self.shard_size
+        
+        new_buffer = []
+        for chunk in self.buffer:
+            if remaining <= 0:
+                new_buffer.append(chunk)
+                continue
+            
+            if chunk.shape[0] <= remaining:
+                shard_data.append(chunk)
+                remaining -= chunk.shape[0]
+            else:
+                shard_data.append(chunk[:remaining])
+                new_buffer.append(chunk[remaining:])
+                remaining = 0
+        
+        # Concatenate shard data
+        data = np.vstack(shard_data) if len(shard_data) > 1 else shard_data[0]
+        
+        # Write shard
+        shard_path = self.output_dir / f"shard_{self.shard_id:04d}.npy"
+        
+        if self.compression == 'npz':
+            save_path = shard_path.with_suffix('.npz')
+            np.savez_compressed(save_path, data=data)
+        else:
+            save_path = shard_path
+            np.save(save_path, data)
+        
+        # Update shard info
         shard_info = {
-            "shard_idx": shard_idx,
-            "filename": shard_path.name,
-            "start_idx": start_idx,
-            "end_idx": end_idx,
+            "shard_idx": self.shard_id,
+            "filename": save_path.name,
+            "start_idx": self.shard_index.get("total_samples", 0),
+            "end_idx": self.shard_index.get("total_samples", 0) + data.shape[0],
             "n_samples": data.shape[0],
-            "file_size": int(file_size),
         }
-        shard_index["shards"].append(shard_info)
-        shard_index["n_shards"] += 1
-
-        # Update total_samples for the next shard
-        shard_index["total_samples"] = end_idx
-
-        # Debug log
-        shard_time = time.time() - shard_start
-        self.logger.debug(
-            f"Wrote shard {shard_idx}: {data.shape[0]:,} samples, "
-            f"{file_size/1e6:.1f} MB in {shard_time:.1f}s"
-        )
-    
-    def _validate_group(self, group: h5py.Group) -> bool:
-        """
-        Validate group data and log rejection reasons.
-        Returns False if any NaN/Inf is found or if any species value is 
-        below threshold.
-        """
-        required_keys = self.species_vars + [self.time_var]
-        is_valid = True
-        n_t = group[self.time_var].shape[0]
-        min_threshold = DEFAULT_TOSS
         
-        for key in required_keys:
-            bad_count = 0  # For non-finites
-            below_threshold_count = 0  # For values below threshold
-            
-            for start in range(0, n_t, self.chunk_size):
-                end = min(start + self.chunk_size, n_t)
-                data_chunk = group[key][start:end]
-                
-                # Check for non-finites
-                bad_mask = ~np.isfinite(data_chunk)
-                bad_count += int(bad_mask.sum())
-                
-                # Check for species values below threshold
-                if key in self.species_vars:
-                    below_mask = data_chunk < min_threshold
-                    below_threshold_count += int(below_mask.sum())
-                    
-                    if np.any(below_mask):
-                        is_valid = False
-            
-            self.total_nonfinite_values += bad_count
-            if bad_count > 0:
-                is_valid = False
+        self.shard_index["shards"].append(shard_info)
+        self.shard_index["total_samples"] = shard_info["end_idx"]
+        self.shard_index["n_shards"] += 1
+        self.shard_id += 1
         
-        return is_valid
+        # Update buffer
+        self.buffer = new_buffer
+        self.buffer_size = sum(chunk.shape[0] for chunk in self.buffer)

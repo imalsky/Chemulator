@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
 Data normalization module for chemical kinetics datasets.
-
-Provides efficient normalization with multiple methods
-and numerical stability guarantees.
-Used only during preprocessing; no runtime calls.
 """
 
 import logging
@@ -13,222 +9,113 @@ from typing import Dict, List, Any, Optional
 
 import numpy as np
 import torch
-import time
 
 
 # Normalization constants
 DEFAULT_EPSILON = 1e-37
 DEFAULT_MIN_STD = 1e-10
-DEFAULT_CLAMP = 100.0
-DEFAULT_SYMLOG_PERCENTILE = 0.5
-FIXED_RESERVOIR_SIZE = 1000000  # Fixed size for symlog quantile estimation
+DEFAULT_CLAMP = 50.0
 
-FLOAT32_MAX_EXPONENT = 38  # log10(float32_max) ≈ 38.5
 
 class DataNormalizer:
-    """
-    Calculate normalization statistics from data during preprocessing.
-    """
-
-    def __init__(self,
-                 config: Dict[str, Any],
-                 *,
-                 actual_timesteps: int) -> None:
-        """
-        Initialize the normalizer.
-
-        Args:
-            config: Full configuration dictionary.
-            actual_timesteps: Number of timesteps in the data (for reservoir sizing).
-        """
-        self.config        = config
-        self.data_config   = config["data"]
-        self.norm_config   = config["normalization"]
+    """Calculate normalization statistics from data during preprocessing."""
+    
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config = config
+        self.data_config = config["data"]
+        self.norm_config = config["normalization"]
 
         # Variable lists
-        self.species_vars  = self.data_config["species_variables"]
-        self.global_vars   = self.data_config["global_variables"]
-        self.time_var      = self.data_config["time_variable"]
-        self.all_vars      = self.species_vars + self.global_vars + [self.time_var]
+        self.species_vars = self.data_config["species_variables"]
+        self.global_vars = self.data_config["global_variables"]
+        self.time_var = self.data_config["time_variable"]
+        self.all_vars = self.species_vars + self.global_vars + [self.time_var]
 
         # Numerical constants
-        self.epsilon       = self.norm_config.get("epsilon", 1e-37)
-        self.min_std       = self.norm_config.get("min_std", 1e-10)
-
-        self._actual_timesteps = actual_timesteps
+        self.epsilon = self.norm_config.get("epsilon", DEFAULT_EPSILON)
+        self.min_std = self.norm_config.get("min_std", DEFAULT_MIN_STD)
 
         self.logger = logging.getLogger(__name__)
         
-    def _initialize_accumulators(self, n_profiles: int) -> Dict[str, Dict[str, Any]]:
-        """
-        Initialise per-variable statistics accumulators.
-        Uses fixed reservoir size for simplicity and to avoid dynamic estimation issues.
-        """
-        self.logger.info(
-            f"Using fixed reservoir size {FIXED_RESERVOIR_SIZE:,} for symlog quantile estimation"
-        )
-
-        accumulators: Dict[str, Dict[str, Any]] = {}
+    def _initialize_accumulators(self) -> Dict[str, Dict[str, Any]]:
+        """Initialize per-variable statistics accumulators."""
+        accumulators = {}
         for i, var in enumerate(self.all_vars):
             method = self._get_method(var)
             if method == "none":
                 continue
-            acc = dict(
-                method     = method,
-                index      = i,
-                count      = 0,
-                mean       = 0.0,
-                m2         = 0.0,
-                min        = float("inf"),
-                max        = float("-inf"),
-                reservoir  = ReservoirSampler(FIXED_RESERVOIR_SIZE, seed=self.config["system"]["seed"]) if method == "symlog" else None,
-            )
+                
+                
+            acc = {
+                "method": method,
+                "index": i,
+                "count": 0,
+                "mean": 0.0,
+                "m2": 0.0,
+                "min": float("inf"),
+                "max": float("-inf"),
+            }
             accumulators[var] = acc
         return accumulators
     
     def _get_method(self, var: str) -> str:
         """Get normalization method for a variable."""
         methods = self.norm_config.get("methods", {})
-        return methods.get(var, self.norm_config["default_method"])
+        method = methods.get(var, self.norm_config["default_method"])
+        return method
     
     def _update_accumulators(
-        self, 
+        self,
         data: np.ndarray,
         accumulators: Dict[str, Dict[str, Any]],
-        n_timesteps: int
-    ):
-        """
-        Update accumulators with a chunk of data using Chan et al.'s parallel algorithm.
-        Assumes data shape: (n_profiles, n_timesteps, n_vars)
-        """
-        n_profiles, n_t_check, _ = data.shape
-        if n_t_check != n_timesteps:
-            raise ValueError(f"Mismatched timesteps: expected {n_timesteps}, got {n_t_check}")
-        
-        # Optional profiling if anomaly detection enabled
-        if self.config["system"].get("detect_anomaly", False):
-            with torch.profiler.profile(with_stack=True, profile_memory=True) as prof:
-                self._perform_update_accumulators(data, accumulators, n_timesteps)
-            prof.export_chrome_trace("update_accumulators_trace.json")
-            self.logger.info("Profiling trace saved to update_accumulators_trace.json")
-        else:
-            self._perform_update_accumulators(data, accumulators, n_timesteps)
+        n_timesteps: int,
+    ) -> None:
+        """Vectorised Chan update of running mean/variance & min/max."""
+        _, _, _ = data.shape  # n_profiles, n_t, n_vars
 
-    def _perform_update_accumulators(
-            self,
-            data: np.ndarray,
-            accumulators: Dict[str, Dict[str, Any]],
-            n_timesteps: int
-        ):
-            """Helper for core update logic, separable for profiling."""
-            n_profiles, n_t_check, _ = data.shape
-            if n_t_check != n_timesteps:
-                raise ValueError(f"Mismatched timesteps: expected {n_timesteps}, got {n_t_check}")
+        for var, acc in accumulators.items():
+            idx     = acc["index"]
+            method  = acc["method"]
 
-            if n_timesteps > 10000:
-                start_time = time.time()
-                self.logger.info(f"Starting accumulator update for large group ({n_timesteps:,} timesteps)")
-
-            for var, acc in accumulators.items():
-                var_idx = acc["index"]
-                method = acc["method"]
+            if var in self.global_vars:
+                value = float(data[0, 0, idx])
+                if method in {"log-standard", "log-min-max"}:
+                    value = np.log10(np.maximum(value, self.epsilon))
                 
-                if var in self.global_vars:
-                    # Globals are constant, use scalar value for efficiency
-                    value = data[0, 0, var_idx]
-                    value = float(value)  # Ensure scalar
-                    n_b = n_profiles * n_timesteps
-                    # Apply transformation if needed
-                    if method in ["log-standard", "log-min-max"]:
-                        value = np.log10(np.maximum(value, self.epsilon))
-                    
-                    mean_b = value
-                    m2_b = 0.0
-                    min_b = max_b = value
-                    
-                    # Filter invalid (though globals usually valid)
-                    if not np.isfinite(value):
-                        continue
-                    
-                    # Update min/max
-                    acc["min"] = min(acc["min"], value)
-                    acc["max"] = max(acc["max"], value)
-                    
-                    # Chan update
-                    if acc["count"] == 0:
-                        acc["count"] = n_b
-                        acc["mean"] = mean_b
-                        acc["m2"] = 0.0
-                    else:
-                        n_a = acc["count"]
-                        mean_a = acc["mean"]
-                        m2_a = acc["m2"]
-                        
-                        delta = mean_b - mean_a
-                        n_ab = n_a + n_b
-                        mean_ab = mean_a + delta * n_b / n_ab
-                        m2_ab = m2_a + delta**2 * n_a * n_b / n_ab  # m2_b=0
-                        
-                        acc["count"] = n_ab
-                        acc["mean"] = float(mean_ab)
-                        acc["m2"] = float(m2_ab)
-                    
-                    # Reservoir for symlog (add once since constant)
-                    if acc["reservoir"] is not None:
-                        acc["reservoir"].add_samples(np.array([value]))
-                else:
-                    # Species/time: original logic
-                    var_data = data[:, :, var_idx].flatten().astype(np.float64)
-                    
-                    valid_mask = np.isfinite(var_data)
-                    var_data = var_data[valid_mask]
-                    
-                    if len(var_data) == 0:
-                        continue
-                    
-                    if method in ["log-standard", "log-min-max"]:
-                        var_data = np.log10(np.maximum(var_data, self.epsilon))
-                    
-                    n_b = len(var_data)
-                    mean_b = np.mean(var_data, dtype=np.float64)
-                    
-                    acc["min"] = min(acc["min"], float(np.min(var_data)))
-                    acc["max"] = max(acc["max"], float(np.max(var_data)))
-                    
-                    # Chan update
-                    if acc["count"] == 0:
-                        acc["count"] = n_b
-                        acc["mean"] = float(mean_b)
-                        if n_b > 1:
-                            acc["m2"] = float(np.sum((var_data - mean_b)**2, dtype=np.float64))
-                        else:
-                            acc["m2"] = 0.0
-                    else:
-                        n_a = acc["count"]
-                        mean_a = acc["mean"]
-                        m2_a = acc["m2"]
-                        
-                        delta = mean_b - mean_a
-                        mean_ab = mean_a + delta * n_b / (n_a + n_b)
-                        
-                        if n_b > 1:
-                            m2_b = float(np.sum((var_data - mean_b)**2, dtype=np.float64))
-                        else:
-                            m2_b = 0.0
-                        
-                        m2_ab = m2_a + m2_b + delta**2 * n_a * n_b / (n_a + n_b)
-                        
-                        acc["count"] = n_a + n_b
-                        acc["mean"] = float(mean_ab)
-                        acc["m2"] = float(m2_ab)
-                    
-                    if method == "symlog" and acc["reservoir"]:
-                        acc["reservoir"].add_samples(var_data)
-            
-            if n_timesteps > 10000:
-                end_time = time.time()
-                self.logger.info(f"Accumulator update completed in {end_time - start_time:.2f} seconds")
-    
+                # Treat each profile as one observation, regardless of timesteps, to avoid biasing towards longer profiles
+                n_b    = 1  
+                mean_b = value
+                m2_b   = 0.0
+
+                acc["min"] = min(acc["min"], value)
+                acc["max"] = max(acc["max"], value)
+
+            # ─ species / time variables – fully vectorised ──────────────────────
+            else:
+                vec = data[:, :, idx].ravel().astype(np.float64)
+                vec = vec[np.isfinite(vec)]
+                if vec.size == 0:
+                    continue
+
+                if method in {"log-standard", "log-min-max"}:
+                    vec = np.log10(np.maximum(vec, self.epsilon))
+
+                n_b    = vec.size
+                mean_b = float(vec.mean())
+                m2_b   = float(((vec - mean_b) ** 2).sum()) if n_b > 1 else 0.0
+
+                acc["min"] = min(acc["min"], float(vec.min()))
+                acc["max"] = max(acc["max"], float(vec.max()))
+
+            # ─ Chan’s parallel mean/variance update ─────────────────────────────
+            n_a  = acc["count"]
+            delta = mean_b - acc["mean"]
+            n_ab  = n_a + n_b
+
+            acc["mean"] += delta * n_b / n_ab
+            acc["m2"]   += m2_b + delta**2 * n_a * n_b / n_ab
+            acc["count"] = n_ab
+        
     def _finalize_statistics(self, accumulators: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         """Finalize statistics from accumulators."""
         stats = {
@@ -266,28 +153,6 @@ class DataNormalizer:
                 var_stats["max"] = acc["max"]
                 if acc["max"] - acc["min"] < self.epsilon:
                     var_stats["max"] = acc["min"] + 1.0
-                
-            elif method == "symlog":
-                if acc["reservoir"] and acc["reservoir"].size > 0:
-                    values = acc["reservoir"].get_samples()
-                    percentile = self.norm_config.get("symlog_percentile", DEFAULT_SYMLOG_PERCENTILE)
-                    threshold = np.percentile(np.abs(values), percentile * 100)
-                    var_stats["threshold"] = max(float(threshold), self.epsilon)
-                    
-                    abs_vals = np.abs(values)
-                    linear_mask = abs_vals <= var_stats["threshold"]
-                    transformed = np.zeros_like(values)
-                    
-                    transformed[linear_mask] = values[linear_mask] / var_stats["threshold"]
-                    log_vals = np.maximum(abs_vals[~linear_mask] / var_stats["threshold"], self.epsilon)
-                    transformed[~linear_mask] = np.sign(values[~linear_mask]) * (
-                        np.log10(log_vals) + 1
-                    )
-                    
-                    var_stats["scale_factor"] = max(float(np.max(np.abs(transformed))), 1.0)
-                else:
-                    var_stats["threshold"] = 1.0
-                    var_stats["scale_factor"] = 1.0
             
             stats["per_key_stats"][var] = var_stats
         
@@ -302,134 +167,40 @@ class DataNormalizer:
         return stats
 
 
-class ReservoirSampler:
-    """
-    Efficient reservoir sampling for quantile estimation.
-    Memory-bounded implementation suitable for large datasets.
-    """
-    
-    def __init__(self, capacity: int, seed: int):
-        # Validate capacity to prevent memory issues
-        if capacity > 10_000_000:  # 10M samples max
-            logging.getLogger(__name__).warning(
-                f"Reservoir capacity {capacity} is very large, capping at 10M samples"
-            )
-            capacity = 10_000_000
-            
-        self.capacity = capacity
-        self.reservoir = []
-        self.count = 0
-        # Initialize RNG with fixed seed for reproducibility
-        self.rng = np.random.RandomState(seed)
-        
-        # Pre-allocate for efficiency if capacity is known
-        if capacity <= 1_000_000:
-            self.reservoir = [0.0] * capacity
-            self.size = 0
-        else:
-            self.reservoir = []
-            self.size = 0
-    
-    def add_samples(self, samples: np.ndarray):
-        """Add samples to the reservoir with memory-efficient batching."""
-        # Process in chunks for very large sample arrays
-        chunk_size = 100_000
-        
-        if len(samples) > chunk_size:
-            for i in range(0, len(samples), chunk_size):
-                chunk = samples[i:i + chunk_size]
-                self._add_chunk(chunk)
-        else:
-            self._add_chunk(samples)
-    
-    def _add_chunk(self, samples: np.ndarray):
-        """Add a chunk of samples to the reservoir."""
-        for sample in samples:
-            self.count += 1
-            
-            if self.size < self.capacity:
-                # Fill reservoir
-                if isinstance(self.reservoir, list) and len(self.reservoir) == self.capacity:
-                    # Pre-allocated list
-                    self.reservoir[self.size] = float(sample)
-                else:
-                    # Dynamic list
-                    self.reservoir.append(float(sample))
-                self.size += 1
-            else:
-                # Randomly replace
-                j = self.rng.randint(0, self.count)
-                if j < self.capacity:
-                    self.reservoir[j] = float(sample)
-    
-    def get_samples(self) -> np.ndarray:
-        """Get reservoir samples as numpy array."""
-        if isinstance(self.reservoir, list) and self.size < len(self.reservoir):
-            # Pre-allocated list not fully filled
-            return np.array(self.reservoir[:self.size], dtype=np.float64)
-        else:
-            return np.array(self.reservoir, dtype=np.float64)
-
-
 class NormalizationHelper:
-    """
-    Normalization helper for use during preprocessing.
-    """
-
-    def __init__(self,
-                 stats: Dict[str, Any],
-                 device: torch.device,
-                 species_vars: List[str],
-                 global_vars: List[str],
-                 time_var: str,
-                 config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the normalization helper.
-
-        Args:
-            stats: Pre-computed normalization statistics
-            device: Target device for operations (usually CPU)
-            species_vars: List of species variable names
-            global_vars: List of global variable names
-            time_var: Time variable name
-            config: Full configuration dictionary (optional)
-        """
+    """Normalization helper for use during preprocessing."""
+    
+    def __init__(self, stats: Dict[str, Any], device: torch.device, 
+                 species_vars: List[str], global_vars: List[str], 
+                 time_var: str, config: Optional[Dict[str, Any]] = None):
         self.stats = stats
         self.device = device
         self.species_vars = species_vars
         self.global_vars = global_vars
         self.time_var = time_var
 
-        # Use lengths to compute column offsets
         self.n_species = len(species_vars)
         self.n_globals = len(global_vars)
         self.methods = stats["normalization_methods"]
         self.per_key_stats = stats["per_key_stats"]
 
-        # Numerical constants from stats or config or defaults
         self.epsilon = stats.get("epsilon", DEFAULT_EPSILON)
-
-        # Get clamp_value from stats first, then config, then default
         self.clamp_value = stats.get("clamp_value", DEFAULT_CLAMP)
-        if config and "normalization" in config:
-            self.clamp_value = config["normalization"].get("clamp_value", self.clamp_value)
 
-        # Pre-compute normalization parameters on device
+        self.logger = logging.getLogger(__name__)
+
+        # Pre-compute normalization parameters
         self._precompute_parameters()
-
-        # Pre-compute for sample batch normalization
-        self._precompute_sample_columns()
 
     def _precompute_parameters(self):
         """Pre-compute normalization parameters for efficiency."""
         self.norm_params = {}
 
-        # Group variables by normalization method for vectorized operations
+        # Group variables by normalization method
         self.method_groups = {
             "standard": [],
             "log-standard": [],
             "log-min-max": [],
-            "symlog": [],
             "none": []
         }
 
@@ -454,14 +225,10 @@ class NormalizationHelper:
                 params["min"] = torch.tensor(var_stats["min"], dtype=torch.float32, device=self.device)
                 params["max"] = torch.tensor(var_stats["max"], dtype=torch.float32, device=self.device)
 
-            elif method == "symlog":
-                params["threshold"] = torch.tensor(var_stats["threshold"], dtype=torch.float32, device=self.device)
-                params["scale_factor"] = torch.tensor(var_stats["scale_factor"], dtype=torch.float32, device=self.device)
-
             self.norm_params[var] = params
             self.method_groups[method].append(var)
 
-        # Pre-compute column indices for each method group
+        # Pre-compute column indices
         self._compute_column_indices()
 
     def _compute_column_indices(self):
@@ -475,32 +242,14 @@ class NormalizationHelper:
             if vars_list:
                 self.col_indices[method] = [var_to_col[var] for var in vars_list]
 
-    def _precompute_sample_columns(self):
-        """Pre-compute variable mapping and indices for sample batches."""
-        # Sample columns: species_init + globals + time + species_target
-        self.sample_col_vars = self.species_vars + self.global_vars + [self.time_var] + self.species_vars
-
-        # Group sample columns by method
-        self.sample_col_indices = {}
-        for method in self.method_groups:
-            self.sample_col_indices[method] = [i for i, var in enumerate(self.sample_col_vars) if self.methods.get(var, "none") == method]
-
     def normalize_profile(self, profile: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize a complete profile tensor using vectorized operations.
-
-        Args:
-            profile: Tensor of shape (timesteps, n_species + n_globals + 1)
-        Returns:
-            Normalized profile tensor
-        """
-        # Ensure profile is on the same device as normalization parameters
+        """Normalize a complete profile tensor using vectorized operations."""
         if profile.device != self.device:
             profile = profile.to(self.device)
 
         normalized = profile.clone()
 
-        # Apply normalization for each method group (vectorized)
+        # Apply normalization for each method group
         for method, col_idxs in self.col_indices.items():
             if not col_idxs or method == "none":
                 continue
@@ -533,88 +282,10 @@ class NormalizationHelper:
                 ranges = torch.clamp(ranges, min=self.epsilon)
                 normalized[:, col_idxs] = torch.clamp((log_data - mins) / ranges, 0.0, 1.0)
 
-            elif method == "symlog":
-                for i, var in enumerate(self.method_groups[method]):
-                    params = self.norm_params[var]
-                    col_idx = col_idxs[i]
-                    normalized[:, col_idx] = self._symlog_transform(
-                        profile[:, col_idx], 
-                        params["threshold"], 
-                        params["scale_factor"]
-                    )
-
-        return normalized
-
-    def normalize_batch(self, batch: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize a batch of samples using vectorized operations.
-
-        Args:
-            batch: Tensor of shape (batch_size, 2*n_species + n_globals + 1)
-        Returns:
-            Normalized batch tensor
-        """
-        if batch.device != self.device:
-            batch = batch.to(self.device)
-
-        normalized = batch.clone()
-
-        # Apply normalization for each method group on sample columns (vectorized)
-        for method, col_idxs in self.sample_col_indices.items():
-            if not col_idxs or method == "none":
-                continue
-
-            cols = normalized[:, col_idxs]
-
-            if method == "standard":
-                var_list = [self.sample_col_vars[col] for col in col_idxs]
-                means = torch.stack([self.norm_params[v]["mean"] for v in var_list])
-                stds = torch.stack([self.norm_params[v]["std"] for v in var_list])
-                normalized[:, col_idxs] = torch.clamp(
-                    (cols - means) / stds,
-                    -self.clamp_value, self.clamp_value
-                )
-
-            elif method == "log-standard":
-                var_list = [self.sample_col_vars[col] for col in col_idxs]
-                log_means = torch.stack([self.norm_params[v]["log_mean"] for v in var_list])
-                log_stds = torch.stack([self.norm_params[v]["log_std"] for v in var_list])
-                log_data = torch.log10(torch.clamp(cols, min=self.epsilon))
-                normalized[:, col_idxs] = torch.clamp(
-                    (log_data - log_means) / log_stds,
-                    -self.clamp_value, self.clamp_value
-                )
-
-            elif method == "log-min-max":
-                var_list = [self.sample_col_vars[col] for col in col_idxs]
-                mins = torch.stack([self.norm_params[v]["min"] for v in var_list])
-                maxs = torch.stack([self.norm_params[v]["max"] for v in var_list])
-                log_data = torch.log10(torch.clamp(cols, min=self.epsilon))
-                ranges = maxs - mins
-                ranges = torch.clamp(ranges, min=self.epsilon)
-                normalized[:, col_idxs] = torch.clamp((log_data - mins) / ranges, 0.0, 1.0)
-
-            elif method == "symlog":
-                for i, col_idx in enumerate(col_idxs):
-                    var = self.sample_col_vars[col_idx]
-                    params = self.norm_params[var]
-                    normalized[:, col_idx] = self._symlog_transform(
-                        batch[:, col_idx],
-                        params["threshold"],
-                        params["scale_factor"]
-                    )
-
         return normalized
 
     def denormalize_profile(self, profile: torch.Tensor) -> torch.Tensor:
-        """
-        Denormalize a complete profile tensor using vectorized operations.
-
-        Args:
-            profile: Normalized tensor of shape (timesteps, n_species + n_globals + 1)
-        Returns:
-            Denormalized profile tensor in original units
-        """
+        """Denormalize a complete profile tensor."""
         if profile.device != self.device:
             profile = profile.to(self.device)
 
@@ -635,6 +306,7 @@ class NormalizationHelper:
                 log_means = torch.stack([self.norm_params[var]["log_mean"] for var in self.method_groups[method]])
                 log_stds = torch.stack([self.norm_params[var]["log_std"] for var in self.method_groups[method]])
                 log_data = cols * log_stds + log_means
+                log_data = torch.clamp(log_data, min=-38.0, max=38.0)
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
             elif method == "log-min-max":
@@ -643,72 +315,7 @@ class NormalizationHelper:
                 ranges = maxs - mins
                 ranges = torch.clamp(ranges, min=self.epsilon)
                 log_data = cols * ranges + mins
+                log_data = torch.clamp(log_data, min=-38.0, max=38.0)
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
-            elif method == "symlog":
-                for i, var in enumerate(self.method_groups[method]):
-                    params = self.norm_params[var]
-                    col_idx = col_idxs[i]
-                    denormalized[:, col_idx] = self._symlog_inverse(
-                        profile[:, col_idx],
-                        params["threshold"],
-                        params["scale_factor"]
-                    )
-
         return denormalized
-
-    def _symlog_transform(self, data: torch.Tensor, threshold: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        """Apply symlog transformation with optimized vectorized operations."""
-        abs_data = torch.abs(data)
-        sign_data = torch.sign(data)
-
-        linear_part = data / threshold
-        log_arg = torch.clamp(abs_data / threshold, min=self.epsilon)
-        log_part = sign_data * (torch.log10(log_arg) + 1.0)
-
-        result = torch.where(
-            abs_data <= threshold,
-            linear_part,
-            log_part
-        ) / scale
-
-        return torch.clamp(result, -self.clamp_value, self.clamp_value)
-
-    def _symlog_inverse(self, data: torch.Tensor, threshold: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        """
-        Apply inverse symlog transformation with robust overflow protection.
-        Prevents numerical overflow for extreme values on A100 GPUs.
-        """
-        scaled_data = data * scale
-        abs_scaled = torch.abs(scaled_data)
-        sign_scaled = torch.sign(scaled_data)
-
-        # Linear region: |scaled_data| <= 1
-        linear_part = scaled_data * threshold
-        
-        # Log region: |scaled_data| > 1
-        # Clamp exponent to prevent overflow
-        exponent = abs_scaled - 1.0
-        max_safe_exponent = FLOAT32_MAX_EXPONENT - 1  # Leave margin for safety
-        
-        # Log extreme values that would overflow
-        extreme_mask = exponent > max_safe_exponent
-        if extreme_mask.any():
-            self.logger.warning(
-                f"Clamping {extreme_mask.sum().item()} extreme values to prevent overflow "
-                f"(max exponent: {exponent.max().item():.2f})"
-            )
-        
-        clamped_exponent = torch.clamp(exponent, max=max_safe_exponent)
-        
-        # Compute log part with clamped exponent
-        log_part = sign_scaled * threshold * torch.pow(10.0, clamped_exponent)
-
-        # Combine linear and log regions
-        result = torch.where(
-            abs_scaled <= 1.0,
-            linear_part,
-            log_part
-        )
-
-        return result
