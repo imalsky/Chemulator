@@ -1,142 +1,104 @@
 #!/usr/bin/env python3
 """
-Optimized training pipeline for chemical kinetics models.
-
-Features:
-- Mixed precision training with BFloat16 on A100
-- Gradient accumulation for large effective batch sizes
-- Advanced learning rate scheduling
-- Memory-efficient training with periodic cache clearing
-- Comprehensive logging
-- Compatible with all device types (CUDA, MPS, CPU)
-- Full CUDA graph support with proper step marking
+Training pipeline for chemical kinetics models.
 """
 
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple
-import sys
+from typing import Dict, Any, Tuple, Optional
+import math
 
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
-from torch.utils.data import DataLoader
 
-from data.dataset import NPYDataset, create_dataloader
-from models.model import export_model  # Updated to modern export
-from data.device_prefetch import DevicePrefetchLoader
-
-
-# Training constants
-DEFAULT_BETAS = (0.9, 0.999)
-DEFAULT_EPS = 1e-8
-LOGGING_INTERVAL_SECONDS = 30.0
-SCHEDULER_PLATEAU_FACTOR = 0.5
-SCHEDULER_PLATEAU_PATIENCE = 10
-SCHEDULER_PLATEAU_MIN_LR = 1e-7
-DEFAULT_EMPTY_CACHE_INTERVAL = 999999
+from models.model import export_model
 
 
 class Trainer:
-    """
-    Optimised trainer for chemical-kinetics networks.
-    """
-    def __init__(               
-        self,
-        model: nn.Module,
-        train_dataset: NPYDataset,
-        val_dataset: NPYDataset,
-        test_dataset: NPYDataset,
-        config: Dict[str, Any],
-        save_dir: Path,
-        device: torch.device,
-    ):
+    """Trainer for chemical kinetics networks."""
+    def __init__(self, model: nn.Module, train_dataset, val_dataset, test_dataset,
+                 config: Dict[str, Any], save_dir: Path, device: torch.device):
         self.logger = logging.getLogger(__name__)
-
-        self.model          = model
-        self.config         = config
-        self.save_dir       = save_dir
-        self.device         = device
-        self.train_config   = self.config["training"]
-        self.system_config  = self.config["system"]
-
-        # Data loaders
-        base_train = create_dataloader(train_dataset, config, shuffle=True,  device=device)
-        base_val   = create_dataloader(val_dataset,   config, shuffle=False, device=device)
-        base_test  = create_dataloader(test_dataset,  config, shuffle=False, device=device)
-
-        self.logger.info("Using pre-normalized data - direct GPU streaming enabled")
         
-        try:
-            from data.device_prefetch import DevicePrefetchLoader
-            use_prefetch = device.type == "cuda"
-        except ModuleNotFoundError:
-            self.logger.warning("DevicePrefetchLoader not found - falling back to plain loaders")
-            use_prefetch = False
+        self.model = model
+        self.config = config
+        self.save_dir = save_dir
+        self.device = device
+        
+        # Extract config sections
+        self.train_config = config["training"]
+        self.system_config = config["system"]
+        self.prediction_config = config.get("prediction", {})
+        
+        # Prediction mode
+        self.prediction_mode = self.prediction_config.get("mode", "absolute")
+        self.output_clamp = self.prediction_config.get("output_clamp")
+        
+        # Dataset info
+        self.n_species = len(config["data"]["species_variables"])
+        
+        # Check for empty validation set
+        self.has_validation = val_dataset is not None and len(val_dataset) > 0
+        if not self.has_validation:
+            self.logger.warning("No validation data – early‑stopping and LR‑plateau will be skipped")
 
-        if use_prefetch:
-            self.train_loader = DevicePrefetchLoader(base_train, device)
-            self.val_loader = DevicePrefetchLoader(base_val, device)
-            self.test_loader = DevicePrefetchLoader(base_test, device)
-            self.logger.info("GPU pre-fetch enabled")
-        else:
-            self.train_loader = base_train
-            self.val_loader = base_val
-            self.test_loader = base_test
-
-        # Misc setup
-        self.log_interval            = self.train_config.get("log_interval", 10)
-        self.current_epoch           = 0
-        self.global_step             = 0
-        self.best_val_loss           = float("inf")
-        self.best_epoch              = -1
-        self.total_training_time     = 0
-        self.patience_counter        = 0
+        
+        # Create data loaders
+        self._setup_dataloaders(train_dataset, val_dataset, test_dataset)
+        
+        # Training state
+        self.current_epoch = 0
+        self.global_step = 0
+        self.best_val_loss = float("inf")
+        self.best_epoch = -1
+        self.total_training_time = 0
+        self.patience_counter = 0
+        
+        # Training parameters
+        self.log_interval = self.train_config.get("log_interval", 1000)
         self.early_stopping_patience = self.train_config["early_stopping_patience"]
-        self.min_delta               = self.train_config["min_delta"]
-        self.empty_cache_interval    = self.system_config.get("empty_cache_interval", DEFAULT_EMPTY_CACHE_INTERVAL)
-
-        self.log_file         = self.save_dir / "training_log.json"
-        self.training_history = {"config": config, "epochs": []}
-        self.max_history_epochs     = 1_000
-        self.history_save_interval  = 100
-
+        self.min_delta = self.train_config["min_delta"]
+        self.gradient_accumulation_steps = self.train_config["gradient_accumulation_steps"]
+        
+        # Setup training components
         self._setup_optimizer()
         self._setup_scheduler()
         self._setup_loss()
         self._setup_amp()
-        self._cuda_graphs_enabled = False
-        self._check_cuda_graphs_compatibility()
         
-    def _check_cuda_graphs_compatibility(self):
-        """Check if we should use CUDA graphs based on the configuration and device."""
-        if (self.device.type == "cuda" and 
-            self.system_config.get("use_torch_compile", False) and 
-            self.train_config.get("use_amp", False) and
-            self.system_config.get("compile_mode") == "max-autotune"):
-            self._cuda_graphs_enabled = True
-            self.logger.info("CUDA graphs compatibility mode enabled")
-            
-            # Import the cudagraph marking function with fallback
-            try:
-                from torch._inductor import cudagraph_mark_step_begin
-                self.cudagraph_mark_step = cudagraph_mark_step_begin
-            except ImportError:
-                try:
-                    from torch._dynamo import mark_step_begin
-                    self.cudagraph_mark_step = mark_step_begin
-                except ImportError:
-                    self.logger.warning("CUDA graph step marking not available, disabling")
-                    self._cuda_graphs_enabled = False
-        else:
-            self._cuda_graphs_enabled = False
+        # Training history
+        self.training_history = {
+            "config": config,
+            "prediction_mode": self.prediction_mode,
+            "epochs": []
+        }
+    
+    def _setup_dataloaders(self, train_dataset, val_dataset, test_dataset):
+        """Setup data loaders."""
+        from data.dataset import create_dataloader
+        
+        self.train_loader = create_dataloader(
+            train_dataset, self.config, shuffle=True, 
+            device=self.device, drop_last=True
+        ) if train_dataset else None
+        
+        self.val_loader = create_dataloader(
+            val_dataset, self.config, shuffle=False, 
+            device=self.device, drop_last=False
+        ) if val_dataset and len(val_dataset) > 0 else None
+        
+        self.test_loader = create_dataloader(
+            test_dataset, self.config, shuffle=False, 
+            device=self.device, drop_last=False
+        ) if test_dataset and len(test_dataset) > 0 else None
     
     def _setup_optimizer(self):
-        """Setup AdamW optimizer with weight decay."""
+        """Setup AdamW optimizer."""
         # Separate parameters for weight decay
         decay_params = []
         no_decay_params = []
@@ -145,8 +107,7 @@ class Trainer:
             if not param.requires_grad:
                 continue
             
-            # Don't apply weight decay to biases, layer norm, and embeddings
-            if param.dim() == 1 or "bias" in name or "norm" in name.lower() or "embed" in name.lower():
+            if param.dim() == 1 or "bias" in name or "norm" in name.lower():
                 no_decay_params.append(param)
             else:
                 decay_params.append(param)
@@ -159,50 +120,64 @@ class Trainer:
         self.optimizer = AdamW(
             param_groups,
             lr=self.train_config["learning_rate"],
-            betas=DEFAULT_BETAS,
-            eps=DEFAULT_EPS
-        )
-        
-        self.logger.info(
-            f"Optimizer: AdamW with lr={self.train_config['learning_rate']:.2e}, "
-            f"weight_decay={self.train_config['weight_decay']:.2e}"
+            betas=tuple(self.train_config.get("betas", [0.9, 0.999])),
+            eps=self.train_config.get("eps", 1e-8)
         )
     
     def _setup_scheduler(self):
-        """Setup learning rate scheduler."""
-        scheduler_type = self.train_config["scheduler"]
-        
+        """Create the learning‑rate scheduler as requested in the config."""
+        scheduler_type = self.train_config.get("scheduler", "none").lower()
+
+        # ─── No scheduler ───────────────────────────────────────────────────────────────
+        if scheduler_type == "none":
+            self.scheduler = None
+            self.scheduler_step_on_batch = False
+            return
+
+        # ─── Common convenience variables ──────────────────────────────────────────────
+        # ceil → count the final (partial) accumulation window
+        steps_per_epoch = math.ceil(
+            len(self.train_loader) / self.gradient_accumulation_steps
+        )
+
+        params: Dict[str, Any] = self.train_config.get("scheduler_params", {})
+
+        # ─── CosineAnnealingWarmRestarts ───────────────────────────────────────────────
         if scheduler_type == "cosine":
-            params = self.train_config["scheduler_params"]
-            
-            # Calculate T_0 in steps - ensure at least 1
-            steps_per_epoch = max(1, len(self.train_loader) // self.train_config["gradient_accumulation_steps"])
-            T_0 = max(1, params["T_0"] * steps_per_epoch)
-            
+            T_0_epochs: int = params.get("T_0", 1)
+            if T_0_epochs <= 0:
+                raise ValueError("`scheduler_params.T_0` must be > 0 for 'cosine'.")
+            T_0_steps = T_0_epochs * steps_per_epoch
+
             self.scheduler = CosineAnnealingWarmRestarts(
                 self.optimizer,
-                T_0=T_0,
-                T_mult=params["T_mult"],
-                eta_min=params["eta_min"]
+                T_0=T_0_steps,
+                T_mult=params.get("T_mult", 2),
+                eta_min=params.get("eta_min", 1e-8),
             )
             self.scheduler_step_on_batch = True
-            
-        elif scheduler_type == "plateau":
-            params = self.train_config.get("scheduler_params", {})
-            
+            return
+
+        # ─── ReduceLROnPlateau ─────────────────────────────────────────────────────────
+        if scheduler_type == "plateau":
+            # Only create plateau scheduler if we have validation data
+            if not self.has_validation:
+                self.logger.warning("Plateau scheduler requires validation data, falling back to no scheduler")
+                self.scheduler = None
+                self.scheduler_step_on_batch = False
+                return
+                
             self.scheduler = ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",
-                factor=params.get("factor", SCHEDULER_PLATEAU_FACTOR),
-                patience=params.get("patience", SCHEDULER_PLATEAU_PATIENCE),
-                min_lr=params.get("min_lr", SCHEDULER_PLATEAU_MIN_LR)
+                factor=params.get("factor", 0.5),
+                patience=params.get("patience", 10),
+                min_lr=params.get("min_lr", 1e-7),
             )
             self.scheduler_step_on_batch = False
-        
-        else:
-            raise ValueError(f"Unknown scheduler: {scheduler_type}")
-        
-        self.logger.info(f"Scheduler: {scheduler_type}")
+            return
+
+        raise ValueError(f"Unknown scheduler '{scheduler_type}'")
     
     def _setup_loss(self):
         """Setup loss function."""
@@ -210,86 +185,61 @@ class Trainer:
         
         if loss_type == "mse":
             self.criterion = nn.MSELoss()
+        elif loss_type == "mae":
+            self.criterion = nn.L1Loss()
         elif loss_type == "huber":
-            self.criterion = nn.HuberLoss(delta=self.train_config["huber_delta"])
+            self.criterion = nn.HuberLoss(delta=self.train_config.get("huber_delta", 0.25))
         else:
             raise ValueError(f"Unknown loss: {loss_type}")
-        
-        self.logger.info(f"Loss function: {loss_type}")
     
     def _setup_amp(self):
-        self.use_amp = self.train_config.get("use_amp", False) and self.device.type in ("cuda", "mps")
+        """Setup automatic mixed precision training."""
+        self.use_amp = self.train_config.get("use_amp", False)
+        if self.device.type not in ('cuda', 'mps', 'cpu'):
+            self.use_amp = False
         self.scaler = None
         self.amp_dtype = None
-
+        
         if not self.use_amp:
-            self.logger.info("AMP disabled")
             return
-
-        dtype_str = str(self.train_config.get("amp_dtype", "float16")).lower()
-        if dtype_str not in ("float16", "bfloat16"):
-            raise ValueError(f"Invalid amp_dtype '{dtype_str}' – choose 'float16' or 'bfloat16'.")
-
+        
+        dtype_str = str(self.train_config.get("amp_dtype", "bfloat16")).lower()
         self.amp_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float16
 
-        # GradScaler only meaningful for fp16 on CUDA
-        if self.amp_dtype is torch.float16 and self.device.type == "cuda":
-            self.scaler = GradScaler()
-        elif self.device.type == "mps" and self.amp_dtype is torch.float16:
-            self.logger.warning("GradScaler not supported on MPS – continuing without it.")
+        if self.device.type == 'cpu' and self.amp_dtype != torch.bfloat16:
+            self.logger.warning(f"AMP with {dtype_str} is not supported on CPU. Disabling AMP.")
+            self.use_amp = False
+            return
 
-        self.logger.info("AMP enabled (dtype=%s, device=%s)", dtype_str, self.device.type)
+        if self.device.type == 'mps' and self.amp_dtype not in [torch.float16, torch.bfloat16]:
+            self.logger.warning(f"AMP with {dtype_str} is not supported on MPS. Disabling AMP.")
+            self.use_amp = False
+            return
+
+        # GradScaler only for float16 on CUDA
+        if self.amp_dtype == torch.float16 and self.device.type == 'cuda':
+            self.scaler = GradScaler('cuda')
         
+    def _apply_delta_and_clamp(self, outputs: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+        """Apply delta mode transformation and clamping consistently."""
+        if self.prediction_mode == "delta":
+            initial_species = inputs[:, :self.n_species]
+            outputs = outputs + initial_species
+        
+        if self.output_clamp is not None:
+            outputs = torch.clamp(outputs, min=self.output_clamp)
+        
+        return outputs
+    
     def train(self) -> float:
-        """
-        Execute the training loop.
-        
-        Returns:
-            Best validation loss achieved
-        """
-        self.logger.info("Starting training...")
+        """Execute the training loop."""
+        self.logger.info(f"Starting training...")
         self.logger.info(f"Train batches: {len(self.train_loader)}")
-        self.logger.info(f"Val batches: {len(self.val_loader)}")
-        
-        if len(self.train_loader) == 0:
-            self.logger.error("Training dataset is empty! Check data splits.")
-            sys.exit(1)
+        if self.has_validation:
+            self.logger.info(f"Val batches: {len(self.val_loader)}")
         
         try:
-            for epoch in range(1, self.train_config["epochs"] + 1):
-                self.current_epoch = epoch
-                epoch_start = time.time()
-                
-                # Training phase
-                train_loss, train_metrics = self._train_epoch()
-                
-                # Validation phase
-                val_loss, val_metrics = self._validate()
-                
-                # Update scheduler
-                if not self.scheduler_step_on_batch:
-                    self.scheduler.step(val_loss)
-                
-                # Track time
-                epoch_time = time.time() - epoch_start
-                self.total_training_time += epoch_time
-                
-                # Log results
-                self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
-                
-                # Check for improvement
-                if val_loss < self.best_val_loss - self.min_delta:
-                    self.best_val_loss = val_loss
-                    self.best_epoch = epoch
-                    self.patience_counter = 0
-                    self._save_best_model()
-                else:
-                    self.patience_counter += 1
-                
-                # Early stopping
-                if self.patience_counter >= self.early_stopping_patience:
-                    self.logger.info(f"Early stopping triggered at epoch {epoch}")
-                    break
+            self._run_training_loop()
             
             self.logger.info(
                 f"Training completed. Best validation loss: {self.best_val_loss:.6f} "
@@ -298,273 +248,215 @@ class Trainer:
             
         except KeyboardInterrupt:
             self.logger.info("Training interrupted by user")
-        
+            
         except Exception as e:
             self.logger.error(f"Training failed: {e}", exc_info=True)
             raise
-        
+            
         finally:
-            # Save training history
-            with open(self.log_file, 'w') as f:
+            # Save final training history
+            save_path = self.save_dir / "training_log.json"
+            with open(save_path, 'w') as f:
                 json.dump(self.training_history, f, indent=2)
+            
+            # Clear cache
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
         
         return self.best_val_loss
     
+    def _run_training_loop(self):
+        """Main training loop."""
+        for epoch in range(1, self.train_config["epochs"] + 1):
+            self.current_epoch = epoch
+            epoch_start = time.time()
+
+            # Train
+            train_loss, train_metrics = self._train_epoch()
+            
+            # Validate if available
+            val_loss, val_metrics = self._validate()
+
+            # Update scheduler
+            if self.scheduler and not self.scheduler_step_on_batch:
+                if isinstance(self.scheduler, ReduceLROnPlateau) and self.has_validation:
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+
+            # Log epoch
+            epoch_time = time.time() - epoch_start
+            self.total_training_time += epoch_time
+            self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
+
+            # Save best model (only if we have validation data)
+            if self.has_validation and val_loss < (self.best_val_loss - self.min_delta):
+                self.best_val_loss = val_loss
+                self.best_epoch = epoch
+                self.patience_counter = 0
+                self._save_best_model()
+            elif not self.has_validation and epoch == 1:
+                # Save first epoch model if no validation
+                self._save_best_model()
+            else:
+                self.patience_counter += 1
+
+            # Early stopping
+            if self.has_validation and self.patience_counter >= self.early_stopping_patience:
+                self.logger.info(f"Early stopping triggered at epoch {epoch}")
+                break
+    
     def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
-        """
-        One training epoch with gradient accumulation.
-        Ensures all batches contribute to gradient updates.
-        """
+        """Run one training epoch and return the average loss."""
         self.model.train()
+
         total_loss, total_samples = 0.0, 0
-        grad_norm_ema = 0.0
-        ema_decay = 0.98
-        accumulation_steps = self.train_config["gradient_accumulation_steps"]
-        last_log_time = time.time()
-        accumulated_loss = 0.0
-        accumulated_batches = 0
-
-        if self._cuda_graphs_enabled and hasattr(self, "cudagraph_mark_step"):
-            self.cudagraph_mark_step()
-
         for batch_idx, (inputs, targets) in enumerate(self.train_loader):
-            inputs = inputs.to(self.device, non_blocking=True)
+            # Move data
+            inputs  = inputs.to(self.device,  non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
-            with autocast(enabled=self.use_amp, device_type=self.device.type, dtype=self.amp_dtype):
+            with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets) / accumulation_steps
+                outputs = self._apply_delta_and_clamp(outputs, inputs)
+                loss    = self.criterion(outputs, targets)
 
-            (self.scaler.scale(loss) if self.scaler else loss).backward()
-            accumulated_loss += loss.item() * accumulation_steps
-            accumulated_batches += 1
+                loss = loss / self.gradient_accumulation_steps
 
-            # Perform optimizer step at accumulation boundary or last batch
-            is_accumulation_boundary = (batch_idx + 1) % accumulation_steps == 0
-            is_last_batch = (batch_idx + 1) == len(self.train_loader)
-            
-            if is_accumulation_boundary or is_last_batch:
-                if self.scaler:
-                    self.scaler.unscale_(self.optimizer)
+            if self.scaler:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
-                grad = nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.train_config["gradient_clip"]
-                )
-                grad_norm_ema = ema_decay * grad_norm_ema + (1 - ema_decay) * float(grad)
+            is_update_step = (
+                (batch_idx + 1) % self.gradient_accumulation_steps == 0
+                or (batch_idx + 1) == len(self.train_loader)
+            )
+            if is_update_step:
+                if self.train_config["gradient_clip"] > 0:
+                    if self.scaler:
+                        self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.train_config["gradient_clip"]
+                    )
 
                 if self.scaler:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     self.optimizer.step()
-
                 self.optimizer.zero_grad(set_to_none=True)
-                
-                # Only step scheduler on full accumulation boundaries
-                if self.scheduler_step_on_batch and is_accumulation_boundary:
+
+                if self.scheduler and self.scheduler_step_on_batch:
                     self.scheduler.step()
-                    
+
                 self.global_step += 1
 
-                if self._cuda_graphs_enabled and hasattr(self, "cudagraph_mark_step"):
-                    self.cudagraph_mark_step()
-
-                # Reset accumulation tracking
-                accumulated_loss = 0.0
-                accumulated_batches = 0
-
-            # Track total loss
-            batch_loss = loss.item() * accumulation_steps
-            total_loss += batch_loss * inputs.size(0)
+            total_loss    += loss.item() * self.gradient_accumulation_steps * inputs.size(0)
             total_samples += inputs.size(0)
 
-            # Progress logging
-            if time.time() - last_log_time > LOGGING_INTERVAL_SECONDS:
-                pct = 100.0 * (batch_idx + 1) / len(self.train_loader)
+            if self.global_step % self.log_interval == 0:
                 self.logger.info(
-                    f"Epoch {self.current_epoch:03d} "
-                    f"{pct:5.1f}%  Loss {batch_loss:.4e}"
+                    f"Epoch {self.current_epoch} | "
+                    f"Batch {batch_idx + 1}/{len(self.train_loader)} | "
+                    f"Loss: {total_loss / total_samples:.6f}"
                 )
-                last_log_time = time.time()
 
-            # Memory management for large batches
-            if self.device.type == 'cuda' and (batch_idx + 1) % self.empty_cache_interval == 0:
-                torch.cuda.empty_cache()
+        return total_loss / total_samples, {}
 
-        avg_loss = total_loss / total_samples if total_samples else float("inf")
-        metrics = {
-            "grad_norm_ema": grad_norm_ema,
-            "learning_rate": self.optimizer.param_groups[0]["lr"],
-        }
-        
-        return avg_loss, metrics
     
-    @torch.no_grad()
-    def _run_eval_loop(self, loader: DataLoader, enable_logging: bool = True) -> Tuple[float, Dict[str, float]]:
-        """
-        Run evaluation loop on any dataset with proper empty loader handling.
-        
-        Args:
-            loader: DataLoader to evaluate
-            enable_logging: Whether to enable progress logging
-            
-        Returns:
-            Tuple of (average loss, metrics dict)
-        """
-        # Check for empty loader
-        if len(loader) == 0:
-            self.logger.warning("Evaluation DataLoader is empty! Returning inf loss.")
-            return float('inf'), {}
-        
-        self.model.eval()
-        
-        total_loss = 0.0
-        total_samples = 0
-        
-        # Time tracking
-        eval_start = time.time()
-        last_log_time = eval_start
-        
-        for batch_idx, (inputs, targets) in enumerate(loader):
-            inputs = inputs.to(self.device, non_blocking=True)
-            targets = targets.to(self.device, non_blocking=True)
-            
-            if self.use_amp:
-                with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                    outputs = self.model(inputs)
-                    loss = self.criterion(outputs, targets)
-            else:
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets)
-            
-            total_loss += loss.item() * inputs.size(0)
-            total_samples += inputs.size(0)
-            
-            if enable_logging:
-                current_time = time.time()
-                if current_time - last_log_time > LOGGING_INTERVAL_SECONDS:
-                    progress = (batch_idx + 1) / len(loader) * 100
-                    elapsed = current_time - eval_start
-                    self.logger.info(
-                        f"Epoch {self.current_epoch:03d} Val: {progress:.1f}% "
-                        f"({batch_idx+1}/{len(loader)} batches), "
-                        f"Elapsed: {elapsed:.1f}s"
-                    )
-                    last_log_time = current_time
-        
-        elapsed_total = time.time() - eval_start
-        if enable_logging:
-            self.logger.info(f"Evaluation completed in {elapsed_total:.1f}s")
-        
-        if total_samples == 0:
-            self.logger.warning("No samples processed during evaluation! Returning inf loss.")
-            return float('inf'), {}
-            
-        avg_loss = total_loss / total_samples
-            
-        return avg_loss, {}
-        
     def _validate(self) -> Tuple[float, Dict[str, float]]:
-        """Validate the model during training."""
-        return self._run_eval_loop(self.val_loader, enable_logging=True)
+        """Evaluate the model on the validation set and return the average loss."""
+        # BUG FIX: Check if validation loader exists
+        if not self.has_validation or self.val_loader is None:
+            return float("inf"), {}
+            
+        self.model.eval()
+        total_loss, total_samples = 0.0, 0
+
+        with torch.no_grad():
+            for inputs, targets in self.val_loader:
+                inputs = inputs.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+
+                with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                    outputs = self.model(inputs)
+                    outputs = self._apply_delta_and_clamp(outputs, inputs)
+                    loss = self.criterion(outputs, targets)
+
+                total_loss += loss.item() * inputs.size(0)
+                total_samples += inputs.size(0)
+
+        avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
+        return avg_loss, {}
     
-    @torch.no_grad()
     def evaluate_test(self) -> float:
-        """Evaluate on test set."""
-        self.logger.info("Evaluating on test set...")
-        
-        # Load best model
-        checkpoint_path = self.save_dir / "best_model.pt"
-        if checkpoint_path.exists():
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-            self.logger.info(f"Loaded best model from epoch {checkpoint['epoch']}")
-        
-        test_loss, _ = self._run_eval_loop(self.test_loader, enable_logging=False)
-        
-        self.logger.info(f"Test loss: {test_loss:.6f}")
-        
-        return test_loss
+        """Compute the loss on the test set; returns `inf` if no test data."""
+        if not self.test_loader:
+            self.logger.warning("No test data available")
+            return float("inf")
+
+        self.model.eval()
+        total_loss, total_samples = 0.0, 0
+
+        with torch.no_grad():
+            for inputs, targets in self.test_loader:
+                inputs = inputs.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+
+                with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                    outputs = self.model(inputs)
+                    outputs = self._apply_delta_and_clamp(outputs, inputs)
+                    loss = self.criterion(outputs, targets)
+
+                total_loss += loss.item() * inputs.size(0)
+                total_samples += inputs.size(0)
+
+        avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
+        self.logger.info(f"Test loss: {avg_loss:.6f}")
+        return avg_loss
     
-    def _save_best_model(self):
-        """Save best model checkpoint."""
-        checkpoint = {
-            "epoch": self.current_epoch,
-            "model_state_dict": self.model.state_dict(),
-            "best_val_loss": self.best_val_loss,
-            "config": self.config,
-            "training_time": self.total_training_time
-        }
-        
-        path = self.save_dir / "best_model.pt"
-        torch.save(checkpoint, path)
-        self.logger.info(f"Saved best model (epoch {self.current_epoch})")
-        
-        # Also export model if requested
-        if self.system_config.get("save_jit_model", False):
-            self._export_model()
-    
-    def _export_model(self):
-        """Export model using modern torch.export with improved error handling."""
-        try:
-            if len(self.val_loader) == 0:
-                self.logger.warning("Validation loader is empty, trying train loader for export")
-                if len(self.train_loader) == 0:
-                    self.logger.warning("Train loader is also empty, skipping export")
-                    return
-                loader_to_use = self.train_loader
-            else:
-                loader_to_use = self.val_loader
-            
-            example_batch = next(iter(loader_to_use))
-            example_input = example_batch[0][:1].to(self.device)  # Single sample
-            
-            export_path = self.save_dir / "best_model_exported.pt"
-            export_model(self.model, example_input, export_path)
-            
-            example_path = self.save_dir / "export_example_input.pt"
-            torch.save(example_input, example_path)
-            self.logger.info(f"Model exported to {export_path}")
-            
-        except Exception as e:
-            self.logger.warning(f"Model export failed: {e}")
-    
-    def _log_epoch(
-        self,
-        train_loss: float,
-        val_loss: float,
-        train_metrics: Dict[str, float],
-        val_metrics: Dict[str, float],
-        epoch_time: float
-    ):
+    def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
         """Log epoch results."""
-        lr = self.optimizer.param_groups[0]["lr"]
-        
-        log_str = (
-            f"Epoch {self.current_epoch:03d}/{self.train_config['epochs']:03d} | "
-            f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
-            f"LR: {lr:.2e} | Time: {epoch_time:.1f}s"
-        )
-        
-        if "grad_norm_ema" in train_metrics:
-            log_str += f" | Grad Norm: {train_metrics['grad_norm_ema']:.2f}"
-        
-        self.logger.info(log_str)
-        
-        # Append to history
-        epoch_data = {
+        log_entry = {
             "epoch": self.current_epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
-            "lr": lr,
-            "time": epoch_time,
-            "train_metrics": train_metrics,
-            "val_metrics": val_metrics
+            "epoch_time": epoch_time,
+            "lr": self.optimizer.param_groups[0]['lr'],
         }
-        self.training_history["epochs"].append(epoch_data)
+        self.training_history["epochs"].append(log_entry)
         
-        # Periodic save
-        if self.current_epoch % self.history_save_interval == 0:
-            with open(self.log_file, 'w') as f:
-                json.dump(self.training_history, f, indent=2)
+        val_str = f"Val loss: {val_loss:.6f}" if self.has_validation else "Val loss: N/A"
+        self.logger.info(
+            f"Epoch {self.current_epoch}/{self.train_config['epochs']} "
+            f"Train loss: {train_loss:.6f} {val_str} "
+            f"Time: {epoch_time:.1f}s LR: {log_entry['lr']:.2e}"
+        )
+    
+    def _save_best_model(self):
+        """Save the best model checkpoint."""
+        checkpoint = {
+            "epoch": self.current_epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
+            "best_val_loss": self.best_val_loss,
+            "config": self.config
+        }
+        
+        checkpoint_path = self.save_dir / "best_model.pt"
+        torch.save(checkpoint, checkpoint_path)
+        self.logger.info(f"Saved best model checkpoint to {checkpoint_path}")
+
+        # Export model if enabled
+        if self.system_config.get("use_torch_export", False):
+            # Get example input
+            if self.val_loader:
+                example_inputs, _ = next(iter(self.val_loader))
+            else:
+                example_inputs, _ = next(iter(self.train_loader))
+            example_inputs = example_inputs.to(self.device)
+            
+            export_path = self.save_dir / "exported_model.pt"
+            export_model(self.model, example_inputs, export_path)
