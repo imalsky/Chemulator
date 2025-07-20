@@ -39,7 +39,7 @@
     
     "preprocessing": {
         // Larger shards for A100's memory capacity
-        "shard_size": 5000000,
+        "shard_size": 10000000,
         "min_species_threshold": 1e-25,
         "compression": null,
         // More workers for faster preprocessing
@@ -138,7 +138,7 @@
         "seed": 42,
         // Torch compile is excellent on A100
         "use_torch_compile": true,
-        "compile_mode": "max-autotune",
+        "compile_mode": "default",
         "compile_fullgraph": false,
         "compile_dynamic_shapes": false,
         "cuda_graphs_enabled": false,
