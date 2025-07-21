@@ -337,7 +337,11 @@ class NormalizationHelper:
         return normalized
 
     def denormalize_profile(self, profile: torch.Tensor) -> torch.Tensor:
-        """Denormalize a complete profile tensor."""
+        """
+        Denormalize a complete profile tensor using vectorized operations.
+        This version includes a fix to clamp the output of the 'standard'
+        method to prevent numerical overflow.
+        """
         if profile.device != self.device:
             profile = profile.to(self.device)
 
@@ -352,12 +356,21 @@ class NormalizationHelper:
             if method == "standard":
                 means = torch.stack([self.norm_params[var]["mean"] for var in self.method_groups[method]])
                 stds = torch.stack([self.norm_params[var]["std"] for var in self.method_groups[method]])
-                denormalized[:, col_idxs] = cols * stds + means
+                
+                # Denormalize the data
+                raw_vals = cols * stds + means
+                
+                # CORRECTED: Clamp the output to prevent numerical overflow, ensuring stability.
+                # The range is chosen to be consistent with the implicit bounds of log-based methods.
+                finfo = torch.finfo(raw_vals.dtype)
+                denormalized[:, col_idxs] = torch.clamp(raw_vals, min=-finfo.max, max=finfo.max)
 
             elif method == "log-standard":
                 log_means = torch.stack([self.norm_params[var]["log_mean"] for var in self.method_groups[method]])
                 log_stds = torch.stack([self.norm_params[var]["log_std"] for var in self.method_groups[method]])
                 log_data = cols * log_stds + log_means
+                
+                # This clamp is crucial to prevent torch.pow from creating inf/NaN values
                 log_data = torch.clamp(log_data, min=-38.0, max=38.0)
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
@@ -374,35 +387,40 @@ class NormalizationHelper:
                 ranges = maxs - mins
                 ranges = torch.clamp(ranges, min=self.epsilon)
                 log_data = cols * ranges + mins
+
+                # This clamp is crucial to prevent torch.pow from creating inf/NaN values
                 log_data = torch.clamp(log_data, min=-38.0, max=38.0)
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
         return denormalized
     
     def denormalize_ratio_predictions(self, standardized_log_ratios: torch.Tensor,
-                                        initial_species: torch.Tensor) -> torch.Tensor:
-            """Convert standardized log-ratio predictions back to species values."""
-            if self.ratio_stats is None:
-                raise ValueError("Ratio statistics not available for denormalization")
+                                    initial_species: torch.Tensor) -> torch.Tensor:
+        """Convert standardized log-ratio predictions back to species values."""
+        if self.ratio_stats is None:
+            raise ValueError("Ratio statistics not available for denormalization")
 
-            # Ensure tensors are on the correct device
-            device = standardized_log_ratios.device
-            initial_species = initial_species.to(device)
+        # Ensure tensors are on the correct device
+        device = standardized_log_ratios.device
+        initial_species = initial_species.to(device)
 
-            # Create tensors for per-species mean and std from the dictionary of stats
-            species_vars = self.species_vars
-            ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in species_vars], device=device, dtype=torch.float32)
-            ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in species_vars], device=device, dtype=torch.float32)
+        # Create tensors for per-species mean and std from the dictionary of stats
+        species_vars = self.species_vars
+        ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in species_vars], device=device, dtype=torch.float32)
+        ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in species_vars], device=device, dtype=torch.float32)
+        
+        # Denormalize the standardized log-ratios (reverse the standardization)
+        # Broadcasting handles the [batch_size, n_species] shape
+        log_ratios = (standardized_log_ratios * ratio_stds) + ratio_means
 
-            # Denormalize the standardized log-ratios (reverse the standardization)
-            # Broadcasting handles the [batch_size, n_species] shape
-            log_ratios = (standardized_log_ratios * ratio_stds) + ratio_means
+        # FIXED: Clamp to prevent overflow/inf in torch.pow
+        log_ratios = torch.clamp(log_ratios, min=-38.0, max=38.0)
+        
+        # Convert log-ratios back to ratios (10^x)
+        ratios = torch.pow(10.0, log_ratios)
 
-            # Convert log-ratios back to ratios (10^x)
-            ratios = torch.pow(10.0, log_ratios)
+        # Apply ratios to initial conditions to get the final predicted species values
+        # Note: initial_species must be in original (non-normalized) scale
+        predicted_species = initial_species * ratios
 
-            # Apply ratios to initial conditions to get the final predicted species values
-            # Note: initial_species must be in original (non-normalized) scale
-            predicted_species = initial_species * ratios
-
-            return predicted_species
+        return predicted_species

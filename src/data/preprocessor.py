@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
 Chemical kinetics data preprocessor with corrected normalization statistics.
-Fixed issues:
-1. Species normalization now uses only t=0 values in ratio mode
-2. Time normalization excludes t=0 values in all modes
 """
 
 import hashlib
@@ -12,7 +9,6 @@ import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
 
 import h5py
 import numpy as np
@@ -53,6 +49,17 @@ class DataPreprocessor:
         # Prediction mode
         self.prediction_mode = config.get("prediction", {}).get("mode", "absolute")
         
+        # Initialize statistics tracking
+        self.preprocessing_stats = {
+            "total_groups_examined": 0,
+            "groups_dropped_subsampling": 0,
+            "groups_dropped_validation": 0,
+            "groups_dropped_no_future": 0,
+            "groups_processed": 0,
+            "total_samples_generated": 0,
+            "per_file_stats": {}
+        }
+        
         self._init_shard_index()
     
     def _init_shard_index(self) -> None:
@@ -86,6 +93,9 @@ class DataPreprocessor:
         # Pass 2: Write normalized shards
         self.logger.info("Pass 2: Writing normalized NPY shards")
         split_indices = self._write_normalized_shards(norm_stats)
+        
+        # Generate data report
+        self._generate_data_report(norm_stats, split_indices)
         
         self.logger.info(f"Preprocessing completed in {time.time() - start_time:.1f}s")
         return split_indices
@@ -361,45 +371,51 @@ class DataPreprocessor:
 
         # Process files
         if self.parallel_enabled and self.num_workers > 1 and len(self.raw_files) > 1:
-            # Parallel processing
-            results = self._parallel_write_shards(
+            # Parallel processing with fixed index handling
+            results = self._parallel_write_shards_fixed(
                 norm_stats, helper, val_f, test_f, 
                 ratio_stats, global_idx
             )
             
-            # Aggregate results with index adjustment
-            actual_global_idx = 0
-            for file_samples, file_splits, written, skipped in results:
+            # Aggregate results - indices are now absolute, no adjustment needed
+            for file_samples, file_splits, written, skipped, file_stats in results:
                 for samples in file_samples:
                     shard_writer.add_samples(samples)
                 
-                # Compute adjustment offset
-                if any(file_splits.values()):  # If any splits in this file
-                    # Find the estimated min_idx (should be the start_global_idx passed to the file)
-                    file_min_idx = min(min(indices) for indices in file_splits.values() if indices)
-                    offset = actual_global_idx - file_min_idx
-                    for split_name, indices in file_splits.items():
-                        if indices:
-                            adjusted_indices = [i + offset for i in indices]
-                            splits[split_name].extend(adjusted_indices)
-                
-                # Update actual_global_idx by the number of samples written for this file
-                file_total_samples = sum(len(indices) for indices in file_splits.values())
-                actual_global_idx += file_total_samples
+                # Directly extend splits with the absolute indices
+                for split_name, indices in file_splits.items():
+                    splits[split_name].extend(indices)
                 
                 profiles_written += written
                 profiles_skipped += skipped
-            global_idx = actual_global_idx  # Set final global_idx to the actual total
+                
+                # Update preprocessing stats
+                for key, value in file_stats.items():
+                    if key in self.preprocessing_stats:
+                        self.preprocessing_stats[key] += value
+            
+            # Calculate total samples from all splits
+            global_idx = sum(len(indices) for indices in splits.values())
         
         else:
             # Sequential processing
             for raw_file in self.raw_files:
+                file_stats = {
+                    "total_groups_examined": 0,
+                    "groups_dropped_subsampling": 0,
+                    "groups_dropped_validation": 0,
+                    "groups_dropped_no_future": 0,
+                    "groups_processed": 0,
+                }
+                
                 with h5py.File(raw_file, "r") as f:
                     for gname in sorted(f.keys()):
+                        file_stats["total_groups_examined"] += 1
+                        
                         result = self._process_single_group(
                             f[gname], gname, helper, 
                             val_f, test_f, global_idx,
-                            ratio_stats
+                            ratio_stats, file_stats
                         )
                         
                         if result is None:
@@ -413,10 +429,17 @@ class DataPreprocessor:
                         global_idx += n_written
                         splits[split_key].extend(range(start_idx, global_idx))
                         profiles_written += 1
+                        file_stats["groups_processed"] += 1
+                
+                # Update global stats
+                for key, value in file_stats.items():
+                    self.preprocessing_stats[key] += value
+                self.preprocessing_stats["per_file_stats"][str(raw_file.name)] = file_stats
 
         # Finalize
         shard_writer.flush()
         self.shard_index["total_samples"] = global_idx
+        self.preprocessing_stats["total_samples_generated"] = global_idx
         save_json(self.shard_index, self.output_dir / "shard_index.json")
 
         # Log statistics
@@ -430,25 +453,32 @@ class DataPreprocessor:
 
         return splits
         
-    def _parallel_write_shards(self, norm_stats, helper, val_f, test_f, 
-                            ratio_stats, start_global_idx):
-        """Process files in parallel for writing shards."""
+    def _parallel_write_shards_fixed(self, norm_stats, helper, val_f, test_f, 
+                                    ratio_stats, start_global_idx):
+        """Process files in parallel with fixed index handling."""
         results = []
         
+        # Pre-calculate the number of valid samples per file
+        self.logger.info("Pre-calculating sample counts for parallel processing...")
+        file_sample_counts = []
+        for raw_file in self.raw_files:
+            count = self._count_valid_samples_in_file(raw_file)
+            file_sample_counts.append(count)
+            self.logger.debug(f"{raw_file.name}: {count} samples")
+        
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-            # Submit tasks
+            # Submit tasks with deterministic starting indices
             futures = []
             current_idx = start_global_idx
             
-            for raw_file in self.raw_files:
+            for i, (raw_file, sample_count) in enumerate(zip(self.raw_files, file_sample_counts)):
                 future = executor.submit(
-                    self._process_file_for_shards,
+                    self._process_file_for_shards_fixed,
                     raw_file, norm_stats, val_f, test_f,
                     current_idx, ratio_stats
                 )
                 futures.append((future, raw_file))
-                # Estimate indices (will be corrected after processing)
-                current_idx += 10000000  # Rough estimate
+                current_idx += sample_count  # Increment by exact count
             
             # Collect results
             for future, raw_file in futures:
@@ -462,9 +492,33 @@ class DataPreprocessor:
         
         return results
     
-    def _process_file_for_shards(self, raw_file, norm_stats, val_f, test_f, 
-                                start_global_idx, ratio_stats):
-        """Process a single file for shard writing (for parallel execution)."""
+    def _count_valid_samples_in_file(self, raw_file: Path) -> int:
+        """Count the exact number of samples that will be generated from a file."""
+        count = 0
+        use_fraction = self.config["training"]["use_fraction"]
+        
+        with h5py.File(raw_file, "r") as f:
+            for gname in sorted(f.keys()):
+                # Apply subsampling deterministically
+                if use_fraction < 1.0:
+                    h = hashlib.sha256(gname.encode("utf-8")).hexdigest()
+                    if int(h[:8], 16) / 0xFFFFFFFF >= use_fraction:
+                        continue
+                
+                # Check if group is valid
+                if not self._validate_group_simple(f[gname]):
+                    continue
+                
+                # Count samples (n_timesteps - 1)
+                n_t = f[gname][self.time_var].shape[0]
+                if n_t > 1:
+                    count += (n_t - 1)
+        
+        return count
+    
+    def _process_file_for_shards_fixed(self, raw_file, norm_stats, val_f, test_f, 
+                                      start_global_idx, ratio_stats):
+        """Process a single file with fixed global indexing."""
         # Re-create helper in subprocess
         helper = NormalizationHelper(
             norm_stats,
@@ -481,12 +535,22 @@ class DataPreprocessor:
         profiles_skipped = 0
         global_idx = start_global_idx
         
+        file_stats = {
+            "total_groups_examined": 0,
+            "groups_dropped_subsampling": 0,
+            "groups_dropped_validation": 0,
+            "groups_dropped_no_future": 0,
+            "groups_processed": 0,
+        }
+        
         with h5py.File(raw_file, "r") as f:
             for gname in sorted(f.keys()):
+                file_stats["total_groups_examined"] += 1
+                
                 result = self._process_single_group(
                     f[gname], gname, helper,
                     val_f, test_f, global_idx,
-                    ratio_stats
+                    ratio_stats, file_stats
                 )
                 
                 if result is None:
@@ -496,30 +560,43 @@ class DataPreprocessor:
                 samples, split_key, n_written = result
                 file_samples.append(samples)
                 
+                # Use absolute indices
                 start_idx = global_idx
                 global_idx += n_written
                 file_splits[split_key].extend(range(start_idx, global_idx))
                 profiles_written += 1
+                file_stats["groups_processed"] += 1
         
-        return file_samples, file_splits, profiles_written, profiles_skipped
+        return file_samples, file_splits, profiles_written, profiles_skipped, file_stats
         
     def _process_single_group(self, grp, gname, helper, val_f, test_f, 
-                            global_idx, ratio_stats):
+                            global_idx, ratio_stats, file_stats=None):
         """Process a single group and return samples."""
         # Deterministic subsampling
         use_fraction = self.config["training"]["use_fraction"]
         if use_fraction < 1.0:
             h = hashlib.sha256(gname.encode("utf-8")).hexdigest()
             if int(h[:8], 16) / 0xFFFFFFFF >= use_fraction:
+                if file_stats:
+                    file_stats["groups_dropped_subsampling"] += 1
                 return None
         
         if not self._validate_group_simple(grp):
+            if file_stats:
+                file_stats["groups_dropped_validation"] += 1
             return None
         
         # Extract & normalize
         n_t = grp[self.time_var].shape[0]
+        if n_t <= 1:
+            if file_stats:
+                file_stats["groups_dropped_no_future"] += 1
+            return None
+            
         profile = self._extract_profile(grp, gname, n_t)
         if profile is None:
+            if file_stats:
+                file_stats["groups_dropped_validation"] += 1
             return None
         
         # Get samples based on prediction mode
@@ -567,15 +644,14 @@ class DataPreprocessor:
             except Exception:
                 return False
         
-        # Verify globals are constant
-        if hasattr(self, '_validate_constant_globals') and self._validate_constant_globals:
-            for var in self.global_vars:
-                if var in group:
-                    data = group[var][:]
-                    if not np.allclose(data, data[0], rtol=1e-10):
-                        self.logger.warning(f"Global variable {var} is not constant in group {group.name}")
-                        return False
-                
+        # FIXED: Always verify globals are constant (remove conditional)
+        for var in self.global_vars:
+            if var in group:
+                data = group[var][:]
+                if not np.allclose(data, data[0], rtol=1e-10):
+                    self.logger.warning(f"Global variable {var} is not constant in group {group.name}")
+                    return False
+        
         return True
     
     def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> Optional[np.ndarray]:
@@ -685,6 +761,109 @@ class DataPreprocessor:
             samples[:, -n_targets:] = standardized_log_ratios
             
             return samples
+
+    def _generate_data_report(self, norm_stats: Dict[str, Any], split_indices: Dict[str, List[int]]):
+        """Generate a comprehensive data preprocessing report."""
+        report_path = Path(self.config["paths"]["log_dir"]) / "data_report.txt"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(report_path, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("DATA PREPROCESSING REPORT\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Prediction Mode: {self.prediction_mode}\n")
+            f.write("\n")
+            
+            # File information
+            f.write("INPUT FILES\n")
+            f.write("-" * 40 + "\n")
+            for raw_file in self.raw_files:
+                f.write(f"  {raw_file.name}\n")
+            f.write(f"Total files: {len(self.raw_files)}\n")
+            f.write("\n")
+            
+            # Overall statistics
+            f.write("PREPROCESSING STATISTICS\n")
+            f.write("-" * 40 + "\n")
+            total_examined = self.preprocessing_stats["total_groups_examined"]
+            f.write(f"Total groups examined: {total_examined:,}\n")
+            f.write(f"Groups dropped (subsampling): {self.preprocessing_stats['groups_dropped_subsampling']:,} "
+                   f"({100 * self.preprocessing_stats['groups_dropped_subsampling'] / max(1, total_examined):.1f}%)\n")
+            f.write(f"Groups dropped (validation): {self.preprocessing_stats['groups_dropped_validation']:,} "
+                   f"({100 * self.preprocessing_stats['groups_dropped_validation'] / max(1, total_examined):.1f}%)\n")
+            f.write(f"Groups dropped (no future): {self.preprocessing_stats['groups_dropped_no_future']:,} "
+                   f"({100 * self.preprocessing_stats['groups_dropped_no_future'] / max(1, total_examined):.1f}%)\n")
+            f.write(f"Groups processed: {self.preprocessing_stats['groups_processed']:,}\n")
+            f.write(f"Total samples generated: {self.preprocessing_stats['total_samples_generated']:,}\n")
+            f.write(f"Use fraction: {self.config['training']['use_fraction']}\n")
+            f.write("\n")
+            
+            # Per-file breakdown
+            if self.preprocessing_stats.get("per_file_stats"):
+                f.write("PER-FILE BREAKDOWN\n")
+                f.write("-" * 40 + "\n")
+                for filename, stats in self.preprocessing_stats["per_file_stats"].items():
+                    f.write(f"\n{filename}:\n")
+                    f.write(f"  Groups examined: {stats['total_groups_examined']:,}\n")
+                    f.write(f"  Groups processed: {stats['groups_processed']:,}\n")
+                    f.write(f"  Dropped (subsampling): {stats['groups_dropped_subsampling']:,}\n")
+                    f.write(f"  Dropped (validation): {stats['groups_dropped_validation']:,}\n")
+                    f.write(f"  Dropped (no future): {stats['groups_dropped_no_future']:,}\n")
+                f.write("\n")
+            
+            # Split information
+            f.write("DATA SPLITS\n")
+            f.write("-" * 40 + "\n")
+            total_samples = sum(len(indices) for indices in split_indices.values())
+            for split_name, indices in split_indices.items():
+                n_samples = len(indices)
+                percentage = 100 * n_samples / max(1, total_samples)
+                f.write(f"{split_name:12s}: {n_samples:10,} samples ({percentage:5.1f}%)\n")
+            f.write(f"{'Total':12s}: {total_samples:10,} samples\n")
+            f.write("\n")
+            
+            # Normalization statistics summary
+            f.write("NORMALIZATION STATISTICS\n")
+            f.write("-" * 40 + "\n")
+            f.write("Variable normalization methods:\n")
+            for var, method in norm_stats["normalization_methods"].items():
+                f.write(f"  {var:20s}: {method}\n")
+            f.write("\n")
+            
+            # Summarize key statistics
+            f.write("Key statistics per variable:\n")
+            for var, stats in norm_stats.get("per_key_stats", {}).items():
+                f.write(f"\n  {var}:\n")
+                method = stats.get("method", "unknown")
+                if method == "standard":
+                    f.write(f"    Mean: {stats['mean']:.6e}, Std: {stats['std']:.6e}\n")
+                elif method == "log-standard":
+                    f.write(f"    Log Mean: {stats['log_mean']:.6f}, Log Std: {stats['log_std']:.6f}\n")
+                elif method in ["min-max", "log-min-max"]:
+                    f.write(f"    Min: {stats['min']:.6e}, Max: {stats['max']:.6e}\n")
+            
+            # Ratio mode statistics
+            if self.prediction_mode == "ratio" and "ratio_stats" in norm_stats:
+                f.write("\nRatio mode statistics (per-species log-ratios):\n")
+                for var, stats in norm_stats["ratio_stats"].items():
+                    f.write(f"\n  {var}:\n")
+                    f.write(f"    Mean: {stats['mean']:.6f}, Std: {stats['std']:.6f}\n")
+                    f.write(f"    Min: {stats['min']:.6f}, Max: {stats['max']:.6f}\n")
+                    f.write(f"    Count: {stats['count']:,}\n")
+            
+            # Configuration summary
+            f.write("\nCONFIGURATION SUMMARY\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"Species variables: {', '.join(self.species_vars)}\n")
+            f.write(f"Global variables: {', '.join(self.global_vars)}\n")
+            f.write(f"Time variable: {self.time_var}\n")
+            f.write(f"Shard size: {self.shard_size:,}\n")
+            f.write(f"Min species threshold: {self.min_threshold:.2e}\n")
+            f.write(f"Epsilon: {self.config['normalization']['epsilon']:.2e}\n")
+            f.write(f"Min std: {self.config['normalization']['min_std']:.2e}\n")
+            
+        self.logger.info(f"Data report written to {report_path}")
 
 
 class ShardWriter:

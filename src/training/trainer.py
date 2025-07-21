@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 Training pipeline for chemical kinetics models.
+Fixed issues:
+1. Correct scheduler stepping with gradient accumulation
+2. Removed all MAE calculations
+3. Fixed ratio mode loss calculation
+4. Fixed no-validation logic
 """
 
 import json
@@ -202,6 +207,11 @@ class Trainer:
             return
         
         dtype_str = str(self.train_config.get("amp_dtype", "bfloat16")).lower()
+        
+        if dtype_str not in ["bfloat16", "float16"]:
+            self.logger.warning(f"Invalid amp_dtype '{dtype_str}'. Falling back to 'bfloat16'.")
+            dtype_str = "bfloat16"
+        
         self.amp_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float16
 
         if self.device.type == 'cpu' and self.amp_dtype != torch.bfloat16:
@@ -218,47 +228,41 @@ class Trainer:
         if self.amp_dtype == torch.float16 and self.device.type == 'cuda':
             self.scaler = GradScaler(device_type='cuda')
     
-    def _compute_loss(self, outputs: torch.Tensor, targets: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
-        """Compute loss with mode-specific handling and optional clamping."""
+    # --- helper ------------------------------------------------------------
+    def _standardize_log_ratios(self, log_ratios: torch.Tensor) -> torch.Tensor:
+        """
+        Convert raw log‑ratio predictions to the z‑score space used for training
+        targets, using the per‑species statistics saved in self.norm_helper.
+        """
+        if self.norm_helper.ratio_stats is None:                  # absolute mode
+            return log_ratios
+
+        stats = self.norm_helper.ratio_stats
+        species = self.config["data"]["species_variables"]
+        device  = log_ratios.device
+        dtype   = log_ratios.dtype
+
+        means = torch.tensor([stats[v]["mean"] for v in species],
+                             device=device, dtype=dtype)
+        stds  = torch.tensor([stats[v]["std"]  for v in species],
+                             device=device, dtype=dtype)
+
+        stds = torch.clamp(stds, min=self.config["normalization"]["min_std"])
+        return (log_ratios - means) / stds
+
+    # --- patched loss ------------------------------------------------------
+    def _compute_loss(self, outputs: torch.Tensor,
+                      targets: torch.Tensor,
+                      inputs: torch.Tensor) -> torch.Tensor:
+        """Compute loss with mode‑specific handling and optional clamping."""
         if self.prediction_mode == "ratio":
-            # Ratio mode: outputs are already log-ratios, no clamping needed
-            return self.criterion(outputs, targets)
-        else:
-            # Absolute mode: apply optional clamping
-            if self.output_clamp is not None:
-                outputs = torch.clamp(outputs, min=self.output_clamp)
-            return self.criterion(outputs, targets)
-    
-    def _compute_raw_mae(self, outputs: torch.Tensor, targets: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
-        """Compute MAE in original (denormalized) space for metrics."""
-        if self.prediction_mode == "ratio":
-            # Extract components for ratio mode
-            initial_species_norm = inputs[:, :self.n_species]
-            globals_norm = inputs[:, self.n_species:self.n_species + self.n_globals]
-            time_norm = inputs[:, -1:]
-            zero_time_norm = torch.zeros_like(time_norm)
-            initial_profile = torch.cat((initial_species_norm, globals_norm, zero_time_norm), dim=1)
-            initial_species_raw = self.norm_helper.denormalize_profile(initial_profile)[:, :self.n_species]
+            outputs_std = self._standardize_log_ratios(outputs)
+            return self.criterion(outputs_std, targets)
 
-            predicted_species_raw = self.norm_helper.denormalize_ratio_predictions(outputs, initial_species_raw)
-            target_species_raw = self.norm_helper.denormalize_ratio_predictions(targets, initial_species_raw)
-        else:
-            # Absolute mode
-            globals_norm = inputs[:, self.n_species:self.n_species + self.n_globals]
-            time_norm = inputs[:, -1:]
-            
-            # Apply clamping to outputs if needed
-            clamped_outputs = outputs
-            if self.output_clamp is not None:
-                clamped_outputs = torch.clamp(outputs, min=self.output_clamp)
-            
-            predicted_profile = torch.cat((clamped_outputs, globals_norm, time_norm), dim=1)
-            predicted_species_raw = self.norm_helper.denormalize_profile(predicted_profile)[:, :self.n_species]
-
-            target_profile = torch.cat((targets, globals_norm, time_norm), dim=1)
-            target_species_raw = self.norm_helper.denormalize_profile(target_profile)[:, :self.n_species]
-
-        return torch.mean(torch.abs(predicted_species_raw - target_species_raw))
+        # absolute mode
+        if self.output_clamp is not None:
+            outputs = torch.clamp(outputs, min=self.output_clamp)
+        return self.criterion(outputs, targets)
     
     def train(self) -> float:
         """Execute the training loop."""
@@ -312,12 +316,13 @@ class Trainer:
             # Validate if available
             val_loss, val_metrics = self._validate()
 
-            # Update scheduler
+            # CORRECTED: Only step epoch-based schedulers here.
+            # Batch-based schedulers are handled correctly in _train_epoch.
             if self.scheduler and not self.scheduler_step_on_batch:
                 if isinstance(self.scheduler, ReduceLROnPlateau) and self.has_validation:
                     self.scheduler.step(val_loss)
-                else:
-                    self.scheduler.step()
+                # For any other epoch-based scheduler, add logic here.
+                # The cosine scheduler is batch-based, so it's handled in _train_epoch
 
             # Log epoch
             epoch_time = time.time() - epoch_start
@@ -413,7 +418,6 @@ class Trainer:
             
         self.model.eval()
         total_loss = 0.0
-        total_raw_mae = 0.0
         total_samples = 0
         
         with torch.no_grad():
@@ -424,16 +428,12 @@ class Trainer:
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(inputs)
                     loss = self._compute_loss(outputs, targets, inputs)
-                    raw_mae = self._compute_raw_mae(outputs, targets, inputs)
 
                 total_loss += loss.item() * inputs.size(0)
-                total_raw_mae += raw_mae.item() * inputs.size(0)
                 total_samples += inputs.size(0)
         
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
-        avg_raw_mae = total_raw_mae / total_samples if total_samples > 0 else float("inf")
-        val_metrics = {"raw_mae": avg_raw_mae}
-        return avg_loss, val_metrics
+        return avg_loss, {}
 
     def evaluate_test(self) -> float:
         """Compute the loss on the test set; returns `inf` if no test data."""
@@ -443,7 +443,6 @@ class Trainer:
 
         self.model.eval()
         total_loss = 0.0
-        total_raw_mae = 0.0
         total_samples = 0
         
         with torch.no_grad():
@@ -454,15 +453,12 @@ class Trainer:
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(inputs)
                     loss = self._compute_loss(outputs, targets, inputs)
-                    raw_mae = self._compute_raw_mae(outputs, targets, inputs)
 
                 total_loss += loss.item() * inputs.size(0)
-                total_raw_mae += raw_mae.item() * inputs.size(0)
                 total_samples += inputs.size(0)
 
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
-        avg_raw_mae = total_raw_mae / total_samples if total_samples > 0 else float("inf")
-        self.logger.info(f"Test loss: {avg_loss:.6f} Test raw MAE: {avg_raw_mae:.6f}")
+        self.logger.info(f"Test loss: {avg_loss:.6f}")
         return avg_loss
             
     def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
@@ -475,13 +471,9 @@ class Trainer:
             "epoch_time": epoch_time,
             "lr": lr,
         }
-        if val_metrics:
-            log_entry.update(val_metrics)
         self.training_history["epochs"].append(log_entry)
         
         val_str = f"Val loss: {val_loss:.6f}" if self.has_validation else "Val loss: N/A"
-        if 'raw_mae' in val_metrics:
-            val_str += f" Val raw MAE: {val_metrics['raw_mae']:.6f}"
         self.logger.info(
             f"Epoch {self.current_epoch}/{self.train_config['epochs']} "
             f"Train loss: {train_loss:.6f} {val_str} "
