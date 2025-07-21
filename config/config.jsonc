@@ -1,5 +1,7 @@
 {
+    // ===== FILE PATHS =====
     "paths": {
+        // Raw HDF5 data files to process
         "raw_data_files": [
             "data/raw/run8001-result.h5",
             "data/raw/run8002-result.h5",
@@ -12,12 +14,17 @@
             "data/raw/run8009-result.h5",
             "data/raw/run8010-result.h5"
         ],
+        // Directory for processed NPY shards
         "processed_data_dir": "data/processed",
+        // Directory for saved models
         "model_save_dir": "data/models",
+        // Directory for logs
         "log_dir": "logs"
     },
     
+    // ===== DATA CONFIGURATION =====
     "data": {
+        // Chemical species to predict (order matters!)
         "species_variables": [
             "C2H2_evolution",
             "CH4_evolution",
@@ -32,130 +39,182 @@
             "OH_evolution",
             "O_evolution"
         ],
+        // Global parameters (initial conditions)
         "global_variables": ["P_init", "T_init"],
+        // Time variable name in HDF5 files
         "time_variable": "t_time"
     },
     
+    // ===== PREPROCESSING SETTINGS =====
     "preprocessing": {
-        // Larger shards for A100's memory capacity
-        "shard_size": 10000000,
+        // Number of samples per NPY shard file
+        "shard_size": 50000000,
+        // Minimum species concentration threshold
         "min_species_threshold": 1e-25,
+        // Compression type: null for raw npz files
         "compression": null,
-        // More workers for faster preprocessing
-        "num_workers": 16
+        // Number of parallel workers for preprocessing
+        "num_workers": 16,
+        // Enable parallel preprocessing (set false for simpler debugging)
+        "parallel_enabled": true
     },
     
+    // ===== NORMALIZATION SETTINGS =====
     "normalization": {
+        // Default normalization method for all variables
+        // Options: "standard", "log-standard", "min-max", "log-min-max", "none"
         "default_method": "log-min-max",
+        
+        // Override methods for specific variables
         "methods": {
-            "T_init": "standard",
-            "P_init": "log-min-max",
-            "t_time": "log-min-max"
+            "T_init": "standard",      // Temperature: standard normalization
+            "P_init": "log-min-max",    // Pressure: log scale then min-max
+            "t_time": "log-min-max"     // Time: log scale then min-max
         },
-        "epsilon": 1e-37,
+        
+        // Small value to prevent log(0) and division by zero
+        "epsilon": 1e-30,
+        // Minimum standard deviation to prevent division by tiny values
         "min_std": 1e-10,
+        // Clamp normalized values to [-clamp_value, clamp_value]
         "clamp_value": 50.0
     },
     
+    // ===== MODEL ARCHITECTURE =====
     "model": {
-        // DeepONet typically performs better for this task
+        // Model type: "deeponet" or "siren"
         "type": "deeponet",
+        
+        // Activation function: "gelu", "relu", "silu", "tanh"
         "activation": "gelu",
+        
+        // Dropout rate (0.0 = no dropout)
         "dropout": 0.0,
-        "use_time_embedding": false,
-        "time_embedding_dim": 256,
+        
+        // Output scaling factor (1.0 = no scaling)
         "output_scale": 1.0,
         
-        // Larger architecture for A100
-        "branch_layers": [512, 512, 512, 512],
-        "trunk_layers": [256, 256, 256],
-        "basis_dim": 128
+        // DeepONet-specific parameters
+        "branch_layers": [256, 256, 256],  // Hidden layers for branch network
+        "trunk_layers": [128, 128, 128],   // Hidden layers for trunk network
+        "basis_dim": 64,                   // Number of basis functions
+        
+        // SIREN-specific parameters (when type="siren")
+        "hidden_dims": [256, 256, 256, 256],  // Hidden layer dimensions
+        "omega_0": 30.0                       // SIREN frequency parameter
     },
     
+    // ===== FiLM CONDITIONING =====
     "film": {
+        // Enable Feature-wise Linear Modulation
         "enabled": true,
-        "hidden_dims": [256, 256],
+        // Hidden layers for FiLM networks
+        "hidden_dims": [64, 64],
+        // Activation for FiLM networks
         "activation": "gelu"
     },
     
+    // ===== PREDICTION SETTINGS =====
     "prediction": {
-        "mode": "absolute",
-        "output_clamp": 1e-30
+        // Prediction mode: "absolute" or "ratio"
+        // - absolute: predict species concentrations directly
+        // - ratio: predict log-ratios relative to initial conditions (DeepONet only)
+        "mode": "ratio",
+        
+        // Optional output clamping (null = no clamping)
+        // Only used in absolute mode
+        "output_clamp": null
     },
     
+    // ===== TRAINING PARAMETERS =====
     "training": {
-        "val_fraction": 0.15,
-        "test_fraction": 0.15,
-        "use_fraction": 1.0,
+        // Data split fractions
+        "val_fraction": 0.15,   // Validation set fraction
+        "test_fraction": 0.15,  // Test set fraction
+        "use_fraction": 1.0,    // Fraction of data to actually use (for debugging)
         
-        "epochs": 300,
-        // Large batch size for A100
-        "batch_size": 32768,
-        "gradient_accumulation_steps": 1,
-        // Increased cache for 80GB memory
-        "dataset_cache_shards": 256,
+        // Training loop settings
+        "epochs": 300,                      // Maximum epochs
+        "batch_size": 1024,                 // Batch size
+        "gradient_accumulation_steps": 1,   // Gradient accumulation steps
         
-        // Optimal workers for A100
-        "num_workers": 16,
-        "pin_memory": true,
-        "persistent_workers": true,
-        "prefetch_factor": 4,
-        "drop_last": true,
+        // DataLoader settings
+        "num_workers": 16,           // Parallel data loading workers
+        "pin_memory": true,          // Pin memory for faster GPU transfer
+        "persistent_workers": true,  // Keep workers alive between epochs
+        "prefetch_factor": 4,        // Number of batches to prefetch
+        "drop_last": true,           // Drop incomplete final batch
+        "dataset_cache_shards": 256, // Max shards to cache in memory
         
+        // Optimizer settings (AdamW)
         "learning_rate": 3e-4,
         "weight_decay": 1e-5,
-        "gradient_clip": 1.0,
-        "betas": [0.9, 0.999],
-        "eps": 1e-8,
+        "betas": [0.9, 0.999],  // Adam beta parameters
+        "eps": 1e-8,            // Adam epsilon
         
-        "scheduler": "cosine",
+        // Gradient clipping (0 = no clipping)
+        "gradient_clip": 1.0,
+        
+        // Learning rate scheduler
+        "scheduler": "cosine",  // Options: "none", "cosine", "plateau"
         "scheduler_params": {
-            "T_0": 10,
-            "T_mult": 2,
-            "eta_min": 1e-7
+            // For "cosine" scheduler
+            "T_0": 10,          // Initial restart period in epochs
+            "T_mult": 2,        // Period multiplier after each restart
+            "eta_min": 1e-7,    // Minimum learning rate
+            
+            // For "plateau" scheduler
+            "factor": 0.5,      // LR reduction factor
+            "patience": 10,     // Epochs to wait before reducing LR
+            "min_lr": 1e-7      // Minimum learning rate
         },
         
-        "loss": "huber",
-        "huber_delta": 0.5,
+        // Loss function: "mse", "mae", "huber"
+        "loss": "mse",
+        "huber_delta": 0.5,  // Delta for Huber loss (if used)
         
-        // Use bfloat16 for A100
-        "use_amp": true,
-        "amp_dtype": "bfloat16",
+        // Mixed precision training
+        "use_amp": true,              // Enable automatic mixed precision
+        "amp_dtype": "bfloat16",      // AMP dtype: "float16" or "bfloat16"
         
-        "early_stopping_patience": 50,
-        "min_delta": 1e-10,
-        "log_interval": 100,
-        "save_interval": 10,
-        "empty_cache_interval": 1000
+        // Early stopping
+        "early_stopping_patience": 15,  // Epochs to wait before stopping
+        "min_delta": 1e-10,            // Minimum improvement to reset patience
+        
+        // Logging intervals
+        "log_interval": 100,           // Log every N gradient steps
+        "save_interval": 10,           // Save checkpoint every N epochs
+        "empty_cache_interval": 1000,  // Clear GPU cache every N steps
+        
+        // Hyperparameter optimization settings
+        "hpo_epochs": 20  // Reduced epochs for HPO trials
     },
     
-    "optuna": {
-        "enabled": false
-    },
-    
+    // ===== SYSTEM/HARDWARE SETTINGS =====
     "system": {
+        // Random seed for reproducibility
         "seed": 42,
-        // Torch compile is excellent on A100
-        "use_torch_compile": true,
-        "compile_mode": "default",
-        "compile_fullgraph": false,
-        "compile_dynamic_shapes": false,
-        "cuda_graphs_enabled": false,
         
-        "detect_anomaly": false,
-        "profile_enabled": false,
+        // PyTorch optimizations
+        "use_torch_compile": true,   // Use torch.compile (PyTorch 2.0+)
+        "compile_mode": "default",   // Compile mode: "default", "reduce-overhead", "max-autotune"
+        "use_torch_export": true,    // Export model with torch.export
         
-        "use_torch_export": true,
-        "save_jit_model": false,
+        // CUDA optimizations
+        "cudnn_benchmark": true,     // Enable cuDNN autotuner
+        "tf32": true,                // Enable TensorFloat-32 on Ampere GPUs
+        "cuda_memory_fraction": 0.9  // Fraction of GPU memory to use
+    },
+    
+    // ===== HYPERPARAMETER OPTIMIZATION =====
+    "optuna": {
+        // Enable Optuna integration
+        "enabled": false,
         
-        // A100 optimizations
-        "cudnn_benchmark": true,
-        "tf32": true,
-        // Use 90% of GPU memory
-        "cuda_memory_fraction": 0.9,
-        
-        // CPU threads (adjust based on your system)
-        "num_threads": 32,
-        "thread_ratio": 0.5
+        // Optuna study settings (when enabled)
+        "n_trials": 100,
+        "n_startup_trials": 8,
+        "n_warmup_steps": 10,
+        "interval_steps": 2
     }
 }

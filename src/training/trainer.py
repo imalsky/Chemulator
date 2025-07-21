@@ -17,18 +17,21 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
 
 from models.model import export_model
+from data.normalizer import NormalizationHelper
 
 
 class Trainer:
     """Trainer for chemical kinetics networks."""
     def __init__(self, model: nn.Module, train_dataset, val_dataset, test_dataset,
-                 config: Dict[str, Any], save_dir: Path, device: torch.device):
+                config: Dict[str, Any], save_dir: Path, device: torch.device,
+                norm_helper: NormalizationHelper):
         self.logger = logging.getLogger(__name__)
         
         self.model = model
         self.config = config
         self.save_dir = save_dir
         self.device = device
+        self.norm_helper = norm_helper
         
         # Extract config sections
         self.train_config = config["training"]
@@ -41,12 +44,12 @@ class Trainer:
         
         # Dataset info
         self.n_species = len(config["data"]["species_variables"])
+        self.n_globals = len(config["data"]["global_variables"])
         
         # Check for empty validation set
         self.has_validation = val_dataset is not None and len(val_dataset) > 0
         if not self.has_validation:
             self.logger.warning("No validation data – early‑stopping and LR‑plateau will be skipped")
-
         
         # Create data loaders
         self._setup_dataloaders(train_dataset, val_dataset, test_dataset)
@@ -64,6 +67,7 @@ class Trainer:
         self.early_stopping_patience = self.train_config["early_stopping_patience"]
         self.min_delta = self.train_config["min_delta"]
         self.gradient_accumulation_steps = self.train_config["gradient_accumulation_steps"]
+        self.empty_cache_interval = self.train_config.get("empty_cache_interval", 1000)
         
         # Setup training components
         self._setup_optimizer()
@@ -128,21 +132,17 @@ class Trainer:
         """Create the learning‑rate scheduler as requested in the config."""
         scheduler_type = self.train_config.get("scheduler", "none").lower()
 
-        # ─── No scheduler ───────────────────────────────────────────────────────────────
-        if scheduler_type == "none":
+        if scheduler_type == "none" or not self.train_loader:
             self.scheduler = None
             self.scheduler_step_on_batch = False
             return
 
-        # ─── Common convenience variables ──────────────────────────────────────────────
-        # ceil → count the final (partial) accumulation window
         steps_per_epoch = math.ceil(
             len(self.train_loader) / self.gradient_accumulation_steps
         )
 
         params: Dict[str, Any] = self.train_config.get("scheduler_params", {})
 
-        # ─── CosineAnnealingWarmRestarts ───────────────────────────────────────────────
         if scheduler_type == "cosine":
             T_0_epochs: int = params.get("T_0", 1)
             if T_0_epochs <= 0:
@@ -158,9 +158,7 @@ class Trainer:
             self.scheduler_step_on_batch = True
             return
 
-        # ─── ReduceLROnPlateau ─────────────────────────────────────────────────────────
         if scheduler_type == "plateau":
-            # Only create plateau scheduler if we have validation data
             if not self.has_validation:
                 self.logger.warning("Plateau scheduler requires validation data, falling back to no scheduler")
                 self.scheduler = None
@@ -218,21 +216,56 @@ class Trainer:
 
         # GradScaler only for float16 on CUDA
         if self.amp_dtype == torch.float16 and self.device.type == 'cuda':
-            self.scaler = GradScaler('cuda')
-        
-    def _apply_delta_and_clamp(self, outputs: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
-        """Apply delta mode transformation and clamping consistently."""
-        if self.prediction_mode == "delta":
-            initial_species = inputs[:, :self.n_species]
-            outputs = outputs + initial_species
-        
-        if self.output_clamp is not None:
-            outputs = torch.clamp(outputs, min=self.output_clamp)
-        
-        return outputs
+            self.scaler = GradScaler(device_type='cuda')
+    
+    def _compute_loss(self, outputs: torch.Tensor, targets: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+        """Compute loss with mode-specific handling and optional clamping."""
+        if self.prediction_mode == "ratio":
+            # Ratio mode: outputs are already log-ratios, no clamping needed
+            return self.criterion(outputs, targets)
+        else:
+            # Absolute mode: apply optional clamping
+            if self.output_clamp is not None:
+                outputs = torch.clamp(outputs, min=self.output_clamp)
+            return self.criterion(outputs, targets)
+    
+    def _compute_raw_mae(self, outputs: torch.Tensor, targets: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+        """Compute MAE in original (denormalized) space for metrics."""
+        if self.prediction_mode == "ratio":
+            # Extract components for ratio mode
+            initial_species_norm = inputs[:, :self.n_species]
+            globals_norm = inputs[:, self.n_species:self.n_species + self.n_globals]
+            time_norm = inputs[:, -1:]
+            zero_time_norm = torch.zeros_like(time_norm)
+            initial_profile = torch.cat((initial_species_norm, globals_norm, zero_time_norm), dim=1)
+            initial_species_raw = self.norm_helper.denormalize_profile(initial_profile)[:, :self.n_species]
+
+            predicted_species_raw = self.norm_helper.denormalize_ratio_predictions(outputs, initial_species_raw)
+            target_species_raw = self.norm_helper.denormalize_ratio_predictions(targets, initial_species_raw)
+        else:
+            # Absolute mode
+            globals_norm = inputs[:, self.n_species:self.n_species + self.n_globals]
+            time_norm = inputs[:, -1:]
+            
+            # Apply clamping to outputs if needed
+            clamped_outputs = outputs
+            if self.output_clamp is not None:
+                clamped_outputs = torch.clamp(outputs, min=self.output_clamp)
+            
+            predicted_profile = torch.cat((clamped_outputs, globals_norm, time_norm), dim=1)
+            predicted_species_raw = self.norm_helper.denormalize_profile(predicted_profile)[:, :self.n_species]
+
+            target_profile = torch.cat((targets, globals_norm, time_norm), dim=1)
+            target_species_raw = self.norm_helper.denormalize_profile(target_profile)[:, :self.n_species]
+
+        return torch.mean(torch.abs(predicted_species_raw - target_species_raw))
     
     def train(self) -> float:
         """Execute the training loop."""
+        if not self.train_loader:
+            self.logger.error("Training loader not available. Cannot start training.")
+            return float("inf")
+
         self.logger.info(f"Starting training...")
         self.logger.info(f"Train batches: {len(self.train_loader)}")
         if self.has_validation:
@@ -266,7 +299,9 @@ class Trainer:
         return self.best_val_loss
     
     def _run_training_loop(self):
-        """Main training loop."""
+        """Main training loop with fix for no-validation saving."""
+        best_train_loss = float("inf")
+        
         for epoch in range(1, self.train_config["epochs"] + 1):
             self.current_epoch = epoch
             epoch_start = time.time()
@@ -289,49 +324,53 @@ class Trainer:
             self.total_training_time += epoch_time
             self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
 
-            # Save best model (only if we have validation data)
-            if self.has_validation and val_loss < (self.best_val_loss - self.min_delta):
-                self.best_val_loss = val_loss
-                self.best_epoch = epoch
-                self.patience_counter = 0
-                self._save_best_model()
-            elif not self.has_validation and epoch == 1:
-                # Save first epoch model if no validation
-                self._save_best_model()
-            else:
-                self.patience_counter += 1
+            # Save best model and early stopping logic
+            if self.has_validation:
+                if val_loss < (self.best_val_loss - self.min_delta):
+                    self.best_val_loss = val_loss
+                    self.best_epoch = epoch
+                    self.patience_counter = 0
+                    self._save_best_model()
+                else:
+                    self.patience_counter += 1
 
-            # Early stopping
-            if self.has_validation and self.patience_counter >= self.early_stopping_patience:
-                self.logger.info(f"Early stopping triggered at epoch {epoch}")
-                break
+                if self.patience_counter >= self.early_stopping_patience:
+                    self.logger.info(f"Early stopping triggered at epoch {epoch}")
+                    break
+            else:
+                # No validation set: save based on best training loss
+                if train_loss < (best_train_loss - self.min_delta):
+                    best_train_loss = train_loss
+                    self.best_val_loss = train_loss
+                    self.best_epoch = epoch
+                    self._save_best_model()
     
     def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
         """Run one training epoch and return the average loss."""
         self.model.train()
-
         total_loss, total_samples = 0.0, 0
+        
         for batch_idx, (inputs, targets) in enumerate(self.train_loader):
-            # Move data
             inputs  = inputs.to(self.device,  non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
-                outputs = self._apply_delta_and_clamp(outputs, inputs)
-                loss    = self.criterion(outputs, targets)
+                loss = self._compute_loss(outputs, targets, inputs)
 
-                loss = loss / self.gradient_accumulation_steps
+            # Scale loss for gradient accumulation
+            scaled_loss = loss / self.gradient_accumulation_steps
 
             if self.scaler:
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(scaled_loss).backward()
             else:
-                loss.backward()
+                scaled_loss.backward()
 
             is_update_step = (
                 (batch_idx + 1) % self.gradient_accumulation_steps == 0
                 or (batch_idx + 1) == len(self.train_loader)
             )
+            
             if is_update_step:
                 if self.train_config["gradient_clip"] > 0:
                     if self.scaler:
@@ -349,31 +388,34 @@ class Trainer:
 
                 if self.scheduler and self.scheduler_step_on_batch:
                     self.scheduler.step()
-
                 self.global_step += 1
+                
+                # Empty cache periodically
+                if self.global_step % self.empty_cache_interval == 0 and self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
 
-            total_loss    += loss.item() * self.gradient_accumulation_steps * inputs.size(0)
+            total_loss += loss.item() * inputs.size(0)
             total_samples += inputs.size(0)
 
-            if self.global_step % self.log_interval == 0:
+            if self.global_step > 0 and self.global_step % self.log_interval == 0:
                 self.logger.info(
                     f"Epoch {self.current_epoch} | "
                     f"Batch {batch_idx + 1}/{len(self.train_loader)} | "
                     f"Loss: {total_loss / total_samples:.6f}"
                 )
-
+        
         return total_loss / total_samples, {}
 
-    
     def _validate(self) -> Tuple[float, Dict[str, float]]:
         """Evaluate the model on the validation set and return the average loss."""
-        # BUG FIX: Check if validation loader exists
         if not self.has_validation or self.val_loader is None:
             return float("inf"), {}
             
         self.model.eval()
-        total_loss, total_samples = 0.0, 0
-
+        total_loss = 0.0
+        total_raw_mae = 0.0
+        total_samples = 0
+        
         with torch.no_grad():
             for inputs, targets in self.val_loader:
                 inputs = inputs.to(self.device, non_blocking=True)
@@ -381,24 +423,29 @@ class Trainer:
 
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(inputs)
-                    outputs = self._apply_delta_and_clamp(outputs, inputs)
-                    loss = self.criterion(outputs, targets)
+                    loss = self._compute_loss(outputs, targets, inputs)
+                    raw_mae = self._compute_raw_mae(outputs, targets, inputs)
 
                 total_loss += loss.item() * inputs.size(0)
+                total_raw_mae += raw_mae.item() * inputs.size(0)
                 total_samples += inputs.size(0)
-
+        
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
-        return avg_loss, {}
-    
+        avg_raw_mae = total_raw_mae / total_samples if total_samples > 0 else float("inf")
+        val_metrics = {"raw_mae": avg_raw_mae}
+        return avg_loss, val_metrics
+
     def evaluate_test(self) -> float:
         """Compute the loss on the test set; returns `inf` if no test data."""
         if not self.test_loader:
-            self.logger.warning("No test data available")
+            self.logger.warning("No test data available, skipping test evaluation.")
             return float("inf")
 
         self.model.eval()
-        total_loss, total_samples = 0.0, 0
-
+        total_loss = 0.0
+        total_raw_mae = 0.0
+        total_samples = 0
+        
         with torch.no_grad():
             for inputs, targets in self.test_loader:
                 inputs = inputs.to(self.device, non_blocking=True)
@@ -406,28 +453,35 @@ class Trainer:
 
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(inputs)
-                    outputs = self._apply_delta_and_clamp(outputs, inputs)
-                    loss = self.criterion(outputs, targets)
+                    loss = self._compute_loss(outputs, targets, inputs)
+                    raw_mae = self._compute_raw_mae(outputs, targets, inputs)
 
                 total_loss += loss.item() * inputs.size(0)
+                total_raw_mae += raw_mae.item() * inputs.size(0)
                 total_samples += inputs.size(0)
 
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
-        self.logger.info(f"Test loss: {avg_loss:.6f}")
+        avg_raw_mae = total_raw_mae / total_samples if total_samples > 0 else float("inf")
+        self.logger.info(f"Test loss: {avg_loss:.6f} Test raw MAE: {avg_raw_mae:.6f}")
         return avg_loss
-    
+            
     def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
         """Log epoch results."""
+        lr = self.optimizer.param_groups[0]['lr'] if self.optimizer else 0
         log_entry = {
             "epoch": self.current_epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "epoch_time": epoch_time,
-            "lr": self.optimizer.param_groups[0]['lr'],
+            "lr": lr,
         }
+        if val_metrics:
+            log_entry.update(val_metrics)
         self.training_history["epochs"].append(log_entry)
         
         val_str = f"Val loss: {val_loss:.6f}" if self.has_validation else "Val loss: N/A"
+        if 'raw_mae' in val_metrics:
+            val_str += f" Val raw MAE: {val_metrics['raw_mae']:.6f}"
         self.logger.info(
             f"Epoch {self.current_epoch}/{self.train_config['epochs']} "
             f"Train loss: {train_loss:.6f} {val_str} "
@@ -439,7 +493,7 @@ class Trainer:
         checkpoint = {
             "epoch": self.current_epoch,
             "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict() if self.optimizer else None,
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
             "best_val_loss": self.best_val_loss,
             "config": self.config
@@ -451,12 +505,13 @@ class Trainer:
 
         # Export model if enabled
         if self.system_config.get("use_torch_export", False):
-            # Get example input
-            if self.val_loader:
-                example_inputs, _ = next(iter(self.val_loader))
+            # Get example input from the first available loader
+            example_loader = self.val_loader or self.train_loader
+            if example_loader:
+                example_inputs, _ = next(iter(example_loader))
+                example_inputs = example_inputs.to(self.device)
+                
+                export_path = self.save_dir / "exported_model.pt"
+                export_model(self.model, example_inputs, export_path)
             else:
-                example_inputs, _ = next(iter(self.train_loader))
-            example_inputs = example_inputs.to(self.device)
-            
-            export_path = self.save_dir / "exported_model.pt"
-            export_model(self.model, example_inputs, export_path)
+                self.logger.warning("Cannot export model: no data loader available to create example input.")

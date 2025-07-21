@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 Simplified hardware detection and optimization utilities.
-- Removed excessive configuration options
-- Focused on essential hardware setup
 """
 
 import logging
@@ -49,10 +47,13 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
         if config.get("cudnn_benchmark", True):
             torch.backends.cudnn.benchmark = True
             logger.info("cuDNN autotuner enabled")
+        
+        # Set memory fraction
+        memory_fraction = config.get("cuda_memory_fraction", 0.9)
+        if memory_fraction < 1.0:
+            torch.cuda.set_per_process_memory_fraction(memory_fraction)
+            logger.info(f"CUDA memory fraction set to {memory_fraction}")
     
-    # Set number of CPU threads
-    num_threads = config.get("num_threads")
-    if num_threads is None:
-        num_threads = min(32, os.cpu_count() or 1)
-    torch.set_num_threads(num_threads)
-    logger.info(f"Using {num_threads} CPU threads")
+    # Set number of threads for CPU operations
+    torch.set_num_threads(min(32, os.cpu_count() or 1))
+    logger.info(f"Using {torch.get_num_threads()} CPU threads")

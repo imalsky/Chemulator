@@ -1,6 +1,8 @@
 ===== /Users/imalsky/Desktop/Chemulator/config/config.jsonc =====
 {
+    // ===== FILE PATHS =====
     "paths": {
+        // Raw HDF5 data files to process
         "raw_data_files": [
             "data/raw/run8001-result.h5",
             "data/raw/run8002-result.h5",
@@ -13,12 +15,17 @@
             "data/raw/run8009-result.h5",
             "data/raw/run8010-result.h5"
         ],
+        // Directory for processed NPY shards
         "processed_data_dir": "data/processed",
+        // Directory for saved models
         "model_save_dir": "data/models",
+        // Directory for logs
         "log_dir": "logs"
     },
     
+    // ===== DATA CONFIGURATION =====
     "data": {
+        // Chemical species to predict (order matters!)
         "species_variables": [
             "C2H2_evolution",
             "CH4_evolution",
@@ -33,131 +40,183 @@
             "OH_evolution",
             "O_evolution"
         ],
+        // Global parameters (initial conditions)
         "global_variables": ["P_init", "T_init"],
+        // Time variable name in HDF5 files
         "time_variable": "t_time"
     },
     
+    // ===== PREPROCESSING SETTINGS =====
     "preprocessing": {
-        // Larger shards for A100's memory capacity
-        "shard_size": 10000000,
+        // Number of samples per NPY shard file
+        "shard_size": 50000000,
+        // Minimum species concentration threshold
         "min_species_threshold": 1e-25,
+        // Compression type: null, "npz"
         "compression": null,
-        // More workers for faster preprocessing
-        "num_workers": 16
+        // Number of parallel workers for preprocessing
+        "num_workers": 16,
+        // Enable parallel preprocessing (set false for simpler debugging)
+        "parallel_enabled": true
     },
     
+    // ===== NORMALIZATION SETTINGS =====
     "normalization": {
+        // Default normalization method for all variables
+        // Options: "standard", "log-standard", "min-max", "log-min-max", "none"
         "default_method": "log-min-max",
+        
+        // Override methods for specific variables
         "methods": {
-            "T_init": "standard",
-            "P_init": "log-min-max",
-            "t_time": "log-min-max"
+            "T_init": "standard",      // Temperature: standard normalization
+            "P_init": "log-min-max",    // Pressure: log scale then min-max
+            "t_time": "log-min-max"     // Time: log scale then min-max
         },
-        "epsilon": 1e-37,
+        
+        // Small value to prevent log(0) and division by zero
+        "epsilon": 1e-30,
+        // Minimum standard deviation to prevent division by tiny values
         "min_std": 1e-10,
+        // Clamp normalized values to [-clamp_value, clamp_value]
         "clamp_value": 50.0
     },
     
+    // ===== MODEL ARCHITECTURE =====
     "model": {
-        // DeepONet typically performs better for this task
+        // Model type: "deeponet" or "siren"
         "type": "deeponet",
+        
+        // Activation function: "gelu", "relu", "silu", "tanh"
         "activation": "gelu",
+        
+        // Dropout rate (0.0 = no dropout)
         "dropout": 0.0,
-        "use_time_embedding": false,
-        "time_embedding_dim": 256,
+        
+        // Output scaling factor (1.0 = no scaling)
         "output_scale": 1.0,
         
-        // Larger architecture for A100
-        "branch_layers": [512, 512, 512, 512],
-        "trunk_layers": [256, 256, 256],
-        "basis_dim": 128
+        // DeepONet-specific parameters
+        "branch_layers": [256, 256, 256],  // Hidden layers for branch network
+        "trunk_layers": [128, 128, 128],   // Hidden layers for trunk network
+        "basis_dim": 64,                   // Number of basis functions
+        
+        // SIREN-specific parameters (when type="siren")
+        "hidden_dims": [256, 256, 256, 256],  // Hidden layer dimensions
+        "omega_0": 30.0                       // SIREN frequency parameter
     },
     
+    // ===== FiLM CONDITIONING =====
     "film": {
+        // Enable Feature-wise Linear Modulation
         "enabled": true,
-        "hidden_dims": [256, 256],
+        // Hidden layers for FiLM networks
+        "hidden_dims": [64, 64],
+        // Activation for FiLM networks
         "activation": "gelu"
     },
     
+    // ===== PREDICTION SETTINGS =====
     "prediction": {
-        "mode": "absolute",
-        "output_clamp": 1e-30
+        // Prediction mode: "absolute" or "ratio"
+        // - absolute: predict species concentrations directly
+        // - ratio: predict log-ratios relative to initial conditions (DeepONet only)
+        "mode": "ratio",
+        
+        // Optional output clamping (null = no clamping)
+        // Only used in absolute mode
+        "output_clamp": null
     },
     
+    // ===== TRAINING PARAMETERS =====
     "training": {
-        "val_fraction": 0.15,
-        "test_fraction": 0.15,
-        "use_fraction": 1.0,
+        // Data split fractions
+        "val_fraction": 0.15,   // Validation set fraction
+        "test_fraction": 0.15,  // Test set fraction
+        "use_fraction": 1.0,    // Fraction of data to actually use (for debugging)
         
-        "epochs": 300,
-        // Large batch size for A100
-        "batch_size": 32768,
-        "gradient_accumulation_steps": 1,
-        // Increased cache for 80GB memory
-        "dataset_cache_shards": 256,
+        // Training loop settings
+        "epochs": 300,                      // Maximum epochs
+        "batch_size": 1024,                 // Batch size
+        "gradient_accumulation_steps": 1,   // Gradient accumulation steps
         
-        // Optimal workers for A100
-        "num_workers": 16,
-        "pin_memory": true,
-        "persistent_workers": true,
-        "prefetch_factor": 4,
-        "drop_last": true,
+        // DataLoader settings
+        "num_workers": 16,           // Parallel data loading workers
+        "pin_memory": true,          // Pin memory for faster GPU transfer
+        "persistent_workers": true,  // Keep workers alive between epochs
+        "prefetch_factor": 4,        // Number of batches to prefetch
+        "drop_last": true,           // Drop incomplete final batch
+        "dataset_cache_shards": 256, // Max shards to cache in memory
         
+        // Optimizer settings (AdamW)
         "learning_rate": 3e-4,
         "weight_decay": 1e-5,
-        "gradient_clip": 1.0,
-        "betas": [0.9, 0.999],
-        "eps": 1e-8,
+        "betas": [0.9, 0.999],  // Adam beta parameters
+        "eps": 1e-8,            // Adam epsilon
         
-        "scheduler": "cosine",
+        // Gradient clipping (0 = no clipping)
+        "gradient_clip": 1.0,
+        
+        // Learning rate scheduler
+        "scheduler": "cosine",  // Options: "none", "cosine", "plateau"
         "scheduler_params": {
-            "T_0": 10,
-            "T_mult": 2,
-            "eta_min": 1e-7
+            // For "cosine" scheduler
+            "T_0": 10,          // Initial restart period in epochs
+            "T_mult": 2,        // Period multiplier after each restart
+            "eta_min": 1e-7,    // Minimum learning rate
+            
+            // For "plateau" scheduler
+            "factor": 0.5,      // LR reduction factor
+            "patience": 10,     // Epochs to wait before reducing LR
+            "min_lr": 1e-7      // Minimum learning rate
         },
         
-        "loss": "huber",
-        "huber_delta": 0.5,
+        // Loss function: "mse", "mae", "huber"
+        "loss": "mse",
+        "huber_delta": 0.5,  // Delta for Huber loss (if used)
         
-        // Use bfloat16 for A100
-        "use_amp": true,
-        "amp_dtype": "bfloat16",
+        // Mixed precision training
+        "use_amp": true,              // Enable automatic mixed precision
+        "amp_dtype": "bfloat16",      // AMP dtype: "float16" or "bfloat16"
         
-        "early_stopping_patience": 50,
-        "min_delta": 1e-10,
-        "log_interval": 100,
-        "save_interval": 10,
-        "empty_cache_interval": 1000
+        // Early stopping
+        "early_stopping_patience": 15,  // Epochs to wait before stopping
+        "min_delta": 1e-10,            // Minimum improvement to reset patience
+        
+        // Logging intervals
+        "log_interval": 100,           // Log every N gradient steps
+        "save_interval": 10,           // Save checkpoint every N epochs
+        "empty_cache_interval": 1000,  // Clear GPU cache every N steps
+        
+        // Hyperparameter optimization settings
+        "hpo_epochs": 50  // Reduced epochs for HPO trials
     },
     
-    "optuna": {
-        "enabled": false
-    },
-    
+    // ===== SYSTEM/HARDWARE SETTINGS =====
     "system": {
+        // Random seed for reproducibility
         "seed": 42,
-        // Torch compile is excellent on A100
-        "use_torch_compile": true,
-        "compile_mode": "default",
-        "compile_fullgraph": false,
-        "compile_dynamic_shapes": false,
-        "cuda_graphs_enabled": false,
         
-        "detect_anomaly": false,
-        "profile_enabled": false,
+        // PyTorch optimizations
+        "use_torch_compile": true,   // Use torch.compile (PyTorch 2.0+)
+        "compile_mode": "default",   // Compile mode: "default", "reduce-overhead", "max-autotune"
+        "use_torch_export": true,    // Export model with torch.export
         
-        "use_torch_export": true,
-        "save_jit_model": false,
+        // CUDA optimizations
+        "cudnn_benchmark": true,     // Enable cuDNN autotuner
+        "tf32": true,                // Enable TensorFloat-32 on Ampere GPUs
+        "cuda_memory_fraction": 0.9  // Fraction of GPU memory to use
+    },
+    
+    // ===== HYPERPARAMETER OPTIMIZATION =====
+    "optuna": {
+        // Enable Optuna integration
+        "enabled": false,
         
-        // A100 optimizations
-        "cudnn_benchmark": true,
-        "tf32": true,
-        // Use 90% of GPU memory
-        "cuda_memory_fraction": 0.9,
-        
-        // CPU threads (adjust based on your system)
-        "num_threads": 32,
-        "thread_ratio": 0.5
+        // Optuna study settings (when enabled)
+        "n_trials": 100,
+        "n_startup_trials": 8,
+        "n_warmup_steps": 10,
+        "interval_steps": 2
     }
 }
 
@@ -178,6 +237,7 @@ from models.model import create_model
 from training.trainer import Trainer
 import hashlib
 import json
+from data.normalizer import NormalizationHelper
 
 
 class ChemicalKineticsPipeline:
@@ -230,19 +290,26 @@ class ChemicalKineticsPipeline:
             self.processed_dir / "train_indices.npy",
             self.processed_dir / "val_indices.npy",
             self.processed_dir / "test_indices.npy",
-            self.processed_dir / "config_hash.json"  # New: Hash file for validation
+            self.processed_dir / "config_hash.json"
         ]
         
-        # Compute hash of relevant config sections
+        raw_files_info = {
+            "files": [str(f) for f in self.raw_data_files],
+            "sizes": [f.stat().st_size if f.exists() else 0 for f in self.raw_data_files],
+            "mtimes": [f.stat().st_mtime if f.exists() else 0 for f in self.raw_data_files]
+        }
+        
         relevant_config = {
             "data": self.config["data"],
             "preprocessing": self.config["preprocessing"],
             "normalization": self.config["normalization"],
+            "prediction": self.config["prediction"],
             "training": {
                 "val_fraction": self.config["training"]["val_fraction"],
                 "test_fraction": self.config["training"]["test_fraction"],
                 "use_fraction": self.config["training"]["use_fraction"]
-            }
+            },
+            "raw_files": raw_files_info
         }
         config_str = json.dumps(relevant_config, sort_keys=True)
         current_hash = hashlib.sha256(config_str.encode('utf-8')).hexdigest()
@@ -273,28 +340,45 @@ class ChemicalKineticsPipeline:
         
         split_indices = preprocessor.process_to_npy_shards()
         
-        # Save the new hash after successful processing
+        # Save the new hash
         save_json({"hash": current_hash}, self.processed_dir / "config_hash.json")
         
         # Verify we have data
         total_samples = sum(len(indices) for indices in split_indices.values())
         if total_samples == 0:
             raise ValueError("No valid data processed from raw files")
-
+            
     def train_model(self):
-        """Train the neural network model."""
+        """Train the neural network model with data loader cache warm-up."""
         self.logger.info("Starting model training...")
-        
+
+        # Enforce mode-model compatibility before proceeding
+        prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
+        model_type = self.config["model"]["type"]
+        if prediction_mode == "ratio" and model_type != "deeponet":
+            raise ValueError(f"Prediction mode 'ratio' is only compatible with model type 'deeponet', but '{model_type}' was specified.")
+
         # Save config for this run
         save_json(self.config, self.run_save_dir / "config.json")
-        
+
         # Create model
         model = create_model(self.config, self.device)
-        
+
         # Log model info
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.logger.info(f"Model: {self.config['model']['type']} - Parameters: {total_params:,}")
-        
+
+        # Load normalization stats and create helper
+        norm_stats = load_json(self.processed_dir / "normalization.json")
+        norm_helper = NormalizationHelper(
+            norm_stats,
+            self.device,
+            self.config["data"]["species_variables"],
+            self.config["data"]["global_variables"],
+            self.config["data"]["time_variable"],
+            self.config
+        )
+
         # Create datasets
         train_indices = np.load(self.processed_dir / "train_indices.npy")
         train_dataset = NPYDataset(
@@ -323,7 +407,7 @@ class ChemicalKineticsPipeline:
             split_name="test"
         ) if len(test_indices) > 0 else None
         
-        # Initialize trainer
+        # Initialize trainer with norm_helper
         trainer = Trainer(
             model=model,
             train_dataset=train_dataset,
@@ -331,9 +415,16 @@ class ChemicalKineticsPipeline:
             test_dataset=test_dataset,
             config=self.config,
             save_dir=self.run_save_dir,
-            device=self.device
+            device=self.device,
+            norm_helper=norm_helper
         )
-        
+        if trainer.train_loader and trainer.train_loader.num_workers > 0:
+            self.logger.info(f"Warming up data loader cache with {trainer.train_loader.num_workers} workers...")
+            start_warmup = time.time()
+            for _ in trainer.train_loader:
+                break # Iterating once is enough to trigger a parallel read.
+            self.logger.info(f"Cache warmup complete in {time.time() - start_warmup:.2f}s.")
+
         # Train model
         best_val_loss = trainer.train()
         
@@ -423,7 +514,7 @@ def main():
         
         # Print results
         print("\n" + "="*60)
-        print("OPTIMIZATION COMPLETE")
+        print("Optimization Complete")
         print("="*60)
         print(f"Best validation loss: {study.best_value:.6f}")
         print(f"Best trial: {study.best_trial.number}")
@@ -448,126 +539,146 @@ if __name__ == "__main__":
 
 ===== /Users/imalsky/Desktop/Chemulator/src/hyperparameter_tuning.py =====
 #!/usr/bin/env python3
-"""Hyperparameter tuning for chemical kinetics models using Optuna."""
+"""
+Hyperparameter tuning for chemical kinetics models using Optuna.
+This version correctly handles and explores multiple prediction modes ('absolute', 'ratio').
+"""
 
 import copy
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 
 import numpy as np
 import optuna
 from optuna.samplers import TPESampler
 import torch
 
+# Correctly import from other modules in the project
+from main import ChemicalKineticsPipeline
 from utils.hardware import setup_device, optimize_hardware
-from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json
 from data.dataset import NPYDataset
 from models.model import create_model
 from training.trainer import Trainer
+from data.normalizer import NormalizationHelper
+from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
 
 
-class OptunaPipeline:
-    """Reusable pipeline for Optuna trials with shared datasets."""
-    
-    def __init__(self, base_config_path: Path):
+class OptunaTrialRunner:
+    """
+    Manages the execution of a single Optuna trial, ensuring that the correct
+    preprocessed data is used for the chosen prediction mode.
+    """
+    def __init__(self, base_config_path: Path, mode_to_dir: Dict[str, Path]):
+        self.base_config_path = base_config_path
         self.base_config = load_json_config(base_config_path)
         self.device = setup_device()
         self.logger = logging.getLogger(__name__)
+        self.mode_to_dir = mode_to_dir  # Precomputed mode directories
+        self._pipelines = {}  # Instance-level now, since preprocessing is done upfront
+
+    def _get_pipeline_for_mode(self, mode: str) -> 'OptunaPipeline':
+        if mode not in self._pipelines:
+            self.logger.info(f"Loading pipeline for '{mode}' mode from preprocessed data.")
+            mode_config = copy.deepcopy(self.base_config)
+            mode_config["prediction"]["mode"] = mode
+            mode_config["paths"]["processed_data_dir"] = str(self.mode_to_dir[mode])
+            self._pipelines[mode] = OptunaPipeline(mode_config)
+        return self._pipelines[mode]
+
+    def run_trial(self, trial: optuna.Trial) -> float:
+        """
+        Configures and runs a single trial, selecting the correct pipeline.
+        """
+        # First, suggest the core configuration for the trial.
+        config = suggest_model_config(trial, self.base_config)
+        prediction_mode = config["prediction"]["mode"]
         
-        # Setup paths
-        self.processed_dir = Path(self.base_config["paths"]["processed_data_dir"])
-        self.model_save_root = Path(self.base_config["paths"]["model_save_dir"])
+        # Get the appropriate pipeline (and its preprocessed data).
+        pipeline = self._get_pipeline_for_mode(prediction_mode)
         
-        # Load datasets once
-        self._load_datasets()
+        # Now, execute the trial using the selected pipeline.
+        return pipeline.execute_trial(config, trial)
+
+
+class OptunaPipeline:
+    """
+    Holds pre-loaded datasets and executes the training for a specific prediction mode.
+    Instances of this class are shared across trials of the same mode.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.device = setup_device()
+        self.logger = logging.getLogger(f"OptunaPipeline_{config['prediction']['mode']}")
         
-    def _load_datasets(self):
-        """Load datasets once for reuse across trials."""
-        self.logger.info("Loading datasets for Optuna optimization...")
+        self.processed_dir = Path(self.config["paths"]["processed_data_dir"])
+        self.model_save_root = Path(self.config["paths"]["model_save_dir"])
         
-        # Load indices
-        train_indices = np.load(self.processed_dir / "train_indices.npy")
-        val_indices = np.load(self.processed_dir / "val_indices.npy")
-        test_indices = np.load(self.processed_dir / "test_indices.npy")
+        # Load normalization stats and create the helper for this data mode
+        norm_stats_path = self.processed_dir / "normalization.json"
+        if not norm_stats_path.exists():
+            raise FileNotFoundError(f"Normalization stats not found in {norm_stats_path}")
+        norm_stats = load_json(norm_stats_path)
         
-        # Create datasets
-        self.train_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            indices=train_indices,
-            config=self.base_config,
+        self.norm_helper = NormalizationHelper(
+            stats=norm_stats,
             device=self.device,
-            split_name="train"
+            species_vars=self.config["data"]["species_variables"],
+            global_vars=self.config["data"]["global_variables"],
+            time_var=self.config["data"]["time_variable"],
+            config=self.config
         )
         
-        self.val_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            indices=val_indices,
-            config=self.base_config,
-            device=self.device,
-            split_name="validation"
-        ) if len(val_indices) > 0 else None
+        self._load_datasets()
+
+    def _load_datasets(self):
+        """Loads datasets from the mode-specific directory."""
+        self.logger.info(f"Loading datasets from: {self.processed_dir}")
+        train_indices_path = self.processed_dir / "train_indices.npy"
+        val_indices_path = self.processed_dir / "val_indices.npy"
         
-        self.test_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            indices=test_indices,
-            config=self.base_config,
-            device=self.device,
-            split_name="test"
-        ) if len(test_indices) > 0 else None
+        if not train_indices_path.exists() or not val_indices_path.exists():
+             raise FileNotFoundError(f"Train/validation index files not found in {self.processed_dir}")
+
+        train_indices = np.load(train_indices_path)
+        val_indices = np.load(val_indices_path)
         
-        self.logger.info(f"Datasets loaded: train={len(self.train_dataset)}, "
-                        f"val={len(self.val_dataset) if self.val_dataset else 0}, "
-                        f"test={len(self.test_dataset) if self.test_dataset else 0}")
-    
-    def run_trial(self, config: Dict[str, Any], trial: optuna.Trial) -> float:
-        """Run a single trial with the given config."""
-        # Create unique directory for this trial
+        self.train_dataset = NPYDataset(self.processed_dir, train_indices, self.config, self.device, "train")
+        self.val_dataset = NPYDataset(self.processed_dir, val_indices, self.config, self.device, "validation")
+        self.logger.info(f"Datasets loaded: train={len(self.train_dataset)}, val={len(self.val_dataset)}")
+
+    def execute_trial(self, config: Dict[str, Any], trial: optuna.Trial) -> float:
+        """Runs a single trial's training and evaluation logic."""
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        trial_id = f"trial_{trial.number:04d}"
-        save_dir = self.model_save_root / f"optuna_{timestamp}_{trial_id}"
+        trial_id = f"trial_{trial.number:04d}_{config['prediction']['mode']}"
+        save_dir = self.model_save_root / "optuna" / f"{timestamp}_{trial_id}"
         ensure_directories(save_dir)
         
-        # Setup logging for this trial
-        log_file = save_dir / "trial.log"
-        trial_logger = logging.getLogger(f"trial_{trial.number}")
-        
         try:
-            # Set random seed
             seed_everything(config["system"]["seed"])
-            
-            # Apply hardware optimizations
             optimize_hardware(config["system"], self.device)
-            
-            # Create model
             model = create_model(config, self.device)
             
-            # Log model info
-            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            trial_logger.info(f"Model parameters: {total_params:,}")
-            
-            # Create trainer with shared datasets
             trainer = Trainer(
                 model=model,
                 train_dataset=self.train_dataset,
                 val_dataset=self.val_dataset,
-                test_dataset=self.test_dataset,
+                test_dataset=None,  # No need for test set during HPO
                 config=config,
                 save_dir=save_dir,
-                device=self.device
+                device=self.device,
+                norm_helper=self.norm_helper  # Pass the correct helper
             )
-            
-            # Train model with reduced epochs for hyperparameter search
-            original_epochs = config["training"]["epochs"]
-            config["training"]["epochs"] = min(50, original_epochs)  # Cap at 50 for search
+
+            # Cap epochs for faster HPO
+            config["training"]["epochs"] = min(config["training"].get("hpo_epochs", 50), config["training"]["epochs"])
             
             best_val_loss = trainer.train()
-            
-            # Save trial config
+
+            trial.set_user_attr("full_config", config)
             save_json(config, save_dir / "config.json")
             
-            # Report intermediate values for pruning
             for epoch_data in trainer.training_history["epochs"]:
                 trial.report(epoch_data["val_loss"], epoch_data["epoch"])
                 if trial.should_prune():
@@ -576,153 +687,142 @@ class OptunaPipeline:
             return best_val_loss
             
         except optuna.TrialPruned:
-            trial_logger.info(f"Trial {trial.number} pruned")
+            self.logger.info(f"Trial {trial.number} pruned.")
             raise
-            
         except Exception as e:
-            trial_logger.error(f"Trial {trial.number} failed: {e}", exc_info=True)
-            raise optuna.TrialPruned(f"Trial failed: {str(e)}")
-            
+            self.logger.error(f"Trial {trial.number} failed: {e}", exc_info=True)
+            return float("inf") # Return a high loss value for failed trials
         finally:
-            # Clean up GPU memory
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
 
 def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Suggest model architecture and training hyperparameters."""
+    """Suggests a valid model and training configuration for a trial."""
     config = copy.deepcopy(base_config)
-    
-    # Model type and prediction mode
-    model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
+
+    # 1. Choose prediction mode first, as it constrains model choice.
+    prediction_mode = trial.suggest_categorical("prediction_mode", ["absolute", "ratio"])
+    config["prediction"]["mode"] = prediction_mode
+
+    # 2. Choose model type based on prediction mode.
+    if prediction_mode == "ratio":
+        # Ratio mode is only implemented for DeepONet.
+        model_type = "deeponet"
+    else: # absolute mode
+        # Absolute mode works with both SIREN and DeepONet.
+        model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
     config["model"]["type"] = model_type
     
-    # Prediction mode (SIREN only supports absolute)
+    # 3. Suggest common and model-specific parameters.
+    config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu"])
+    config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
+    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [1024, 2048, 4096, 8192])
+
     if model_type == "deeponet":
-        config["prediction"]["mode"] = trial.suggest_categorical("prediction_mode", ["absolute", "delta"])
-    else:
-        config["prediction"]["mode"] = "absolute"
-    
-    # Common parameters
-    config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "relu", "silu"])
-    config["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.3, step=0.05)
-    
-    # Model-specific architecture
-    if model_type == "deeponet":
-        # Branch network
         n_branch = trial.suggest_int("n_branch_layers", 2, 5)
-        branch_layers = [
-            trial.suggest_int(f"branch_layer_{i}", 64, 512, step=64) 
-            for i in range(n_branch)
+        config["model"]["branch_layers"] = [
+            trial.suggest_int(f"branch_layer_{i}", 64, 512, step=64) for i in range(n_branch)
         ]
-        config["model"]["branch_layers"] = branch_layers
-        
-        # Trunk network
         n_trunk = trial.suggest_int("n_trunk_layers", 2, 4)
-        trunk_layers = [
-            trial.suggest_int(f"trunk_layer_{i}", 32, 256, step=32) 
-            for i in range(n_trunk)
+        config["model"]["trunk_layers"] = [
+            trial.suggest_int(f"trunk_layer_{i}", 64, 256, step=32) for i in range(n_trunk)
         ]
-        config["model"]["trunk_layers"] = trunk_layers
-        config["model"]["basis_dim"] = trial.suggest_int("basis_dim", 32, 128, step=16)
-        
+        config["model"]["basis_dim"] = trial.suggest_categorical("basis_dim", [64, 128, 256])
     else:  # SIREN
-        n_layers = trial.suggest_int("n_hidden_layers", 3, 6)
-        hidden_dims = [
-            trial.suggest_int(f"hidden_dim_{i}", 128, 512, step=64) 
-            for i in range(n_layers)
+        n_layers = trial.suggest_int("n_hidden_layers", 3, 7)
+        config["model"]["hidden_dims"] = [
+            trial.suggest_int(f"hidden_dim_{i}", 128, 512, step=64) for i in range(n_layers)
         ]
-        config["model"]["hidden_dims"] = hidden_dims
-        config["model"]["omega_0"] = trial.suggest_float("omega_0", 10.0, 50.0)
-    
-    # FiLM layers
+        config["model"]["omega_0"] = trial.suggest_float("omega_0", 20.0, 40.0)
+
+    # 4. Suggest FiLM layer configuration.
     if trial.suggest_categorical("use_film", [True, False]):
         config["film"]["enabled"] = True
         n_film = trial.suggest_int("film_n_layers", 1, 3)
-        film_dims = [
-            trial.suggest_int(f"film_layer_{i}", 64, 256, step=32) 
-            for i in range(n_film)
+        config["film"]["hidden_dims"] = [
+            trial.suggest_int(f"film_layer_{i}", 64, 256, step=32) for i in range(n_film)
         ]
-        config["film"]["hidden_dims"] = film_dims
     else:
         config["film"]["enabled"] = False
-    
-    # Training hyperparameters
-    config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
-    config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
-    config["training"]["batch_size"] = trial.suggest_int("batch_size", 2048, 16384, step=2048)
-    
-    # Loss function
-    loss_type = trial.suggest_categorical("loss", ["mse", "mae", "huber"])
-    config["training"]["loss"] = loss_type
-    if loss_type == "huber":
-        config["training"]["huber_delta"] = trial.suggest_float("huber_delta", 0.1, 1.0)
-    
-    # Scheduler
-    scheduler = trial.suggest_categorical("scheduler", ["plateau", "cosine", "none"])
-    config["training"]["scheduler"] = scheduler
-    if scheduler == "cosine":
-        config["training"]["scheduler_params"] = {
-            "T_0": trial.suggest_int("cosine_T_0", 1, 10),
-            "T_mult": trial.suggest_int("cosine_T_mult", 1, 2),
-        }
-    
+
     return config
 
 
-def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1, 
-             study_name: str = "chemical_kinetics_opt", pruner: Optional[optuna.pruners.BasePruner] = None):
-    """Run Optuna optimization with dataset reuse."""
-    # Create pipeline with shared datasets
-    pipeline = OptunaPipeline(config_path)
+def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
+             study_name: str = "chemulator_hpo", pruner: Optional[optuna.pruners.BasePruner] = None):
+    """
+    Main function to run Optuna optimization. It orchestrates the trial execution
+    by selecting the correct data pipeline based on the trial's suggested parameters.
+    """
+    base_config = load_json_config(config_path)
     
-    def objective(trial):
-        # Get suggested config
-        config = suggest_model_config(trial, pipeline.base_config)
+    # Initial step: Preprocess data for all possible modes upfront to avoid redundancy
+    possible_modes = ["absolute", "ratio"]  # Hardcoded based on suggest_model_config options
+    mode_to_dir = {}
+    for mode in possible_modes:
+        mode_config = copy.deepcopy(base_config)
+        mode_config["prediction"]["mode"] = mode
+        processed_dir = Path(mode_config["paths"]["processed_data_dir"]) / f"mode_{mode}"
+        mode_config["paths"]["processed_data_dir"] = str(processed_dir)
         
-        # Run trial with shared datasets
-        return pipeline.run_trial(config, trial)
-    
-    # Default pruner if not specified
+        pipeline = ChemicalKineticsPipeline(config_path)
+        pipeline.config = mode_config
+        pipeline.setup_paths()
+        pipeline.processed_dir = processed_dir
+        pipeline.preprocess_data()  # Run once per mode
+        
+        mode_to_dir[mode] = processed_dir
+
+    # Setup the trial runner with preprocessed directories
+    trial_runner = OptunaTrialRunner(config_path, mode_to_dir)
+
+    def objective(trial: optuna.Trial) -> float:
+        # The runner handles selection of the correct data and pipeline.
+        return trial_runner.run_trial(trial)
+
     if pruner is None:
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10)
-    
-    # Create study
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=8, n_warmup_steps=10, interval_steps=2)
+
     study = optuna.create_study(
         direction="minimize",
         sampler=TPESampler(seed=42),
         pruner=pruner,
-        study_name=study_name
+        study_name=study_name,
+        storage=f"sqlite:///{study_name}.db",  # Use a database for robust storage
+        load_if_exists=True
     )
-    
-    # Run optimization
+
     study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
-    
-    # Save results
+
+    # --- Save Results ---
     results_dir = Path("optuna_results")
-    results_dir.mkdir(exist_ok=True)
-    
+    ensure_directories(results_dir)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    study_path = results_dir / f"{study_name}_{timestamp}.pkl"
-    
-    # Save study
-    import pickle
-    with open(study_path, "wb") as f:
-        pickle.dump(study, f)
-    
-    # Save best config
-    best_config = suggest_model_config(study.best_trial, pipeline.base_config)
+
+    # Retrieve the exact config from the best trial's user attributes for reproducibility.
+    best_config = study.best_trial.user_attrs.get("full_config", {})
+    if not best_config:
+         # Fallback if user_attrs not set (e.g., in a failed trial)
+        best_config = suggest_model_config(study.best_trial, trial_runner.base_config)
+
     best_results = {
         "best_value": study.best_value,
         "best_params": study.best_params,
         "best_config": best_config,
-        "n_trials": len(study.trials),
-        "n_completed": len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
-        "n_pruned": len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]),
-        "study_file": str(study_path)
+        "n_trials_completed": len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
+        "study_db": f"{study_name}.db"
     }
     
-    save_json(best_results, results_dir / f"best_config_{timestamp}.json")
+    save_json(best_results, results_dir / f"best_config_{study_name}_{timestamp}.json")
+    
+    print("\n" + "="*60)
+    print("OPTIMIZATION COMPLETE")
+    print("="*60)
+    print(f"Best validation loss: {best_results['best_value']:.6f}")
+    print("\nBest parameters:")
+    for key, value in best_results['best_params'].items():
+        print(f"  {key}: {value}")
     
     return study
 
@@ -746,18 +846,21 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
 
 from models.model import export_model
+from data.normalizer import NormalizationHelper
 
 
 class Trainer:
     """Trainer for chemical kinetics networks."""
     def __init__(self, model: nn.Module, train_dataset, val_dataset, test_dataset,
-                 config: Dict[str, Any], save_dir: Path, device: torch.device):
+                config: Dict[str, Any], save_dir: Path, device: torch.device,
+                norm_helper: NormalizationHelper):
         self.logger = logging.getLogger(__name__)
         
         self.model = model
         self.config = config
         self.save_dir = save_dir
         self.device = device
+        self.norm_helper = norm_helper
         
         # Extract config sections
         self.train_config = config["training"]
@@ -770,12 +873,12 @@ class Trainer:
         
         # Dataset info
         self.n_species = len(config["data"]["species_variables"])
+        self.n_globals = len(config["data"]["global_variables"])
         
         # Check for empty validation set
         self.has_validation = val_dataset is not None and len(val_dataset) > 0
         if not self.has_validation:
             self.logger.warning("No validation data – early‑stopping and LR‑plateau will be skipped")
-
         
         # Create data loaders
         self._setup_dataloaders(train_dataset, val_dataset, test_dataset)
@@ -793,6 +896,7 @@ class Trainer:
         self.early_stopping_patience = self.train_config["early_stopping_patience"]
         self.min_delta = self.train_config["min_delta"]
         self.gradient_accumulation_steps = self.train_config["gradient_accumulation_steps"]
+        self.empty_cache_interval = self.train_config.get("empty_cache_interval", 1000)
         
         # Setup training components
         self._setup_optimizer()
@@ -857,21 +961,17 @@ class Trainer:
         """Create the learning‑rate scheduler as requested in the config."""
         scheduler_type = self.train_config.get("scheduler", "none").lower()
 
-        # ─── No scheduler ───────────────────────────────────────────────────────────────
-        if scheduler_type == "none":
+        if scheduler_type == "none" or not self.train_loader:
             self.scheduler = None
             self.scheduler_step_on_batch = False
             return
 
-        # ─── Common convenience variables ──────────────────────────────────────────────
-        # ceil → count the final (partial) accumulation window
         steps_per_epoch = math.ceil(
             len(self.train_loader) / self.gradient_accumulation_steps
         )
 
         params: Dict[str, Any] = self.train_config.get("scheduler_params", {})
 
-        # ─── CosineAnnealingWarmRestarts ───────────────────────────────────────────────
         if scheduler_type == "cosine":
             T_0_epochs: int = params.get("T_0", 1)
             if T_0_epochs <= 0:
@@ -887,9 +987,7 @@ class Trainer:
             self.scheduler_step_on_batch = True
             return
 
-        # ─── ReduceLROnPlateau ─────────────────────────────────────────────────────────
         if scheduler_type == "plateau":
-            # Only create plateau scheduler if we have validation data
             if not self.has_validation:
                 self.logger.warning("Plateau scheduler requires validation data, falling back to no scheduler")
                 self.scheduler = None
@@ -947,21 +1045,56 @@ class Trainer:
 
         # GradScaler only for float16 on CUDA
         if self.amp_dtype == torch.float16 and self.device.type == 'cuda':
-            self.scaler = GradScaler('cuda')
-        
-    def _apply_delta_and_clamp(self, outputs: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
-        """Apply delta mode transformation and clamping consistently."""
-        if self.prediction_mode == "delta":
-            initial_species = inputs[:, :self.n_species]
-            outputs = outputs + initial_species
-        
-        if self.output_clamp is not None:
-            outputs = torch.clamp(outputs, min=self.output_clamp)
-        
-        return outputs
+            self.scaler = GradScaler(device_type='cuda')
+    
+    def _compute_loss(self, outputs: torch.Tensor, targets: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+        """Compute loss with mode-specific handling and optional clamping."""
+        if self.prediction_mode == "ratio":
+            # Ratio mode: outputs are already log-ratios, no clamping needed
+            return self.criterion(outputs, targets)
+        else:
+            # Absolute mode: apply optional clamping
+            if self.output_clamp is not None:
+                outputs = torch.clamp(outputs, min=self.output_clamp)
+            return self.criterion(outputs, targets)
+    
+    def _compute_raw_mae(self, outputs: torch.Tensor, targets: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+        """Compute MAE in original (denormalized) space for metrics."""
+        if self.prediction_mode == "ratio":
+            # Extract components for ratio mode
+            initial_species_norm = inputs[:, :self.n_species]
+            globals_norm = inputs[:, self.n_species:self.n_species + self.n_globals]
+            time_norm = inputs[:, -1:]
+            zero_time_norm = torch.zeros_like(time_norm)
+            initial_profile = torch.cat((initial_species_norm, globals_norm, zero_time_norm), dim=1)
+            initial_species_raw = self.norm_helper.denormalize_profile(initial_profile)[:, :self.n_species]
+
+            predicted_species_raw = self.norm_helper.denormalize_ratio_predictions(outputs, initial_species_raw)
+            target_species_raw = self.norm_helper.denormalize_ratio_predictions(targets, initial_species_raw)
+        else:
+            # Absolute mode
+            globals_norm = inputs[:, self.n_species:self.n_species + self.n_globals]
+            time_norm = inputs[:, -1:]
+            
+            # Apply clamping to outputs if needed
+            clamped_outputs = outputs
+            if self.output_clamp is not None:
+                clamped_outputs = torch.clamp(outputs, min=self.output_clamp)
+            
+            predicted_profile = torch.cat((clamped_outputs, globals_norm, time_norm), dim=1)
+            predicted_species_raw = self.norm_helper.denormalize_profile(predicted_profile)[:, :self.n_species]
+
+            target_profile = torch.cat((targets, globals_norm, time_norm), dim=1)
+            target_species_raw = self.norm_helper.denormalize_profile(target_profile)[:, :self.n_species]
+
+        return torch.mean(torch.abs(predicted_species_raw - target_species_raw))
     
     def train(self) -> float:
         """Execute the training loop."""
+        if not self.train_loader:
+            self.logger.error("Training loader not available. Cannot start training.")
+            return float("inf")
+
         self.logger.info(f"Starting training...")
         self.logger.info(f"Train batches: {len(self.train_loader)}")
         if self.has_validation:
@@ -995,7 +1128,9 @@ class Trainer:
         return self.best_val_loss
     
     def _run_training_loop(self):
-        """Main training loop."""
+        """Main training loop with fix for no-validation saving."""
+        best_train_loss = float("inf")
+        
         for epoch in range(1, self.train_config["epochs"] + 1):
             self.current_epoch = epoch
             epoch_start = time.time()
@@ -1018,49 +1153,53 @@ class Trainer:
             self.total_training_time += epoch_time
             self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
 
-            # Save best model (only if we have validation data)
-            if self.has_validation and val_loss < (self.best_val_loss - self.min_delta):
-                self.best_val_loss = val_loss
-                self.best_epoch = epoch
-                self.patience_counter = 0
-                self._save_best_model()
-            elif not self.has_validation and epoch == 1:
-                # Save first epoch model if no validation
-                self._save_best_model()
-            else:
-                self.patience_counter += 1
+            # Save best model and early stopping logic
+            if self.has_validation:
+                if val_loss < (self.best_val_loss - self.min_delta):
+                    self.best_val_loss = val_loss
+                    self.best_epoch = epoch
+                    self.patience_counter = 0
+                    self._save_best_model()
+                else:
+                    self.patience_counter += 1
 
-            # Early stopping
-            if self.has_validation and self.patience_counter >= self.early_stopping_patience:
-                self.logger.info(f"Early stopping triggered at epoch {epoch}")
-                break
+                if self.patience_counter >= self.early_stopping_patience:
+                    self.logger.info(f"Early stopping triggered at epoch {epoch}")
+                    break
+            else:
+                # No validation set: save based on best training loss
+                if train_loss < (best_train_loss - self.min_delta):
+                    best_train_loss = train_loss
+                    self.best_val_loss = train_loss
+                    self.best_epoch = epoch
+                    self._save_best_model()
     
     def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
         """Run one training epoch and return the average loss."""
         self.model.train()
-
         total_loss, total_samples = 0.0, 0
+        
         for batch_idx, (inputs, targets) in enumerate(self.train_loader):
-            # Move data
             inputs  = inputs.to(self.device,  non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
-                outputs = self._apply_delta_and_clamp(outputs, inputs)
-                loss    = self.criterion(outputs, targets)
+                loss = self._compute_loss(outputs, targets, inputs)
 
-                loss = loss / self.gradient_accumulation_steps
+            # Scale loss for gradient accumulation
+            scaled_loss = loss / self.gradient_accumulation_steps
 
             if self.scaler:
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(scaled_loss).backward()
             else:
-                loss.backward()
+                scaled_loss.backward()
 
             is_update_step = (
                 (batch_idx + 1) % self.gradient_accumulation_steps == 0
                 or (batch_idx + 1) == len(self.train_loader)
             )
+            
             if is_update_step:
                 if self.train_config["gradient_clip"] > 0:
                     if self.scaler:
@@ -1078,31 +1217,34 @@ class Trainer:
 
                 if self.scheduler and self.scheduler_step_on_batch:
                     self.scheduler.step()
-
                 self.global_step += 1
+                
+                # Empty cache periodically
+                if self.global_step % self.empty_cache_interval == 0 and self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
 
-            total_loss    += loss.item() * self.gradient_accumulation_steps * inputs.size(0)
+            total_loss += loss.item() * inputs.size(0)
             total_samples += inputs.size(0)
 
-            if self.global_step % self.log_interval == 0:
+            if self.global_step > 0 and self.global_step % self.log_interval == 0:
                 self.logger.info(
                     f"Epoch {self.current_epoch} | "
                     f"Batch {batch_idx + 1}/{len(self.train_loader)} | "
                     f"Loss: {total_loss / total_samples:.6f}"
                 )
-
+        
         return total_loss / total_samples, {}
 
-    
     def _validate(self) -> Tuple[float, Dict[str, float]]:
         """Evaluate the model on the validation set and return the average loss."""
-        # BUG FIX: Check if validation loader exists
         if not self.has_validation or self.val_loader is None:
             return float("inf"), {}
             
         self.model.eval()
-        total_loss, total_samples = 0.0, 0
-
+        total_loss = 0.0
+        total_raw_mae = 0.0
+        total_samples = 0
+        
         with torch.no_grad():
             for inputs, targets in self.val_loader:
                 inputs = inputs.to(self.device, non_blocking=True)
@@ -1110,24 +1252,29 @@ class Trainer:
 
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(inputs)
-                    outputs = self._apply_delta_and_clamp(outputs, inputs)
-                    loss = self.criterion(outputs, targets)
+                    loss = self._compute_loss(outputs, targets, inputs)
+                    raw_mae = self._compute_raw_mae(outputs, targets, inputs)
 
                 total_loss += loss.item() * inputs.size(0)
+                total_raw_mae += raw_mae.item() * inputs.size(0)
                 total_samples += inputs.size(0)
-
+        
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
-        return avg_loss, {}
-    
+        avg_raw_mae = total_raw_mae / total_samples if total_samples > 0 else float("inf")
+        val_metrics = {"raw_mae": avg_raw_mae}
+        return avg_loss, val_metrics
+
     def evaluate_test(self) -> float:
         """Compute the loss on the test set; returns `inf` if no test data."""
         if not self.test_loader:
-            self.logger.warning("No test data available")
+            self.logger.warning("No test data available, skipping test evaluation.")
             return float("inf")
 
         self.model.eval()
-        total_loss, total_samples = 0.0, 0
-
+        total_loss = 0.0
+        total_raw_mae = 0.0
+        total_samples = 0
+        
         with torch.no_grad():
             for inputs, targets in self.test_loader:
                 inputs = inputs.to(self.device, non_blocking=True)
@@ -1135,28 +1282,35 @@ class Trainer:
 
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(inputs)
-                    outputs = self._apply_delta_and_clamp(outputs, inputs)
-                    loss = self.criterion(outputs, targets)
+                    loss = self._compute_loss(outputs, targets, inputs)
+                    raw_mae = self._compute_raw_mae(outputs, targets, inputs)
 
                 total_loss += loss.item() * inputs.size(0)
+                total_raw_mae += raw_mae.item() * inputs.size(0)
                 total_samples += inputs.size(0)
 
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
-        self.logger.info(f"Test loss: {avg_loss:.6f}")
+        avg_raw_mae = total_raw_mae / total_samples if total_samples > 0 else float("inf")
+        self.logger.info(f"Test loss: {avg_loss:.6f} Test raw MAE: {avg_raw_mae:.6f}")
         return avg_loss
-    
+            
     def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
         """Log epoch results."""
+        lr = self.optimizer.param_groups[0]['lr'] if self.optimizer else 0
         log_entry = {
             "epoch": self.current_epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "epoch_time": epoch_time,
-            "lr": self.optimizer.param_groups[0]['lr'],
+            "lr": lr,
         }
+        if val_metrics:
+            log_entry.update(val_metrics)
         self.training_history["epochs"].append(log_entry)
         
         val_str = f"Val loss: {val_loss:.6f}" if self.has_validation else "Val loss: N/A"
+        if 'raw_mae' in val_metrics:
+            val_str += f" Val raw MAE: {val_metrics['raw_mae']:.6f}"
         self.logger.info(
             f"Epoch {self.current_epoch}/{self.train_config['epochs']} "
             f"Train loss: {train_loss:.6f} {val_str} "
@@ -1168,7 +1322,7 @@ class Trainer:
         checkpoint = {
             "epoch": self.current_epoch,
             "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict() if self.optimizer else None,
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
             "best_val_loss": self.best_val_loss,
             "config": self.config
@@ -1180,23 +1334,21 @@ class Trainer:
 
         # Export model if enabled
         if self.system_config.get("use_torch_export", False):
-            # Get example input
-            if self.val_loader:
-                example_inputs, _ = next(iter(self.val_loader))
+            # Get example input from the first available loader
+            example_loader = self.val_loader or self.train_loader
+            if example_loader:
+                example_inputs, _ = next(iter(example_loader))
+                example_inputs = example_inputs.to(self.device)
+                
+                export_path = self.save_dir / "exported_model.pt"
+                export_model(self.model, example_inputs, export_path)
             else:
-                example_inputs, _ = next(iter(self.train_loader))
-            example_inputs = example_inputs.to(self.device)
-            
-            export_path = self.save_dir / "exported_model.pt"
-            export_model(self.model, example_inputs, export_path)
+                self.logger.warning("Cannot export model: no data loader available to create example input.")
 
 ===== /Users/imalsky/Desktop/Chemulator/src/utils/utils.py =====
 #!/usr/bin/env python3
 """
 Simplified utility functions for the chemical kinetics pipeline.
-- Removed excessive validation
-- Simplified configuration loading
-- Focused on essential utilities
 """
 
 import json
@@ -1313,8 +1465,6 @@ def ensure_directories(*paths: Union[str, Path]) -> None:
 #!/usr/bin/env python3
 """
 Simplified hardware detection and optimization utilities.
-- Removed excessive configuration options
-- Focused on essential hardware setup
 """
 
 import logging
@@ -1361,18 +1511,21 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
         if config.get("cudnn_benchmark", True):
             torch.backends.cudnn.benchmark = True
             logger.info("cuDNN autotuner enabled")
+        
+        # Set memory fraction
+        memory_fraction = config.get("cuda_memory_fraction", 0.9)
+        if memory_fraction < 1.0:
+            torch.cuda.set_per_process_memory_fraction(memory_fraction)
+            logger.info(f"CUDA memory fraction set to {memory_fraction}")
     
-    # Set number of CPU threads
-    num_threads = config.get("num_threads")
-    if num_threads is None:
-        num_threads = min(32, os.cpu_count() or 1)
-    torch.set_num_threads(num_threads)
-    logger.info(f"Using {num_threads} CPU threads")
+    # Set number of threads for CPU operations
+    torch.set_num_threads(min(32, os.cpu_count() or 1))
+    logger.info(f"Using {torch.get_num_threads()} CPU threads")
 
 ===== /Users/imalsky/Desktop/Chemulator/src/models/model.py =====
 #!/usr/bin/env python3
 """
-Model definitions for chemical kinetics neural networks.
+Model definitions for chemical kinetics neural networks with ratio mode support.
 """
 
 import logging
@@ -1443,60 +1596,60 @@ class FiLMLayer(nn.Module):
 class FiLMSIREN(nn.Module):
     """SIREN with FiLM conditioning for chemical kinetics."""
     def __init__(self, config: Dict[str, Any]):
-                super().__init__()
+        super().__init__()
 
-                # Extract dimensions
-                self.num_species = len(config["data"]["species_variables"])
-                self.num_globals = len(config["data"]["global_variables"])
-                self.hidden_dims = config["model"]["hidden_dims"]
+        # Extract dimensions
+        self.num_species = len(config["data"]["species_variables"])
+        self.num_globals = len(config["data"]["global_variables"])
+        self.hidden_dims = config["model"]["hidden_dims"]
 
-                # SIREN parameters
-                self.omega_0 = config["model"].get("omega_0", 30.0)
+        # SIREN parameters
+        self.omega_0 = config["model"].get("omega_0", 30.0)
 
-                # FiLM configuration
-                film_config = config.get("film", {})
-                self.use_film = film_config.get("enabled", True)
+        # FiLM configuration
+        film_config = config.get("film", {})
+        self.use_film = film_config.get("enabled", True)
 
-                # Input dimension
-                input_dim = self.num_species + self.num_globals + 1
+        # Input dimension
+        input_dim = self.num_species + self.num_globals + 1
 
-                # Build network layers
-                self.layers = nn.ModuleList()
-                self.film_layers = nn.ModuleList() if self.use_film else None
+        # Build network layers
+        self.layers = nn.ModuleList()
+        self.film_layers = nn.ModuleList() if self.use_film else None
 
-                prev_dim = input_dim
-                condition_dim = self.num_species + self.num_globals
+        prev_dim = input_dim
+        condition_dim = self.num_species + self.num_globals
 
-                for i, dim in enumerate(self.hidden_dims):
-                    # Main layer
-                    self.layers.append(nn.Linear(prev_dim, dim))
+        for i, dim in enumerate(self.hidden_dims):
+            # Main layer
+            self.layers.append(nn.Linear(prev_dim, dim))
 
-                    # FiLM layer with SIREN-compatible initialization
-                    if self.use_film:
-                        film_layer = FiLMLayer(
-                            condition_dim=condition_dim,
-                            feature_dim=dim,
-                            hidden_dims=film_config.get("hidden_dims", [128, 128]),
-                            activation=film_config.get("activation", "gelu")
-                        )
+            # FiLM layer with SIREN-compatible initialization
+            if self.use_film:
+                film_layer = FiLMLayer(
+                    condition_dim=condition_dim,
+                    feature_dim=dim,
+                    hidden_dims=film_config.get("hidden_dims", [128, 128]),
+                    activation=film_config.get("activation", "gelu")
+                )
 
-                        with torch.no_grad():
-                            final_layer = film_layer.film_net[-1]
-                            final_layer.weight.data.zero_()
-                            # Set bias for gamma part to 1
-                            final_layer.bias.data[:dim] = 1.0
-                            # Set bias for beta part to 0
-                            final_layer.bias.data[dim:] = 0.0
+                with torch.no_grad():
+                    final_layer = film_layer.film_net[-1]
+                    final_layer.weight.data.zero_()
+                    # Set bias for gamma part to 1
+                    final_layer.bias.data[:dim] = 1.0
+                    # Set bias for beta part to 0
+                    final_layer.bias.data[dim:] = 0.0
 
-                        self.film_layers.append(film_layer)
+                self.film_layers.append(film_layer)
 
-                    prev_dim = dim
+            prev_dim = dim
 
-                # Output layer
-                self.output_layer = nn.Linear(prev_dim, self.num_species)
+        # Output layer
+        self.output_layer = nn.Linear(prev_dim, self.num_species)
 
-                # Initialize SIREN weights
-                self._initialize_siren_weights()
+        # Initialize SIREN weights
+        self._initialize_siren_weights()
     
     def _initialize_siren_weights(self):
         """Initialize weights following SIREN paper."""
@@ -1542,14 +1695,13 @@ class FiLMSIREN(nn.Module):
 
 
 class FiLMDeepONet(nn.Module):
-    """Deep Operator Network with FiLM conditioning (no bias for delta mode)."""
+    """Deep Operator Network with FiLM conditioning for ratio mode."""
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         
         # Extract dimensions
         self.num_species = len(config["data"]["species_variables"])
         self.num_globals = len(config["data"]["global_variables"])
-        self.prediction_mode = config.get("prediction", {}).get("mode", "absolute")
 
         # Architecture parameters
         branch_layers = config["model"]["branch_layers"]
@@ -1562,9 +1714,8 @@ class FiLMDeepONet(nn.Module):
         film_config = config.get("film", {})
         self.use_film = film_config.get("enabled", True)
         
-        # Determine bias based on prediction mode (critical for delta mode to ensure zero at t=0)
-        prediction_mode = config.get("prediction", {}).get("mode", "absolute")
-        bias = (prediction_mode != "delta")
+        # For ratio mode, we can use standard bias
+        bias = True
         
         # Build branch network (processes initial conditions)
         self.branch_net = self._build_mlp_with_film(
@@ -1582,7 +1733,7 @@ class FiLMDeepONet(nn.Module):
             output_dim=self.basis_dim,
             condition_dim=self.num_species + self.num_globals if self.use_film else None,
             film_config=film_config if self.use_film else None,
-            bias=bias  # No bias in trunk for delta mode
+            bias=bias
         )
     
     def _get_activation(self, name: str):
@@ -1595,73 +1746,71 @@ class FiLMDeepONet(nn.Module):
         return activations.get(name.lower(), nn.GELU())
     
     def _build_mlp_with_film(self, input_dim: int, hidden_layers: List[int],
-                                output_dim: int, condition_dim: Optional[int] = None,
-                                film_config: Optional[Dict] = None, bias: bool = True) -> nn.Module:
-            """
-            Build an MLP with optional FiLM layers.
+                            output_dim: int, condition_dim: Optional[int] = None,
+                            film_config: Optional[Dict] = None, bias: bool = True) -> nn.Module:
+        """
+        Build an MLP with optional FiLM layers.
 
-            Args:
-                input_dim: Input dimension for the MLP.
-                hidden_layers: List of hidden layer dimensions.
-                output_dim: Output dimension for the MLP.
-                condition_dim: Dimension of the conditioning vector for FiLM.
-                film_config: Configuration dictionary for FiLM layers.
-                bias: If True, adds a learnable bias to the linear layers. This is set
-                    to False for the trunk network in delta mode to ensure output is
-                    zero at t=0.
-            """
+        Args:
+            input_dim: Input dimension for the MLP.
+            hidden_layers: List of hidden layer dimensions.
+            output_dim: Output dimension for the MLP.
+            condition_dim: Dimension of the conditioning vector for FiLM.
+            film_config: Configuration dictionary for FiLM layers.
+            bias: If True, adds a learnable bias to the linear layers.
+        """
 
-            if self.use_film and condition_dim is not None and film_config is not None:
-                # Build with FiLM
-                layers = nn.ModuleList()
-                film_layers = nn.ModuleList()
+        if self.use_film and condition_dim is not None and film_config is not None:
+            # Build with FiLM
+            layers = nn.ModuleList()
+            film_layers = nn.ModuleList()
 
-                prev_dim = input_dim
-                for dim in hidden_layers:
-                    layers.append(nn.Linear(prev_dim, dim, bias=bias))
+            prev_dim = input_dim
+            for dim in hidden_layers:
+                layers.append(nn.Linear(prev_dim, dim, bias=bias))
 
-                    film_layers.append(
-                        FiLMLayer(
-                            condition_dim=condition_dim,
-                            feature_dim=dim,
-                            hidden_dims=film_config.get("hidden_dims", [128, 128]),
-                            activation=film_config.get("activation", "gelu"),
-                            use_beta=True  # Beta is always needed for effective FiLM.
-                        )
+                film_layers.append(
+                    FiLMLayer(
+                        condition_dim=condition_dim,
+                        feature_dim=dim,
+                        hidden_dims=film_config.get("hidden_dims", [128, 128]),
+                        activation=film_config.get("activation", "gelu"),
+                        use_beta=True
                     )
-                    prev_dim = dim
+                )
+                prev_dim = dim
 
-                output_layer = nn.Linear(prev_dim, output_dim, bias=bias)
+            output_layer = nn.Linear(prev_dim, output_dim, bias=bias)
 
-                class MLPWithFiLM(nn.Module):
-                    def __init__(self, layers, film_layers, output_layer, activation):
-                        super().__init__()
-                        self.layers = layers
-                        self.film_layers = film_layers
-                        self.output_layer = output_layer
-                        self.activation = activation
+            class MLPWithFiLM(nn.Module):
+                def __init__(self, layers, film_layers, output_layer, activation):
+                    super().__init__()
+                    self.layers = layers
+                    self.film_layers = film_layers
+                    self.output_layer = output_layer
+                    self.activation = activation
 
-                    def forward(self, x, condition):
-                        h = x
-                        for layer, film_layer in zip(self.layers, self.film_layers):
-                            h = layer(h)
-                            h = film_layer(h, condition)
-                            h = self.activation(h)
-                        return self.output_layer(h)
+                def forward(self, x, condition):
+                    h = x
+                    for layer, film_layer in zip(self.layers, self.film_layers):
+                        h = layer(h)
+                        h = film_layer(h, condition)
+                        h = self.activation(h)
+                    return self.output_layer(h)
 
-                return MLPWithFiLM(layers, film_layers, output_layer, self.activation)
+            return MLPWithFiLM(layers, film_layers, output_layer, self.activation)
 
-            else:
-                # Build standard MLP
-                layers = []
-                prev_dim = input_dim
+        else:
+            # Build standard MLP
+            layers = []
+            prev_dim = input_dim
 
-                for dim in hidden_layers:
-                    layers.extend([nn.Linear(prev_dim, dim, bias=bias), self.activation])
-                    prev_dim = dim
+            for dim in hidden_layers:
+                layers.extend([nn.Linear(prev_dim, dim, bias=bias), self.activation])
+                prev_dim = dim
 
-                layers.append(nn.Linear(prev_dim, output_dim, bias=bias))
-                return nn.Sequential(*layers)
+            layers.append(nn.Linear(prev_dim, output_dim, bias=bias))
+            return nn.Sequential(*layers)
             
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Forward pass with FiLM conditioning."""
@@ -1683,10 +1832,7 @@ class FiLMDeepONet(nn.Module):
         # Reshape branch output
         branch_out = branch_out.view(-1, self.num_species, self.basis_dim)
 
-        # Combine with dot product (no bias!)
-        if self.prediction_mode == "delta":
-            trunk_out = trunk_out * trunk_input
-
+        # Combine with dot product
         output = torch.einsum("bni,bi->bn", branch_out, trunk_out)
 
         # Optional output scaling
@@ -1700,45 +1846,8 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     """Create model based on configuration."""
     model_type = config["model"]["type"].lower()
     
-    prediction_mode = config.get("prediction", {}).get("mode", "absolute")
-    if prediction_mode == "delta":
-        norm_config = config["normalization"]
-        default_method = norm_config["default_method"]
-        methods = norm_config.get("methods", {})
-
-        # 1. FATAL: Check for log-scaling on species variables in delta mode.
-        # This is invalid because delta is an additive concept, while log-scaling is multiplicative.
-        for var in config["data"]["species_variables"]:
-            method = methods.get(var, default_method)
-            if "log" in method:
-                raise ValueError(
-                    f"Delta prediction mode is incompatible with log-based normalization "
-                    f"for species variables. Variable '{var}' uses '{method}'."
-                )
-
-        # 2. Validate time variable normalization for delta mode.
-        time_var = config["data"]["time_variable"]
-        time_method = methods.get(time_var, default_method)
-
-        # FATAL: Standard scaling breaks the guarantee that pred(t=0) is zero.
-        if "standard" in time_method:
-            raise ValueError(
-                f"Delta prediction mode requires a min-max style normalizer for the time "
-                f"variable ('{time_var}') to ensure the prediction at t=0 is zero. "
-                f"The current method '{time_method}' is not supported."
-            )
-        
-        # WARNING: Log-scaling time is physically unintuitive for a delta model.
-        if "log-min-max" in time_method:
-            logging.warning(
-                f"Using log-scaling ('{time_method}') for the time variable ('{time_var}') "
-                f"in delta mode is not recommended. It forces the model to learn a "
-                f"physically unintuitive mapping and may lead to poor performance."
-            )
-
+    
     if model_type == "siren":
-        if prediction_mode == "delta":
-            raise ValueError("SIREN model not supported in delta prediction mode due to activation incompatibility.")
         model = FiLMSIREN(config)
     elif model_type == "deeponet":
         model = FiLMDeepONet(config)
@@ -1748,7 +1857,7 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     model = model.to(device)
     
     # Compile model if enabled and supported
-    if config["system"].get("use_torch_compile", False) and device.type == "cuda":
+    if config["system"].get("use_torch_compile", False) and hasattr(torch, 'compile'):
         compile_mode = config["system"].get("compile_mode", "default")
         logging.info(f"Compiling model with mode='{compile_mode}'...")
         
@@ -1774,10 +1883,17 @@ def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path)
     
     with torch.no_grad():
         try:
-            # Export the model
-            exported_program = torch.export.export(model, (example_input,))
-            torch.export.save(exported_program, str(save_path))
-            logger.info(f"Model exported to {save_path}")
+            # Use the new torch.export API if available
+            if hasattr(torch, 'export'):
+                # Export the model
+                exported_program = torch.export.export(model, (example_input,))
+                torch.export.save(exported_program, str(save_path))
+                logger.info(f"Model exported using torch.export to {save_path}")
+            else:
+                # Fallback to torch.jit.trace for older versions
+                traced_model = torch.jit.trace(model, example_input)
+                torch.jit.save(traced_model, str(save_path))
+                logger.info(f"Model exported using torch.jit to {save_path}")
         except Exception as e:
             logger.error(f"Export failed: {e}")
             raise
@@ -1785,19 +1901,20 @@ def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path)
 ===== /Users/imalsky/Desktop/Chemulator/src/data/preprocessor.py =====
 #!/usr/bin/env python3
 """
-Chemical kinetics data preprocessor.
+Chemical kinetics data preprocessor with ratio mode support.
 """
 
 import hashlib
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 import h5py
 import numpy as np
 import torch
-
 
 from .normalizer import DataNormalizer, NormalizationHelper
 from utils.utils import save_json
@@ -1807,7 +1924,6 @@ class DataPreprocessor:
     """Preprocess HDF5 raw data to normalized NPY shards."""
     def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
         # Sort the raw_files list to ensure a deterministic processing order.
-        # This is critical for reproducible train/validation/test splits.
         self.raw_files = sorted(raw_files)
         self.output_dir = Path(output_dir)
         self.config = config
@@ -1829,6 +1945,11 @@ class DataPreprocessor:
         self.shard_size = preprocess_config["shard_size"]
         self.min_threshold = preprocess_config["min_species_threshold"]
         self.compression = preprocess_config.get("compression", None)
+        self.num_workers = preprocess_config.get("num_workers", 16)
+        self.parallel_enabled = preprocess_config.get("parallel_enabled", True)
+        
+        # Prediction mode
+        self.prediction_mode = config.get("prediction", {}).get("mode", "absolute")
         
         self._init_shard_index()
     
@@ -1847,12 +1968,14 @@ class DataPreprocessor:
                 "validation": "val_indices.npy",
                 "test": "test_indices.npy"
             },
+            "prediction_mode": self.prediction_mode,
         }
         
     def process_to_npy_shards(self) -> Dict[str, Any]:
         """Two-pass processing: collect statistics then write normalized shards."""
         start_time = time.time()
         self.logger.info(f"Starting preprocessing with {len(self.raw_files)} files")
+        self.logger.info(f"Prediction mode: {self.prediction_mode}")
         
         # Pass 1: Collect statistics
         self.logger.info("Pass 1: Collecting normalization statistics")
@@ -1866,23 +1989,52 @@ class DataPreprocessor:
         return split_indices
         
     def _collect_statistics(self) -> Dict[str, Any]:
-        """First pass: collect normalization statistics."""
-        self.normalizer = DataNormalizer(self.config)
-        accumulators = self.normalizer._initialize_accumulators()
-        
-        for raw_file in self.raw_files:
-            self._process_file_statistics(raw_file, accumulators)
-        
-        # Finalize statistics
-        norm_stats = self.normalizer._finalize_statistics(accumulators)
-        save_json(norm_stats, self.output_dir / "normalization.json")
-        
-        return norm_stats
-    
-    def _process_file_statistics(self, raw_file: Path, accumulators: Dict[str, Any]):
-        """Process a single file for statistics collection."""
+            """First pass: collect normalization statistics."""
+            self.normalizer = DataNormalizer(self.config)
+            accumulators = self.normalizer._initialize_accumulators()
+
+            # In ratio mode, create per-species accumulators for the log-ratios.
+            if self.prediction_mode == "ratio":
+                # Create a dictionary of accumulators, one for each species variable.
+                ratio_accumulators = {
+                    var: {"count": 0, "mean": 0.0, "m2": 0.0, "min": float("inf"), "max": float("-inf")}
+                    for var in self.species_vars
+                }
+
+            for raw_file in self.raw_files:
+                if self.prediction_mode == "ratio":
+                    self._process_file_statistics_ratio(raw_file, accumulators, ratio_accumulators)
+                else:
+                    self._process_file_statistics(raw_file, accumulators)
+
+            # Finalize statistics for the input variables.
+            norm_stats = self.normalizer._finalize_statistics(accumulators)
+
+            # If in ratio mode, finalize the per-species ratio statistics.
+            if self.prediction_mode == "ratio":
+                norm_stats["ratio_stats"] = {}
+                for var, acc in ratio_accumulators.items():
+                    if acc["count"] > 1:
+                        variance = acc["m2"] / (acc["count"] - 1)
+                        std = max(np.sqrt(variance), self.config["normalization"]["min_std"])
+                    else:
+                        std = 1.0
+
+                    norm_stats["ratio_stats"][var] = {
+                        "mean": acc["mean"],
+                        "std": std,
+                        "min": acc["min"],
+                        "max": acc["max"],
+                        "count": acc["count"]
+                    }
+                self.logger.info("Per-species ratio statistics calculated.")
+
+            save_json(norm_stats, self.output_dir / "normalization.json")
+            return norm_stats
+
+    def _process_file_statistics_ratio(self, raw_file: Path, accumulators: Dict[str, Any],
+                                    ratio_accumulators: Dict[str, Dict[str, Any]]):
         groups_processed = 0
-        
         with h5py.File(raw_file, "r") as f:
             for gname in f.keys():
                 grp = f[gname]
@@ -1894,27 +2046,69 @@ class DataPreprocessor:
                     if hash_float >= use_fraction:
                         continue
                 
-                # Validate group
                 if not self._validate_group_simple(grp):
                     continue
-                
-                # Extract profile data
+
                 n_t = grp[self.time_var].shape[0]
                 profile = self._extract_profile(grp, gname, n_t)
-                
-                if profile is None:
+
+                if profile is None or n_t <= 1:
                     continue
-                
-                # Update statistics
+
+                # Update stats for inputs (species, globals, time)
                 profile_3d = profile.reshape(1, n_t, self.n_vars)
                 self.normalizer._update_accumulators(profile_3d, accumulators, n_t)
+
+                # Calculate and accumulate log-ratios for each species independently.
+                initial_species = profile[0, :self.n_species]
+                future_species = profile[1:, :self.n_species]
+                
+                # Vectorized calculation of log-ratios is efficient
+                epsilon = self.config["normalization"]["epsilon"]
+                ratios = future_species / np.maximum(initial_species[None, :], epsilon)
+                log_ratios = np.log10(np.maximum(ratios, epsilon))
+
+                # This loop correctly updates the accumulator for EACH species
+                for i, var_name in enumerate(self.species_vars):
+                    # Get the accumulator for the current species
+                    acc = ratio_accumulators[var_name]
+                    vec = log_ratios[:, i]
+                    
+                    # Welford's algorithm for this species
+                    if vec.size > 0:
+                        finite_mask = np.isfinite(vec)
+                        vec = vec[finite_mask]
+                        if vec.size == 0:
+                            continue
+
+                        n_a = acc["count"]
+                        n_b = vec.size
+
+                        if n_b == 0:
+                            continue # Skip if no new data
+
+                        mean_a = acc["mean"] # Store old mean
+                        mean_b = float(vec.mean())
+                        m2_b = float(((vec - mean_b) ** 2).sum())
+
+                        delta = mean_b - mean_a # Calculate delta with old mean
+                        n_ab = n_a + n_b
+
+                        if n_ab > 0:
+                            # Update mean first
+                            acc["mean"] = (n_a * mean_a + n_b * mean_b) / n_ab
+                            # Then update m2 using the original delta
+                            acc["m2"] += m2_b + (delta**2 * n_a * n_b) / n_ab
+                            acc["count"] = n_ab
+                            acc["min"] = min(acc["min"], float(vec.min()))
+                            acc["max"] = max(acc["max"], float(vec.max()))
+
                 groups_processed += 1
-        
-        self.logger.info(f"  Processed {groups_processed} groups from {raw_file.name}")
+        self.logger.info(f"  Processed {groups_processed} groups from {raw_file.name} for ratio stats")
         
     def _write_normalized_shards(self, norm_stats: Dict[str, Any]) -> Dict[str, List[int]]:
-        """Second pass – write normalized data to NPY shards with fixed splitting."""
-        # ─── setup ────────────────────────────────────────────────────────────────
+        """Second pass – write normalized data to NPY shards."""
+        # Setup helper and writer
         helper = NormalizationHelper(
             norm_stats,
             torch.device("cpu"),
@@ -1939,59 +2133,65 @@ class DataPreprocessor:
         profiles_written = 0
         profiles_skipped = 0
 
-        # ─── iterate over raw HDF5 files ─────────────────────────────────────────
-        for raw_file in self.raw_files:
-            with h5py.File(raw_file, "r") as f:
-                for gname in sorted(f.keys()):
-                    grp = f[gname]
+        # Get full ratio stats dict if in ratio mode
+        ratio_stats = norm_stats.get("ratio_stats", {})
 
-                    # deterministic subsampling – must match statistics‑pass logic
-                    use_fraction = self.config["training"]["use_fraction"]
-                    if use_fraction < 1.0:
-                        h = hashlib.sha256(gname.encode("utf-8")).hexdigest()
-                        if int(h[:8], 16) / 0xFFFFFFFF >= use_fraction:
-                            continue
-
-                    if not self._validate_group_simple(grp):
-                        continue
-
-                    # extract & normalise
-                    n_t     = grp[self.time_var].shape[0]
-                    profile = self._extract_profile(grp, gname, n_t)
-                    if profile is None:
-                        continue
-
-                    profile_t = torch.from_numpy(profile)
-                    norm_prof = helper.normalize_profile(profile_t).numpy()
-
-                    # convert to fixed‑alignment samples
-                    samples = self._profile_to_samples(norm_prof, n_t)
-                    if samples is None:
-                        profiles_skipped += 1
-                        continue
-
-                    # BUG FIX: Only update indices for successfully written samples
-                    n_written = samples.shape[0]
-                    
-                    # Add samples to writer
+        # Process files
+        if self.parallel_enabled and self.num_workers > 1 and len(self.raw_files) > 1:
+            # Parallel processing
+            results = self._parallel_write_shards(
+                norm_stats, helper, val_f, test_f, 
+                ratio_stats, global_idx
+            )
+            
+            # Aggregate results with index adjustment
+            actual_global_idx = 0
+            for file_samples, file_splits, written, skipped in results:
+                for samples in file_samples:
                     shard_writer.add_samples(samples)
+                
+                # Compute adjustment offset
+                if any(file_splits.values()):  # If any splits in this file
+                    # Find the estimated min_idx (should be the start_global_idx passed to the file)
+                    file_min_idx = min(min(indices) for indices in file_splits.values() if indices)
+                    offset = actual_global_idx - file_min_idx
+                    for split_name, indices in file_splits.items():
+                        if indices:
+                            adjusted_indices = [i + offset for i in indices]
+                            splits[split_name].extend(adjusted_indices)
+                
+                # Update actual_global_idx by the number of samples written for this file
+                file_total_samples = sum(len(indices) for indices in file_splits.values())
+                actual_global_idx += file_total_samples
+                
+                profiles_written += written
+                profiles_skipped += skipped
+            global_idx = actual_global_idx  # Set final global_idx to the actual total
+        
+        else:
+            # Sequential processing
+            for raw_file in self.raw_files:
+                with h5py.File(raw_file, "r") as f:
+                    for gname in sorted(f.keys()):
+                        result = self._process_single_group(
+                            f[gname], gname, helper, 
+                            val_f, test_f, global_idx,
+                            ratio_stats
+                        )
+                        
+                        if result is None:
+                            profiles_skipped += 1
+                            continue
+                        
+                        samples, split_key, n_written = result
+                        shard_writer.add_samples(samples)
+                        
+                        start_idx = global_idx
+                        global_idx += n_written
+                        splits[split_key].extend(range(start_idx, global_idx))
+                        profiles_written += 1
 
-                    # ─ split bookkeeping ─────────────────────────────────────────
-                    split_h   = hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()
-                    p         = int(split_h[:8], 16) / 0xFFFFFFFF
-
-                    split_key = (
-                        "test" if p < test_f
-                        else "validation" if p < test_f + val_f
-                        else "train"
-                    )
-
-                    start_idx = global_idx
-                    global_idx += n_written
-                    splits[split_key].extend(range(start_idx, global_idx))
-                    profiles_written += 1
-
-        # ─── finalise ────────────────────────────────────────────────────────────
+        # Finalize
         shard_writer.flush()
         self.shard_index["total_samples"] = global_idx
         save_json(self.shard_index, self.output_dir / "shard_index.json")
@@ -2006,6 +2206,123 @@ class DataPreprocessor:
                 self.logger.info(f"{split_name} split: {len(idxs):,} samples")
 
         return splits
+        
+    def _parallel_write_shards(self, norm_stats, helper, val_f, test_f, 
+                            ratio_stats, start_global_idx):
+        """Process files in parallel for writing shards."""
+        results = []
+        
+        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+            # Submit tasks
+            futures = []
+            current_idx = start_global_idx
+            
+            for raw_file in self.raw_files:
+                future = executor.submit(
+                    self._process_file_for_shards,
+                    raw_file, norm_stats, val_f, test_f,
+                    current_idx, ratio_stats
+                )
+                futures.append((future, raw_file))
+                # Estimate indices (will be corrected after processing)
+                current_idx += 10000000  # Rough estimate
+            
+            # Collect results
+            for future, raw_file in futures:
+                try:
+                    result = future.result()
+                    results.append(result)
+                    self.logger.info(f"Completed processing {raw_file.name}")
+                except Exception as e:
+                    self.logger.error(f"Failed to process {raw_file}: {e}")
+                    raise
+        
+        return results
+    
+    def _process_file_for_shards(self, raw_file, norm_stats, val_f, test_f, 
+                                start_global_idx, ratio_stats):
+        """Process a single file for shard writing (for parallel execution)."""
+        # Re-create helper in subprocess
+        helper = NormalizationHelper(
+            norm_stats,
+            torch.device("cpu"),
+            self.species_vars,
+            self.global_vars,
+            self.time_var,
+            self.config,
+        )
+        
+        file_samples = []
+        file_splits = {"train": [], "validation": [], "test": []}
+        profiles_written = 0
+        profiles_skipped = 0
+        global_idx = start_global_idx
+        
+        with h5py.File(raw_file, "r") as f:
+            for gname in sorted(f.keys()):
+                result = self._process_single_group(
+                    f[gname], gname, helper,
+                    val_f, test_f, global_idx,
+                    ratio_stats
+                )
+                
+                if result is None:
+                    profiles_skipped += 1
+                    continue
+                
+                samples, split_key, n_written = result
+                file_samples.append(samples)
+                
+                start_idx = global_idx
+                global_idx += n_written
+                file_splits[split_key].extend(range(start_idx, global_idx))
+                profiles_written += 1
+        
+        return file_samples, file_splits, profiles_written, profiles_skipped
+        
+    def _process_single_group(self, grp, gname, helper, val_f, test_f, 
+                            global_idx, ratio_stats):
+        """Process a single group and return samples."""
+        # Deterministic subsampling
+        use_fraction = self.config["training"]["use_fraction"]
+        if use_fraction < 1.0:
+            h = hashlib.sha256(gname.encode("utf-8")).hexdigest()
+            if int(h[:8], 16) / 0xFFFFFFFF >= use_fraction:
+                return None
+        
+        if not self._validate_group_simple(grp):
+            return None
+        
+        # Extract & normalize
+        n_t = grp[self.time_var].shape[0]
+        profile = self._extract_profile(grp, gname, n_t)
+        if profile is None:
+            return None
+        
+        # Get samples based on prediction mode
+        if self.prediction_mode == "ratio":
+            samples = self._profile_to_samples_ratio(
+                profile, n_t, helper, ratio_stats
+            )
+        else:
+            profile_t = torch.from_numpy(profile)
+            norm_prof = helper.normalize_profile(profile_t).numpy()
+            samples = self._profile_to_samples(norm_prof, n_t)
+        
+        if samples is None:
+            return None
+        
+        # Determine split
+        split_h = hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()
+        p = int(split_h[:8], 16) / 0xFFFFFFFF
+        
+        split_key = (
+            "test" if p < test_f
+            else "validation" if p < test_f + val_f
+            else "train"
+        )
+        
+        return samples, split_key, samples.shape[0]
     
     def _validate_group_simple(self, group: h5py.Group) -> bool:
         """Simplified validation - only check essentials."""
@@ -2020,8 +2337,21 @@ class DataPreprocessor:
                 var_data = group[var][:]
                 if not np.all(np.isfinite(var_data)) or np.any(var_data < self.min_threshold):
                     return False
+                # Additional check for ratio mode: ensure no exact zeros at t=0
+                if self.prediction_mode == "ratio" and var_data[0] < self.config["normalization"]["epsilon"]:
+                    self.logger.debug(f"Skipping group {group.name}: zero initial condition for {var}")
+                    return False
             except Exception:
                 return False
+        
+        # Verify globals are constant
+        if hasattr(self, '_validate_constant_globals') and self._validate_constant_globals:
+            for var in self.global_vars:
+                if var in group:
+                    data = group[var][:]
+                    if not np.allclose(data, data[0], rtol=1e-10):
+                        self.logger.warning(f"Global variable {var} is not constant in group {group.name}")
+                        return False
                 
         return True
     
@@ -2034,6 +2364,7 @@ class DataPreprocessor:
         globals_dict = {}
         
         # Find all _label_value patterns before SEED
+        # More robust regex to handle scientific notation and spaces
         matches = re.findall(r"_(\w+)_([\d.eE+-]+)", gname)
         for label, value in matches:
             if label in global_labels:
@@ -2042,10 +2373,13 @@ class DataPreprocessor:
                     try:
                         globals_dict[var] = float(value)
                     except ValueError:
+                        self.logger.warning(f"Failed to parse value '{value}' for {var} in {gname}")
                         return None
         
         # Check if all global_vars were found
         if set(globals_dict.keys()) != set(self.global_vars):
+            missing = set(self.global_vars) - set(globals_dict.keys())
+            self.logger.debug(f"Missing global variables {missing} in {gname}")
             return None
         
         # Pre-allocate buffer
@@ -2058,7 +2392,8 @@ class DataPreprocessor:
                     profile[:, i] = group[var][:].astype(np.float32)
                 elif var in self.global_vars:
                     profile[:, i] = globals_dict[var]
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"Failed to extract profile from {gname}: {e}")
             return None
         
         return profile
@@ -2087,6 +2422,46 @@ class DataPreprocessor:
         samples[:, -self.n_species:] = normalized_profile[1:, :self.n_species]
         
         return samples
+    
+    def _profile_to_samples_ratio(self, raw_profile: np.ndarray, n_t: int,
+                                    helper: NormalizationHelper,
+                                    ratio_stats: Dict[str, Dict[str, float]]) -> Optional[np.ndarray]:
+            """Convert profile to samples for ratio mode with per-species standardization."""
+            if n_t <= 1:
+                return None
+
+            # --- Prepare inputs ---
+            n_samples = n_t - 1
+            n_inputs = self.n_species + self.n_globals + 1
+            n_targets = self.n_species
+            samples = np.empty((n_samples, n_inputs + n_targets), dtype=np.float32)
+
+            # Normalize the full profile to get normalized inputs
+            profile_t = torch.from_numpy(raw_profile)
+            norm_profile = helper.normalize_profile(profile_t).numpy()
+            
+            # Use initial state at t=0 for branch network inputs
+            samples[:, :self.n_species + self.n_globals] = norm_profile[0, :self.n_species + self.n_globals]
+            # Use time at t > 0 for trunk network input
+            samples[:, self.n_species + self.n_globals] = norm_profile[1:, -1]
+
+            # --- Prepare targets (Standardized Per-Species Log-Ratios) ---
+            initial_species_raw = raw_profile[0, :self.n_species]
+            future_species_raw = raw_profile[1:, :self.n_species]
+
+            epsilon = self.config["normalization"]["epsilon"]
+            ratios = future_species_raw / np.maximum(initial_species_raw[None, :], epsilon)
+            log_ratios = np.log10(np.maximum(ratios, epsilon))
+
+            # Get per-species mean and std for standardization from the dictionary
+            ratio_means = np.array([ratio_stats[var]["mean"] for var in self.species_vars], dtype=np.float32)
+            ratio_stds = np.array([ratio_stats[var]["std"] for var in self.species_vars], dtype=np.float32)
+            
+            # Standardize each column (species) with its own mean and std
+            standardized_log_ratios = (log_ratios - ratio_means) / ratio_stds
+            samples[:, -n_targets:] = standardized_log_ratios
+            
+            return samples
 
 
 class ShardWriter:
@@ -2148,17 +2523,19 @@ class ShardWriter:
             save_path = shard_path
             np.save(save_path, data)
         
-        # Update shard info
+        # Update shard info with clarified indexing
+        start_idx = self.shard_index.get("total_samples", 0)
+        end_idx = start_idx + data.shape[0]
         shard_info = {
             "shard_idx": self.shard_id,
             "filename": save_path.name,
-            "start_idx": self.shard_index.get("total_samples", 0),
-            "end_idx": self.shard_index.get("total_samples", 0) + data.shape[0],
+            "start_idx": start_idx,
+            "end_idx": end_idx,
             "n_samples": data.shape[0],
         }
         
         self.shard_index["shards"].append(shard_info)
-        self.shard_index["total_samples"] = shard_info["end_idx"]
+        self.shard_index["total_samples"] = end_idx
         self.shard_index["n_shards"] += 1
         self.shard_id += 1
         
@@ -2169,31 +2546,29 @@ class ShardWriter:
 ===== /Users/imalsky/Desktop/Chemulator/src/data/dataset.py =====
 #!/usr/bin/env python3
 """
-Dataset for chemical kinetics data.
+Dataset for chemical kinetics data with simplified caching.
 """
 
 import json
 import logging
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
-import gc
-import psutil
+from functools import lru_cache
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-import collections
+import psutil
 
 
 class NPYDataset(Dataset):
-    """High-performance dataset using memory-mapped NPY shards."""
+    """High-performance dataset using NPY shards with LRU caching."""
     
     def __init__(self, shard_dir: Path, indices: np.ndarray, config: Dict[str, Any],
                  device: torch.device, split_name: Optional[str] = None):
         super().__init__()
         self.shard_dir = Path(shard_dir)
         self.config = config
-        # The device parameter is no longer needed here but is kept for API consistency.
         self.device = device
         self.split_name = split_name
         self.logger = logging.getLogger(__name__)
@@ -2206,6 +2581,7 @@ class NPYDataset(Dataset):
         self.n_species = self.shard_index["n_species"]
         self.n_globals = self.shard_index["n_globals"]
         self.samples_per_shard = self.shard_index["samples_per_shard"]
+        self.prediction_mode = self.shard_index.get("prediction_mode", "absolute")
         
         # Store indices
         self.sample_indices = indices
@@ -2219,7 +2595,8 @@ class NPYDataset(Dataset):
 
         self.logger.info(
             f"NPYDataset initialized: {self.n_total_samples:,} samples, "
-            f"cache size: {self._max_cache_size} shards"
+            f"cache size: {self._max_cache_size} shards, "
+            f"prediction mode: {self.prediction_mode}"
         )
     
     def _setup_cache(self):
@@ -2228,7 +2605,7 @@ class NPYDataset(Dataset):
         try:
             available_memory = psutil.virtual_memory().available
         except:
-            available_memory = 4 * 1024**3  # Default to 4GB if psutil fails
+            available_memory = 4 * 1024**3
         
         # Estimate shard size
         n_features = self.n_species * 2 + self.n_globals + 1
@@ -2239,65 +2616,50 @@ class NPYDataset(Dataset):
         max_cache_memory = available_memory * 0.25
         self._max_cache_size = max(1, min(
             int(max_cache_memory / bytes_per_shard),
-            self.config["training"].get("dataset_cache_shards", 4)
+            self.config["training"].get("dataset_cache_shards", 256)
         ))
         
-        # Use an OrderedDict for LRU behavior
-        self._shard_cache = collections.OrderedDict()
+        # Set up LRU cache for shard loading
+        self._get_shard_data = lru_cache(maxsize=self._max_cache_size)(self._get_shard_data_impl)
     
     def _build_shard_lookup(self):
-        """Pre-build lookup table for shard indices."""
+        """Pre-build lookup table for shard indices with binary search support."""
         self._shard_starts = np.array([s["start_idx"] for s in self.shard_index["shards"]])
         self._shard_ends = np.array([s["end_idx"] for s in self.shard_index["shards"]])
         
-    def _get_shard_data(self, shard_idx: int) -> np.ndarray:
-        """Get shard data with LRU caching and memory management."""
-        if shard_idx in self._shard_cache:
-            # Move the accessed item to the end to mark it as most recently used
-            self._shard_cache.move_to_end(shard_idx)
-            return self._shard_cache[shard_idx]
-
-        # Load shard data
+        # Verify shards are contiguous and sorted
+        assert np.all(self._shard_starts[1:] == self._shard_ends[:-1]), "Shards must be contiguous"
+        assert np.all(self._shard_starts[:-1] < self._shard_starts[1:]), "Shards must be sorted"
+    
+    def _get_shard_data_impl(self, shard_idx: int) -> np.ndarray:
+        """Load shard data from disk."""
         shard_info = self.shard_index["shards"][shard_idx]
         shard_path = self.shard_dir / shard_info["filename"]
 
         try:
             if self.shard_index.get("compression") == "npz":
                 with np.load(shard_path) as npz_file:
-                    shard_data = npz_file['data'].copy()  # Copy to ensure it's in memory
+                    return npz_file['data'].copy()  # Copy to ensure it's in memory
             else:
-                # Use memory-mapping for efficient read-only access to .npy files
-                shard_data = np.load(shard_path, mmap_mode='r')
+                return np.load(shard_path)
         except Exception as e:
             self.logger.error(f"Failed to load shard {shard_idx} from {shard_path}: {e}")
             raise
-
-        # Evict the least recently used item if the cache is full
-        if len(self._shard_cache) >= self._max_cache_size:
-            # popitem(last=False) removes the first item added (the LRU item)
-            evicted_key, evicted_data = self._shard_cache.popitem(last=False)
-            # For memory-mapped arrays, delete reference to close the file
-            del evicted_data
-            # Force garbage collection for large arrays
-            if self._max_cache_size < 10:
-                gc.collect()
-
-        # Add the newly loaded shard to the cache
-        self._shard_cache[shard_idx] = shard_data
-        
-        return shard_data
     
     def _find_shard_idx(self, global_idx: int) -> Tuple[int, int]:
-        """Find shard index and local index using vectorized search."""
-        # Vectorized search
-        valid_shards = (self._shard_starts <= global_idx) & (global_idx < self._shard_ends)
-        shard_indices = np.where(valid_shards)[0]
+        """Find shard index and local index using binary search."""
+        # Use binary search instead of linear scan
+        shard_idx = np.searchsorted(self._shard_starts, global_idx, side='right') - 1
         
-        if len(shard_indices) == 0:
+        # Validate the result
+        if shard_idx < 0 or shard_idx >= len(self._shard_starts):
             raise IndexError(f"Sample index {global_idx} not found in any shard.")
         
-        shard_idx = shard_indices[0]
         local_idx = global_idx - self._shard_starts[shard_idx]
+        
+        # Double-check the bounds
+        if not (0 <= local_idx < (self._shard_ends[shard_idx] - self._shard_starts[shard_idx])):
+            raise IndexError(f"Sample index {global_idx} not in shard {shard_idx} bounds.")
         
         return shard_idx, local_idx
     
@@ -2305,19 +2667,19 @@ class NPYDataset(Dataset):
         return self.n_total_samples
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get a single sample as a CPU tensor with improved error handling."""
+        """Get a single sample as a CPU tensor."""
         # Validate index
         if idx < 0 or idx >= self.n_total_samples:
             raise IndexError(f"Index {idx} out of range [0, {self.n_total_samples})")
         
         try:
-            # Step 1: Get the true global index from the split-specific indices
+            # Get the true global index from the split-specific indices
             global_idx = self.sample_indices[idx]
 
-            # Step 2: Find the correct shard and local index
+            # Find the correct shard and local index
             shard_idx, local_idx = self._find_shard_idx(global_idx)
             
-            # Step 3: Get the shard data using the LRU cache
+            # Get the shard data using the LRU cache
             shard_data = self._get_shard_data(shard_idx)
 
             # Validate local index
@@ -2329,25 +2691,25 @@ class NPYDataset(Dataset):
             
             row = shard_data[local_idx]
             
-            # Step 4: Extract input and target and convert to tensors
+            # Extract input and target
             n_input = self.n_species + self.n_globals + 1
             input_arr = row[:n_input]
             target_arr = row[n_input:]
             
-            # .copy() is important to avoid PyTorch errors with read-only memory-mapped arrays
+            # .copy() is important to avoid PyTorch errors with numpy arrays
             input_tensor = torch.from_numpy(input_arr.copy())
             target_tensor = torch.from_numpy(target_arr.copy())
             
             return input_tensor, target_tensor
             
         except Exception as e:
-            self.logger.error(f"Error accessing sample {idx} (global {global_idx}): {e}")
+            self.logger.error(f"Error accessing sample {idx} (global {global_idx if 'global_idx' in locals() else 'unknown'}): {e}")
             raise
 
 
 def create_dataloader(dataset: Dataset, config: Dict[str, Any], shuffle: bool = True,
                      device: Optional[torch.device] = None, drop_last: bool = True) -> DataLoader:
-    """Create an optimized standard DataLoader."""
+    """Create an optimized DataLoader."""
     if dataset is None or len(dataset) == 0:
         return None
         
@@ -2360,7 +2722,7 @@ def create_dataloader(dataset: Dataset, config: Dict[str, Any], shuffle: bool = 
     if len(dataset) < batch_size * 10:
         num_workers = min(2, num_workers)  # Reduce workers for small datasets
     
-    # Use pin_memory for faster CPU-to-GPU transfers, handled by the trainer.
+    # Use pin_memory for faster CPU-to-GPU transfers
     pin_memory = train_cfg.get("pin_memory", False) and device and device.type == "cuda"
     
     return DataLoader(
@@ -2371,13 +2733,13 @@ def create_dataloader(dataset: Dataset, config: Dict[str, Any], shuffle: bool = 
         pin_memory=pin_memory,
         persistent_workers=True if num_workers > 0 else False,
         drop_last=drop_last,
-        prefetch_factor=2 if num_workers > 0 else None
+        prefetch_factor=train_cfg.get("prefetch_factor", 2) if num_workers > 0 else None
     )
 
 ===== /Users/imalsky/Desktop/Chemulator/src/data/normalizer.py =====
 #!/usr/bin/env python3
 """
-Data normalization module for chemical kinetics datasets.
+Data normalization module for chemical kinetics datasets with numerical stability fixes.
 """
 
 import logging
@@ -2388,8 +2750,7 @@ import numpy as np
 import torch
 
 
-# Normalization constants
-DEFAULT_EPSILON = 1e-37
+DEFAULT_EPSILON = 1e-20
 DEFAULT_MIN_STD = 1e-10
 DEFAULT_CLAMP = 50.0
 
@@ -2421,7 +2782,6 @@ class DataNormalizer:
             method = self._get_method(var)
             if method == "none":
                 continue
-                
                 
             acc = {
                 "method": method,
@@ -2456,10 +2816,19 @@ class DataNormalizer:
 
             if var in self.global_vars:
                 value = float(data[0, 0, idx])
+                
+                # Verify global is constant across timesteps
+                if not np.allclose(data[0, :, idx], value, rtol=1e-10):
+                    self.logger.warning(f"Global variable {var} is not constant across timesteps")
+                
                 if method in {"log-standard", "log-min-max"}:
+                    if value < self.epsilon:
+                        self.logger.warning(
+                            f"Global variable {var} has value {value:.2e} below epsilon {self.epsilon}"
+                        )
                     value = np.log10(np.maximum(value, self.epsilon))
                 
-                # Treat each profile as one observation, regardless of timesteps, to avoid biasing towards longer profiles
+                # Treat each profile as one observation
                 n_b    = 1  
                 mean_b = value
                 m2_b   = 0.0
@@ -2467,15 +2836,39 @@ class DataNormalizer:
                 acc["min"] = min(acc["min"], value)
                 acc["max"] = max(acc["max"], value)
 
-            # ─ species / time variables – fully vectorised ──────────────────────
+            # Species / time variables – fully vectorised
             else:
                 vec = data[:, :, idx].ravel().astype(np.float64)
-                vec = vec[np.isfinite(vec)]
+                
+                # Filter non-finite values and warn if many
+                finite_mask = np.isfinite(vec)
+                n_non_finite = (~finite_mask).sum()
+                if n_non_finite > 0:
+                    if n_non_finite / vec.size > 0.01:  # More than 1% non-finite
+                        self.logger.warning(
+                            f"Variable {var} has {n_non_finite}/{vec.size} non-finite values"
+                        )
+                    vec = vec[finite_mask]
+                
                 if vec.size == 0:
+                    self.logger.warning(f"Variable {var} has no finite values, skipping")
                     continue
 
                 if method in {"log-standard", "log-min-max"}:
+                    # Check for values below epsilon
+                    below_epsilon = vec < self.epsilon
+                    if below_epsilon.any():
+                        self.logger.warning(
+                            f"Variable {var} has {below_epsilon.sum()} values below epsilon {self.epsilon}. "
+                            f"Min value: {vec.min():.2e}"
+                        )
                     vec = np.log10(np.maximum(vec, self.epsilon))
+                    
+                    # Check for extreme log values
+                    if vec.min() < -30 or vec.max() > 30:
+                        self.logger.warning(
+                            f"Variable {var} has extreme log values: [{vec.min():.1f}, {vec.max():.1f}]"
+                        )
 
                 n_b    = vec.size
                 mean_b = float(vec.mean())
@@ -2484,7 +2877,7 @@ class DataNormalizer:
                 acc["min"] = min(acc["min"], float(vec.min()))
                 acc["max"] = max(acc["max"], float(vec.max()))
 
-            # ─ Chan’s parallel mean/variance update ─────────────────────────────
+            # Chan's parallel mean/variance update
             n_a  = acc["count"]
             delta = mean_b - acc["mean"]
             n_ab  = n_a + n_b
@@ -2525,6 +2918,12 @@ class DataNormalizer:
                 var_stats["log_mean"] = acc["mean"]
                 var_stats["log_std"] = std
                 
+            elif method == "min-max":
+                var_stats["min"] = acc["min"]
+                var_stats["max"] = acc["max"]
+                if acc["max"] - acc["min"] < self.epsilon:
+                    var_stats["max"] = acc["min"] + 1.0
+                    
             elif method == "log-min-max":
                 var_stats["min"] = acc["min"]
                 var_stats["max"] = acc["max"]
@@ -2545,7 +2944,7 @@ class DataNormalizer:
 
 
 class NormalizationHelper:
-    """Normalization helper for use during preprocessing."""
+    """Normalization helper for use during preprocessing and inference."""
     
     def __init__(self, stats: Dict[str, Any], device: torch.device, 
                  species_vars: List[str], global_vars: List[str], 
@@ -2563,6 +2962,9 @@ class NormalizationHelper:
 
         self.epsilon = stats.get("epsilon", DEFAULT_EPSILON)
         self.clamp_value = stats.get("clamp_value", DEFAULT_CLAMP)
+        
+        # Ratio mode statistics if available
+        self.ratio_stats = stats.get("ratio_stats", None)
 
         self.logger = logging.getLogger(__name__)
 
@@ -2577,6 +2979,7 @@ class NormalizationHelper:
         self.method_groups = {
             "standard": [],
             "log-standard": [],
+            "min-max": [],
             "log-min-max": [],
             "none": []
         }
@@ -2598,6 +3001,10 @@ class NormalizationHelper:
                 params["log_mean"] = torch.tensor(var_stats["log_mean"], dtype=torch.float32, device=self.device)
                 params["log_std"] = torch.tensor(var_stats["log_std"], dtype=torch.float32, device=self.device)
 
+            elif method == "min-max":
+                params["min"] = torch.tensor(var_stats["min"], dtype=torch.float32, device=self.device)
+                params["max"] = torch.tensor(var_stats["max"], dtype=torch.float32, device=self.device)
+                
             elif method == "log-min-max":
                 params["min"] = torch.tensor(var_stats["min"], dtype=torch.float32, device=self.device)
                 params["max"] = torch.tensor(var_stats["max"], dtype=torch.float32, device=self.device)
@@ -2651,6 +3058,13 @@ class NormalizationHelper:
                     -self.clamp_value, self.clamp_value
                 )
 
+            elif method == "min-max":
+                mins = torch.stack([self.norm_params[var]["min"] for var in self.method_groups[method]])
+                maxs = torch.stack([self.norm_params[var]["max"] for var in self.method_groups[method]])
+                ranges = maxs - mins
+                ranges = torch.clamp(ranges, min=self.epsilon)
+                normalized[:, col_idxs] = torch.clamp((cols - mins) / ranges, 0.0, 1.0)
+                
             elif method == "log-min-max":
                 mins = torch.stack([self.norm_params[var]["min"] for var in self.method_groups[method]])
                 maxs = torch.stack([self.norm_params[var]["max"] for var in self.method_groups[method]])
@@ -2686,6 +3100,13 @@ class NormalizationHelper:
                 log_data = torch.clamp(log_data, min=-38.0, max=38.0)
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
+            elif method == "min-max":
+                mins = torch.stack([self.norm_params[var]["min"] for var in self.method_groups[method]])
+                maxs = torch.stack([self.norm_params[var]["max"] for var in self.method_groups[method]])
+                ranges = maxs - mins
+                ranges = torch.clamp(ranges, min=self.epsilon)
+                denormalized[:, col_idxs] = cols * ranges + mins
+                
             elif method == "log-min-max":
                 mins = torch.stack([self.norm_params[var]["min"] for var in self.method_groups[method]])
                 maxs = torch.stack([self.norm_params[var]["max"] for var in self.method_groups[method]])
@@ -2696,4 +3117,32 @@ class NormalizationHelper:
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
         return denormalized
+    
+    def denormalize_ratio_predictions(self, standardized_log_ratios: torch.Tensor,
+                                        initial_species: torch.Tensor) -> torch.Tensor:
+            """Convert standardized log-ratio predictions back to species values."""
+            if self.ratio_stats is None:
+                raise ValueError("Ratio statistics not available for denormalization")
+
+            # Ensure tensors are on the correct device
+            device = standardized_log_ratios.device
+            initial_species = initial_species.to(device)
+
+            # Create tensors for per-species mean and std from the dictionary of stats
+            species_vars = self.species_vars
+            ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in species_vars], device=device, dtype=torch.float32)
+            ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in species_vars], device=device, dtype=torch.float32)
+
+            # Denormalize the standardized log-ratios (reverse the standardization)
+            # Broadcasting handles the [batch_size, n_species] shape
+            log_ratios = (standardized_log_ratios * ratio_stds) + ratio_means
+
+            # Convert log-ratios back to ratios (10^x)
+            ratios = torch.pow(10.0, log_ratios)
+
+            # Apply ratios to initial conditions to get the final predicted species values
+            # Note: initial_species must be in original (non-normalized) scale
+            predicted_species = initial_species * ratios
+
+            return predicted_species
 
