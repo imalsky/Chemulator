@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
 Simplified utility functions for the chemical kinetics pipeline.
-- Removed excessive validation
-- Simplified configuration loading
-- Focused on essential utilities
 """
 
 import json

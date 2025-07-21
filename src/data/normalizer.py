@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Data normalization module for chemical kinetics datasets.
+Data normalization module for chemical kinetics datasets with numerical stability fixes.
 """
 
 import logging
@@ -11,8 +11,7 @@ import numpy as np
 import torch
 
 
-# Normalization constants
-DEFAULT_EPSILON = 1e-37
+DEFAULT_EPSILON = 1e-20
 DEFAULT_MIN_STD = 1e-10
 DEFAULT_CLAMP = 50.0
 
@@ -44,7 +43,6 @@ class DataNormalizer:
             method = self._get_method(var)
             if method == "none":
                 continue
-                
                 
             acc = {
                 "method": method,
@@ -79,10 +77,19 @@ class DataNormalizer:
 
             if var in self.global_vars:
                 value = float(data[0, 0, idx])
+                
+                # Verify global is constant across timesteps
+                if not np.allclose(data[0, :, idx], value, rtol=1e-10):
+                    raise ValueError(f"Global variable {var} is not constant across timesteps")
+                
                 if method in {"log-standard", "log-min-max"}:
+                    if value < self.epsilon:
+                        self.logger.warning(
+                            f"Global variable {var} has value {value:.2e} below epsilon {self.epsilon}"
+                        )
                     value = np.log10(np.maximum(value, self.epsilon))
                 
-                # Treat each profile as one observation, regardless of timesteps, to avoid biasing towards longer profiles
+                # Treat each profile as one observation
                 n_b    = 1  
                 mean_b = value
                 m2_b   = 0.0
@@ -90,15 +97,39 @@ class DataNormalizer:
                 acc["min"] = min(acc["min"], value)
                 acc["max"] = max(acc["max"], value)
 
-            # ─ species / time variables – fully vectorised ──────────────────────
+            # Species / time variables – fully vectorised
             else:
                 vec = data[:, :, idx].ravel().astype(np.float64)
-                vec = vec[np.isfinite(vec)]
+                
+                # Filter non-finite values and warn if many
+                finite_mask = np.isfinite(vec)
+                n_non_finite = (~finite_mask).sum()
+                if n_non_finite > 0:
+                    if n_non_finite / vec.size > 0.01:  # More than 1% non-finite
+                        self.logger.warning(
+                            f"Variable {var} has {n_non_finite}/{vec.size} non-finite values"
+                        )
+                    vec = vec[finite_mask]
+                
                 if vec.size == 0:
+                    self.logger.warning(f"Variable {var} has no finite values, skipping")
                     continue
 
                 if method in {"log-standard", "log-min-max"}:
+                    # Check for values below epsilon
+                    below_epsilon = vec < self.epsilon
+                    if below_epsilon.any():
+                        self.logger.warning(
+                            f"Variable {var} has {below_epsilon.sum()} values below epsilon {self.epsilon}. "
+                            f"Min value: {vec.min():.2e}"
+                        )
                     vec = np.log10(np.maximum(vec, self.epsilon))
+                    
+                    # Check for extreme log values
+                    if vec.min() < -30 or vec.max() > 30:
+                        self.logger.warning(
+                            f"Variable {var} has extreme log values: [{vec.min():.1f}, {vec.max():.1f}]"
+                        )
 
                 n_b    = vec.size
                 mean_b = float(vec.mean())
@@ -107,7 +138,7 @@ class DataNormalizer:
                 acc["min"] = min(acc["min"], float(vec.min()))
                 acc["max"] = max(acc["max"], float(vec.max()))
 
-            # ─ Chan’s parallel mean/variance update ─────────────────────────────
+            # Chan's parallel mean/variance update
             n_a  = acc["count"]
             delta = mean_b - acc["mean"]
             n_ab  = n_a + n_b
@@ -148,6 +179,12 @@ class DataNormalizer:
                 var_stats["log_mean"] = acc["mean"]
                 var_stats["log_std"] = std
                 
+            elif method == "min-max":
+                var_stats["min"] = acc["min"]
+                var_stats["max"] = acc["max"]
+                if acc["max"] - acc["min"] < self.epsilon:
+                    var_stats["max"] = acc["min"] + 1.0
+                    
             elif method == "log-min-max":
                 var_stats["min"] = acc["min"]
                 var_stats["max"] = acc["max"]
@@ -168,7 +205,7 @@ class DataNormalizer:
 
 
 class NormalizationHelper:
-    """Normalization helper for use during preprocessing."""
+    """Normalization helper for use during preprocessing and inference."""
     
     def __init__(self, stats: Dict[str, Any], device: torch.device, 
                  species_vars: List[str], global_vars: List[str], 
@@ -186,6 +223,9 @@ class NormalizationHelper:
 
         self.epsilon = stats.get("epsilon", DEFAULT_EPSILON)
         self.clamp_value = stats.get("clamp_value", DEFAULT_CLAMP)
+        
+        # Ratio mode statistics if available
+        self.ratio_stats = stats.get("ratio_stats", None)
 
         self.logger = logging.getLogger(__name__)
 
@@ -200,6 +240,7 @@ class NormalizationHelper:
         self.method_groups = {
             "standard": [],
             "log-standard": [],
+            "min-max": [],
             "log-min-max": [],
             "none": []
         }
@@ -221,6 +262,10 @@ class NormalizationHelper:
                 params["log_mean"] = torch.tensor(var_stats["log_mean"], dtype=torch.float32, device=self.device)
                 params["log_std"] = torch.tensor(var_stats["log_std"], dtype=torch.float32, device=self.device)
 
+            elif method == "min-max":
+                params["min"] = torch.tensor(var_stats["min"], dtype=torch.float32, device=self.device)
+                params["max"] = torch.tensor(var_stats["max"], dtype=torch.float32, device=self.device)
+                
             elif method == "log-min-max":
                 params["min"] = torch.tensor(var_stats["min"], dtype=torch.float32, device=self.device)
                 params["max"] = torch.tensor(var_stats["max"], dtype=torch.float32, device=self.device)
@@ -274,6 +319,13 @@ class NormalizationHelper:
                     -self.clamp_value, self.clamp_value
                 )
 
+            elif method == "min-max":
+                mins = torch.stack([self.norm_params[var]["min"] for var in self.method_groups[method]])
+                maxs = torch.stack([self.norm_params[var]["max"] for var in self.method_groups[method]])
+                ranges = maxs - mins
+                ranges = torch.clamp(ranges, min=self.epsilon)
+                normalized[:, col_idxs] = torch.clamp((cols - mins) / ranges, 0.0, 1.0)
+                
             elif method == "log-min-max":
                 mins = torch.stack([self.norm_params[var]["min"] for var in self.method_groups[method]])
                 maxs = torch.stack([self.norm_params[var]["max"] for var in self.method_groups[method]])
@@ -309,6 +361,13 @@ class NormalizationHelper:
                 log_data = torch.clamp(log_data, min=-38.0, max=38.0)
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
+            elif method == "min-max":
+                mins = torch.stack([self.norm_params[var]["min"] for var in self.method_groups[method]])
+                maxs = torch.stack([self.norm_params[var]["max"] for var in self.method_groups[method]])
+                ranges = maxs - mins
+                ranges = torch.clamp(ranges, min=self.epsilon)
+                denormalized[:, col_idxs] = cols * ranges + mins
+                
             elif method == "log-min-max":
                 mins = torch.stack([self.norm_params[var]["min"] for var in self.method_groups[method]])
                 maxs = torch.stack([self.norm_params[var]["max"] for var in self.method_groups[method]])
@@ -319,3 +378,31 @@ class NormalizationHelper:
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
         return denormalized
+    
+    def denormalize_ratio_predictions(self, standardized_log_ratios: torch.Tensor,
+                                        initial_species: torch.Tensor) -> torch.Tensor:
+            """Convert standardized log-ratio predictions back to species values."""
+            if self.ratio_stats is None:
+                raise ValueError("Ratio statistics not available for denormalization")
+
+            # Ensure tensors are on the correct device
+            device = standardized_log_ratios.device
+            initial_species = initial_species.to(device)
+
+            # Create tensors for per-species mean and std from the dictionary of stats
+            species_vars = self.species_vars
+            ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in species_vars], device=device, dtype=torch.float32)
+            ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in species_vars], device=device, dtype=torch.float32)
+
+            # Denormalize the standardized log-ratios (reverse the standardization)
+            # Broadcasting handles the [batch_size, n_species] shape
+            log_ratios = (standardized_log_ratios * ratio_stds) + ratio_means
+
+            # Convert log-ratios back to ratios (10^x)
+            ratios = torch.pow(10.0, log_ratios)
+
+            # Apply ratios to initial conditions to get the final predicted species values
+            # Note: initial_species must be in original (non-normalized) scale
+            predicted_species = initial_species * ratios
+
+            return predicted_species

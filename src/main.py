@@ -3,6 +3,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+import shutil
 
 import numpy as np
 
@@ -14,6 +15,7 @@ from models.model import create_model
 from training.trainer import Trainer
 import hashlib
 import json
+from data.normalizer import NormalizationHelper
 
 
 class ChemicalKineticsPipeline:
@@ -57,6 +59,36 @@ class ChemicalKineticsPipeline:
         # Create directories
         ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
 
+    def _clean_old_shards(self):
+        """Remove old shard files from the processed directory."""
+        self.logger.info("Cleaning old shard files...")
+        
+        # Remove all .npy and .npz shard files
+        shard_patterns = ["shard_*.npy", "shard_*.npz"]
+        removed_count = 0
+        
+        for pattern in shard_patterns:
+            for shard_file in self.processed_dir.glob(pattern):
+                try:
+                    shard_file.unlink()
+                    removed_count += 1
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove {shard_file}: {e}")
+        
+        if removed_count > 0:
+            self.logger.info(f"Removed {removed_count} old shard files")
+        
+        # Also remove old index files to ensure clean state
+        old_files = ["normalization.json", "shard_index.json", 
+                     "train_indices.npy", "val_indices.npy", "test_indices.npy"]
+        for filename in old_files:
+            filepath = self.processed_dir / filename
+            if filepath.exists():
+                try:
+                    filepath.unlink()
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove {filepath}: {e}")
+
     def preprocess_data(self):
         """Pre-process raw files to normalized NPY shards."""
         # Check if already processed
@@ -66,21 +98,28 @@ class ChemicalKineticsPipeline:
             self.processed_dir / "train_indices.npy",
             self.processed_dir / "val_indices.npy",
             self.processed_dir / "test_indices.npy",
-            self.processed_dir / "config_hash.json"  # New: Hash file for validation
+            self.processed_dir / "config_hash.json"
         ]
         
-        # Compute hash of relevant config sections
+        raw_files_info = {
+            "files": [str(f) for f in self.raw_data_files],
+            "sizes": [f.stat().st_size if f.exists() else 0 for f in self.raw_data_files],
+            "mtimes": [f.stat().st_mtime if f.exists() else 0 for f in self.raw_data_files]
+        }
+        
         relevant_config = {
             "data": self.config["data"],
             "preprocessing": self.config["preprocessing"],
             "normalization": self.config["normalization"],
+            "prediction": self.config["prediction"],
             "training": {
                 "val_fraction": self.config["training"]["val_fraction"],
                 "test_fraction": self.config["training"]["test_fraction"],
                 "use_fraction": self.config["training"]["use_fraction"]
-            }
+            },
+            "raw_files": raw_files_info
         }
-        config_str = json.dumps(relevant_config, sort_keys=True)
+        config_str = json.dumps(relevant_config, sort_keys=True, default=lambda x: f"{x:.20e}" if isinstance(x, float) else x)
         current_hash = hashlib.sha256(config_str.encode('utf-8')).hexdigest()
         
         if all(f.exists() for f in required_files):
@@ -91,8 +130,13 @@ class ChemicalKineticsPipeline:
                 return
             else:
                 self.logger.info("Config has changed; regenerating preprocessed data")
+                # Clean old shards before regenerating
+                self._clean_old_shards()
         else:
             self.logger.info("Preprocessed data missing; generating new data")
+            # Ensure directory is clean for first-time processing
+            if self.processed_dir.exists() and any(self.processed_dir.glob("shard_*.n*")):
+                self._clean_old_shards()
         
         # Check raw files exist
         missing = [p for p in self.raw_data_files if not p.exists()]
@@ -109,28 +153,45 @@ class ChemicalKineticsPipeline:
         
         split_indices = preprocessor.process_to_npy_shards()
         
-        # Save the new hash after successful processing
+        # Save the new hash
         save_json({"hash": current_hash}, self.processed_dir / "config_hash.json")
         
         # Verify we have data
         total_samples = sum(len(indices) for indices in split_indices.values())
         if total_samples == 0:
             raise ValueError("No valid data processed from raw files")
-
+            
     def train_model(self):
-        """Train the neural network model."""
+        """Train the neural network model with data loader cache warm-up."""
         self.logger.info("Starting model training...")
-        
+
+        # Enforce mode-model compatibility before proceeding
+        prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
+        model_type = self.config["model"]["type"]
+        if prediction_mode == "ratio" and model_type != "deeponet":
+            raise ValueError(f"Prediction mode 'ratio' is only compatible with model type 'deeponet', but '{model_type}' was specified.")
+
         # Save config for this run
         save_json(self.config, self.run_save_dir / "config.json")
-        
+
         # Create model
         model = create_model(self.config, self.device)
-        
+
         # Log model info
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.logger.info(f"Model: {self.config['model']['type']} - Parameters: {total_params:,}")
-        
+
+        # Load normalization stats and create helper
+        norm_stats = load_json(self.processed_dir / "normalization.json")
+        norm_helper = NormalizationHelper(
+            norm_stats,
+            self.device,
+            self.config["data"]["species_variables"],
+            self.config["data"]["global_variables"],
+            self.config["data"]["time_variable"],
+            self.config
+        )
+
         # Create datasets
         train_indices = np.load(self.processed_dir / "train_indices.npy")
         train_dataset = NPYDataset(
@@ -159,7 +220,7 @@ class ChemicalKineticsPipeline:
             split_name="test"
         ) if len(test_indices) > 0 else None
         
-        # Initialize trainer
+        # Initialize trainer with norm_helper
         trainer = Trainer(
             model=model,
             train_dataset=train_dataset,
@@ -167,9 +228,16 @@ class ChemicalKineticsPipeline:
             test_dataset=test_dataset,
             config=self.config,
             save_dir=self.run_save_dir,
-            device=self.device
+            device=self.device,
+            norm_helper=norm_helper
         )
-        
+        if trainer.train_loader and trainer.train_loader.num_workers > 0:
+            self.logger.info(f"Warming up data loader cache with {trainer.train_loader.num_workers} workers...")
+            start_warmup = time.time()
+            for _ in trainer.train_loader:
+                break # Iterating once is enough to trigger a parallel read.
+            self.logger.info(f"Cache warmup complete in {time.time() - start_warmup:.2f}s.")
+
         # Train model
         best_val_loss = trainer.train()
         
@@ -259,7 +327,7 @@ def main():
         
         # Print results
         print("\n" + "="*60)
-        print("OPTIMIZATION COMPLETE")
+        print("Optimization Complete")
         print("="*60)
         print(f"Best validation loss: {study.best_value:.6f}")
         print(f"Best trial: {study.best_trial.number}")
