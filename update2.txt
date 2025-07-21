@@ -5,15 +5,15 @@
         // Raw HDF5 data files to process
         "raw_data_files": [
             "data/raw/run8001-result.h5",
-            "data/raw/run8002-result.h5",
-            "data/raw/run8003-result.h5",
-            "data/raw/run8004-result.h5",
-            "data/raw/run8005-result.h5",
-            "data/raw/run8006-result.h5",
-            "data/raw/run8007-result.h5",
-            "data/raw/run8008-result.h5",
-            "data/raw/run8009-result.h5",
-            "data/raw/run8010-result.h5"
+            //"data/raw/run8002-result.h5",
+            //"data/raw/run8003-result.h5",
+            //"data/raw/run8004-result.h5",
+            //"data/raw/run8005-result.h5",
+            //"data/raw/run8006-result.h5",
+            //"data/raw/run8007-result.h5",
+            //"data/raw/run8008-result.h5",
+            //"data/raw/run8009-result.h5",
+            //"data/raw/run8010-result.h5"
         ],
         // Directory for processed NPY shards
         "processed_data_dir": "data/processed",
@@ -52,7 +52,7 @@
         "shard_size": 50000000,
         // Minimum species concentration threshold
         "min_species_threshold": 1e-25,
-        // Compression type: null, "npz"
+        // Compression type: null for raw npz files
         "compression": null,
         // Number of parallel workers for preprocessing
         "num_workers": 16,
@@ -188,7 +188,7 @@
         "empty_cache_interval": 1000,  // Clear GPU cache every N steps
         
         // Hyperparameter optimization settings
-        "hpo_epochs": 50  // Reduced epochs for HPO trials
+        "hpo_epochs": 20  // Reduced epochs for HPO trials
     },
     
     // ===== SYSTEM/HARDWARE SETTINGS =====
@@ -226,6 +226,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+import shutil
 
 import numpy as np
 
@@ -281,6 +282,36 @@ class ChemicalKineticsPipeline:
         # Create directories
         ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
 
+    def _clean_old_shards(self):
+        """Remove old shard files from the processed directory."""
+        self.logger.info("Cleaning old shard files...")
+        
+        # Remove all .npy and .npz shard files
+        shard_patterns = ["shard_*.npy", "shard_*.npz"]
+        removed_count = 0
+        
+        for pattern in shard_patterns:
+            for shard_file in self.processed_dir.glob(pattern):
+                try:
+                    shard_file.unlink()
+                    removed_count += 1
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove {shard_file}: {e}")
+        
+        if removed_count > 0:
+            self.logger.info(f"Removed {removed_count} old shard files")
+        
+        # Also remove old index files to ensure clean state
+        old_files = ["normalization.json", "shard_index.json", 
+                     "train_indices.npy", "val_indices.npy", "test_indices.npy"]
+        for filename in old_files:
+            filepath = self.processed_dir / filename
+            if filepath.exists():
+                try:
+                    filepath.unlink()
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove {filepath}: {e}")
+
     def preprocess_data(self):
         """Pre-process raw files to normalized NPY shards."""
         # Check if already processed
@@ -311,7 +342,7 @@ class ChemicalKineticsPipeline:
             },
             "raw_files": raw_files_info
         }
-        config_str = json.dumps(relevant_config, sort_keys=True)
+        config_str = json.dumps(relevant_config, sort_keys=True, default=lambda x: f"{x:.20e}" if isinstance(x, float) else x)
         current_hash = hashlib.sha256(config_str.encode('utf-8')).hexdigest()
         
         if all(f.exists() for f in required_files):
@@ -322,8 +353,13 @@ class ChemicalKineticsPipeline:
                 return
             else:
                 self.logger.info("Config has changed; regenerating preprocessed data")
+                # Clean old shards before regenerating
+                self._clean_old_shards()
         else:
             self.logger.info("Preprocessed data missing; generating new data")
+            # Ensure directory is clean for first-time processing
+            if self.processed_dir.exists() and any(self.processed_dir.glob("shard_*.n*")):
+                self._clean_old_shards()
         
         # Check raw files exist
         missing = [p for p in self.raw_data_files if not p.exists()]
@@ -541,21 +577,22 @@ if __name__ == "__main__":
 #!/usr/bin/env python3
 """
 Hyperparameter tuning for chemical kinetics models using Optuna.
-This version correctly handles and explores multiple prediction modes ('absolute', 'ratio').
+This version includes fixes for:
+1. Effective pruning during training via callbacks.
+2. Robust reconstruction of the best trial's configuration for saving.
 """
 
 import copy
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 
 import numpy as np
 import optuna
 from optuna.samplers import TPESampler
 import torch
 
-# Correctly import from other modules in the project
 from main import ChemicalKineticsPipeline
 from utils.hardware import setup_device, optimize_hardware
 from data.dataset import NPYDataset
@@ -565,18 +602,38 @@ from data.normalizer import NormalizationHelper
 from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
 
 
+class OptunaPruningCallback:
+    """Callback to report intermediate values to Optuna for pruning."""
+    def __init__(self, trial: optuna.Trial):
+        self.trial = trial
+        
+    def __call__(self, epoch: int, val_loss: float) -> bool:
+        """
+        Report intermediate value to Optuna and check if should prune.
+        
+        Args:
+            epoch: Current epoch number.
+            val_loss: Validation loss for this epoch.
+            
+        Returns:
+            True if the trial should be pruned, False otherwise.
+        """
+        self.trial.report(val_loss, epoch)
+        
+        if self.trial.should_prune():
+            return True
+        return False
+
+
 class OptunaTrialRunner:
-    """
-    Manages the execution of a single Optuna trial, ensuring that the correct
-    preprocessed data is used for the chosen prediction mode.
-    """
+    """Manages the execution of a single Optuna trial."""
     def __init__(self, base_config_path: Path, mode_to_dir: Dict[str, Path]):
         self.base_config_path = base_config_path
         self.base_config = load_json_config(base_config_path)
         self.device = setup_device()
         self.logger = logging.getLogger(__name__)
-        self.mode_to_dir = mode_to_dir  # Precomputed mode directories
-        self._pipelines = {}  # Instance-level now, since preprocessing is done upfront
+        self.mode_to_dir = mode_to_dir
+        self._pipelines = {}
 
     def _get_pipeline_for_mode(self, mode: str) -> 'OptunaPipeline':
         if mode not in self._pipelines:
@@ -588,25 +645,15 @@ class OptunaTrialRunner:
         return self._pipelines[mode]
 
     def run_trial(self, trial: optuna.Trial) -> float:
-        """
-        Configures and runs a single trial, selecting the correct pipeline.
-        """
-        # First, suggest the core configuration for the trial.
+        """Configures and runs a single trial."""
         config = suggest_model_config(trial, self.base_config)
         prediction_mode = config["prediction"]["mode"]
-        
-        # Get the appropriate pipeline (and its preprocessed data).
         pipeline = self._get_pipeline_for_mode(prediction_mode)
-        
-        # Now, execute the trial using the selected pipeline.
         return pipeline.execute_trial(config, trial)
 
 
 class OptunaPipeline:
-    """
-    Holds pre-loaded datasets and executes the training for a specific prediction mode.
-    Instances of this class are shared across trials of the same mode.
-    """
+    """Holds datasets and executes the training for a specific prediction mode."""
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.device = setup_device()
@@ -615,41 +662,32 @@ class OptunaPipeline:
         self.processed_dir = Path(self.config["paths"]["processed_data_dir"])
         self.model_save_root = Path(self.config["paths"]["model_save_dir"])
         
-        # Load normalization stats and create the helper for this data mode
         norm_stats_path = self.processed_dir / "normalization.json"
         if not norm_stats_path.exists():
             raise FileNotFoundError(f"Normalization stats not found in {norm_stats_path}")
         norm_stats = load_json(norm_stats_path)
         
         self.norm_helper = NormalizationHelper(
-            stats=norm_stats,
-            device=self.device,
+            stats=norm_stats, device=self.device,
             species_vars=self.config["data"]["species_variables"],
             global_vars=self.config["data"]["global_variables"],
             time_var=self.config["data"]["time_variable"],
             config=self.config
         )
-        
         self._load_datasets()
 
     def _load_datasets(self):
         """Loads datasets from the mode-specific directory."""
         self.logger.info(f"Loading datasets from: {self.processed_dir}")
-        train_indices_path = self.processed_dir / "train_indices.npy"
-        val_indices_path = self.processed_dir / "val_indices.npy"
-        
-        if not train_indices_path.exists() or not val_indices_path.exists():
-             raise FileNotFoundError(f"Train/validation index files not found in {self.processed_dir}")
-
-        train_indices = np.load(train_indices_path)
-        val_indices = np.load(val_indices_path)
+        train_indices = np.load(self.processed_dir / "train_indices.npy")
+        val_indices = np.load(self.processed_dir / "val_indices.npy")
         
         self.train_dataset = NPYDataset(self.processed_dir, train_indices, self.config, self.device, "train")
         self.val_dataset = NPYDataset(self.processed_dir, val_indices, self.config, self.device, "validation")
         self.logger.info(f"Datasets loaded: train={len(self.train_dataset)}, val={len(self.val_dataset)}")
 
     def execute_trial(self, config: Dict[str, Any], trial: optuna.Trial) -> float:
-        """Runs a single trial's training and evaluation logic."""
+        """Runs a single trial's training and evaluation with pruning."""
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         trial_id = f"trial_{trial.number:04d}_{config['prediction']['mode']}"
         save_dir = self.model_save_root / "optuna" / f"{timestamp}_{trial_id}"
@@ -660,29 +698,23 @@ class OptunaPipeline:
             optimize_hardware(config["system"], self.device)
             model = create_model(config, self.device)
             
-            trainer = Trainer(
-                model=model,
-                train_dataset=self.train_dataset,
-                val_dataset=self.val_dataset,
-                test_dataset=None,  # No need for test set during HPO
-                config=config,
-                save_dir=save_dir,
-                device=self.device,
-                norm_helper=self.norm_helper  # Pass the correct helper
+            pruning_callback = OptunaPruningCallback(trial)
+            
+            trainer = PrunableTrainer(
+                model=model, train_dataset=self.train_dataset,
+                val_dataset=self.val_dataset, test_dataset=None,
+                config=config, save_dir=save_dir, device=self.device,
+                norm_helper=self.norm_helper, epoch_callback=pruning_callback
             )
 
-            # Cap epochs for faster HPO
-            config["training"]["epochs"] = min(config["training"].get("hpo_epochs", 50), config["training"]["epochs"])
+            config["training"]["epochs"] = min(
+                config["training"].get("hpo_epochs", 50), config["training"]["epochs"]
+            )
             
             best_val_loss = trainer.train()
 
             trial.set_user_attr("full_config", config)
             save_json(config, save_dir / "config.json")
-            
-            for epoch_data in trainer.training_history["epochs"]:
-                trial.report(epoch_data["val_loss"], epoch_data["epoch"])
-                if trial.should_prune():
-                    raise optuna.TrialPruned()
             
             return best_val_loss
             
@@ -691,105 +723,193 @@ class OptunaPipeline:
             raise
         except Exception as e:
             self.logger.error(f"Trial {trial.number} failed: {e}", exc_info=True)
-            return float("inf") # Return a high loss value for failed trials
+            return float("inf")
         finally:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
+
+
+class PrunableTrainer(Trainer):
+    """Extended Trainer that supports epoch callbacks for Optuna pruning."""
+    def __init__(self, *args, epoch_callback: Optional[Callable[[int, float], bool]] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.epoch_callback = epoch_callback
+        
+    def _run_training_loop(self):
+        """Main training loop with pruning support."""
+        best_train_loss = float("inf")
+        
+        for epoch in range(1, self.train_config["epochs"] + 1):
+            self.current_epoch = epoch
+            epoch_start = time.time()
+            train_loss, train_metrics = self._train_epoch()
+            val_loss, val_metrics = self._validate()
+
+            if self.scheduler and not self.scheduler_step_on_batch:
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau) and self.has_validation:
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+
+            epoch_time = time.time() - epoch_start
+            self.total_training_time += epoch_time
+            self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
+
+            if self.epoch_callback and self.has_validation:
+                if self.epoch_callback(epoch, val_loss):
+                    raise optuna.TrialPruned()
+
+            if self.has_validation:
+                if val_loss < (self.best_val_loss - self.min_delta):
+                    self.best_val_loss = val_loss
+                    self.best_epoch = epoch
+                    self.patience_counter = 0
+                    self._save_best_model()
+                else:
+                    self.patience_counter += 1
+
+                if self.patience_counter >= self.early_stopping_patience:
+                    self.logger.info(f"Early stopping triggered at epoch {epoch}")
+                    break
+            else:
+                # No validation set: save based on best training loss
+                if train_loss < (best_train_loss - self.min_delta):
+                    best_train_loss = train_loss
+                    self.best_val_loss = train_loss
+                    self.best_epoch = epoch
+                    self._save_best_model()
 
 
 def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[str, Any]:
     """Suggests a valid model and training configuration for a trial."""
     config = copy.deepcopy(base_config)
 
-    # 1. Choose prediction mode first, as it constrains model choice.
     prediction_mode = trial.suggest_categorical("prediction_mode", ["absolute", "ratio"])
     config["prediction"]["mode"] = prediction_mode
 
-    # 2. Choose model type based on prediction mode.
     if prediction_mode == "ratio":
-        # Ratio mode is only implemented for DeepONet.
         model_type = "deeponet"
-    else: # absolute mode
-        # Absolute mode works with both SIREN and DeepONet.
+    else:
         model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
     config["model"]["type"] = model_type
     
-    # 3. Suggest common and model-specific parameters.
     config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu"])
     config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
     config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [1024, 2048, 4096, 8192])
 
     if model_type == "deeponet":
         n_branch = trial.suggest_int("n_branch_layers", 2, 5)
-        config["model"]["branch_layers"] = [
-            trial.suggest_int(f"branch_layer_{i}", 64, 512, step=64) for i in range(n_branch)
-        ]
+        config["model"]["branch_layers"] = [trial.suggest_int(f"branch_layer_{i}", 64, 512, step=64) for i in range(n_branch)]
         n_trunk = trial.suggest_int("n_trunk_layers", 2, 4)
-        config["model"]["trunk_layers"] = [
-            trial.suggest_int(f"trunk_layer_{i}", 64, 256, step=32) for i in range(n_trunk)
-        ]
+        config["model"]["trunk_layers"] = [trial.suggest_int(f"trunk_layer_{i}", 64, 256, step=32) for i in range(n_trunk)]
         config["model"]["basis_dim"] = trial.suggest_categorical("basis_dim", [64, 128, 256])
     else:  # SIREN
         n_layers = trial.suggest_int("n_hidden_layers", 3, 7)
-        config["model"]["hidden_dims"] = [
-            trial.suggest_int(f"hidden_dim_{i}", 128, 512, step=64) for i in range(n_layers)
-        ]
+        config["model"]["hidden_dims"] = [trial.suggest_int(f"hidden_dim_{i}", 128, 512, step=64) for i in range(n_layers)]
         config["model"]["omega_0"] = trial.suggest_float("omega_0", 20.0, 40.0)
 
-    # 4. Suggest FiLM layer configuration.
     if trial.suggest_categorical("use_film", [True, False]):
         config["film"]["enabled"] = True
         n_film = trial.suggest_int("film_n_layers", 1, 3)
-        config["film"]["hidden_dims"] = [
-            trial.suggest_int(f"film_layer_{i}", 64, 256, step=32) for i in range(n_film)
-        ]
+        config["film"]["hidden_dims"] = [trial.suggest_int(f"film_layer_{i}", 64, 256, step=32) for i in range(n_film)]
     else:
         config["film"]["enabled"] = False
 
     return config
 
 
+def _reconstruct_config_from_params(base_config: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Reconstructs the full config dictionary from a flat dictionary of Optuna parameters.
+    This serves as a robust fallback for saving the best trial's configuration.
+    """
+    config = copy.deepcopy(base_config)
+    
+    # Simple direct mappings
+    config["prediction"]["mode"] = params.get("prediction_mode", config["prediction"]["mode"])
+    config["model"]["type"] = params.get("model_type", config["model"]["type"])
+    config["model"]["activation"] = params.get("activation", config["model"]["activation"])
+    config["training"]["learning_rate"] = params.get("lr", config["training"]["learning_rate"])
+    config["training"]["batch_size"] = params.get("batch_size", config["training"]["batch_size"])
+    config["film"]["enabled"] = params.get("use_film", config["film"]["enabled"])
+
+    # Conditional logic for model type
+    if config["prediction"]["mode"] == "ratio":
+        config["model"]["type"] = "deeponet"
+
+    # DeepONet specific parameters
+    if config["model"]["type"] == "deeponet":
+        if "n_branch_layers" in params:
+            n = params["n_branch_layers"]
+            config["model"]["branch_layers"] = [params[f"branch_layer_{i}"] for i in range(n)]
+        if "n_trunk_layers" in params:
+            n = params["n_trunk_layers"]
+            config["model"]["trunk_layers"] = [params[f"trunk_layer_{i}"] for i in range(n)]
+        if "basis_dim" in params:
+            config["model"]["basis_dim"] = params["basis_dim"]
+
+    # SIREN specific parameters
+    elif config["model"]["type"] == "siren":
+        if "n_hidden_layers" in params:
+            n = params["n_hidden_layers"]
+            config["model"]["hidden_dims"] = [params[f"hidden_dim_{i}"] for i in range(n)]
+        if "omega_0" in params:
+            config["model"]["omega_0"] = params["omega_0"]
+
+    # FiLM specific parameters
+    if config["film"]["enabled"]:
+        if "film_n_layers" in params:
+            n = params["film_n_layers"]
+            config["film"]["hidden_dims"] = [params[f"film_layer_{i}"] for i in range(n)]
+            
+    return config
+
+
 def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
              study_name: str = "chemulator_hpo", pruner: Optional[optuna.pruners.BasePruner] = None):
     """
-    Main function to run Optuna optimization. It orchestrates the trial execution
-    by selecting the correct data pipeline based on the trial's suggested parameters.
+    Main function to run Optuna optimization with fixed pruning and result saving.
     """
+    logger = logging.getLogger(__name__)
     base_config = load_json_config(config_path)
     
-    # Initial step: Preprocess data for all possible modes upfront to avoid redundancy
-    possible_modes = ["absolute", "ratio"]  # Hardcoded based on suggest_model_config options
+    possible_modes = ["absolute", "ratio"]
     mode_to_dir = {}
     for mode in possible_modes:
+        logger.info(f"Preparing data for prediction mode: '{mode}'")
         mode_config = copy.deepcopy(base_config)
         mode_config["prediction"]["mode"] = mode
-        processed_dir = Path(mode_config["paths"]["processed_data_dir"]) / f"mode_{mode}"
+        
+        # Construct the processed data directory path within the base processed_data_dir
+        base_processed_dir = Path(mode_config["paths"]["processed_data_dir"])
+        processed_dir = base_processed_dir / f"mode_{mode}"
         mode_config["paths"]["processed_data_dir"] = str(processed_dir)
         
-        pipeline = ChemicalKineticsPipeline(config_path)
-        pipeline.config = mode_config
+        # Correctly instantiate and configure the pipeline for the specific mode.
+        # This ensures that all setup (seeding, hardware, paths) uses the
+        # mode-specific configuration before preprocessing is called.
+        pipeline = ChemicalKineticsPipeline(config_path) # Instantiates with base config
+        pipeline.config = mode_config                    # Overwrite with mode-specific config
+        
+        # Rerun setup steps with the correct mode_config
         pipeline.setup_paths()
         pipeline.processed_dir = processed_dir
-        pipeline.preprocess_data()  # Run once per mode
+        seed_everything(pipeline.config["system"]["seed"])
+        optimize_hardware(pipeline.config["system"], pipeline.device)
         
+        # Preprocess the data for the current mode
+        pipeline.preprocess_data()
         mode_to_dir[mode] = processed_dir
 
-    # Setup the trial runner with preprocessed directories
     trial_runner = OptunaTrialRunner(config_path, mode_to_dir)
-
-    def objective(trial: optuna.Trial) -> float:
-        # The runner handles selection of the correct data and pipeline.
-        return trial_runner.run_trial(trial)
+    objective = trial_runner.run_trial
 
     if pruner is None:
         pruner = optuna.pruners.MedianPruner(n_startup_trials=8, n_warmup_steps=10, interval_steps=2)
 
     study = optuna.create_study(
-        direction="minimize",
-        sampler=TPESampler(seed=42),
-        pruner=pruner,
-        study_name=study_name,
-        storage=f"sqlite:///{study_name}.db",  # Use a database for robust storage
+        direction="minimize", sampler=TPESampler(seed=42), pruner=pruner,
+        study_name=study_name, storage=f"sqlite:///{study_name}.db",
         load_if_exists=True
     )
 
@@ -800,17 +920,18 @@ def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
     ensure_directories(results_dir)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-    # Retrieve the exact config from the best trial's user attributes for reproducibility.
+    # Retrieve the exact config, using the new reconstruction method as a fallback
     best_config = study.best_trial.user_attrs.get("full_config", {})
     if not best_config:
-         # Fallback if user_attrs not set (e.g., in a failed trial)
-        best_config = suggest_model_config(study.best_trial, trial_runner.base_config)
+        logger.warning("Could not retrieve full config from user_attrs. Reconstructing from best_params.")
+        best_config = _reconstruct_config_from_params(base_config, study.best_trial.params)
 
     best_results = {
         "best_value": study.best_value,
-        "best_params": study.best_params,
+        "best_params": study.best_trial.params,
         "best_config": best_config,
         "n_trials_completed": len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
+        "n_trials_pruned": len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]),
         "study_db": f"{study_name}.db"
     }
     
@@ -820,6 +941,7 @@ def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
     print("OPTIMIZATION COMPLETE")
     print("="*60)
     print(f"Best validation loss: {best_results['best_value']:.6f}")
+    print(f"Trials: {best_results['n_trials_completed']} completed, {best_results['n_trials_pruned']} pruned")
     print("\nBest parameters:")
     for key, value in best_results['best_params'].items():
         print(f"  {key}: {value}")
@@ -830,6 +952,11 @@ def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
 #!/usr/bin/env python3
 """
 Training pipeline for chemical kinetics models.
+Fixed issues:
+1. Correct scheduler stepping with gradient accumulation
+2. Removed all MAE calculations
+3. Fixed ratio mode loss calculation
+4. Fixed no-validation logic
 """
 
 import json
@@ -1031,6 +1158,11 @@ class Trainer:
             return
         
         dtype_str = str(self.train_config.get("amp_dtype", "bfloat16")).lower()
+        
+        if dtype_str not in ["bfloat16", "float16"]:
+            self.logger.warning(f"Invalid amp_dtype '{dtype_str}'. Falling back to 'bfloat16'.")
+            dtype_str = "bfloat16"
+        
         self.amp_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float16
 
         if self.device.type == 'cpu' and self.amp_dtype != torch.bfloat16:
@@ -1047,47 +1179,41 @@ class Trainer:
         if self.amp_dtype == torch.float16 and self.device.type == 'cuda':
             self.scaler = GradScaler(device_type='cuda')
     
-    def _compute_loss(self, outputs: torch.Tensor, targets: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
-        """Compute loss with mode-specific handling and optional clamping."""
+    # --- helper ------------------------------------------------------------
+    def _standardize_log_ratios(self, log_ratios: torch.Tensor) -> torch.Tensor:
+        """
+        Convert raw log‑ratio predictions to the z‑score space used for training
+        targets, using the per‑species statistics saved in self.norm_helper.
+        """
+        if self.norm_helper.ratio_stats is None:                  # absolute mode
+            return log_ratios
+
+        stats = self.norm_helper.ratio_stats
+        species = self.config["data"]["species_variables"]
+        device  = log_ratios.device
+        dtype   = log_ratios.dtype
+
+        means = torch.tensor([stats[v]["mean"] for v in species],
+                             device=device, dtype=dtype)
+        stds  = torch.tensor([stats[v]["std"]  for v in species],
+                             device=device, dtype=dtype)
+
+        stds = torch.clamp(stds, min=self.config["normalization"]["min_std"])
+        return (log_ratios - means) / stds
+
+    # --- patched loss ------------------------------------------------------
+    def _compute_loss(self, outputs: torch.Tensor,
+                      targets: torch.Tensor,
+                      inputs: torch.Tensor) -> torch.Tensor:
+        """Compute loss with mode‑specific handling and optional clamping."""
         if self.prediction_mode == "ratio":
-            # Ratio mode: outputs are already log-ratios, no clamping needed
-            return self.criterion(outputs, targets)
-        else:
-            # Absolute mode: apply optional clamping
-            if self.output_clamp is not None:
-                outputs = torch.clamp(outputs, min=self.output_clamp)
-            return self.criterion(outputs, targets)
-    
-    def _compute_raw_mae(self, outputs: torch.Tensor, targets: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
-        """Compute MAE in original (denormalized) space for metrics."""
-        if self.prediction_mode == "ratio":
-            # Extract components for ratio mode
-            initial_species_norm = inputs[:, :self.n_species]
-            globals_norm = inputs[:, self.n_species:self.n_species + self.n_globals]
-            time_norm = inputs[:, -1:]
-            zero_time_norm = torch.zeros_like(time_norm)
-            initial_profile = torch.cat((initial_species_norm, globals_norm, zero_time_norm), dim=1)
-            initial_species_raw = self.norm_helper.denormalize_profile(initial_profile)[:, :self.n_species]
+            outputs_std = self._standardize_log_ratios(outputs)
+            return self.criterion(outputs_std, targets)
 
-            predicted_species_raw = self.norm_helper.denormalize_ratio_predictions(outputs, initial_species_raw)
-            target_species_raw = self.norm_helper.denormalize_ratio_predictions(targets, initial_species_raw)
-        else:
-            # Absolute mode
-            globals_norm = inputs[:, self.n_species:self.n_species + self.n_globals]
-            time_norm = inputs[:, -1:]
-            
-            # Apply clamping to outputs if needed
-            clamped_outputs = outputs
-            if self.output_clamp is not None:
-                clamped_outputs = torch.clamp(outputs, min=self.output_clamp)
-            
-            predicted_profile = torch.cat((clamped_outputs, globals_norm, time_norm), dim=1)
-            predicted_species_raw = self.norm_helper.denormalize_profile(predicted_profile)[:, :self.n_species]
-
-            target_profile = torch.cat((targets, globals_norm, time_norm), dim=1)
-            target_species_raw = self.norm_helper.denormalize_profile(target_profile)[:, :self.n_species]
-
-        return torch.mean(torch.abs(predicted_species_raw - target_species_raw))
+        # absolute mode
+        if self.output_clamp is not None:
+            outputs = torch.clamp(outputs, min=self.output_clamp)
+        return self.criterion(outputs, targets)
     
     def train(self) -> float:
         """Execute the training loop."""
@@ -1141,12 +1267,13 @@ class Trainer:
             # Validate if available
             val_loss, val_metrics = self._validate()
 
-            # Update scheduler
+            # CORRECTED: Only step epoch-based schedulers here.
+            # Batch-based schedulers are handled correctly in _train_epoch.
             if self.scheduler and not self.scheduler_step_on_batch:
                 if isinstance(self.scheduler, ReduceLROnPlateau) and self.has_validation:
                     self.scheduler.step(val_loss)
-                else:
-                    self.scheduler.step()
+                # For any other epoch-based scheduler, add logic here.
+                # The cosine scheduler is batch-based, so it's handled in _train_epoch
 
             # Log epoch
             epoch_time = time.time() - epoch_start
@@ -1242,7 +1369,6 @@ class Trainer:
             
         self.model.eval()
         total_loss = 0.0
-        total_raw_mae = 0.0
         total_samples = 0
         
         with torch.no_grad():
@@ -1253,16 +1379,12 @@ class Trainer:
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(inputs)
                     loss = self._compute_loss(outputs, targets, inputs)
-                    raw_mae = self._compute_raw_mae(outputs, targets, inputs)
 
                 total_loss += loss.item() * inputs.size(0)
-                total_raw_mae += raw_mae.item() * inputs.size(0)
                 total_samples += inputs.size(0)
         
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
-        avg_raw_mae = total_raw_mae / total_samples if total_samples > 0 else float("inf")
-        val_metrics = {"raw_mae": avg_raw_mae}
-        return avg_loss, val_metrics
+        return avg_loss, {}
 
     def evaluate_test(self) -> float:
         """Compute the loss on the test set; returns `inf` if no test data."""
@@ -1272,7 +1394,6 @@ class Trainer:
 
         self.model.eval()
         total_loss = 0.0
-        total_raw_mae = 0.0
         total_samples = 0
         
         with torch.no_grad():
@@ -1283,15 +1404,12 @@ class Trainer:
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(inputs)
                     loss = self._compute_loss(outputs, targets, inputs)
-                    raw_mae = self._compute_raw_mae(outputs, targets, inputs)
 
                 total_loss += loss.item() * inputs.size(0)
-                total_raw_mae += raw_mae.item() * inputs.size(0)
                 total_samples += inputs.size(0)
 
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
-        avg_raw_mae = total_raw_mae / total_samples if total_samples > 0 else float("inf")
-        self.logger.info(f"Test loss: {avg_loss:.6f} Test raw MAE: {avg_raw_mae:.6f}")
+        self.logger.info(f"Test loss: {avg_loss:.6f}")
         return avg_loss
             
     def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
@@ -1304,13 +1422,9 @@ class Trainer:
             "epoch_time": epoch_time,
             "lr": lr,
         }
-        if val_metrics:
-            log_entry.update(val_metrics)
         self.training_history["epochs"].append(log_entry)
         
         val_str = f"Val loss: {val_loss:.6f}" if self.has_validation else "Val loss: N/A"
-        if 'raw_mae' in val_metrics:
-            val_str += f" Val raw MAE: {val_metrics['raw_mae']:.6f}"
         self.logger.info(
             f"Epoch {self.current_epoch}/{self.train_config['epochs']} "
             f"Train loss: {train_loss:.6f} {val_str} "
@@ -1526,6 +1640,8 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
 #!/usr/bin/env python3
 """
 Model definitions for chemical kinetics neural networks with ratio mode support.
+Fixed issues:
+1. FiLM layer initialization only zeros weights when beta is used
 """
 
 import logging
@@ -1633,13 +1749,16 @@ class FiLMSIREN(nn.Module):
                     activation=film_config.get("activation", "gelu")
                 )
 
+                # CORRECTED: Only zero weights if beta is used, otherwise it's frozen
                 with torch.no_grad():
                     final_layer = film_layer.film_net[-1]
-                    final_layer.weight.data.zero_()
+                    if film_layer.use_beta:
+                        final_layer.weight.data.zero_()
                     # Set bias for gamma part to 1
                     final_layer.bias.data[:dim] = 1.0
                     # Set bias for beta part to 0
-                    final_layer.bias.data[dim:] = 0.0
+                    if film_layer.use_beta:
+                        final_layer.bias.data[dim:] = 0.0
 
                 self.film_layers.append(film_layer)
 
@@ -1901,7 +2020,7 @@ def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path)
 ===== /Users/imalsky/Desktop/Chemulator/src/data/preprocessor.py =====
 #!/usr/bin/env python3
 """
-Chemical kinetics data preprocessor with ratio mode support.
+Chemical kinetics data preprocessor with corrected normalization statistics.
 """
 
 import hashlib
@@ -1910,7 +2029,6 @@ import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing
 
 import h5py
 import numpy as np
@@ -1951,6 +2069,17 @@ class DataPreprocessor:
         # Prediction mode
         self.prediction_mode = config.get("prediction", {}).get("mode", "absolute")
         
+        # Initialize statistics tracking
+        self.preprocessing_stats = {
+            "total_groups_examined": 0,
+            "groups_dropped_subsampling": 0,
+            "groups_dropped_validation": 0,
+            "groups_dropped_no_future": 0,
+            "groups_processed": 0,
+            "total_samples_generated": 0,
+            "per_file_stats": {}
+        }
+        
         self._init_shard_index()
     
     def _init_shard_index(self) -> None:
@@ -1985,55 +2114,61 @@ class DataPreprocessor:
         self.logger.info("Pass 2: Writing normalized NPY shards")
         split_indices = self._write_normalized_shards(norm_stats)
         
+        # Generate data report
+        self._generate_data_report(norm_stats, split_indices)
+        
         self.logger.info(f"Preprocessing completed in {time.time() - start_time:.1f}s")
         return split_indices
         
     def _collect_statistics(self) -> Dict[str, Any]:
-            """First pass: collect normalization statistics."""
-            self.normalizer = DataNormalizer(self.config)
-            accumulators = self.normalizer._initialize_accumulators()
+        """First pass: collect normalization statistics with mode-specific handling."""
+        self.normalizer = DataNormalizer(self.config)
+        
+        # Initialize accumulators for input variables
+        # In ratio mode: species and globals use only t=0, time uses t>0
+        # In absolute mode: all variables use all timesteps except time uses t>0
+        accumulators = self.normalizer._initialize_accumulators()
+        
+        # In ratio mode, create per-species accumulators for the log-ratios
+        if self.prediction_mode == "ratio":
+            ratio_accumulators = {
+                var: {"count": 0, "mean": 0.0, "m2": 0.0, "min": float("inf"), "max": float("-inf")}
+                for var in self.species_vars
+            }
 
-            # In ratio mode, create per-species accumulators for the log-ratios.
+        for raw_file in self.raw_files:
             if self.prediction_mode == "ratio":
-                # Create a dictionary of accumulators, one for each species variable.
-                ratio_accumulators = {
-                    var: {"count": 0, "mean": 0.0, "m2": 0.0, "min": float("inf"), "max": float("-inf")}
-                    for var in self.species_vars
-                }
+                self._process_file_statistics_ratio(raw_file, accumulators, ratio_accumulators)
+            else:
+                self._process_file_statistics_absolute(raw_file, accumulators)
 
-            for raw_file in self.raw_files:
-                if self.prediction_mode == "ratio":
-                    self._process_file_statistics_ratio(raw_file, accumulators, ratio_accumulators)
+        # Finalize statistics for the input variables
+        norm_stats = self.normalizer._finalize_statistics(accumulators)
+
+        # If in ratio mode, finalize the per-species ratio statistics
+        if self.prediction_mode == "ratio":
+            norm_stats["ratio_stats"] = {}
+            for var, acc in ratio_accumulators.items():
+                if acc["count"] > 1:
+                    variance = acc["m2"] / (acc["count"] - 1)
+                    std = max(np.sqrt(variance), self.config["normalization"]["min_std"])
                 else:
-                    self._process_file_statistics(raw_file, accumulators)
+                    std = 1.0
 
-            # Finalize statistics for the input variables.
-            norm_stats = self.normalizer._finalize_statistics(accumulators)
+                norm_stats["ratio_stats"][var] = {
+                    "mean": acc["mean"],
+                    "std": std,
+                    "min": acc["min"],
+                    "max": acc["max"],
+                    "count": acc["count"]
+                }
+            self.logger.info("Per-species ratio statistics calculated.")
 
-            # If in ratio mode, finalize the per-species ratio statistics.
-            if self.prediction_mode == "ratio":
-                norm_stats["ratio_stats"] = {}
-                for var, acc in ratio_accumulators.items():
-                    if acc["count"] > 1:
-                        variance = acc["m2"] / (acc["count"] - 1)
-                        std = max(np.sqrt(variance), self.config["normalization"]["min_std"])
-                    else:
-                        std = 1.0
+        save_json(norm_stats, self.output_dir / "normalization.json")
+        return norm_stats
 
-                    norm_stats["ratio_stats"][var] = {
-                        "mean": acc["mean"],
-                        "std": std,
-                        "min": acc["min"],
-                        "max": acc["max"],
-                        "count": acc["count"]
-                    }
-                self.logger.info("Per-species ratio statistics calculated.")
-
-            save_json(norm_stats, self.output_dir / "normalization.json")
-            return norm_stats
-
-    def _process_file_statistics_ratio(self, raw_file: Path, accumulators: Dict[str, Any],
-                                    ratio_accumulators: Dict[str, Dict[str, Any]]):
+    def _process_file_statistics_absolute(self, raw_file: Path, accumulators: Dict[str, Any]):
+        """Process statistics for absolute mode - species/globals use all timesteps, time uses t>0."""
         groups_processed = 0
         with h5py.File(raw_file, "r") as f:
             for gname in f.keys():
@@ -2055,26 +2190,57 @@ class DataPreprocessor:
                 if profile is None or n_t <= 1:
                     continue
 
-                # Update stats for inputs (species, globals, time)
-                profile_3d = profile.reshape(1, n_t, self.n_vars)
-                self.normalizer._update_accumulators(profile_3d, accumulators, n_t)
+                # For absolute mode:
+                # - Species and globals: use all timesteps
+                # - Time: use only t>0
+                self._update_accumulators_selective(profile, accumulators, n_t, 
+                                                   exclude_t0_for_time=True)
 
-                # Calculate and accumulate log-ratios for each species independently.
+                groups_processed += 1
+        self.logger.info(f"  Processed {groups_processed} groups from {raw_file.name}")
+
+    def _process_file_statistics_ratio(self, raw_file: Path, accumulators: Dict[str, Any],
+                                    ratio_accumulators: Dict[str, Dict[str, Any]]):
+        """Process statistics for ratio mode - species/globals use only t=0, time uses t>0."""
+        groups_processed = 0
+        with h5py.File(raw_file, "r") as f:
+            for gname in f.keys():
+                grp = f[gname]
+                
+                use_fraction = self.config["training"]["use_fraction"]
+                if use_fraction < 1.0:
+                    gname_hash = hashlib.sha256(gname.encode('utf-8')).hexdigest()
+                    hash_float = int(gname_hash[:8], 16) / 0xFFFFFFFF
+                    if hash_float >= use_fraction:
+                        continue
+                
+                if not self._validate_group_simple(grp):
+                    continue
+
+                n_t = grp[self.time_var].shape[0]
+                profile = self._extract_profile(grp, gname, n_t)
+
+                if profile is None or n_t <= 1:
+                    continue
+
+                # For ratio mode:
+                # - Species and globals: use only t=0 (initial conditions)
+                # - Time: use only t>0 (actual input times)
+                self._update_accumulators_ratio_mode(profile, accumulators, n_t)
+
+                # Calculate and accumulate log-ratios for each species
                 initial_species = profile[0, :self.n_species]
                 future_species = profile[1:, :self.n_species]
                 
-                # Vectorized calculation of log-ratios is efficient
                 epsilon = self.config["normalization"]["epsilon"]
                 ratios = future_species / np.maximum(initial_species[None, :], epsilon)
                 log_ratios = np.log10(np.maximum(ratios, epsilon))
 
-                # This loop correctly updates the accumulator for EACH species
+                # Update ratio statistics per species
                 for i, var_name in enumerate(self.species_vars):
-                    # Get the accumulator for the current species
                     acc = ratio_accumulators[var_name]
                     vec = log_ratios[:, i]
                     
-                    # Welford's algorithm for this species
                     if vec.size > 0:
                         finite_mask = np.isfinite(vec)
                         vec = vec[finite_mask]
@@ -2084,20 +2250,15 @@ class DataPreprocessor:
                         n_a = acc["count"]
                         n_b = vec.size
 
-                        if n_b == 0:
-                            continue # Skip if no new data
-
-                        mean_a = acc["mean"] # Store old mean
+                        mean_a = acc["mean"]
                         mean_b = float(vec.mean())
                         m2_b = float(((vec - mean_b) ** 2).sum())
 
-                        delta = mean_b - mean_a # Calculate delta with old mean
+                        delta = mean_b - mean_a
                         n_ab = n_a + n_b
 
                         if n_ab > 0:
-                            # Update mean first
                             acc["mean"] = (n_a * mean_a + n_b * mean_b) / n_ab
-                            # Then update m2 using the original delta
                             acc["m2"] += m2_b + (delta**2 * n_a * n_b) / n_ab
                             acc["count"] = n_ab
                             acc["min"] = min(acc["min"], float(vec.min()))
@@ -2105,6 +2266,98 @@ class DataPreprocessor:
 
                 groups_processed += 1
         self.logger.info(f"  Processed {groups_processed} groups from {raw_file.name} for ratio stats")
+
+    def _update_accumulators_selective(self, profile: np.ndarray, accumulators: Dict[str, Any], 
+                                     n_t: int, exclude_t0_for_time: bool = True):
+        """Update accumulators with selective timestep handling."""
+        profile_3d = profile.reshape(1, n_t, self.n_vars)
+        
+        for var, acc in accumulators.items():
+            idx = acc["index"]
+            method = acc["method"]
+            
+            if var == self.time_var and exclude_t0_for_time and n_t > 1:
+                # For time variable, exclude t=0
+                vec = profile_3d[0, 1:, idx].astype(np.float64)
+            else:
+                # For other variables, use all timesteps
+                vec = profile_3d[0, :, idx].ravel().astype(np.float64)
+            
+            # Rest of the update logic remains the same
+            finite_mask = np.isfinite(vec)
+            if (~finite_mask).sum() > 0:
+                if (~finite_mask).sum() / vec.size > 0.01:
+                    self.logger.warning(f"Variable {var} has {(~finite_mask).sum()}/{vec.size} non-finite values")
+                vec = vec[finite_mask]
+            
+            if vec.size == 0:
+                self.logger.warning(f"Variable {var} has no finite values, skipping")
+                continue
+
+            if method in {"log-standard", "log-min-max"}:
+                below_epsilon = vec < self.normalizer.epsilon
+                if below_epsilon.any():
+                    self.logger.warning(
+                        f"Variable {var} has {below_epsilon.sum()} values below epsilon. "
+                        f"Min value: {vec.min():.2e}"
+                    )
+                vec = np.log10(np.maximum(vec, self.normalizer.epsilon))
+
+            n_b = vec.size
+            mean_b = float(vec.mean())
+            m2_b = float(((vec - mean_b) ** 2).sum()) if n_b > 1 else 0.0
+
+            acc["min"] = min(acc["min"], float(vec.min()))
+            acc["max"] = max(acc["max"], float(vec.max()))
+
+            # Chan's parallel mean/variance update
+            n_a = acc["count"]
+            delta = mean_b - acc["mean"]
+            n_ab = n_a + n_b
+
+            acc["mean"] += delta * n_b / n_ab
+            acc["m2"] += m2_b + delta**2 * n_a * n_b / n_ab
+            acc["count"] = n_ab
+
+    def _update_accumulators_ratio_mode(self, profile: np.ndarray, accumulators: Dict[str, Any], n_t: int):
+        """Update accumulators for ratio mode: species/globals use t=0, time uses t>0."""
+        for var, acc in accumulators.items():
+            idx = acc["index"]
+            method = acc["method"]
+            
+            if var in self.species_vars or var in self.global_vars:
+                # For species and globals in ratio mode, use only t=0
+                vec = np.array([profile[0, idx]], dtype=np.float64)
+            elif var == self.time_var:
+                # For time, use only t>0
+                if n_t > 1:
+                    vec = profile[1:, idx].astype(np.float64)
+                else:
+                    continue
+            else:
+                # Should not happen
+                continue
+            
+            # Apply log transform if needed
+            if method in {"log-standard", "log-min-max"}:
+                vec = np.log10(np.maximum(vec, self.normalizer.epsilon))
+            
+            # Update statistics
+            n_b = vec.size
+            mean_b = float(vec.mean())
+            m2_b = float(((vec - mean_b) ** 2).sum()) if n_b > 1 else 0.0
+
+            acc["min"] = min(acc["min"], float(vec.min()))
+            acc["max"] = max(acc["max"], float(vec.max()))
+
+            # Chan's update
+            n_a = acc["count"]
+            delta = mean_b - acc["mean"]
+            n_ab = n_a + n_b
+
+            acc["mean"] += delta * n_b / n_ab
+            acc["m2"] += m2_b + delta**2 * n_a * n_b / n_ab
+            acc["count"] = n_ab
         
     def _write_normalized_shards(self, norm_stats: Dict[str, Any]) -> Dict[str, List[int]]:
         """Second pass – write normalized data to NPY shards."""
@@ -2138,45 +2391,51 @@ class DataPreprocessor:
 
         # Process files
         if self.parallel_enabled and self.num_workers > 1 and len(self.raw_files) > 1:
-            # Parallel processing
-            results = self._parallel_write_shards(
+            # Parallel processing with fixed index handling
+            results = self._parallel_write_shards_fixed(
                 norm_stats, helper, val_f, test_f, 
                 ratio_stats, global_idx
             )
             
-            # Aggregate results with index adjustment
-            actual_global_idx = 0
-            for file_samples, file_splits, written, skipped in results:
+            # Aggregate results - indices are now absolute, no adjustment needed
+            for file_samples, file_splits, written, skipped, file_stats in results:
                 for samples in file_samples:
                     shard_writer.add_samples(samples)
                 
-                # Compute adjustment offset
-                if any(file_splits.values()):  # If any splits in this file
-                    # Find the estimated min_idx (should be the start_global_idx passed to the file)
-                    file_min_idx = min(min(indices) for indices in file_splits.values() if indices)
-                    offset = actual_global_idx - file_min_idx
-                    for split_name, indices in file_splits.items():
-                        if indices:
-                            adjusted_indices = [i + offset for i in indices]
-                            splits[split_name].extend(adjusted_indices)
-                
-                # Update actual_global_idx by the number of samples written for this file
-                file_total_samples = sum(len(indices) for indices in file_splits.values())
-                actual_global_idx += file_total_samples
+                # Directly extend splits with the absolute indices
+                for split_name, indices in file_splits.items():
+                    splits[split_name].extend(indices)
                 
                 profiles_written += written
                 profiles_skipped += skipped
-            global_idx = actual_global_idx  # Set final global_idx to the actual total
+                
+                # Update preprocessing stats
+                for key, value in file_stats.items():
+                    if key in self.preprocessing_stats:
+                        self.preprocessing_stats[key] += value
+            
+            # Calculate total samples from all splits
+            global_idx = sum(len(indices) for indices in splits.values())
         
         else:
             # Sequential processing
             for raw_file in self.raw_files:
+                file_stats = {
+                    "total_groups_examined": 0,
+                    "groups_dropped_subsampling": 0,
+                    "groups_dropped_validation": 0,
+                    "groups_dropped_no_future": 0,
+                    "groups_processed": 0,
+                }
+                
                 with h5py.File(raw_file, "r") as f:
                     for gname in sorted(f.keys()):
+                        file_stats["total_groups_examined"] += 1
+                        
                         result = self._process_single_group(
                             f[gname], gname, helper, 
                             val_f, test_f, global_idx,
-                            ratio_stats
+                            ratio_stats, file_stats
                         )
                         
                         if result is None:
@@ -2190,10 +2449,17 @@ class DataPreprocessor:
                         global_idx += n_written
                         splits[split_key].extend(range(start_idx, global_idx))
                         profiles_written += 1
+                        file_stats["groups_processed"] += 1
+                
+                # Update global stats
+                for key, value in file_stats.items():
+                    self.preprocessing_stats[key] += value
+                self.preprocessing_stats["per_file_stats"][str(raw_file.name)] = file_stats
 
         # Finalize
         shard_writer.flush()
         self.shard_index["total_samples"] = global_idx
+        self.preprocessing_stats["total_samples_generated"] = global_idx
         save_json(self.shard_index, self.output_dir / "shard_index.json")
 
         # Log statistics
@@ -2207,25 +2473,32 @@ class DataPreprocessor:
 
         return splits
         
-    def _parallel_write_shards(self, norm_stats, helper, val_f, test_f, 
-                            ratio_stats, start_global_idx):
-        """Process files in parallel for writing shards."""
+    def _parallel_write_shards_fixed(self, norm_stats, helper, val_f, test_f, 
+                                    ratio_stats, start_global_idx):
+        """Process files in parallel with fixed index handling."""
         results = []
         
+        # Pre-calculate the number of valid samples per file
+        self.logger.info("Pre-calculating sample counts for parallel processing...")
+        file_sample_counts = []
+        for raw_file in self.raw_files:
+            count = self._count_valid_samples_in_file(raw_file)
+            file_sample_counts.append(count)
+            self.logger.debug(f"{raw_file.name}: {count} samples")
+        
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-            # Submit tasks
+            # Submit tasks with deterministic starting indices
             futures = []
             current_idx = start_global_idx
             
-            for raw_file in self.raw_files:
+            for i, (raw_file, sample_count) in enumerate(zip(self.raw_files, file_sample_counts)):
                 future = executor.submit(
-                    self._process_file_for_shards,
+                    self._process_file_for_shards_fixed,
                     raw_file, norm_stats, val_f, test_f,
                     current_idx, ratio_stats
                 )
                 futures.append((future, raw_file))
-                # Estimate indices (will be corrected after processing)
-                current_idx += 10000000  # Rough estimate
+                current_idx += sample_count  # Increment by exact count
             
             # Collect results
             for future, raw_file in futures:
@@ -2239,9 +2512,33 @@ class DataPreprocessor:
         
         return results
     
-    def _process_file_for_shards(self, raw_file, norm_stats, val_f, test_f, 
-                                start_global_idx, ratio_stats):
-        """Process a single file for shard writing (for parallel execution)."""
+    def _count_valid_samples_in_file(self, raw_file: Path) -> int:
+        """Count the exact number of samples that will be generated from a file."""
+        count = 0
+        use_fraction = self.config["training"]["use_fraction"]
+        
+        with h5py.File(raw_file, "r") as f:
+            for gname in sorted(f.keys()):
+                # Apply subsampling deterministically
+                if use_fraction < 1.0:
+                    h = hashlib.sha256(gname.encode("utf-8")).hexdigest()
+                    if int(h[:8], 16) / 0xFFFFFFFF >= use_fraction:
+                        continue
+                
+                # Check if group is valid
+                if not self._validate_group_simple(f[gname]):
+                    continue
+                
+                # Count samples (n_timesteps - 1)
+                n_t = f[gname][self.time_var].shape[0]
+                if n_t > 1:
+                    count += (n_t - 1)
+        
+        return count
+    
+    def _process_file_for_shards_fixed(self, raw_file, norm_stats, val_f, test_f, 
+                                      start_global_idx, ratio_stats):
+        """Process a single file with fixed global indexing."""
         # Re-create helper in subprocess
         helper = NormalizationHelper(
             norm_stats,
@@ -2258,12 +2555,22 @@ class DataPreprocessor:
         profiles_skipped = 0
         global_idx = start_global_idx
         
+        file_stats = {
+            "total_groups_examined": 0,
+            "groups_dropped_subsampling": 0,
+            "groups_dropped_validation": 0,
+            "groups_dropped_no_future": 0,
+            "groups_processed": 0,
+        }
+        
         with h5py.File(raw_file, "r") as f:
             for gname in sorted(f.keys()):
+                file_stats["total_groups_examined"] += 1
+                
                 result = self._process_single_group(
                     f[gname], gname, helper,
                     val_f, test_f, global_idx,
-                    ratio_stats
+                    ratio_stats, file_stats
                 )
                 
                 if result is None:
@@ -2273,30 +2580,43 @@ class DataPreprocessor:
                 samples, split_key, n_written = result
                 file_samples.append(samples)
                 
+                # Use absolute indices
                 start_idx = global_idx
                 global_idx += n_written
                 file_splits[split_key].extend(range(start_idx, global_idx))
                 profiles_written += 1
+                file_stats["groups_processed"] += 1
         
-        return file_samples, file_splits, profiles_written, profiles_skipped
+        return file_samples, file_splits, profiles_written, profiles_skipped, file_stats
         
     def _process_single_group(self, grp, gname, helper, val_f, test_f, 
-                            global_idx, ratio_stats):
+                            global_idx, ratio_stats, file_stats=None):
         """Process a single group and return samples."""
         # Deterministic subsampling
         use_fraction = self.config["training"]["use_fraction"]
         if use_fraction < 1.0:
             h = hashlib.sha256(gname.encode("utf-8")).hexdigest()
             if int(h[:8], 16) / 0xFFFFFFFF >= use_fraction:
+                if file_stats:
+                    file_stats["groups_dropped_subsampling"] += 1
                 return None
         
         if not self._validate_group_simple(grp):
+            if file_stats:
+                file_stats["groups_dropped_validation"] += 1
             return None
         
         # Extract & normalize
         n_t = grp[self.time_var].shape[0]
+        if n_t <= 1:
+            if file_stats:
+                file_stats["groups_dropped_no_future"] += 1
+            return None
+            
         profile = self._extract_profile(grp, gname, n_t)
         if profile is None:
+            if file_stats:
+                file_stats["groups_dropped_validation"] += 1
             return None
         
         # Get samples based on prediction mode
@@ -2344,15 +2664,14 @@ class DataPreprocessor:
             except Exception:
                 return False
         
-        # Verify globals are constant
-        if hasattr(self, '_validate_constant_globals') and self._validate_constant_globals:
-            for var in self.global_vars:
-                if var in group:
-                    data = group[var][:]
-                    if not np.allclose(data, data[0], rtol=1e-10):
-                        self.logger.warning(f"Global variable {var} is not constant in group {group.name}")
-                        return False
-                
+        # FIXED: Always verify globals are constant (remove conditional)
+        for var in self.global_vars:
+            if var in group:
+                data = group[var][:]
+                if not np.allclose(data, data[0], rtol=1e-10):
+                    self.logger.warning(f"Global variable {var} is not constant in group {group.name}")
+                    return False
+        
         return True
     
     def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> Optional[np.ndarray]:
@@ -2463,6 +2782,109 @@ class DataPreprocessor:
             
             return samples
 
+    def _generate_data_report(self, norm_stats: Dict[str, Any], split_indices: Dict[str, List[int]]):
+        """Generate a comprehensive data preprocessing report."""
+        report_path = Path(self.config["paths"]["log_dir"]) / "data_report.txt"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(report_path, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("DATA PREPROCESSING REPORT\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Prediction Mode: {self.prediction_mode}\n")
+            f.write("\n")
+            
+            # File information
+            f.write("INPUT FILES\n")
+            f.write("-" * 40 + "\n")
+            for raw_file in self.raw_files:
+                f.write(f"  {raw_file.name}\n")
+            f.write(f"Total files: {len(self.raw_files)}\n")
+            f.write("\n")
+            
+            # Overall statistics
+            f.write("PREPROCESSING STATISTICS\n")
+            f.write("-" * 40 + "\n")
+            total_examined = self.preprocessing_stats["total_groups_examined"]
+            f.write(f"Total groups examined: {total_examined:,}\n")
+            f.write(f"Groups dropped (subsampling): {self.preprocessing_stats['groups_dropped_subsampling']:,} "
+                   f"({100 * self.preprocessing_stats['groups_dropped_subsampling'] / max(1, total_examined):.1f}%)\n")
+            f.write(f"Groups dropped (validation): {self.preprocessing_stats['groups_dropped_validation']:,} "
+                   f"({100 * self.preprocessing_stats['groups_dropped_validation'] / max(1, total_examined):.1f}%)\n")
+            f.write(f"Groups dropped (no future): {self.preprocessing_stats['groups_dropped_no_future']:,} "
+                   f"({100 * self.preprocessing_stats['groups_dropped_no_future'] / max(1, total_examined):.1f}%)\n")
+            f.write(f"Groups processed: {self.preprocessing_stats['groups_processed']:,}\n")
+            f.write(f"Total samples generated: {self.preprocessing_stats['total_samples_generated']:,}\n")
+            f.write(f"Use fraction: {self.config['training']['use_fraction']}\n")
+            f.write("\n")
+            
+            # Per-file breakdown
+            if self.preprocessing_stats.get("per_file_stats"):
+                f.write("PER-FILE BREAKDOWN\n")
+                f.write("-" * 40 + "\n")
+                for filename, stats in self.preprocessing_stats["per_file_stats"].items():
+                    f.write(f"\n{filename}:\n")
+                    f.write(f"  Groups examined: {stats['total_groups_examined']:,}\n")
+                    f.write(f"  Groups processed: {stats['groups_processed']:,}\n")
+                    f.write(f"  Dropped (subsampling): {stats['groups_dropped_subsampling']:,}\n")
+                    f.write(f"  Dropped (validation): {stats['groups_dropped_validation']:,}\n")
+                    f.write(f"  Dropped (no future): {stats['groups_dropped_no_future']:,}\n")
+                f.write("\n")
+            
+            # Split information
+            f.write("DATA SPLITS\n")
+            f.write("-" * 40 + "\n")
+            total_samples = sum(len(indices) for indices in split_indices.values())
+            for split_name, indices in split_indices.items():
+                n_samples = len(indices)
+                percentage = 100 * n_samples / max(1, total_samples)
+                f.write(f"{split_name:12s}: {n_samples:10,} samples ({percentage:5.1f}%)\n")
+            f.write(f"{'Total':12s}: {total_samples:10,} samples\n")
+            f.write("\n")
+            
+            # Normalization statistics summary
+            f.write("NORMALIZATION STATISTICS\n")
+            f.write("-" * 40 + "\n")
+            f.write("Variable normalization methods:\n")
+            for var, method in norm_stats["normalization_methods"].items():
+                f.write(f"  {var:20s}: {method}\n")
+            f.write("\n")
+            
+            # Summarize key statistics
+            f.write("Key statistics per variable:\n")
+            for var, stats in norm_stats.get("per_key_stats", {}).items():
+                f.write(f"\n  {var}:\n")
+                method = stats.get("method", "unknown")
+                if method == "standard":
+                    f.write(f"    Mean: {stats['mean']:.6e}, Std: {stats['std']:.6e}\n")
+                elif method == "log-standard":
+                    f.write(f"    Log Mean: {stats['log_mean']:.6f}, Log Std: {stats['log_std']:.6f}\n")
+                elif method in ["min-max", "log-min-max"]:
+                    f.write(f"    Min: {stats['min']:.6e}, Max: {stats['max']:.6e}\n")
+            
+            # Ratio mode statistics
+            if self.prediction_mode == "ratio" and "ratio_stats" in norm_stats:
+                f.write("\nRatio mode statistics (per-species log-ratios):\n")
+                for var, stats in norm_stats["ratio_stats"].items():
+                    f.write(f"\n  {var}:\n")
+                    f.write(f"    Mean: {stats['mean']:.6f}, Std: {stats['std']:.6f}\n")
+                    f.write(f"    Min: {stats['min']:.6f}, Max: {stats['max']:.6f}\n")
+                    f.write(f"    Count: {stats['count']:,}\n")
+            
+            # Configuration summary
+            f.write("\nCONFIGURATION SUMMARY\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"Species variables: {', '.join(self.species_vars)}\n")
+            f.write(f"Global variables: {', '.join(self.global_vars)}\n")
+            f.write(f"Time variable: {self.time_var}\n")
+            f.write(f"Shard size: {self.shard_size:,}\n")
+            f.write(f"Min species threshold: {self.min_threshold:.2e}\n")
+            f.write(f"Epsilon: {self.config['normalization']['epsilon']:.2e}\n")
+            f.write(f"Min std: {self.config['normalization']['min_std']:.2e}\n")
+            
+        self.logger.info(f"Data report written to {report_path}")
+
 
 class ShardWriter:
     """Efficient shard writer with buffering."""
@@ -2547,6 +2969,8 @@ class ShardWriter:
 #!/usr/bin/env python3
 """
 Dataset for chemical kinetics data with simplified caching.
+Fixed issues:
+1. Enforce float32 dtype to match model weights
 """
 
 import json
@@ -2696,9 +3120,9 @@ class NPYDataset(Dataset):
             input_arr = row[:n_input]
             target_arr = row[n_input:]
             
-            # .copy() is important to avoid PyTorch errors with numpy arrays
-            input_tensor = torch.from_numpy(input_arr.copy())
-            target_tensor = torch.from_numpy(target_arr.copy())
+            # CORRECTED: Enforce float32 dtype to match model weights
+            input_tensor = torch.from_numpy(input_arr.copy()).to(dtype=torch.float32)
+            target_tensor = torch.from_numpy(target_arr.copy()).to(dtype=torch.float32)
             
             return input_tensor, target_tensor
             
@@ -2819,7 +3243,7 @@ class DataNormalizer:
                 
                 # Verify global is constant across timesteps
                 if not np.allclose(data[0, :, idx], value, rtol=1e-10):
-                    self.logger.warning(f"Global variable {var} is not constant across timesteps")
+                    raise ValueError(f"Global variable {var} is not constant across timesteps")
                 
                 if method in {"log-standard", "log-min-max"}:
                     if value < self.epsilon:
@@ -3076,7 +3500,11 @@ class NormalizationHelper:
         return normalized
 
     def denormalize_profile(self, profile: torch.Tensor) -> torch.Tensor:
-        """Denormalize a complete profile tensor."""
+        """
+        Denormalize a complete profile tensor using vectorized operations.
+        This version includes a fix to clamp the output of the 'standard'
+        method to prevent numerical overflow.
+        """
         if profile.device != self.device:
             profile = profile.to(self.device)
 
@@ -3091,12 +3519,21 @@ class NormalizationHelper:
             if method == "standard":
                 means = torch.stack([self.norm_params[var]["mean"] for var in self.method_groups[method]])
                 stds = torch.stack([self.norm_params[var]["std"] for var in self.method_groups[method]])
-                denormalized[:, col_idxs] = cols * stds + means
+                
+                # Denormalize the data
+                raw_vals = cols * stds + means
+                
+                # CORRECTED: Clamp the output to prevent numerical overflow, ensuring stability.
+                # The range is chosen to be consistent with the implicit bounds of log-based methods.
+                finfo = torch.finfo(raw_vals.dtype)
+                denormalized[:, col_idxs] = torch.clamp(raw_vals, min=-finfo.max, max=finfo.max)
 
             elif method == "log-standard":
                 log_means = torch.stack([self.norm_params[var]["log_mean"] for var in self.method_groups[method]])
                 log_stds = torch.stack([self.norm_params[var]["log_std"] for var in self.method_groups[method]])
                 log_data = cols * log_stds + log_means
+                
+                # This clamp is crucial to prevent torch.pow from creating inf/NaN values
                 log_data = torch.clamp(log_data, min=-38.0, max=38.0)
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
@@ -3113,36 +3550,41 @@ class NormalizationHelper:
                 ranges = maxs - mins
                 ranges = torch.clamp(ranges, min=self.epsilon)
                 log_data = cols * ranges + mins
+
+                # This clamp is crucial to prevent torch.pow from creating inf/NaN values
                 log_data = torch.clamp(log_data, min=-38.0, max=38.0)
                 denormalized[:, col_idxs] = torch.pow(10.0, log_data)
 
         return denormalized
     
     def denormalize_ratio_predictions(self, standardized_log_ratios: torch.Tensor,
-                                        initial_species: torch.Tensor) -> torch.Tensor:
-            """Convert standardized log-ratio predictions back to species values."""
-            if self.ratio_stats is None:
-                raise ValueError("Ratio statistics not available for denormalization")
+                                    initial_species: torch.Tensor) -> torch.Tensor:
+        """Convert standardized log-ratio predictions back to species values."""
+        if self.ratio_stats is None:
+            raise ValueError("Ratio statistics not available for denormalization")
 
-            # Ensure tensors are on the correct device
-            device = standardized_log_ratios.device
-            initial_species = initial_species.to(device)
+        # Ensure tensors are on the correct device
+        device = standardized_log_ratios.device
+        initial_species = initial_species.to(device)
 
-            # Create tensors for per-species mean and std from the dictionary of stats
-            species_vars = self.species_vars
-            ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in species_vars], device=device, dtype=torch.float32)
-            ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in species_vars], device=device, dtype=torch.float32)
+        # Create tensors for per-species mean and std from the dictionary of stats
+        species_vars = self.species_vars
+        ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in species_vars], device=device, dtype=torch.float32)
+        ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in species_vars], device=device, dtype=torch.float32)
+        
+        # Denormalize the standardized log-ratios (reverse the standardization)
+        # Broadcasting handles the [batch_size, n_species] shape
+        log_ratios = (standardized_log_ratios * ratio_stds) + ratio_means
 
-            # Denormalize the standardized log-ratios (reverse the standardization)
-            # Broadcasting handles the [batch_size, n_species] shape
-            log_ratios = (standardized_log_ratios * ratio_stds) + ratio_means
+        # FIXED: Clamp to prevent overflow/inf in torch.pow
+        log_ratios = torch.clamp(log_ratios, min=-38.0, max=38.0)
+        
+        # Convert log-ratios back to ratios (10^x)
+        ratios = torch.pow(10.0, log_ratios)
 
-            # Convert log-ratios back to ratios (10^x)
-            ratios = torch.pow(10.0, log_ratios)
+        # Apply ratios to initial conditions to get the final predicted species values
+        # Note: initial_species must be in original (non-normalized) scale
+        predicted_species = initial_species * ratios
 
-            # Apply ratios to initial conditions to get the final predicted species values
-            # Note: initial_species must be in original (non-normalized) scale
-            predicted_species = initial_species * ratios
-
-            return predicted_species
+        return predicted_species
 

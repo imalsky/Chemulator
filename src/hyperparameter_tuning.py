@@ -196,6 +196,7 @@ class PrunableTrainer(Trainer):
                     self.logger.info(f"Early stopping triggered at epoch {epoch}")
                     break
             else:
+                # No validation set: save based on best training loss
                 if train_loss < (best_train_loss - self.min_delta):
                     best_train_loss = train_loss
                     self.best_val_loss = train_loss
@@ -299,15 +300,28 @@ def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
     possible_modes = ["absolute", "ratio"]
     mode_to_dir = {}
     for mode in possible_modes:
+        logger.info(f"Preparing data for prediction mode: '{mode}'")
         mode_config = copy.deepcopy(base_config)
         mode_config["prediction"]["mode"] = mode
-        processed_dir = Path(mode_config["paths"]["processed_data_dir"]) / f"mode_{mode}"
+        
+        # Construct the processed data directory path within the base processed_data_dir
+        base_processed_dir = Path(mode_config["paths"]["processed_data_dir"])
+        processed_dir = base_processed_dir / f"mode_{mode}"
         mode_config["paths"]["processed_data_dir"] = str(processed_dir)
         
-        pipeline = ChemicalKineticsPipeline(config_path)
-        pipeline.config = mode_config
+        # Correctly instantiate and configure the pipeline for the specific mode.
+        # This ensures that all setup (seeding, hardware, paths) uses the
+        # mode-specific configuration before preprocessing is called.
+        pipeline = ChemicalKineticsPipeline(config_path) # Instantiates with base config
+        pipeline.config = mode_config                    # Overwrite with mode-specific config
+        
+        # Rerun setup steps with the correct mode_config
         pipeline.setup_paths()
         pipeline.processed_dir = processed_dir
+        seed_everything(pipeline.config["system"]["seed"])
+        optimize_hardware(pipeline.config["system"], pipeline.device)
+        
+        # Preprocess the data for the current mode
         pipeline.preprocess_data()
         mode_to_dir[mode] = processed_dir
 

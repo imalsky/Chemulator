@@ -4,15 +4,15 @@
         // Raw HDF5 data files to process
         "raw_data_files": [
             "data/raw/run8001-result.h5",
-            "data/raw/run8002-result.h5",
-            "data/raw/run8003-result.h5",
-            "data/raw/run8004-result.h5",
-            "data/raw/run8005-result.h5",
-            "data/raw/run8006-result.h5",
-            "data/raw/run8007-result.h5",
-            "data/raw/run8008-result.h5",
-            "data/raw/run8009-result.h5",
-            "data/raw/run8010-result.h5"
+            //"data/raw/run8002-result.h5",
+            //"data/raw/run8003-result.h5",
+            //"data/raw/run8004-result.h5",
+            //"data/raw/run8005-result.h5",
+            //"data/raw/run8006-result.h5",
+            //"data/raw/run8007-result.h5",
+            //"data/raw/run8008-result.h5",
+            //"data/raw/run8009-result.h5",
+            //"data/raw/run8010-result.h5"
         ],
         // Directory for processed NPY shards
         "processed_data_dir": "data/processed",

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 Dataset for chemical kinetics data with simplified caching.
+Fixed issues:
+1. Enforce float32 dtype to match model weights
 """
 
 import json
@@ -150,9 +152,9 @@ class NPYDataset(Dataset):
             input_arr = row[:n_input]
             target_arr = row[n_input:]
             
-            # .copy() is important to avoid PyTorch errors with numpy arrays
-            input_tensor = torch.from_numpy(input_arr.copy())
-            target_tensor = torch.from_numpy(target_arr.copy())
+            # CORRECTED: Enforce float32 dtype to match model weights
+            input_tensor = torch.from_numpy(input_arr.copy()).to(dtype=torch.float32)
+            target_tensor = torch.from_numpy(target_arr.copy()).to(dtype=torch.float32)
             
             return input_tensor, target_tensor
             

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 Model definitions for chemical kinetics neural networks with ratio mode support.
+Fixed issues:
+1. FiLM layer initialization only zeros weights when beta is used
 """
 
 import logging
@@ -108,13 +110,16 @@ class FiLMSIREN(nn.Module):
                     activation=film_config.get("activation", "gelu")
                 )
 
+                # CORRECTED: Only zero weights if beta is used, otherwise it's frozen
                 with torch.no_grad():
                     final_layer = film_layer.film_net[-1]
-                    final_layer.weight.data.zero_()
+                    if film_layer.use_beta:
+                        final_layer.weight.data.zero_()
                     # Set bias for gamma part to 1
                     final_layer.bias.data[:dim] = 1.0
                     # Set bias for beta part to 0
-                    final_layer.bias.data[dim:] = 0.0
+                    if film_layer.use_beta:
+                        final_layer.bias.data[dim:] = 0.0
 
                 self.film_layers.append(film_layer)
 
