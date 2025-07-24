@@ -1,0 +1,81 @@
+#!/bin/bash
+# This script is modified to run a 12-hour job on a single A100 GPU on Cabeus.
+
+# --- PBS Directives for an A100 GPU Job ---
+
+# A more descriptive job name
+#PBS -N a100_train_job
+
+# QUEUE: Use the primetime GPU queue for jobs > 2 hours
+#####PBS -q p_gpu_normal
+#PBS -q gpu_devel
+
+# WALLTIME: 12 hours for your job + 1 hour buffer
+#####PBS -l walltime=13:00:00
+#PBS -l walltime=02:00:00
+
+# PROJECT: Your allocation ID. Confirm this is the right one for GPU time.
+#PBS -W group_list=s2458
+
+# Combine standard output and error into one file
+#PBS -j oe
+
+# SELECT LINE: This is the most critical part for requesting the GPU.
+# We request 1 "chunk" with:
+# - ngpus=1: One NVIDIA GPU
+# - model=mil_a100: This specifically requests the A100 nodes.
+# - ncpus=16: A standard number of CPU cores to pair with one GPU.
+# - mem=120GB: A safe amount of memory for one GPU slice.
+#PBS -l select=1:ncpus=16:ngpus=1:mem=120GB:model=mil_a100
+
+# PLACE LINE: This ensures you are only charged for the 1 GPU you use and allows
+# other users to run on the remaining 3 GPUs on the same physical node.
+#PBS -l place=scatter:shared
+
+# --- End of PBS Directives ---
+
+
+echo "#####################################################"
+echo "Job starting on $(hostname) at $(date)"
+echo "#####################################################"
+
+
+# --- Environment and Module Setup ---
+echo "Setting up environment..."
+
+# Start with a clean environment
+module purge
+
+# Load the necessary base module for conda on this system
+module use -a /swbuild/analytix/tools/modulefiles
+module load miniconda3/v4
+
+# Source the conda shell script to enable 'conda activate' (this is bash syntax)
+CONDA_BASE=$(conda info --base)
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+
+# Activate your specific conda environment
+conda activate pyt2_7
+echo "Conda environment 'pyt2_7' activated."
+
+
+# --- Diagnostic Check (Highly Recommended) ---
+# Verify that PyTorch can see the GPU before starting the long training process.
+echo "---------------------------------"
+echo "Checking for GPU with PyTorch:"
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'Device count: {torch.cuda.device_count()}'); \
+          print(f'Device name: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"}')"
+echo "---------------------------------"
+
+
+# --- Job Execution ---
+# Navigate to the directory where you submitted the job
+cd $PBS_O_WORKDIR
+echo "Changed directory to: $(pwd)"
+
+echo "Starting Python training script..."
+python src/main.py
+
+echo "#####################################################"
+echo "Job finished at $(date)"
+echo "#####################################################"

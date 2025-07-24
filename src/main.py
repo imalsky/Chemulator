@@ -4,6 +4,10 @@ import sys
 import time
 from pathlib import Path
 import shutil
+import torch
+from torch.profiler import profile, ProfilerActivity, schedule
+from torch.profiler import tensorboard_trace_handler
+from typing import Dict, Any, Optional, Callable, Union
 
 import numpy as np
 
@@ -20,10 +24,22 @@ from data.normalizer import NormalizationHelper
 
 class ChemicalKineticsPipeline:
     """Simplified training pipeline for chemical kinetics prediction."""
-    
-    def __init__(self, config_path: Path):
-        # Load configuration
-        self.config = load_json_config(config_path)
+    def __init__(self, config_or_path: Union[Path, Dict[str, Any]]):
+        """
+        Initialize the pipeline with either a config file path or a config dictionary.
+        
+        Args:
+            config_or_path: Either a Path to a config file or a config dictionary
+        """
+        # FIX: Accept either a path or a dictionary for more flexible initialization
+        if isinstance(config_or_path, (Path, str)):
+            # Load configuration from file
+            self.config = load_json_config(Path(config_or_path))
+        elif isinstance(config_or_path, dict):
+            # Use provided configuration dictionary directly
+            self.config = config_or_path
+        else:
+            raise TypeError(f"config_or_path must be a Path, str, or dict, not {type(config_or_path)}")
         
         # Setup paths
         self.setup_paths()
@@ -33,7 +49,7 @@ class ChemicalKineticsPipeline:
         setup_logging(log_file=log_file)
         
         self.logger = logging.getLogger(__name__)
-        self.logger.info(f"Chemical Kinetics Pipeline - Config: {config_path}")
+        self.logger.info(f"Chemical Kinetics Pipeline initialized")
         
         # Set random seed
         seed_everything(self.config["system"]["seed"])
@@ -89,78 +105,125 @@ class ChemicalKineticsPipeline:
                 except Exception as e:
                     self.logger.warning(f"Failed to remove {filepath}: {e}")
 
-    def preprocess_data(self):
-        """Pre-process raw files to normalized NPY shards."""
-        # Check if already processed
-        required_files = [
-            self.processed_dir / "normalization.json",
-            self.processed_dir / "shard_index.json",
-            self.processed_dir / "train_indices.npy",
-            self.processed_dir / "val_indices.npy",
-            self.processed_dir / "test_indices.npy",
-            self.processed_dir / "config_hash.json"
-        ]
+    def _clean_all_processed_data(self):
+        """Remove ALL processed files, including shards and indices."""
+        self.logger.info("Cleaning ALL old processed files...")
+        if not self.processed_dir.exists(): return
         
+        patterns = ["shard_*.npy", "shard_*.npz", "*.json", "*_indices.npy"]
+        removed_count = 0
+        
+        for pattern in patterns:
+            for file in self.processed_dir.glob(pattern):
+                try:
+                    file.unlink()
+                    removed_count += 1
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove {file}: {e}")
+        self.logger.info(f"Removed {removed_count} old files from {self.processed_dir}")
+
+    def _clean_split_files(self):
+        """Remove only split-related files."""
+        self.logger.info("Cleaning old split index files...")
+        files_to_remove = ["train_indices.npy", "val_indices.npy", "test_indices.npy", "split_hash.json"]
+        removed_count = 0
+        for filename in files_to_remove:
+            filepath = self.processed_dir / filename
+            if filepath.exists():
+                try:
+                    filepath.unlink()
+                    removed_count += 1
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove {filepath}: {e}")
+        self.logger.info(f"Removed {removed_count} old split files.")
+
+    def preprocess_data(self):
+        """
+        Pre-process raw files to normalized NPY shards with intelligent,
+        greedy data reuse based on a two-stage hashing system.
+        """
+        # --- Stage 1: Check Core Data Hash ---
+        proc_conf = self.config["preprocessing"]
+        relevant_proc_config = {
+            "shard_size": proc_conf.get("shard_size"),
+            "min_value_threshold": proc_conf.get("min_value_threshold"),
+            "compression": proc_conf.get("compression")
+        }
         raw_files_info = {
             "files": [str(f) for f in self.raw_data_files],
             "sizes": [f.stat().st_size if f.exists() else 0 for f in self.raw_data_files],
             "mtimes": [f.stat().st_mtime if f.exists() else 0 for f in self.raw_data_files]
         }
-        
-        relevant_config = {
+        core_data_config = {
             "data": self.config["data"],
-            "preprocessing": self.config["preprocessing"],
+            "preprocessing": relevant_proc_config,
             "normalization": self.config["normalization"],
-            "prediction": self.config["prediction"],
-            "training": {
-                "val_fraction": self.config["training"]["val_fraction"],
-                "test_fraction": self.config["training"]["test_fraction"],
-                "use_fraction": self.config["training"]["use_fraction"]
-            },
+            "prediction_mode": self.config["prediction"]["mode"],
             "raw_files": raw_files_info
         }
-        config_str = json.dumps(relevant_config, sort_keys=True, default=lambda x: f"{x:.20e}" if isinstance(x, float) else x)
-        current_hash = hashlib.sha256(config_str.encode('utf-8')).hexdigest()
+        config_str = json.dumps(core_data_config, sort_keys=True, default=lambda x: f"{x:.20e}" if isinstance(x, float) else x)
+        current_data_hash = hashlib.sha256(config_str.encode('utf-8')).hexdigest()
+        data_hash_path = self.processed_dir / "data_hash.json"
         
-        if all(f.exists() for f in required_files):
-            # Load saved hash and compare
-            saved_hash = load_json(self.processed_dir / "config_hash.json").get("hash")
-            if saved_hash == current_hash:
-                self.logger.info("Using existing preprocessed data (config matches)")
-                return
-            else:
-                self.logger.info("Config has changed; regenerating preprocessed data")
-                # Clean old shards before regenerating
-                self._clean_old_shards()
-        else:
-            self.logger.info("Preprocessed data missing; generating new data")
-            # Ensure directory is clean for first-time processing
-            if self.processed_dir.exists() and any(self.processed_dir.glob("shard_*.n*")):
-                self._clean_old_shards()
-        
-        # Check raw files exist
-        missing = [p for p in self.raw_data_files if not p.exists()]
-        if missing:
-            raise FileNotFoundError(f"Missing raw data files: {missing}")
-        
-        # Process data
-        self.logger.info("Starting data preprocessing...")
+        # ** KEY CHANGE: Instantiate preprocessor ONCE, up front **
         preprocessor = DataPreprocessor(
             raw_files=self.raw_data_files,
             output_dir=self.processed_dir,
             config=self.config
         )
         
-        split_indices = preprocessor.process_to_npy_shards()
-        
-        # Save the new hash
-        save_json({"hash": current_hash}, self.processed_dir / "config_hash.json")
-        
-        # Verify we have data
-        total_samples = sum(len(indices) for indices in split_indices.values())
-        if total_samples == 0:
-            raise ValueError("No valid data processed from raw files")
+        regenerate_core_data = True
+        if data_hash_path.exists():
+            saved_data_hash = load_json(data_hash_path).get("hash")
+            if saved_data_hash == current_data_hash:
+                self.logger.info("Core data hash matches. Reusing existing shards and normalization stats.")
+                regenerate_core_data = False
+            else:
+                self.logger.info("Core data hash mismatch. Regenerating ALL processed data.")
+                self._clean_all_processed_data()
+        else:
+            self.logger.info("Core data hash not found. Regenerating ALL processed data.")
+            self._clean_all_processed_data()
+
+        if regenerate_core_data:
+            missing = [p for p in self.raw_data_files if not p.exists()]
+            if missing:
+                raise FileNotFoundError(f"Missing raw data files: {missing}")
             
+            # This is the full, slow process. It's only run when absolutely necessary.
+            preprocessor.process_to_npy_shards()
+            save_json({"hash": current_data_hash}, data_hash_path)
+
+        # --- Stage 2: Check Split Hash ---
+        split_config = {
+            "val_fraction": self.config["training"]["val_fraction"],
+            "test_fraction": self.config["training"]["test_fraction"],
+            "use_fraction": self.config["training"]["use_fraction"]
+        }
+        current_split_hash = hashlib.sha256(json.dumps(split_config, sort_keys=True).encode('utf-8')).hexdigest()
+        split_hash_path = self.processed_dir / "split_hash.json"
+        
+        regenerate_splits = True
+        if split_hash_path.exists():
+            if not regenerate_core_data: # Don't check split hash if we already regenerated everything
+                saved_split_hash = load_json(split_hash_path).get("hash")
+                if saved_split_hash == current_split_hash:
+                    self.logger.info("Split hash matches. Reusing existing train/val/test indices.")
+                    regenerate_splits = False
+                else:
+                    self.logger.info("Split hash mismatch. Regenerating train/val/test indices.")
+                    self._clean_split_files()
+            else: # If core data was regenerated, splits must be too.
+                self._clean_split_files()
+        else:
+            self.logger.info("Split hash not found. Generating new train/val/test indices.")
+            self._clean_split_files()
+
+        if regenerate_splits:
+            # ** KEY CHANGE: Call the new, FAST function for splitting **
+            preprocessor.generate_split_indices()
+            save_json({"hash": current_split_hash}, split_hash_path)
+
     def train_model(self):
         """Train the neural network model with data loader cache warm-up."""
         self.logger.info("Starting model training...")
@@ -303,48 +366,68 @@ def main():
     if not args.config.exists():
         print(f"Error: Configuration file not found: {args.config}", file=sys.stderr)
         sys.exit(1)
-    
-    # Run with or without hyperparameter optimization
-    if args.trials:
-        # Ensure optuna is installed
-        try:
-            import optuna
-        except ImportError:
-            print("Installing optuna...")
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "optuna"])
-        
-        # Import and run optimization
-        from hyperparameter_tuning import optimize
-        
-        print(f"Starting hyperparameter optimization with {args.trials} trials...")
-        study = optimize(
-            config_path=args.config,
-            n_trials=args.trials,
-            n_jobs=1,  # Always use 1 for GPU training
-            study_name=args.study_name
-        )
-        
-        # Print results
-        print("\n" + "="*60)
-        print("Optimization Complete")
-        print("="*60)
-        print(f"Best validation loss: {study.best_value:.6f}")
-        print(f"Best trial: {study.best_trial.number}")
-        print("\nBest parameters:")
-        for key, value in study.best_params.items():
-            print(f"  {key}: {value}")
-        
-        # Show trial statistics
-        completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-        pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
-        print(f"\nTrials: {completed} completed, {pruned} pruned")
-        print(f"\nBest configuration saved to: optuna_results/")
-        
-    else:
-        # Normal training
-        pipeline = ChemicalKineticsPipeline(args.config)
-        pipeline.run()
+
+    # Profiler setup: Activities (CPU + CUDA if available)
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+
+    # Schedule for long runs: Profile cycles to reduce overhead
+    my_schedule = schedule(wait=1, warmup=1, active=3, repeat=2)  # Adjust as needed
+
+    # Wrap the entire pipeline (normal or Optuna)
+    with profile(
+        activities=activities,
+        schedule=my_schedule,
+        on_trace_ready=tensorboard_trace_handler("./logs/profiler"),  # Export to TensorBoard
+        record_shapes=True,  # Optional: Track tensor shapes
+        profile_memory=True,  # Optional: Track memory (adds slight overhead)
+        with_stack=True  # Optional: Stack traces for debugging
+    ) as prof:
+        # Run with or without hyperparameter optimization
+        if args.trials:
+            # Ensure optuna is installed
+            try:
+                import optuna
+            except ImportError:
+                print("Installing optuna...")
+                import subprocess
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "optuna"])
+            
+            # Import and run optimization
+            from hyperparameter_tuning import optimize
+            
+            print(f"Starting hyperparameter optimization with {args.trials} trials...")
+            study = optimize(
+                config_path=args.config,
+                n_trials=args.trials,
+                n_jobs=1,  # Always use 1 for GPU training
+                study_name=args.study_name
+            )
+            
+            # Print results
+            print("\n" + "="*60)
+            print("Optimization Complete")
+            print("="*60)
+            print(f"Best validation loss: {study.best_value:.6f}")
+            print(f"Best trial: {study.best_trial.number}")
+            print("\nBest parameters:")
+            for key, value in study.best_params.items():
+                print(f"  {key}: {value}")
+            
+            # Show trial statistics
+            completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+            pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
+            print(f"\nTrials: {completed} completed, {pruned} pruned")
+            print(f"\nBest configuration saved to: optuna_results/")
+            
+            prof.step()  # Step after Optuna (if using schedule)
+            
+        else:
+            # Normal training
+            pipeline = ChemicalKineticsPipeline(args.config)
+            pipeline.run()
+            prof.step()  # Step after run (if using schedule)
 
 
 if __name__ == "__main__":

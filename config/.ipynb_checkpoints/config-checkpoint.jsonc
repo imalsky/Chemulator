@@ -7,12 +7,12 @@
             //"data/raw/run9002-result.h5",
             //"data/raw/run9003-result.h5",
             //"data/raw/run9004-result.h5",
-            //"data/raw/run9005-result.h5",
-            //"data/raw/run9006-result.h5",
-            //"data/raw/run9007-result.h5",
-            //"data/raw/run9008-result.h5",
-            //"data/raw/run9009-result.h5",
-            //"data/raw/run9010-result.h5"
+            //"data/raw/run8005-result.h5",
+            //"data/raw/run8006-result.h5",
+            //"data/raw/run8007-result.h5",
+            //"data/raw/run8008-result.h5",
+            //"data/raw/run8009-result.h5",
+            //"data/raw/run8010-result.h5"
         ],
         // Directory for processed NPY shards
         "processed_data_dir": "data/processed",
@@ -50,11 +50,11 @@
         // Number of samples per NPY shard file
         "shard_size": 1000000,
         // Minimum species concentration threshold
-        "min_value_threshold": 1e-25,
+        "min_species_threshold": 1e-25,
         // Compression type: null for raw npz files
         "compression": null,
         // Number of parallel workers for preprocessing
-        "num_workers": 8,
+        "num_workers": 1,
         // Enable parallel preprocessing (set false for simpler debugging)
         "parallel_enabled": true
     },
@@ -95,8 +95,8 @@
         "output_scale": 1.0,
         
         // DeepONet-specific parameters
-        "branch_layers": [384, 384, 384],  // Hidden layers for branch network
-        "trunk_layers": [128, 128, 128],   // Hidden layers for trunk network
+        "branch_layers": [384, 64, 512, 512],  // Hidden layers for branch network
+        "trunk_layers": [128, 128],   // Hidden layers for trunk network
         "basis_dim": 128,                   // Number of basis functions
         
         // SIREN-specific parameters (when type="siren")
@@ -128,47 +128,66 @@
     
     // ===== TRAINING PARAMETERS =====
     "training": {
-        "val_fraction": 0.15,
-        "test_fraction": 0.15,
-        "use_fraction": 1.0,
+        // Data split fractions
+        "val_fraction": 0.15,   // Validation set fraction
+        "test_fraction": 0.15,  // Test set fraction
+        "use_fraction": 1.0,    // Fraction of data to actually use (for debugging)
         
-        "epochs": 100,
-        "batch_size": 8192,
-        "gradient_accumulation_steps": 1,
+        // Training loop settings
+        "epochs": 100,                      // Maximum epochs
+        "batch_size": 8192,                 // Batch size
+        "gradient_accumulation_steps": 1,   // Gradient accumulation steps
         
-        // DataLoader settings - CRITICAL CHANGES
-        "num_workers": 16,            // Changed from 8 to 0 for large datasets
-        "pin_memory": true,         // Changed from true to false
-        "persistent_workers": true, // Changed from true to false  
-        "prefetch_factor": 4,        // Reduced from 4 to 2
-        "drop_last": true,
-        "dataset_cache_shards": 64,   // CRITICAL: Reduced from 256 to 4
+        // DataLoader settings
+        "num_workers": 1,           // Parallel data loading workers
+        "pin_memory": true,          // Pin memory for faster GPU transfer
+        "persistent_workers": true,  // Keep workers alive between epochs
+        "prefetch_factor": 4,        // Number of batches to prefetch
+        "drop_last": true,           // Drop incomplete final batch
+        "dataset_cache_shards": 256, // Max shards to cache in memory
         
-        // Rest of training config remains the same...
+        // Optimizer settings (AdamW)
         "learning_rate": 3e-4,
         "weight_decay": 1e-5,
-        "betas": [0.9, 0.999],
-        "eps": 1e-8,
+        "betas": [0.9, 0.999],  // Adam beta parameters
+        "eps": 1e-8,            // Adam epsilon
+        
+        // Gradient clipping (0 = no clipping)
         "gradient_clip": 1.0,
-        "scheduler": "cosine",
+        
+        // Learning rate scheduler
+        "scheduler": "cosine",  // Options: "none", "cosine", "plateau"
         "scheduler_params": {
-            "T_0": 10,
-            "T_mult": 2,
-            "eta_min": 1e-7,
-            "factor": 0.5,
-            "patience": 10,
-            "min_lr": 1e-7
+            // For "cosine" scheduler
+            "T_0": 10,          // Initial restart period in epochs
+            "T_mult": 2,        // Period multiplier after each restart
+            "eta_min": 1e-7,    // Minimum learning rate
+            
+            // For "plateau" scheduler
+            "factor": 0.5,      // LR reduction factor
+            "patience": 10,     // Epochs to wait before reducing LR
+            "min_lr": 1e-7      // Minimum learning rate
         },
+        
+        // Loss function: "mse", "mae", "huber"
         "loss": "mse",
-        "huber_delta": 0.5,
-        "use_amp": true,
-        "amp_dtype": "bfloat16",
-        "early_stopping_patience": 15,
-        "min_delta": 1e-10,
-        "log_interval": 1000,
-        "save_interval": 10,
-        "empty_cache_interval": 1000,
-        "hpo_epochs": 20
+        "huber_delta": 0.5,  // Delta for Huber loss (if used)
+        
+        // Mixed precision training
+        "use_amp": true,              // Enable automatic mixed precision
+        "amp_dtype": "bfloat16",      // AMP dtype: "float16" or "bfloat16"
+        
+        // Early stopping
+        "early_stopping_patience": 15,  // Epochs to wait before stopping
+        "min_delta": 1e-10,            // Minimum improvement to reset patience
+        
+        // Logging intervals
+        "log_interval": 1000,           // Log every N gradient steps
+        "save_interval": 10,           // Save checkpoint every N epochs
+        "empty_cache_interval": 1000,  // Clear GPU cache every N steps
+        
+        // Hyperparameter optimization settings
+        "hpo_epochs": 20  // Reduced epochs for HPO trials
     },
     
     // ===== SYSTEM/HARDWARE SETTINGS =====
