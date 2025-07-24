@@ -12,7 +12,7 @@ from typing import Dict, Any, List, Optional
 
 import torch
 import torch.nn as nn
-
+from torch.export import Dim
 
 class FiLMLayer(nn.Module):
     """Feature-wise Linear Modulation layer."""
@@ -294,6 +294,8 @@ class FiLMDeepONet(nn.Module):
             
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Forward pass with FiLM conditioning."""
+        batch_size = inputs.shape[0]
+
         # Split inputs
         branch_input = inputs[:, :self.num_species + self.num_globals]
         trunk_input = inputs[:, -1:]  # Time
@@ -310,7 +312,7 @@ class FiLMDeepONet(nn.Module):
             trunk_out = self.trunk_net(trunk_input)
 
         # Reshape branch output
-        branch_out = branch_out.view(-1, self.num_species, self.basis_dim)
+        branch_out = branch_out.view(batch_size, self.num_species, self.basis_dim)
 
         # Combine with dot product
         output = torch.einsum("bni,bi->bn", branch_out, trunk_out)
@@ -323,9 +325,17 @@ class FiLMDeepONet(nn.Module):
 
 
 def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
-    """Create model based on configuration."""
+    """Create model based on configuration with mode-model compatibility check."""
     model_type = config["model"]["type"].lower()
+    prediction_mode = config.get("prediction", {}).get("mode", "absolute")
     
+    # Bug 4 Fix: Enforce mode-model compatibility
+    if prediction_mode == "ratio" and model_type != "deeponet":
+        raise ValueError(
+            f"Prediction mode 'ratio' is only compatible with model type 'deeponet', "
+            f"but '{model_type}' was specified. Either change model.type to 'deeponet' "
+            f"or change prediction.mode to 'absolute'."
+        )
     
     if model_type == "siren":
         model = FiLMSIREN(config)
@@ -351,7 +361,7 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
 
 
 def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path):
-    """Export model using torch.export."""
+    """Export model using torch.export with dynamic batch size support."""
     logger = logging.getLogger(__name__)
     
     model.eval()
@@ -364,16 +374,28 @@ def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path)
     with torch.no_grad():
         try:
             # Use the new torch.export API if available
-            if hasattr(torch, 'export'):
-                # Export the model
-                exported_program = torch.export.export(model, (example_input,))
+            if hasattr(torch, 'export'):      
+                
+                # A large but finite number is sufficient.
+                batch_dim = Dim("batch", min=1, max=16384)
+                
+                # The key MUST match the argument name in the model's forward() method.
+                # For FiLMDeepONet, the signature is `forward(self, inputs: ...)`.
+                dynamic_shapes = {"inputs": {0: batch_dim}}
+                
+                # Export the model with dynamic batch dimension
+                exported_program = torch.export.export(
+                    model, 
+                    (example_input,),
+                    dynamic_shapes=dynamic_shapes
+                )
                 torch.export.save(exported_program, str(save_path))
-                logger.info(f"Model exported using torch.export to {save_path}")
+                logger.info(f"Model exported with dynamic batch size to {save_path}")
             else:
-                # Fallback to torch.jit.trace for older versions
                 traced_model = torch.jit.trace(model, example_input)
                 torch.jit.save(traced_model, str(save_path))
                 logger.info(f"Model exported using torch.jit to {save_path}")
+                logger.warning("JIT export may not support dynamic batch sizes as well as torch.export")
         except Exception as e:
             logger.error(f"Export failed: {e}")
             raise

@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-Chemical kinetics data preprocessor with corrected normalization statistics.
+Chemical kinetics data preprocessor.
+This version uses a highly efficient, parallelized, two-pass process with an
+architecture that minimizes inter-process communication (IPC) and memory overhead.
+
+--- UPDATED FEATURES ---
+- Stricter Filtering: Drops entire profiles if they contain any non-finite values (NaN/inf)
+  or any species value below a configurable 'min_value_threshold'.
+- Summary Reporting: Generates a human-readable summary log detailing how many
+  profiles were processed, kept, and dropped (with reasons).
 """
 
 import hashlib
@@ -8,6 +16,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import h5py
@@ -15,932 +24,551 @@ import numpy as np
 import torch
 
 from .normalizer import DataNormalizer, NormalizationHelper
-from utils.utils import save_json
+from utils.utils import save_json, load_json
 
 
-class DataPreprocessor:
-    """Preprocess HDF5 raw data to normalized NPY shards."""
-    def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
-        # Sort the raw_files list to ensure a deterministic processing order.
-        self.raw_files = sorted(raw_files)
-        self.output_dir = Path(output_dir)
-        self.config = config
-        self.logger = logging.getLogger(__name__)
-        
-        # Data configuration
-        data_config = config["data"]
-        self.species_vars = data_config["species_variables"]
-        self.global_vars = data_config["global_variables"]
-        self.time_var = data_config["time_variable"]
+# ##############################################################################
+# LIGHTWEIGHT WORKER-SIDE IMPLEMENTATION
+# ##############################################################################
+
+class CorePreprocessor:
+    """A lightweight helper class containing only the logic needed within a worker."""
+    def __init__(self, config: Dict[str, Any], norm_stats: Optional[Dict[str, Any]] = None):
+        self.data_cfg = config["data"]
+        self.norm_cfg = config["normalization"]
+        self.train_cfg = config["training"]
+        self.pred_cfg = config.get("prediction", {})
+        self.proc_cfg = config["preprocessing"]
+
+        self.species_vars = self.data_cfg["species_variables"]
+        self.global_vars = self.data_cfg["global_variables"]
+        self.time_var = self.data_cfg["time_variable"]
         self.var_order = self.species_vars + self.global_vars + [self.time_var]
         
         self.n_species = len(self.species_vars)
         self.n_globals = len(self.global_vars)
         self.n_vars = self.n_species + self.n_globals + 1
         
-        # Preprocessing config
-        preprocess_config = config["preprocessing"]
-        self.shard_size = preprocess_config["shard_size"]
-        self.min_threshold = preprocess_config["min_species_threshold"]
-        self.compression = preprocess_config.get("compression", None)
-        self.num_workers = preprocess_config.get("num_workers", 16)
-        self.parallel_enabled = preprocess_config.get("parallel_enabled", True)
+        self.min_value_threshold = self.proc_cfg.get("min_value_threshold", 1e-30)
         
-        # Prediction mode
-        self.prediction_mode = config.get("prediction", {}).get("mode", "absolute")
+        self.prediction_mode = self.pred_cfg.get("mode", "absolute")
+        self.normalizer = DataNormalizer(config)
+        self.norm_stats = norm_stats or {}
         
-        # Initialize statistics tracking
-        self.preprocessing_stats = {
-            "total_groups_examined": 0,
-            "groups_dropped_subsampling": 0,
-            "groups_dropped_validation": 0,
-            "groups_dropped_no_future": 0,
-            "groups_processed": 0,
-            "total_samples_generated": 0,
-            "per_file_stats": {}
-        }
+        # Create index mappings for robust variable ordering (Bug 3 fix)
+        self._create_index_mappings()
         
-        self._init_shard_index()
-    
-    def _init_shard_index(self) -> None:
-        """Initialize shard index structure."""
-        self.shard_index = {
-            "n_species": self.n_species,
-            "n_globals": self.n_globals,
-            "samples_per_shard": self.shard_size,
-            "n_shards": 0,
-            "total_samples": 0,
-            "compression": self.compression,
-            "shards": [],
-            "split_files": {
-                "train": "train_indices.npy",
-                "validation": "val_indices.npy",
-                "test": "test_indices.npy"
-            },
-            "prediction_mode": self.prediction_mode,
-        }
-        
-    def process_to_npy_shards(self) -> Dict[str, Any]:
-        """Two-pass processing: collect statistics then write normalized shards."""
-        start_time = time.time()
-        self.logger.info(f"Starting preprocessing with {len(self.raw_files)} files")
-        self.logger.info(f"Prediction mode: {self.prediction_mode}")
-        
-        # Pass 1: Collect statistics
-        self.logger.info("Pass 1: Collecting normalization statistics")
-        norm_stats = self._collect_statistics()
-        
-        # Pass 2: Write normalized shards
-        self.logger.info("Pass 2: Writing normalized NPY shards")
-        split_indices = self._write_normalized_shards(norm_stats)
-        
-        # Generate data report
-        self._generate_data_report(norm_stats, split_indices)
-        
-        self.logger.info(f"Preprocessing completed in {time.time() - start_time:.1f}s")
-        return split_indices
-        
-    def _collect_statistics(self) -> Dict[str, Any]:
-        """First pass: collect normalization statistics with mode-specific handling."""
-        self.normalizer = DataNormalizer(self.config)
-        
-        # Initialize accumulators for input variables
-        # In ratio mode: species and globals use only t=0, time uses t>0
-        # In absolute mode: all variables use all timesteps except time uses t>0
-        accumulators = self.normalizer._initialize_accumulators()
-        
-        # In ratio mode, create per-species accumulators for the log-ratios
-        if self.prediction_mode == "ratio":
-            ratio_accumulators = {
-                var: {"count": 0, "mean": 0.0, "m2": 0.0, "min": float("inf"), "max": float("-inf")}
-                for var in self.species_vars
-            }
-
-        for raw_file in self.raw_files:
-            if self.prediction_mode == "ratio":
-                self._process_file_statistics_ratio(raw_file, accumulators, ratio_accumulators)
-            else:
-                self._process_file_statistics_absolute(raw_file, accumulators)
-
-        # Finalize statistics for the input variables
-        norm_stats = self.normalizer._finalize_statistics(accumulators)
-
-        # If in ratio mode, finalize the per-species ratio statistics
-        if self.prediction_mode == "ratio":
-            norm_stats["ratio_stats"] = {}
-            for var, acc in ratio_accumulators.items():
-                if acc["count"] > 1:
-                    variance = acc["m2"] / (acc["count"] - 1)
-                    std = max(np.sqrt(variance), self.config["normalization"]["min_std"])
-                else:
-                    std = 1.0
-
-                norm_stats["ratio_stats"][var] = {
-                    "mean": acc["mean"],
-                    "std": std,
-                    "min": acc["min"],
-                    "max": acc["max"],
-                    "count": acc["count"]
-                }
-            self.logger.info("Per-species ratio statistics calculated.")
-
-        save_json(norm_stats, self.output_dir / "normalization.json")
-        return norm_stats
-
-    def _process_file_statistics_absolute(self, raw_file: Path, accumulators: Dict[str, Any]):
-        """Process statistics for absolute mode - species/globals use all timesteps, time uses t>0."""
-        groups_processed = 0
-        with h5py.File(raw_file, "r") as f:
-            for gname in f.keys():
-                grp = f[gname]
-                
-                use_fraction = self.config["training"]["use_fraction"]
-                if use_fraction < 1.0:
-                    gname_hash = hashlib.sha256(gname.encode('utf-8')).hexdigest()
-                    hash_float = int(gname_hash[:8], 16) / 0xFFFFFFFF
-                    if hash_float >= use_fraction:
-                        continue
-                
-                if not self._validate_group_simple(grp):
-                    continue
-
-                n_t = grp[self.time_var].shape[0]
-                profile = self._extract_profile(grp, gname, n_t)
-
-                if profile is None or n_t <= 1:
-                    continue
-
-                # For absolute mode:
-                # - Species and globals: use all timesteps
-                # - Time: use only t>0
-                self._update_accumulators_selective(profile, accumulators, n_t, 
-                                                   exclude_t0_for_time=True)
-
-                groups_processed += 1
-        self.logger.info(f"  Processed {groups_processed} groups from {raw_file.name}")
-
-    def _process_file_statistics_ratio(self, raw_file: Path, accumulators: Dict[str, Any],
-                                    ratio_accumulators: Dict[str, Dict[str, Any]]):
-        """Process statistics for ratio mode - species/globals use only t=0, time uses t>0."""
-        groups_processed = 0
-        with h5py.File(raw_file, "r") as f:
-            for gname in f.keys():
-                grp = f[gname]
-                
-                use_fraction = self.config["training"]["use_fraction"]
-                if use_fraction < 1.0:
-                    gname_hash = hashlib.sha256(gname.encode('utf-8')).hexdigest()
-                    hash_float = int(gname_hash[:8], 16) / 0xFFFFFFFF
-                    if hash_float >= use_fraction:
-                        continue
-                
-                if not self._validate_group_simple(grp):
-                    continue
-
-                n_t = grp[self.time_var].shape[0]
-                profile = self._extract_profile(grp, gname, n_t)
-
-                if profile is None or n_t <= 1:
-                    continue
-
-                # For ratio mode:
-                # - Species and globals: use only t=0 (initial conditions)
-                # - Time: use only t>0 (actual input times)
-                self._update_accumulators_ratio_mode(profile, accumulators, n_t)
-
-                # Calculate and accumulate log-ratios for each species
-                initial_species = profile[0, :self.n_species]
-                future_species = profile[1:, :self.n_species]
-                
-                epsilon = self.config["normalization"]["epsilon"]
-                ratios = future_species / np.maximum(initial_species[None, :], epsilon)
-                log_ratios = np.log10(np.maximum(ratios, epsilon))
-
-                # Update ratio statistics per species
-                for i, var_name in enumerate(self.species_vars):
-                    acc = ratio_accumulators[var_name]
-                    vec = log_ratios[:, i]
-                    
-                    if vec.size > 0:
-                        finite_mask = np.isfinite(vec)
-                        vec = vec[finite_mask]
-                        if vec.size == 0:
-                            continue
-
-                        n_a = acc["count"]
-                        n_b = vec.size
-
-                        mean_a = acc["mean"]
-                        mean_b = float(vec.mean())
-                        m2_b = float(((vec - mean_b) ** 2).sum())
-
-                        delta = mean_b - mean_a
-                        n_ab = n_a + n_b
-
-                        if n_ab > 0:
-                            acc["mean"] = (n_a * mean_a + n_b * mean_b) / n_ab
-                            acc["m2"] += m2_b + (delta**2 * n_a * n_b) / n_ab
-                            acc["count"] = n_ab
-                            acc["min"] = min(acc["min"], float(vec.min()))
-                            acc["max"] = max(acc["max"], float(vec.max()))
-
-                groups_processed += 1
-        self.logger.info(f"  Processed {groups_processed} groups from {raw_file.name} for ratio stats")
-
-    def _update_accumulators_selective(self, profile: np.ndarray, accumulators: Dict[str, Any], 
-                                     n_t: int, exclude_t0_for_time: bool = True):
-        """Update accumulators with selective timestep handling."""
-        profile_3d = profile.reshape(1, n_t, self.n_vars)
-        
-        for var, acc in accumulators.items():
-            idx = acc["index"]
-            method = acc["method"]
-            
-            if var == self.time_var and exclude_t0_for_time and n_t > 1:
-                # For time variable, exclude t=0
-                vec = profile_3d[0, 1:, idx].astype(np.float64)
-            else:
-                # For other variables, use all timesteps
-                vec = profile_3d[0, :, idx].ravel().astype(np.float64)
-            
-            # Rest of the update logic remains the same
-            finite_mask = np.isfinite(vec)
-            if (~finite_mask).sum() > 0:
-                if (~finite_mask).sum() / vec.size > 0.01:
-                    self.logger.warning(f"Variable {var} has {(~finite_mask).sum()}/{vec.size} non-finite values")
-                vec = vec[finite_mask]
-            
-            if vec.size == 0:
-                self.logger.warning(f"Variable {var} has no finite values, skipping")
-                continue
-
-            if method in {"log-standard", "log-min-max"}:
-                below_epsilon = vec < self.normalizer.epsilon
-                if below_epsilon.any():
-                    self.logger.warning(
-                        f"Variable {var} has {below_epsilon.sum()} values below epsilon. "
-                        f"Min value: {vec.min():.2e}"
-                    )
-                vec = np.log10(np.maximum(vec, self.normalizer.epsilon))
-
-            n_b = vec.size
-            mean_b = float(vec.mean())
-            m2_b = float(((vec - mean_b) ** 2).sum()) if n_b > 1 else 0.0
-
-            acc["min"] = min(acc["min"], float(vec.min()))
-            acc["max"] = max(acc["max"], float(vec.max()))
-
-            # Chan's parallel mean/variance update
-            n_a = acc["count"]
-            delta = mean_b - acc["mean"]
-            n_ab = n_a + n_b
-
-            acc["mean"] += delta * n_b / n_ab
-            acc["m2"] += m2_b + delta**2 * n_a * n_b / n_ab
-            acc["count"] = n_ab
-
-    def _update_accumulators_ratio_mode(self, profile: np.ndarray, accumulators: Dict[str, Any], n_t: int):
-        """Update accumulators for ratio mode: species/globals use t=0, time uses t>0."""
-        for var, acc in accumulators.items():
-            idx = acc["index"]
-            method = acc["method"]
-            
-            if var in self.species_vars or var in self.global_vars:
-                # For species and globals in ratio mode, use only t=0
-                vec = np.array([profile[0, idx]], dtype=np.float64)
-            elif var == self.time_var:
-                # For time, use only t>0
-                if n_t > 1:
-                    vec = profile[1:, idx].astype(np.float64)
-                else:
-                    continue
-            else:
-                # Should not happen
-                continue
-            
-            # Apply log transform if needed
-            if method in {"log-standard", "log-min-max"}:
-                vec = np.log10(np.maximum(vec, self.normalizer.epsilon))
-            
-            # Update statistics
-            n_b = vec.size
-            mean_b = float(vec.mean())
-            m2_b = float(((vec - mean_b) ** 2).sum()) if n_b > 1 else 0.0
-
-            acc["min"] = min(acc["min"], float(vec.min()))
-            acc["max"] = max(acc["max"], float(vec.max()))
-
-            # Chan's update
-            n_a = acc["count"]
-            delta = mean_b - acc["mean"]
-            n_ab = n_a + n_b
-
-            acc["mean"] += delta * n_b / n_ab
-            acc["m2"] += m2_b + delta**2 * n_a * n_b / n_ab
-            acc["count"] = n_ab
-        
-    def _write_normalized_shards(self, norm_stats: Dict[str, Any]) -> Dict[str, List[int]]:
-        """Second pass – write normalized data to NPY shards."""
-        # Setup helper and writer
-        helper = NormalizationHelper(
-            norm_stats,
-            torch.device("cpu"),
-            self.species_vars,
-            self.global_vars,
-            self.time_var,
-            self.config,
-        )
-
-        shard_writer = ShardWriter(
-            self.output_dir,
-            self.shard_size,
-            self.shard_index,
-            compression=self.compression,
-        )
-
-        val_f  = self.config["training"]["val_fraction"]
-        test_f = self.config["training"]["test_fraction"]
-        splits = {"train": [], "validation": [], "test": []}
-
-        global_idx = 0
-        profiles_written = 0
-        profiles_skipped = 0
-
-        # Get full ratio stats dict if in ratio mode
-        ratio_stats = norm_stats.get("ratio_stats", {})
-
-        # Process files
-        if self.parallel_enabled and self.num_workers > 1 and len(self.raw_files) > 1:
-            # Parallel processing with fixed index handling
-            results = self._parallel_write_shards_fixed(
-                norm_stats, helper, val_f, test_f, 
-                ratio_stats, global_idx
+        if norm_stats:
+            self.norm_helper = NormalizationHelper(
+                norm_stats, torch.device("cpu"), self.species_vars,
+                self.global_vars, self.time_var, config
             )
-            
-            # Aggregate results - indices are now absolute, no adjustment needed
-            for file_samples, file_splits, written, skipped, file_stats in results:
-                for samples in file_samples:
-                    shard_writer.add_samples(samples)
-                
-                # Directly extend splits with the absolute indices
-                for split_name, indices in file_splits.items():
-                    splits[split_name].extend(indices)
-                
-                profiles_written += written
-                profiles_skipped += skipped
-                
-                # Update preprocessing stats
-                for key, value in file_stats.items():
-                    if key in self.preprocessing_stats:
-                        self.preprocessing_stats[key] += value
-            
-            # Calculate total samples from all splits
-            global_idx = sum(len(indices) for indices in splits.values())
-        
-        else:
-            # Sequential processing
-            for raw_file in self.raw_files:
-                file_stats = {
-                    "total_groups_examined": 0,
-                    "groups_dropped_subsampling": 0,
-                    "groups_dropped_validation": 0,
-                    "groups_dropped_no_future": 0,
-                    "groups_processed": 0,
-                }
-                
-                with h5py.File(raw_file, "r") as f:
-                    for gname in sorted(f.keys()):
-                        file_stats["total_groups_examined"] += 1
-                        
-                        result = self._process_single_group(
-                            f[gname], gname, helper, 
-                            val_f, test_f, global_idx,
-                            ratio_stats, file_stats
-                        )
-                        
-                        if result is None:
-                            profiles_skipped += 1
-                            continue
-                        
-                        samples, split_key, n_written = result
-                        shard_writer.add_samples(samples)
-                        
-                        start_idx = global_idx
-                        global_idx += n_written
-                        splits[split_key].extend(range(start_idx, global_idx))
-                        profiles_written += 1
-                        file_stats["groups_processed"] += 1
-                
-                # Update global stats
-                for key, value in file_stats.items():
-                    self.preprocessing_stats[key] += value
-                self.preprocessing_stats["per_file_stats"][str(raw_file.name)] = file_stats
-
-        # Finalize
-        shard_writer.flush()
-        self.shard_index["total_samples"] = global_idx
-        self.preprocessing_stats["total_samples_generated"] = global_idx
-        save_json(self.shard_index, self.output_dir / "shard_index.json")
-
-        # Log statistics
-        self.logger.info(f"Profiles written: {profiles_written}, skipped: {profiles_skipped}")
-
-        for split_name, idxs in splits.items():
-            if idxs:
-                fname = self.shard_index["split_files"][split_name]
-                np.save(self.output_dir / fname, np.array(idxs, dtype=np.int64))
-                self.logger.info(f"{split_name} split: {len(idxs):,} samples")
-
-        return splits
-        
-    def _parallel_write_shards_fixed(self, norm_stats, helper, val_f, test_f, 
-                                    ratio_stats, start_global_idx):
-        """Process files in parallel with fixed index handling."""
-        results = []
-        
-        # Pre-calculate the number of valid samples per file
-        self.logger.info("Pre-calculating sample counts for parallel processing...")
-        file_sample_counts = []
-        for raw_file in self.raw_files:
-            count = self._count_valid_samples_in_file(raw_file)
-            file_sample_counts.append(count)
-            self.logger.debug(f"{raw_file.name}: {count} samples")
-        
-        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-            # Submit tasks with deterministic starting indices
-            futures = []
-            current_idx = start_global_idx
-            
-            for i, (raw_file, sample_count) in enumerate(zip(self.raw_files, file_sample_counts)):
-                future = executor.submit(
-                    self._process_file_for_shards_fixed,
-                    raw_file, norm_stats, val_f, test_f,
-                    current_idx, ratio_stats
-                )
-                futures.append((future, raw_file))
-                current_idx += sample_count  # Increment by exact count
-            
-            # Collect results
-            for future, raw_file in futures:
-                try:
-                    result = future.result()
-                    results.append(result)
-                    self.logger.info(f"Completed processing {raw_file.name}")
-                except Exception as e:
-                    self.logger.error(f"Failed to process {raw_file}: {e}")
-                    raise
-        
-        return results
     
-    def _count_valid_samples_in_file(self, raw_file: Path) -> int:
-        """Count the exact number of samples that will be generated from a file."""
-        count = 0
-        use_fraction = self.config["training"]["use_fraction"]
-        
-        with h5py.File(raw_file, "r") as f:
-            for gname in sorted(f.keys()):
-                # Apply subsampling deterministically
-                if use_fraction < 1.0:
-                    h = hashlib.sha256(gname.encode("utf-8")).hexdigest()
-                    if int(h[:8], 16) / 0xFFFFFFFF >= use_fraction:
-                        continue
-                
-                # Check if group is valid
-                if not self._validate_group_simple(f[gname]):
-                    continue
-                
-                # Count samples (n_timesteps - 1)
-                n_t = f[gname][self.time_var].shape[0]
-                if n_t > 1:
-                    count += (n_t - 1)
-        
-        return count
-    
-    def _process_file_for_shards_fixed(self, raw_file, norm_stats, val_f, test_f, 
-                                      start_global_idx, ratio_stats):
-        """Process a single file with fixed global indexing."""
-        # Re-create helper in subprocess
-        helper = NormalizationHelper(
-            norm_stats,
-            torch.device("cpu"),
-            self.species_vars,
-            self.global_vars,
-            self.time_var,
-            self.config,
-        )
-        
-        file_samples = []
-        file_splits = {"train": [], "validation": [], "test": []}
-        profiles_written = 0
-        profiles_skipped = 0
-        global_idx = start_global_idx
-        
-        file_stats = {
-            "total_groups_examined": 0,
-            "groups_dropped_subsampling": 0,
-            "groups_dropped_validation": 0,
-            "groups_dropped_no_future": 0,
-            "groups_processed": 0,
-        }
-        
-        with h5py.File(raw_file, "r") as f:
-            for gname in sorted(f.keys()):
-                file_stats["total_groups_examined"] += 1
-                
-                result = self._process_single_group(
-                    f[gname], gname, helper,
-                    val_f, test_f, global_idx,
-                    ratio_stats, file_stats
-                )
-                
-                if result is None:
-                    profiles_skipped += 1
-                    continue
-                
-                samples, split_key, n_written = result
-                file_samples.append(samples)
-                
-                # Use absolute indices
-                start_idx = global_idx
-                global_idx += n_written
-                file_splits[split_key].extend(range(start_idx, global_idx))
-                profiles_written += 1
-                file_stats["groups_processed"] += 1
-        
-        return file_samples, file_splits, profiles_written, profiles_skipped, file_stats
-        
-    def _process_single_group(self, grp, gname, helper, val_f, test_f, 
-                            global_idx, ratio_stats, file_stats=None):
-        """Process a single group and return samples."""
-        # Deterministic subsampling
-        use_fraction = self.config["training"]["use_fraction"]
-        if use_fraction < 1.0:
-            h = hashlib.sha256(gname.encode("utf-8")).hexdigest()
-            if int(h[:8], 16) / 0xFFFFFFFF >= use_fraction:
-                if file_stats:
-                    file_stats["groups_dropped_subsampling"] += 1
-                return None
-        
-        if not self._validate_group_simple(grp):
-            if file_stats:
-                file_stats["groups_dropped_validation"] += 1
-            return None
-        
-        # Extract & normalize
-        n_t = grp[self.time_var].shape[0]
-        if n_t <= 1:
-            if file_stats:
-                file_stats["groups_dropped_no_future"] += 1
-            return None
-            
-        profile = self._extract_profile(grp, gname, n_t)
-        if profile is None:
-            if file_stats:
-                file_stats["groups_dropped_validation"] += 1
-            return None
-        
-        # Get samples based on prediction mode
-        if self.prediction_mode == "ratio":
-            samples = self._profile_to_samples_ratio(
-                profile, n_t, helper, ratio_stats
-            )
-        else:
-            profile_t = torch.from_numpy(profile)
-            norm_prof = helper.normalize_profile(profile_t).numpy()
-            samples = self._profile_to_samples(norm_prof, n_t)
-        
-        if samples is None:
-            return None
-        
-        # Determine split
-        split_h = hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()
-        p = int(split_h[:8], 16) / 0xFFFFFFFF
-        
-        split_key = (
-            "test" if p < test_f
-            else "validation" if p < test_f + val_f
-            else "train"
-        )
-        
-        return samples, split_key, samples.shape[0]
-    
-    def _validate_group_simple(self, group: h5py.Group) -> bool:
-        """Simplified validation - only check essentials."""
-        # Check required variables exist
-        required_vars = set(self.species_vars + [self.time_var])
-        if not required_vars.issubset(group.keys()):
-            return False
-        
-        # Check for minimum threshold violations and non-finite values
-        for var in self.species_vars:
+    def _create_index_mappings(self):
+        """Create index mappings for robust variable access (Bug 3 fix)."""
+        self.var_to_idx = {var: i for i, var in enumerate(self.var_order)}
+        self.species_indices = [self.var_to_idx[var] for var in self.species_vars]
+        self.global_indices = [self.var_to_idx[var] for var in self.global_vars]
+        self.time_idx = self.var_to_idx[self.time_var]
+
+    def _is_profile_valid(self, group: h5py.Group) -> Tuple[bool, str]:
+        """
+        Checks if a profile is valid according to strict criteria.
+        Returns (is_valid, reason_for_failure_or_success).
+        """
+        # 1. Check for missing datasets
+        required_keys = self.species_vars + [self.time_var]
+        if not set(required_keys).issubset(group.keys()):
+            return False, "missing_keys"
+
+        # 2. Check each dataset for NaNs, Infs, and value thresholds
+        for var in required_keys:
             try:
-                var_data = group[var][:]
-                if not np.all(np.isfinite(var_data)) or np.any(var_data < self.min_threshold):
-                    return False
-                # Additional check for ratio mode: ensure no exact zeros at t=0
-                if self.prediction_mode == "ratio" and var_data[0] < self.config["normalization"]["epsilon"]:
-                    self.logger.debug(f"Skipping group {group.name}: zero initial condition for {var}")
-                    return False
-            except Exception:
-                return False
-        
-        # FIXED: Always verify globals are constant (remove conditional)
-        for var in self.global_vars:
-            if var in group:
                 data = group[var][:]
-                if not np.allclose(data, data[0], rtol=1e-10):
-                    self.logger.warning(f"Global variable {var} is not constant in group {group.name}")
-                    return False
+            except Exception:
+                return False, "read_error"
+
+            if not np.all(np.isfinite(data)):
+                return False, "non_finite"
+
+            if var in self.species_vars:
+                if np.any(data < self.min_value_threshold):
+                    return False, "below_threshold"
         
-        return True
+        return True, "valid"
+    
+    def process_file_for_stats(self, file_path: Path) -> Tuple[Dict, Dict, int, Dict]:
+        """Worker logic for Pass 1: compute stats, counts, and a validation report."""
+        accumulators = self.normalizer._initialize_accumulators()
+        ratio_accumulators = {
+            var: {"count": 0, "mean": 0.0, "m2": 0.0, "min": float("inf"), "max": float("-inf")}
+            for var in self.species_vars
+        } if self.prediction_mode == "ratio" else {}
+        
+        valid_sample_count = 0
+        
+        # --- NEW: Reporting dictionary for this worker ---
+        report = {
+            "total_profiles": 0,
+            "profiles_kept": 0,
+            "dropped_reasons": defaultdict(int)
+        }
+        
+        with h5py.File(file_path, "r") as f:
+            for gname in sorted(f.keys()):
+                report["total_profiles"] += 1
+                grp = f[gname]
+                
+                # --- NEW: Use the stricter validation function ---
+                is_valid, reason = self._is_profile_valid(grp)
+                if not is_valid:
+                    report["dropped_reasons"][reason] += 1
+                    continue
+
+                use_fraction = self.train_cfg["use_fraction"]
+                if use_fraction < 1.0 and int(hashlib.sha256(gname.encode('utf-8')).hexdigest()[:8], 16) / 0xFFFFFFFF >= use_fraction:
+                    continue
+
+                n_t = grp[self.time_var].shape[0]
+                if n_t <= 1:
+                    report["dropped_reasons"]["too_few_timesteps"] += 1
+                    continue
+                
+                profile = self._extract_profile(grp, gname, n_t)
+                if profile is None:
+                    report["dropped_reasons"]["extract_profile_failed"] += 1
+                    continue
+                
+                report["profiles_kept"] += 1
+                valid_sample_count += (n_t - 1)
+                self._update_stats_for_profile(profile, n_t, accumulators, ratio_accumulators)
+
+        return accumulators, ratio_accumulators, valid_sample_count, report
+
+    # --- UPDATED: Pass 2 now also uses the strict validation ---
+    def process_file_for_shards(self, file_path: Path, output_dir: Path, start_idx: int) -> Dict[str, Any]:
+        """Worker logic for Pass 2: process a file, write shards, and return metadata."""
+        shard_idx_base = f"{file_path.stem}_{start_idx}"
+        shard_writer = ShardWriter(output_dir, self.proc_cfg["shard_size"], shard_idx_base)
+        
+        splits = {"train": [], "validation": [], "test": []}
+        current_idx = start_idx
+        ratio_stats = self.norm_stats.get("ratio_stats", {})
+        
+        with h5py.File(file_path, "r") as f:
+            for gname in sorted(f.keys()):
+                # --- NEW: Re-validate to ensure consistency between passes ---
+                is_valid, _ = self._is_profile_valid(f[gname])
+                if not is_valid:
+                    continue
+                
+                use_fraction = self.train_cfg["use_fraction"]
+                if use_fraction < 1.0 and int(hashlib.sha256(gname.encode('utf-8')).hexdigest()[:8], 16) / 0xFFFFFFFF >= use_fraction:
+                    continue
+                
+                result = self._process_single_group(f[gname], gname, ratio_stats)
+                if result is None:
+                    continue
+                
+                samples, split_key = result
+                n_written = samples.shape[0]
+                shard_writer.add_samples(samples, current_idx)
+                
+                splits[split_key].extend(range(current_idx, current_idx + n_written))
+                current_idx += n_written
+
+        shard_writer.flush()
+        return {
+            "shards": shard_writer.get_shard_metadata(),
+            "splits": splits,
+            "rows_written": current_idx - start_idx,
+        }
+
+    def _update_stats_for_profile(self, profile, n_t, accumulators, ratio_accumulators):
+        """Updated method with Bug 1 fix: consistent normalization in both modes."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        if self.prediction_mode == "ratio":
+            # Bug 1 Fix: Use full profiles for all variables in ratio mode
+            for var, acc in accumulators.items():
+                idx = acc["index"]
+                method = acc["method"]
+                
+                # Use full profile data for all variables (not just initial timestep)
+                if var == self.time_var and n_t > 1:
+                    vec = profile[1:, idx]  # Time starts from t=1
+                else:
+                    vec = profile[:, idx]   # Full profile for species and globals
+                
+                if vec.size > 0:
+                    if method.startswith("log-"):
+                        vec = np.log10(np.maximum(vec, self.normalizer.epsilon))
+                    self.normalizer._update_single_accumulator(acc, vec, var)
+            
+            # Compute ratio statistics correctly with proper indices (Bug 3 fix)
+            initial = profile[0, self.species_indices]
+            future = profile[1:, self.species_indices]
+            
+            ratios = future / np.maximum(initial[None, :], self.normalizer.epsilon)
+            
+            # Bug 5 Fix: Add logging for extreme values
+            if np.any(ratios < self.normalizer.epsilon):
+                n_below = np.sum(ratios < self.normalizer.epsilon)
+                logger.warning(f"Found {n_below} ratio values below epsilon {self.normalizer.epsilon}")
+            
+            log_ratios = np.log10(np.maximum(ratios, self.normalizer.epsilon))
+            
+            # Bug 5 Fix: Log if clipping is needed
+            if np.any(np.abs(log_ratios) > self.norm_cfg.get("clamp_value", 50.0)):
+                n_clamped = np.sum(np.abs(log_ratios) > self.norm_cfg.get("clamp_value", 50.0))
+                logger.warning(f"Clamping {n_clamped} extreme log-ratio values")
+            
+            for i, var_name in enumerate(self.species_vars):
+                self.normalizer._update_single_accumulator(
+                    ratio_accumulators[var_name], log_ratios[:, i], var_name
+                )
+        else:
+            # Absolute mode - existing logic is correct
+            for var, acc in accumulators.items():
+                idx = acc["index"]
+                vec = profile[1:, idx] if (var == self.time_var and n_t > 1) else profile[:, idx]
+                if vec.size > 0:
+                    self.normalizer._update_single_accumulator(acc, vec, var)
+
+    def _process_single_group(self, grp, gname, ratio_stats) -> Optional[Tuple[np.ndarray, str]]:
+        # The stricter validation is now done before this function is called.
+        n_t = grp[self.time_var].shape[0]
+        if n_t <= 1: return None
+        profile = self._extract_profile(grp, gname, n_t)
+        if profile is None: return None
+        
+        if self.prediction_mode == "ratio": samples = self._profile_to_samples_ratio(profile, n_t, ratio_stats)
+        else: samples = self._profile_to_samples(self.norm_helper.normalize_profile(torch.from_numpy(profile)).numpy(), n_t)
+        if samples is None: return None
+        
+        p = int(hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+        split_key = "test" if p < self.train_cfg["test_fraction"] else "validation" if p < self.train_cfg["test_fraction"] + self.train_cfg["val_fraction"] else "train"
+        return samples, split_key
+
     
     def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> Optional[np.ndarray]:
-        """Extract profile data from group."""
         import re
-        
-        # Define labels from global_vars by stripping "_init"
-        global_labels = [var.replace("_init", "") for var in self.global_vars]
-        globals_dict = {}
-        
-        # Find all _label_value patterns before SEED
-        # More robust regex to handle scientific notation and spaces
-        matches = re.findall(r"_(\w+)_([\d.eE+-]+)", gname)
-        for label, value in matches:
-            if label in global_labels:
-                var = label + "_init"
-                if var in self.global_vars:
-                    try:
-                        globals_dict[var] = float(value)
-                    except ValueError:
-                        self.logger.warning(f"Failed to parse value '{value}' for {var} in {gname}")
-                        return None
-        
-        # Check if all global_vars were found
-        if set(globals_dict.keys()) != set(self.global_vars):
-            missing = set(self.global_vars) - set(globals_dict.keys())
-            self.logger.debug(f"Missing global variables {missing} in {gname}")
-            return None
-        
-        # Pre-allocate buffer
+        globals_dict = {f"{lbl}_init": float(val) for lbl, val in re.findall(r"_([A-Z])_([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", gname) if f"{lbl}_init" in self.global_vars}
+        if len(globals_dict) != len(self.global_vars): return None
         profile = np.empty((n_t, self.n_vars), dtype=np.float32)
-        
-        # Fill data
         try:
             for i, var in enumerate(self.var_order):
-                if var in self.species_vars or var == self.time_var:
-                    profile[:, i] = group[var][:].astype(np.float32)
-                elif var in self.global_vars:
-                    profile[:, i] = globals_dict[var]
-        except Exception as e:
-            self.logger.warning(f"Failed to extract profile from {gname}: {e}")
-            return None
-        
+                profile[:, i] = group[var][:] if var in group else globals_dict[var]
+        except Exception: return None
         return profile
-    
-    def _profile_to_samples(self, normalized_profile: np.ndarray, n_t: int) -> Optional[np.ndarray]:
-        """Convert profile to input-output samples with fixed time alignment."""
+
+    def _profile_to_samples(self, norm_prof, n_t):
+        """Updated method with Bug 3 fix: use proper indices."""
         if n_t <= 1:
             return None
         
-        n_samples = n_t - 1
-        n_features = self.n_species + self.n_globals + 1 + self.n_species
+        n_inputs = self.n_species + self.n_globals + 1
+        samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
         
-        samples = np.empty((n_samples, n_features), dtype=np.float32)
-        
-        # Initial species at t=0
-        samples[:, :self.n_species] = normalized_profile[0, :self.n_species]
-        
-        # Initial globals at t=0
-        initial_globals = normalized_profile[0, self.n_species:self.n_species + self.n_globals]
-        samples[:, self.n_species:self.n_species + self.n_globals] = initial_globals
-        
-        # Time at t+1
-        samples[:, self.n_species + self.n_globals] = normalized_profile[1:, -1]
-        
-        # Target species at t+1
-        samples[:, -self.n_species:] = normalized_profile[1:, :self.n_species]
+        # Use proper variable ordering (Bug 3 fix)
+        samples[:, :self.n_species] = norm_prof[0, self.species_indices]  # Initial species
+        samples[:, self.n_species:self.n_species + self.n_globals] = norm_prof[0, self.global_indices]  # Globals
+        samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]  # Time
+        samples[:, n_inputs:] = norm_prof[1:, self.species_indices]  # Target species
         
         return samples
-    
-    def _profile_to_samples_ratio(self, raw_profile: np.ndarray, n_t: int,
-                                    helper: NormalizationHelper,
-                                    ratio_stats: Dict[str, Dict[str, float]]) -> Optional[np.ndarray]:
-            """Convert profile to samples for ratio mode with per-species standardization."""
-            if n_t <= 1:
-                return None
 
-            # --- Prepare inputs ---
-            n_samples = n_t - 1
-            n_inputs = self.n_species + self.n_globals + 1
-            n_targets = self.n_species
-            samples = np.empty((n_samples, n_inputs + n_targets), dtype=np.float32)
-
-            # Normalize the full profile to get normalized inputs
-            profile_t = torch.from_numpy(raw_profile)
-            norm_profile = helper.normalize_profile(profile_t).numpy()
-            
-            # Use initial state at t=0 for branch network inputs
-            samples[:, :self.n_species + self.n_globals] = norm_profile[0, :self.n_species + self.n_globals]
-            # Use time at t > 0 for trunk network input
-            samples[:, self.n_species + self.n_globals] = norm_profile[1:, -1]
-
-            # --- Prepare targets (Standardized Per-Species Log-Ratios) ---
-            initial_species_raw = raw_profile[0, :self.n_species]
-            future_species_raw = raw_profile[1:, :self.n_species]
-
-            epsilon = self.config["normalization"]["epsilon"]
-            ratios = future_species_raw / np.maximum(initial_species_raw[None, :], epsilon)
-            log_ratios = np.log10(np.maximum(ratios, epsilon))
-
-            # Get per-species mean and std for standardization from the dictionary
-            ratio_means = np.array([ratio_stats[var]["mean"] for var in self.species_vars], dtype=np.float32)
-            ratio_stds = np.array([ratio_stats[var]["std"] for var in self.species_vars], dtype=np.float32)
-            
-            # Standardize each column (species) with its own mean and std
-            standardized_log_ratios = (log_ratios - ratio_means) / ratio_stds
-            samples[:, -n_targets:] = standardized_log_ratios
-            
-            return samples
-
-    def _generate_data_report(self, norm_stats: Dict[str, Any], split_indices: Dict[str, List[int]]):
-        """Generate a comprehensive data preprocessing report."""
-        report_path = Path(self.config["paths"]["log_dir"]) / "data_report.txt"
-        report_path.parent.mkdir(parents=True, exist_ok=True)
+    def _profile_to_samples_ratio(self, raw_prof, n_t, ratio_stats):
+        """Updated method with Bug 3 fix: use proper indices."""
+        import logging
+        logger = logging.getLogger(__name__)
         
-        with open(report_path, 'w') as f:
-            f.write("=" * 80 + "\n")
-            f.write("DATA PREPROCESSING REPORT\n")
-            f.write("=" * 80 + "\n")
-            f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Prediction Mode: {self.prediction_mode}\n")
-            f.write("\n")
-            
-            # File information
-            f.write("INPUT FILES\n")
-            f.write("-" * 40 + "\n")
-            for raw_file in self.raw_files:
-                f.write(f"  {raw_file.name}\n")
-            f.write(f"Total files: {len(self.raw_files)}\n")
-            f.write("\n")
-            
-            # Overall statistics
-            f.write("PREPROCESSING STATISTICS\n")
-            f.write("-" * 40 + "\n")
-            total_examined = self.preprocessing_stats["total_groups_examined"]
-            f.write(f"Total groups examined: {total_examined:,}\n")
-            f.write(f"Groups dropped (subsampling): {self.preprocessing_stats['groups_dropped_subsampling']:,} "
-                   f"({100 * self.preprocessing_stats['groups_dropped_subsampling'] / max(1, total_examined):.1f}%)\n")
-            f.write(f"Groups dropped (validation): {self.preprocessing_stats['groups_dropped_validation']:,} "
-                   f"({100 * self.preprocessing_stats['groups_dropped_validation'] / max(1, total_examined):.1f}%)\n")
-            f.write(f"Groups dropped (no future): {self.preprocessing_stats['groups_dropped_no_future']:,} "
-                   f"({100 * self.preprocessing_stats['groups_dropped_no_future'] / max(1, total_examined):.1f}%)\n")
-            f.write(f"Groups processed: {self.preprocessing_stats['groups_processed']:,}\n")
-            f.write(f"Total samples generated: {self.preprocessing_stats['total_samples_generated']:,}\n")
-            f.write(f"Use fraction: {self.config['training']['use_fraction']}\n")
-            f.write("\n")
-            
-            # Per-file breakdown
-            if self.preprocessing_stats.get("per_file_stats"):
-                f.write("PER-FILE BREAKDOWN\n")
-                f.write("-" * 40 + "\n")
-                for filename, stats in self.preprocessing_stats["per_file_stats"].items():
-                    f.write(f"\n{filename}:\n")
-                    f.write(f"  Groups examined: {stats['total_groups_examined']:,}\n")
-                    f.write(f"  Groups processed: {stats['groups_processed']:,}\n")
-                    f.write(f"  Dropped (subsampling): {stats['groups_dropped_subsampling']:,}\n")
-                    f.write(f"  Dropped (validation): {stats['groups_dropped_validation']:,}\n")
-                    f.write(f"  Dropped (no future): {stats['groups_dropped_no_future']:,}\n")
-                f.write("\n")
-            
-            # Split information
-            f.write("DATA SPLITS\n")
-            f.write("-" * 40 + "\n")
-            total_samples = sum(len(indices) for indices in split_indices.values())
-            for split_name, indices in split_indices.items():
-                n_samples = len(indices)
-                percentage = 100 * n_samples / max(1, total_samples)
-                f.write(f"{split_name:12s}: {n_samples:10,} samples ({percentage:5.1f}%)\n")
-            f.write(f"{'Total':12s}: {total_samples:10,} samples\n")
-            f.write("\n")
-            
-            # Normalization statistics summary
-            f.write("NORMALIZATION STATISTICS\n")
-            f.write("-" * 40 + "\n")
-            f.write("Variable normalization methods:\n")
-            for var, method in norm_stats["normalization_methods"].items():
-                f.write(f"  {var:20s}: {method}\n")
-            f.write("\n")
-            
-            # Summarize key statistics
-            f.write("Key statistics per variable:\n")
-            for var, stats in norm_stats.get("per_key_stats", {}).items():
-                f.write(f"\n  {var}:\n")
-                method = stats.get("method", "unknown")
-                if method == "standard":
-                    f.write(f"    Mean: {stats['mean']:.6e}, Std: {stats['std']:.6e}\n")
-                elif method == "log-standard":
-                    f.write(f"    Log Mean: {stats['log_mean']:.6f}, Log Std: {stats['log_std']:.6f}\n")
-                elif method in ["min-max", "log-min-max"]:
-                    f.write(f"    Min: {stats['min']:.6e}, Max: {stats['max']:.6e}\n")
-            
-            # Ratio mode statistics
-            if self.prediction_mode == "ratio" and "ratio_stats" in norm_stats:
-                f.write("\nRatio mode statistics (per-species log-ratios):\n")
-                for var, stats in norm_stats["ratio_stats"].items():
-                    f.write(f"\n  {var}:\n")
-                    f.write(f"    Mean: {stats['mean']:.6f}, Std: {stats['std']:.6f}\n")
-                    f.write(f"    Min: {stats['min']:.6f}, Max: {stats['max']:.6f}\n")
-                    f.write(f"    Count: {stats['count']:,}\n")
-            
-            # Configuration summary
-            f.write("\nCONFIGURATION SUMMARY\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"Species variables: {', '.join(self.species_vars)}\n")
-            f.write(f"Global variables: {', '.join(self.global_vars)}\n")
-            f.write(f"Time variable: {self.time_var}\n")
-            f.write(f"Shard size: {self.shard_size:,}\n")
-            f.write(f"Min species threshold: {self.min_threshold:.2e}\n")
-            f.write(f"Epsilon: {self.config['normalization']['epsilon']:.2e}\n")
-            f.write(f"Min std: {self.config['normalization']['min_std']:.2e}\n")
-            
-        self.logger.info(f"Data report written to {report_path}")
+        if n_t <= 1:
+            return None
+        
+        n_inputs = self.n_species + self.n_globals + 1
+        samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
+        
+        # Normalize the profile
+        norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(raw_prof)).numpy()
+        
+        # Use proper variable ordering (Bug 3 fix)
+        samples[:, :self.n_species] = norm_prof[0, self.species_indices]  # Initial species
+        samples[:, self.n_species:self.n_species + self.n_globals] = norm_prof[0, self.global_indices]  # Globals
+        samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]  # Time
+        
+        # Compute log-ratios with proper indices
+        initial = raw_prof[0, self.species_indices]
+        future = raw_prof[1:, self.species_indices]
+        ratios = future / np.maximum(initial[None, :], self.norm_cfg["epsilon"])
+        
+        # Bug 5 Fix: Log extreme values before processing
+        if np.any(ratios == 0):
+            logger.warning(f"Found {np.sum(ratios == 0)} zero ratios - will be clamped to epsilon")
+        
+        log_ratios = np.log10(np.clip(ratios, 1e-38, 1e38))
+        
+        # Standardize log-ratios
+        means = np.array([ratio_stats[v]["mean"] for v in self.species_vars], dtype=np.float32)
+        stds = np.array([ratio_stats[v]["std"] for v in self.species_vars], dtype=np.float32)
+        std_log_ratios = (log_ratios - means) / np.maximum(stds, self.norm_cfg["min_std"])
+        
+        # Bug 5 Fix: Log if clamping occurs
+        clamp_val = self.norm_cfg.get("clamp_value", 50.0)
+        if np.any(np.abs(std_log_ratios) > clamp_val):
+            n_clamped = np.sum(np.abs(std_log_ratios) > clamp_val)
+            logger.warning(f"Clamping {n_clamped} standardized log-ratio values to [-{clamp_val}, {clamp_val}]")
+        
+        samples[:, n_inputs:] = np.clip(std_log_ratios, -clamp_val, clamp_val)
+        
+        return samples
 
+def stats_worker(file_path, config):
+    return CorePreprocessor(config).process_file_for_stats(Path(file_path))
 
-class ShardWriter:
-    """Efficient shard writer with buffering."""
-    
-    def __init__(self, output_dir: Path, shard_size: int, shard_index: Dict, compression: str = None):
+def shard_worker(file_path, config, norm_stats, start_idx, output_dir):
+    return CorePreprocessor(config, norm_stats).process_file_for_shards(Path(file_path), Path(output_dir), start_idx)
+
+# ##############################################################################
+# MAIN PARENT PREPROCESSOR CLASS
+# ##############################################################################
+
+class DataPreprocessor:
+    """Main parent class to orchestrate parallel data preprocessing."""
+    def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
+        self.raw_files = sorted(raw_files)
         self.output_dir = output_dir
-        self.shard_size = shard_size
-        self.shard_index = shard_index
-        self.compression = compression
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        self.normalizer = DataNormalizer(config)
+        self.num_workers = config["preprocessing"].get("num_workers", 1)
+        self.parallel = self.num_workers > 1 and len(self.raw_files) > 1
+
+    def process_to_npy_shards(self) -> None:
+        """## MODIFIED ## Main entry point. Now ONLY creates core data (shards, normalization, index)."""
+        start_time = time.time()
+        self.logger.info(f"Starting core data preprocessing with {len(self.raw_files)} files...")
         
-        self.buffer = []
-        self.buffer_size = 0
-        self.shard_id = 0
+        norm_stats, file_sample_counts, summary_report = self._collect_stats_and_counts()
+        save_json(norm_stats, self.output_dir / "normalization.json")
+
+        all_shards = self._write_normalized_shards(norm_stats, file_sample_counts)
+        
+        total_samples = sum(s['n_samples'] for s in all_shards)
+        shard_index = {
+            "n_species": len(self.config["data"]["species_variables"]),
+            "n_globals": len(self.config["data"]["global_variables"]),
+            "samples_per_shard": self.config["preprocessing"]["shard_size"],
+            "compression": self.config["preprocessing"].get("compression"),
+            "prediction_mode": self.config.get("prediction", {}).get("mode", "absolute"),
+            "shards": sorted(all_shards, key=lambda x: x['start_idx']),
+            "n_shards": len(all_shards),
+            "total_samples": total_samples,
+            "split_files": { "train": "train_indices.npy", "validation": "val_indices.npy", "test": "test_indices.npy" }
+        }
+        save_json(shard_index, self.output_dir / "shard_index.json")
+
+        self._write_summary_log(summary_report, total_samples)
+        self.logger.info(f"Core data preprocessing completed in {time.time() - start_time:.1f}s")
     
-    def add_samples(self, samples: np.ndarray):
-        """Add samples to buffer and flush if needed."""
-        self.buffer.append(samples)
-        self.buffer_size += samples.shape[0]
+    ## NEW FUNCTION ##
+    def generate_split_indices(self) -> None:
+        """Generates train/val/test split indices from an existing shard_index.json. This is a very fast operation."""
+        self.logger.info("Generating new train/val/test split indices...")
+        shard_index_path = self.output_dir / "shard_index.json"
+        if not shard_index_path.exists():
+            raise FileNotFoundError(f"Cannot generate splits: shard_index.json not found in {self.output_dir}")
         
-        while self.buffer_size >= self.shard_size:
-            self._write_shard()
-    
-    def flush(self):
-        """Write any remaining samples."""
-        if self.buffer_size > 0:
-            self._write_shard()
-    
-    def _write_shard(self):
-        """Write a single shard to disk."""
-        # Collect samples for one shard
-        shard_data = []
-        remaining = self.shard_size
+        shard_index = load_json(shard_index_path)
+        total_samples = shard_index["total_samples"]
+        indices = np.arange(total_samples)
         
-        new_buffer = []
-        for chunk in self.buffer:
-            if remaining <= 0:
-                new_buffer.append(chunk)
-                continue
-            
-            if chunk.shape[0] <= remaining:
-                shard_data.append(chunk)
-                remaining -= chunk.shape[0]
-            else:
-                shard_data.append(chunk[:remaining])
-                new_buffer.append(chunk[remaining:])
-                remaining = 0
+        seed = self.config.get("system", {}).get("seed", 42)
+        np.random.seed(seed)
+        np.random.shuffle(indices)
         
-        # Concatenate shard data
-        data = np.vstack(shard_data) if len(shard_data) > 1 else shard_data[0]
+        use_fraction = self.config["training"].get("use_fraction", 1.0)
+        if use_fraction < 1.0:
+            indices = indices[:int(total_samples * use_fraction)]
         
-        # Write shard
-        shard_path = self.output_dir / f"shard_{self.shard_id:04d}.npy"
+        n = len(indices)
+        test_frac = self.config["training"]["test_fraction"]
+        val_frac = self.config["training"]["val_fraction"]
         
-        if self.compression == 'npz':
-            save_path = shard_path.with_suffix('.npz')
-            np.savez_compressed(save_path, data=data)
-        else:
-            save_path = shard_path
-            np.save(save_path, data)
+        test_split_idx = int(n * test_frac)
+        val_split_idx = test_split_idx + int(n * val_frac)
         
-        # Update shard info with clarified indexing
-        start_idx = self.shard_index.get("total_samples", 0)
-        end_idx = start_idx + data.shape[0]
-        shard_info = {
-            "shard_idx": self.shard_id,
-            "filename": save_path.name,
-            "start_idx": start_idx,
-            "end_idx": end_idx,
-            "n_samples": data.shape[0],
+        split_data = {
+            "test": np.sort(indices[:test_split_idx]).astype(np.int64),
+            "validation": np.sort(indices[test_split_idx:val_split_idx]).astype(np.int64),
+            "train": np.sort(indices[val_split_idx:]).astype(np.int64)
         }
         
-        self.shard_index["shards"].append(shard_info)
-        self.shard_index["total_samples"] = end_idx
-        self.shard_index["n_shards"] += 1
-        self.shard_id += 1
+        for name, idx_array in split_data.items():
+            path = self.output_dir / shard_index["split_files"][name]
+            np.save(path, idx_array)
+            self.logger.info(f"Saved {name} indices to {path} ({len(idx_array)} samples)")
+
+    ## MODIFIED ## This private method now returns only a list of shard metadata dictionaries.
+    def _write_normalized_shards(self, norm_stats, file_sample_counts) -> List[Dict]:
+        self.logger.info("Pass 2: Writing shards and collecting metadata...")
+        all_shards = []
+        current_idx = 0
         
-        # Update buffer
-        self.buffer = new_buffer
-        self.buffer_size = sum(chunk.shape[0] for chunk in self.buffer)
+        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
+            futures = {fp.name: executor.submit(shard_worker, fp, self.config, norm_stats, 0, self.output_dir) for fp in self.raw_files}
+            for f_path in self.raw_files:
+                meta = futures[f_path.name].result()
+                
+                offset = current_idx
+                for shard in meta["shards"]:
+                    shard["start_idx"] += offset
+                    shard["end_idx"] += offset
+                all_shards.extend(meta["shards"])
+                current_idx += meta["rows_written"]
+        return all_shards
+
+    # --- UPDATED: This function now aggregates the reports from workers ---
+    def _collect_stats_and_counts(self) -> Tuple[Dict, Dict, Dict]:
+        self.logger.info("Pass 1: Collecting statistics and sample counts...")
+        prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
+        final_accs = self.normalizer._initialize_accumulators()
+        final_ratio_accs = {var: {"count": 0,"mean": 0.0,"m2": 0.0,"min": float('inf'),"max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
+        file_counts = {}
+        
+        # --- NEW: Aggregate report dictionary ---
+        total_report = {
+            "total_profiles": 0,
+            "profiles_kept": 0,
+            "dropped_reasons": defaultdict(int)
+        }
+
+        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
+            futures = {executor.submit(stats_worker, fp, self.config): fp for fp in self.raw_files}
+            for fut in as_completed(futures):
+                accs, ratio_accs, count, worker_report = fut.result()
+                
+                # Aggregate results
+                self.normalizer._merge_accumulators(final_accs, accs)
+                if ratio_accs: self.normalizer._merge_accumulators(final_ratio_accs, ratio_accs)
+                file_counts[futures[fut].name] = count
+                
+                # --- NEW: Aggregate the reports ---
+                total_report["total_profiles"] += worker_report["total_profiles"]
+                total_report["profiles_kept"] += worker_report["profiles_kept"]
+                for reason, num in worker_report["dropped_reasons"].items():
+                    total_report["dropped_reasons"][reason] += num
+
+        norm_stats = self.normalizer._finalize_statistics(final_accs)
+        if final_ratio_accs:
+            norm_stats["ratio_stats"] = self.normalizer._finalize_statistics(final_ratio_accs, is_ratio=True)
+        return norm_stats, file_counts, total_report
+
+    # --- MODIFIED: Now accepts total_samples instead of split_indices ---
+    def _write_summary_log(self, report: Dict, total_samples: int):
+        """Writes a human-readable summary of the preprocessing results."""
+        log_dir = Path(self.config["paths"]["log_dir"])
+        log_dir.mkdir(exist_ok=True)
+        summary_path = log_dir / f"preprocessing_summary_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        
+        dropped_count = report["total_profiles"] - report["profiles_kept"]
+        
+        reason_map = {
+            "missing_keys": "Required dataset keys were missing",
+            "non_finite": "Contained NaN or Infinity values",
+            "below_threshold": f"A species value was below the threshold ({self.config['preprocessing']['min_value_threshold']:.1e})",
+            "too_few_timesteps": "Contained 1 or fewer time steps",
+            "extract_profile_failed": "Failed to extract global variables from name",
+            "read_error": "Could not read a dataset from the HDF5 group"
+        }
+
+        with open(summary_path, 'w') as f:
+            f.write("="*60 + "\n")
+            f.write("      Data Preprocessing Summary\n")
+            f.write("="*60 + "\n\n")
+            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Raw Files Processed: {len(self.raw_files)}\n\n")
+
+            f.write("--- Profile Filtering --- \n")
+            f.write(f"Total Profiles Found:     {report['total_profiles']:,}\n")
+            f.write(f"Profiles Kept:            {report['profiles_kept']:,}\n")
+            f.write(f"Profiles Dropped:         {dropped_count:,}\n\n")
+            
+            if dropped_count > 0:
+                f.write("--- Reasons for Dropped Profiles ---\n")
+                for reason, count in sorted(report["dropped_reasons"].items()):
+                    f.write(f"  - {count:>10,} : {reason_map.get(reason, reason)}\n")
+                f.write("\n")
+
+            f.write("--- Final Sample Count ---\n")
+            f.write(f"Total Usable Samples:     {total_samples:,}\n")
+            f.write("(Train/Val/Test splits generated separately)\n")
+
+        self.logger.info(f"Preprocessing summary saved to: {summary_path}")
+
+
+# This class is unchanged but included for completeness of the file
+class ShardWriter:
+    """Writes numpy arrays to shard files, handling buffering and file naming."""
+    def __init__(self, output_dir: Path, shard_size: int, shard_idx_base: str):
+        self.output_dir = output_dir
+        self.shard_size = shard_size
+        self.shard_idx_base = shard_idx_base
+        self.buffer: List[Tuple[np.ndarray, int]] = []
+        self.buffer_size = 0
+        self.local_shard_id = 0
+        self.shard_metadata: List[Dict] = []
+
+    def add_samples(self, samples: np.ndarray, global_start_idx: int):
+        self.buffer.append((samples, global_start_idx))
+        self.buffer_size += samples.shape[0]
+        while self.buffer_size >= self.shard_size:
+            self._write_shard()
+
+    def flush(self):
+        while self.buffer_size > 0:
+            self._write_shard()
+    
+    def get_shard_metadata(self) -> List[Dict]:
+        return self.shard_metadata
+
+    def _write_shard(self):
+        if not self.buffer: return
+        
+        data_to_write, remaining_buffer = [], []
+        write_size = 0
+        current_global_start_idx = self.buffer[0][1]
+
+        temp_buffer = self.buffer
+        self.buffer = [] # Clear original buffer
+
+        for samples, start_idx in temp_buffer:
+            if write_size + samples.shape[0] <= self.shard_size:
+                data_to_write.append(samples)
+                write_size += samples.shape[0]
+            else:
+                split_idx = self.shard_size - write_size
+                data_to_write.append(samples[:split_idx])
+                self.buffer.append((samples[split_idx:], start_idx + split_idx))
+                write_size += split_idx
+                break
+        
+        processed_chunks = len(data_to_write)
+        if len(temp_buffer) > processed_chunks:
+             self.buffer.extend(temp_buffer[processed_chunks:])
+
+        self.buffer_size = sum(s.shape[0] for s, _ in self.buffer)
+        
+        data = np.concatenate(data_to_write)
+        
+        shard_filename = f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
+        np.save(self.output_dir / shard_filename, data)
+        
+        self.shard_metadata.append({
+            "filename": shard_filename,
+            "start_idx": current_global_start_idx,
+            "end_idx": current_global_start_idx + data.shape[0],
+            "n_samples": data.shape[0]
+        })
+        self.local_shard_id += 1

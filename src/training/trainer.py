@@ -86,6 +86,25 @@ class Trainer:
             "prediction_mode": self.prediction_mode,
             "epochs": []
         }
+        
+    def trainer_init_validation(self):
+        """Add this to Trainer.__init__ after self.prediction_mode is set"""
+        # Bug 2 Fix: Validate ratio mode requirements at initialization
+        if self.prediction_mode == "ratio":
+            if not hasattr(self.norm_helper, 'ratio_stats') or self.norm_helper.ratio_stats is None:
+                raise ValueError(
+                    "Training in 'ratio' mode requires ratio statistics from preprocessing. "
+                    "Ensure data was preprocessed with prediction.mode='ratio' in config. "
+                    "Current normalization data does not contain ratio_stats."
+                )
+            
+            # Additional check for model compatibility
+            model_type = self.config["model"]["type"]
+            if model_type != "deeponet":
+                raise ValueError(
+                    f"Ratio prediction mode is only compatible with 'deeponet' model, "
+                    f"but '{model_type}' was specified. Please use 'deeponet' or switch to 'absolute' mode."
+                )
     
     def _setup_dataloaders(self, train_dataset, val_dataset, test_dataset):
         """Setup data loaders."""
@@ -231,31 +250,41 @@ class Trainer:
     # --- helper ------------------------------------------------------------
     def _standardize_log_ratios(self, log_ratios: torch.Tensor) -> torch.Tensor:
         """
-        Convert raw log‑ratio predictions to the z‑score space used for training
-        targets, using the per‑species statistics saved in self.norm_helper.
+        Standardizes raw log-ratio model outputs for loss calculation.
         """
-        if self.norm_helper.ratio_stats is None:                  # absolute mode
+        # Bug 2 Fix: Raise error immediately if ratio stats missing
+        if self.prediction_mode == "ratio" and self.norm_helper.ratio_stats is None:
+            raise ValueError(
+                "Ratio statistics are missing but prediction mode is 'ratio'. "
+                "This likely means data was preprocessed in 'absolute' mode. "
+                "Please reprocess data with prediction.mode='ratio' in config."
+            )
+        
+        # If not in ratio mode, return as-is (shouldn't happen but defensive)
+        if self.norm_helper.ratio_stats is None:
             return log_ratios
 
         stats = self.norm_helper.ratio_stats
         species = self.config["data"]["species_variables"]
-        device  = log_ratios.device
-        dtype   = log_ratios.dtype
+        device = log_ratios.device
+        dtype = log_ratios.dtype
 
         means = torch.tensor([stats[v]["mean"] for v in species],
-                             device=device, dtype=dtype)
-        stds  = torch.tensor([stats[v]["std"]  for v in species],
-                             device=device, dtype=dtype)
+                            device=device, dtype=dtype)
+        stds = torch.tensor([stats[v]["std"] for v in species],
+                            device=device, dtype=dtype)
 
         stds = torch.clamp(stds, min=self.config["normalization"]["min_std"])
         return (log_ratios - means) / stds
 
-    # --- patched loss ------------------------------------------------------
     def _compute_loss(self, outputs: torch.Tensor,
-                      targets: torch.Tensor,
-                      inputs: torch.Tensor) -> torch.Tensor:
-        """Compute loss with mode‑specific handling and optional clamping."""
+                    targets: torch.Tensor,
+                    inputs: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the loss with Bug 2 fix for ratio mode validation.
+        """
         if self.prediction_mode == "ratio":
+            # Bug 2 Fix: This will now raise an error if ratio_stats are missing
             outputs_std = self._standardize_log_ratios(outputs)
             return self.criterion(outputs_std, targets)
 
@@ -406,7 +435,7 @@ class Trainer:
                 self.logger.info(
                     f"Epoch {self.current_epoch} | "
                     f"Batch {batch_idx + 1}/{len(self.train_loader)} | "
-                    f"Loss: {total_loss / total_samples:.6f}"
+                    f"Loss: {total_loss / total_samples:.3e}"
                 )
         
         return total_loss / total_samples, {}
@@ -473,10 +502,10 @@ class Trainer:
         }
         self.training_history["epochs"].append(log_entry)
         
-        val_str = f"Val loss: {val_loss:.6f}" if self.has_validation else "Val loss: N/A"
+        val_str = f"Val loss: {val_loss:.3e}" if self.has_validation else "Val loss: N/A"
         self.logger.info(
             f"Epoch {self.current_epoch}/{self.train_config['epochs']} "
-            f"Train loss: {train_loss:.6f} {val_str} "
+            f"Train loss: {train_loss:.3e} {val_str} "
             f"Time: {epoch_time:.1f}s LR: {log_entry['lr']:.2e}"
         )
     
@@ -500,10 +529,17 @@ class Trainer:
             # Get example input from the first available loader
             example_loader = self.val_loader or self.train_loader
             if example_loader:
+                # Get a single sample batch for export
                 example_inputs, _ = next(iter(example_loader))
                 example_inputs = example_inputs.to(self.device)
                 
+                # Note: We pass the full batch, but export_model will handle
+                # making the batch dimension dynamic
                 export_path = self.save_dir / "exported_model.pt"
+                
+                # Log the shape being used for export
+                self.logger.info(f"Exporting model with example input shape: {example_inputs.shape}")
+                
                 export_model(self.model, example_inputs, export_path)
             else:
                 self.logger.warning("Cannot export model: no data loader available to create example input.")

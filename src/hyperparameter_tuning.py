@@ -179,8 +179,13 @@ class PrunableTrainer(Trainer):
             self.total_training_time += epoch_time
             self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
 
-            if self.epoch_callback and self.has_validation:
-                if self.epoch_callback(epoch, val_loss):
+            if self.epoch_callback:
+                # Use validation loss if available, otherwise fall back to training loss
+                loss_for_pruning = val_loss if self.has_validation and val_loss != float("inf") else train_loss
+                
+                # Report the loss and check if trial should be pruned
+                if self.epoch_callback(epoch, loss_for_pruning):
+                    self.logger.info(f"Trial pruned at epoch {epoch} with loss {loss_for_pruning:.6f}")
                     raise optuna.TrialPruned()
 
             if self.has_validation:
@@ -208,34 +213,53 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     """Suggests a valid model and training configuration for a trial."""
     config = copy.deepcopy(base_config)
 
+    # First decide prediction mode
     prediction_mode = trial.suggest_categorical("prediction_mode", ["absolute", "ratio"])
     config["prediction"]["mode"] = prediction_mode
 
+    # Bug 4 Fix: Enforce model type based on prediction mode
     if prediction_mode == "ratio":
+        # Ratio mode ONLY works with deeponet
         model_type = "deeponet"
+        # Don't even suggest it as a hyperparameter
     else:
+        # Absolute mode can use either model
         model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
+    
     config["model"]["type"] = model_type
     
+    # Rest of the hyperparameter suggestions
     config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu"])
     config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
     config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [1024, 2048, 4096, 8192])
 
     if model_type == "deeponet":
         n_branch = trial.suggest_int("n_branch_layers", 2, 5)
-        config["model"]["branch_layers"] = [trial.suggest_int(f"branch_layer_{i}", 64, 512, step=64) for i in range(n_branch)]
+        config["model"]["branch_layers"] = [
+            trial.suggest_int(f"branch_layer_{i}", 64, 512, step=64) 
+            for i in range(n_branch)
+        ]
         n_trunk = trial.suggest_int("n_trunk_layers", 2, 4)
-        config["model"]["trunk_layers"] = [trial.suggest_int(f"trunk_layer_{i}", 64, 256, step=32) for i in range(n_trunk)]
+        config["model"]["trunk_layers"] = [
+            trial.suggest_int(f"trunk_layer_{i}", 64, 256, step=32) 
+            for i in range(n_trunk)
+        ]
         config["model"]["basis_dim"] = trial.suggest_categorical("basis_dim", [64, 128, 256])
     else:  # SIREN
         n_layers = trial.suggest_int("n_hidden_layers", 3, 7)
-        config["model"]["hidden_dims"] = [trial.suggest_int(f"hidden_dim_{i}", 128, 512, step=64) for i in range(n_layers)]
+        config["model"]["hidden_dims"] = [
+            trial.suggest_int(f"hidden_dim_{i}", 128, 512, step=64) 
+            for i in range(n_layers)
+        ]
         config["model"]["omega_0"] = trial.suggest_float("omega_0", 20.0, 40.0)
 
     if trial.suggest_categorical("use_film", [True, False]):
         config["film"]["enabled"] = True
         n_film = trial.suggest_int("film_n_layers", 1, 3)
-        config["film"]["hidden_dims"] = [trial.suggest_int(f"film_layer_{i}", 64, 256, step=32) for i in range(n_film)]
+        config["film"]["hidden_dims"] = [
+            trial.suggest_int(f"film_layer_{i}", 64, 256, step=32) 
+            for i in range(n_film)
+        ]
     else:
         config["film"]["enabled"] = False
 
@@ -309,17 +333,12 @@ def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
         processed_dir = base_processed_dir / f"mode_{mode}"
         mode_config["paths"]["processed_data_dir"] = str(processed_dir)
         
-        # Correctly instantiate and configure the pipeline for the specific mode.
-        # This ensures that all setup (seeding, hardware, paths) uses the
-        # mode-specific configuration before preprocessing is called.
-        pipeline = ChemicalKineticsPipeline(config_path) # Instantiates with base config
-        pipeline.config = mode_config                    # Overwrite with mode-specific config
+        # FIX: Directly instantiate pipeline with the mode-specific config dictionary
+        # This avoids redundant file reading and makes the intent clearer
+        pipeline = ChemicalKineticsPipeline(mode_config)
         
-        # Rerun setup steps with the correct mode_config
-        pipeline.setup_paths()
+        # Update the processed_dir since it was set in setup_paths
         pipeline.processed_dir = processed_dir
-        seed_everything(pipeline.config["system"]["seed"])
-        optimize_hardware(pipeline.config["system"], pipeline.device)
         
         # Preprocess the data for the current mode
         pipeline.preprocess_data()
