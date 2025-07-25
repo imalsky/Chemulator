@@ -9,6 +9,28 @@ from torch.profiler import profile, ProfilerActivity, schedule
 from torch.profiler import tensorboard_trace_handler
 from typing import Dict, Any, Optional, Callable, Union
 
+# ============================ START: CRITICAL FIX BLOCK ===========================
+# This must be the first major action in the script to configure PyTorch's
+# multiprocessing behavior BEFORE any DataLoader workers are ever created.
+
+# 1. Set up basic logging IMMEDIATELY to see all messages.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout
+)
+
+# 2. Change the multiprocessing sharing strategy to prevent /dev/shm crashes.
+import torch.multiprocessing
+try:
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    logging.info("SUCCESS: Set multiprocessing sharing strategy to 'file_system'.")
+except RuntimeError:
+    logging.warning("Could not set multiprocessing sharing strategy (already set or not supported).")
+# ============================= END: CRITICAL FIX BLOCK ============================
+
+
 import numpy as np
 
 from utils.hardware import setup_device, optimize_hardware
@@ -20,6 +42,9 @@ from training.trainer import Trainer
 import hashlib
 import json
 from data.normalizer import NormalizationHelper
+
+import torch.multiprocessing
+
 
 
 class ChemicalKineticsPipeline:
@@ -49,9 +74,9 @@ class ChemicalKineticsPipeline:
         setup_logging(log_file=log_file)
         
         self.logger = logging.getLogger(__name__)
-        self.logger.info(f"Chemical Kinetics Pipeline initialized")
+        self.logger.info(f"sdfasfsadfasdf Chemical Kinetics Pipeline initialized")
         
-        # Set random seed
+
         seed_everything(self.config["system"]["seed"])
         
         # Setup hardware
@@ -139,62 +164,40 @@ class ChemicalKineticsPipeline:
 
     def preprocess_data(self):
         """
-        Pre-process raw files to normalized NPY shards with intelligent,
-        greedy data reuse based on a two-stage hashing system.
+        MODIFIED: This version bypasses the hash check and only regenerates
+        data if the processed directory is empty.
         """
-        # --- Stage 1: Check Core Data Hash ---
-        proc_conf = self.config["preprocessing"]
-        relevant_proc_config = {
-            "shard_size": proc_conf.get("shard_size"),
-            "min_value_threshold": proc_conf.get("min_value_threshold"),
-            "compression": proc_conf.get("compression")
-        }
-        raw_files_info = {
-            "files": [str(f) for f in self.raw_data_files],
-            "sizes": [f.stat().st_size if f.exists() else 0 for f in self.raw_data_files],
-            "mtimes": [f.stat().st_mtime if f.exists() else 0 for f in self.raw_data_files]
-        }
-        core_data_config = {
-            "data": self.config["data"],
-            "preprocessing": relevant_proc_config,
-            "normalization": self.config["normalization"],
-            "prediction_mode": self.config["prediction"]["mode"],
-            "raw_files": raw_files_info
-        }
-        config_str = json.dumps(core_data_config, sort_keys=True, default=lambda x: f"{x:.20e}" if isinstance(x, float) else x)
-        current_data_hash = hashlib.sha256(config_str.encode('utf-8')).hexdigest()
-        data_hash_path = self.processed_dir / "data_hash.json"
+        self.logger.warning("Using a modified preprocess_data function that bypasses hash checking.")
         
-        # ** KEY CHANGE: Instantiate preprocessor ONCE, up front **
-        preprocessor = DataPreprocessor(
-            raw_files=self.raw_data_files,
-            output_dir=self.processed_dir,
-            config=self.config
-        )
+        # --- Check if essential files exist ---
+        # We will assume if the main index and normalization stats are present, the data is good.
+        shard_index_path = self.processed_dir / "shard_index.json"
+        norm_path = self.processed_dir / "normalization.json"
         
         regenerate_core_data = True
-        if data_hash_path.exists():
-            saved_data_hash = load_json(data_hash_path).get("hash")
-            if saved_data_hash == current_data_hash:
-                self.logger.info("Core data hash matches. Reusing existing shards and normalization stats.")
-                regenerate_core_data = False
-            else:
-                self.logger.info("Core data hash mismatch. Regenerating ALL processed data.")
-                self._clean_all_processed_data()
+        if shard_index_path.exists() and norm_path.exists():
+            self.logger.info("Found existing shard_index.json. SKIPPING core data regeneration.")
+            regenerate_core_data = False
         else:
-            self.logger.info("Core data hash not found. Regenerating ALL processed data.")
+            self.logger.info("Could not find existing processed data. Regenerating from scratch.")
             self._clean_all_processed_data()
 
         if regenerate_core_data:
+            preprocessor = DataPreprocessor(
+                raw_files=self.raw_data_files,
+                output_dir=self.processed_dir,
+                config=self.config
+            )
             missing = [p for p in self.raw_data_files if not p.exists()]
             if missing:
                 raise FileNotFoundError(f"Missing raw data files: {missing}")
             
-            # This is the full, slow process. It's only run when absolutely necessary.
             preprocessor.process_to_npy_shards()
-            save_json({"hash": current_data_hash}, data_hash_path)
+            # We don't save a hash file because we aren't checking it
+            self.logger.info("Finished core data generation.")
 
-        # --- Stage 2: Check Split Hash ---
+        # --- The second part for train/val/test splits remains the same ---
+        # This part has its own simple hash check that should work fine.
         split_config = {
             "val_fraction": self.config["training"]["val_fraction"],
             "test_fraction": self.config["training"]["test_fraction"],
@@ -205,7 +208,7 @@ class ChemicalKineticsPipeline:
         
         regenerate_splits = True
         if split_hash_path.exists():
-            if not regenerate_core_data: # Don't check split hash if we already regenerated everything
+            if not regenerate_core_data:
                 saved_split_hash = load_json(split_hash_path).get("hash")
                 if saved_split_hash == current_split_hash:
                     self.logger.info("Split hash matches. Reusing existing train/val/test indices.")
@@ -213,14 +216,18 @@ class ChemicalKineticsPipeline:
                 else:
                     self.logger.info("Split hash mismatch. Regenerating train/val/test indices.")
                     self._clean_split_files()
-            else: # If core data was regenerated, splits must be too.
+            else:
                 self._clean_split_files()
         else:
             self.logger.info("Split hash not found. Generating new train/val/test indices.")
             self._clean_split_files()
 
         if regenerate_splits:
-            # ** KEY CHANGE: Call the new, FAST function for splitting **
+            preprocessor = DataPreprocessor( # Re-instantiate in case it wasn't created above
+                raw_files=self.raw_data_files,
+                output_dir=self.processed_dir,
+                config=self.config
+            )
             preprocessor.generate_split_indices()
             save_json({"hash": current_split_hash}, split_hash_path)
 
@@ -294,12 +301,7 @@ class ChemicalKineticsPipeline:
             device=self.device,
             norm_helper=norm_helper
         )
-        if trainer.train_loader and trainer.train_loader.num_workers > 0:
-            self.logger.info(f"Warming up data loader cache with {trainer.train_loader.num_workers} workers...")
-            start_warmup = time.time()
-            for _ in trainer.train_loader:
-                break # Iterating once is enough to trigger a parallel read.
-            self.logger.info(f"Cache warmup complete in {time.time() - start_warmup:.2f}s.")
+        _ = train_dataset[0]
 
         # Train model
         best_val_loss = trainer.train()

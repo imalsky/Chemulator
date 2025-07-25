@@ -4,15 +4,15 @@
         // Raw HDF5 data files to process
         "raw_data_files": [
             "data/raw/run9001-result.h5",
-            //"data/raw/run9002-result.h5",
-            //"data/raw/run9003-result.h5",
-            //"data/raw/run9004-result.h5",
-            //"data/raw/run9005-result.h5",
-            //"data/raw/run9006-result.h5",
-            //"data/raw/run9007-result.h5",
-            //"data/raw/run9008-result.h5",
-            //"data/raw/run9009-result.h5",
-            //"data/raw/run9010-result.h5"
+            "data/raw/run9002-result.h5",
+            "data/raw/run9003-result.h5",
+            "data/raw/run9004-result.h5",
+            "data/raw/run9005-result.h5",
+            "data/raw/run9006-result.h5",
+            "data/raw/run9007-result.h5",
+            "data/raw/run9008-result.h5",
+            "data/raw/run9009-result.h5",
+            "data/raw/run9010-result.h5"
         ],
         // Directory for processed NPY shards
         "processed_data_dir": "data/processed",
@@ -95,8 +95,8 @@
         "output_scale": 1.0,
         
         // DeepONet-specific parameters
-        "branch_layers": [384, 384, 384],  // Hidden layers for branch network
-        "trunk_layers": [128, 128, 128],   // Hidden layers for trunk network
+        "branch_layers": [384, 384, 384, 384],  // Hidden layers for branch network
+        "trunk_layers": [128, 128, 128, 128],   // Hidden layers for trunk network
         "basis_dim": 128,                   // Number of basis functions
         
         // SIREN-specific parameters (when type="siren")
@@ -133,16 +133,15 @@
         "use_fraction": 1.0,
         
         "epochs": 100,
-        "batch_size": 8192,
-        "gradient_accumulation_steps": 1,
+        "batch_size": 1024,
+        "gradient_accumulation_steps": 8,
         
-        // DataLoader settings - CRITICAL CHANGES
-        "num_workers": 16,            // Changed from 8 to 0 for large datasets
-        "pin_memory": true,         // Changed from true to false
-        "persistent_workers": true, // Changed from true to false  
-        "prefetch_factor": 4,        // Reduced from 4 to 2
+        "num_workers": 4,           
+        "pin_memory": false,        
+        "persistent_workers": false, 
+        "prefetch_factor": 1,      
         "drop_last": true,
-        "dataset_cache_shards": 64,   // CRITICAL: Reduced from 256 to 4
+        "dataset_cache_shards": 1,   
         
         // Rest of training config remains the same...
         "learning_rate": 3e-4,
@@ -177,9 +176,9 @@
         "seed": 42,
         
         // PyTorch optimizations
-        "use_torch_compile": true,   // Use torch.compile (PyTorch 2.0+)
+        "use_torch_compile": false,   // Use torch.compile (PyTorch 2.0+)
         "compile_mode": "default",   // Compile mode: "default", "reduce-overhead", "max-autotune"
-        "use_torch_export": true,    // Export model with torch.export
+        "use_torch_export": false,    // Export model with torch.export
         
         // CUDA optimizations
         "cudnn_benchmark": true,     // Enable cuDNN autotuner
