@@ -47,6 +47,9 @@ class Trainer:
         self.prediction_mode = self.prediction_config.get("mode", "absolute")
         self.output_clamp = self.prediction_config.get("output_clamp")
         
+        # ADD THIS LINE - Call the validation method
+        self.trainer_init_validation()
+        
         # Dataset info
         self.n_species = len(config["data"]["species_variables"])
         self.n_globals = len(config["data"]["global_variables"])
@@ -489,7 +492,25 @@ class Trainer:
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
         self.logger.info(f"Test loss: {avg_loss:.6f}")
         return avg_loss
-            
+
+    def cleanup_dataloaders(self):
+        """Properly cleanup DataLoader workers to prevent memory leaks."""
+        for loader in [self.train_loader, self.val_loader, self.test_loader]:
+            if loader is not None:
+                try:
+                    # Force workers to terminate
+                    loader._shutdown_workers()
+                    del loader
+                except:
+                    pass
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
     def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
         """Log epoch results."""
         lr = self.optimizer.param_groups[0]['lr'] if self.optimizer else 0

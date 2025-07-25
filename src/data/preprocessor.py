@@ -508,7 +508,6 @@ class DataPreprocessor:
         self.logger.info(f"Preprocessing summary saved to: {summary_path}")
 
 
-# This class is unchanged but included for completeness of the file
 class ShardWriter:
     """Writes numpy arrays to shard files, handling buffering and file naming."""
     def __init__(self, output_dir: Path, shard_size: int, shard_idx_base: str):
@@ -521,6 +520,9 @@ class ShardWriter:
         self.shard_metadata: List[Dict] = []
 
     def add_samples(self, samples: np.ndarray, global_start_idx: int):
+        if samples.dtype != np.float32:
+            samples = samples.astype(np.float32)
+        
         self.buffer.append((samples, global_start_idx))
         self.buffer_size += samples.shape[0]
         while self.buffer_size >= self.shard_size:
@@ -560,15 +562,28 @@ class ShardWriter:
 
         self.buffer_size = sum(s.shape[0] for s, _ in self.buffer)
         
-        data = np.concatenate(data_to_write)
+        # FIX: Ensure data is float32 before saving
+        data = np.concatenate(data_to_write).astype(np.float32)
         
         shard_filename = f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
-        np.save(self.output_dir / shard_filename, data)
+        shard_path = self.output_dir / shard_filename
+        
+        # Save with explicit float32 dtype
+        np.save(shard_path, data)
+        
+        # Log actual size for debugging
+        actual_size_mb = data.nbytes / 1024**2
+        logging.getLogger(__name__).debug(
+            f"Saved shard {shard_filename}: {data.shape[0]} samples, "
+            f"{actual_size_mb:.1f} MB, dtype: {data.dtype}"
+        )
         
         self.shard_metadata.append({
             "filename": shard_filename,
             "start_idx": current_global_start_idx,
             "end_idx": current_global_start_idx + data.shape[0],
-            "n_samples": data.shape[0]
+            "n_samples": data.shape[0],
+            "dtype": "float32",  # Add dtype info to metadata
+            "size_mb": actual_size_mb
         })
         self.local_shard_id += 1
