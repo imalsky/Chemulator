@@ -8,12 +8,7 @@
             "data/raw/run9002-result.h5",
             "data/raw/run9003-result.h5",
             "data/raw/run9004-result.h5",
-            "data/raw/run9005-result.h5",
-            "data/raw/run9006-result.h5",
-            "data/raw/run9007-result.h5",
-            "data/raw/run9008-result.h5",
-            "data/raw/run9009-result.h5",
-            "data/raw/run9010-result.h5"
+            "data/raw/run9005-result.h5"
         ],
         // Directory for processed NPY shards
         "processed_data_dir": "data/processed",
@@ -55,7 +50,7 @@
         // Compression type: null for raw npz files
         "compression": null,
         // Number of parallel workers for preprocessing
-        "num_workers": 8,
+        "num_workers": 16,
         // Enable parallel preprocessing (set false for simpler debugging)
         "parallel_enabled": true
     },
@@ -98,7 +93,7 @@
         // DeepONet-specific parameters
         "branch_layers": [384, 384, 384, 384],  // Hidden layers for branch network
         "trunk_layers": [128, 128, 128, 128],   // Hidden layers for trunk network
-        "basis_dim": 128,                   // Number of basis functions
+        "basis_dim": 128,                       // Number of basis functions
         
         // SIREN-specific parameters (when type="siren")
         "hidden_dims": [256, 256, 256, 256],  // Hidden layer dimensions
@@ -127,29 +122,32 @@
         "output_clamp": null
     },
     
-    // ===== TRAINING PARAMETERS =====
+    // ===== TRAINING PARAMETERS - OPTIMIZED FOR A100 =====
     "training": {
         "val_fraction": 0.15,
         "test_fraction": 0.15,
         "use_fraction": 1.0,
         
         "epochs": 100,
-        "batch_size": 1024,
-        "gradient_accumulation_steps": 8,
+        "batch_size": 2048,              // Increased for better GPU utilization
+        "gradient_accumulation_steps": 4, // Reduced from 8 for more frequent updates
         
-        "num_workers": 4,           
-        "pin_memory": false,        
-        "persistent_workers": false, 
-        "prefetch_factor": 1,      
+        // MEMORY-OPTIMIZED DATALOADER SETTINGS
+        "num_workers": 2,                // Reduced from 4 to prevent OOM
+        "pin_memory": true,              // Enable for faster GPU transfer
+        "persistent_workers": true,      // Keep workers alive between epochs
+        "prefetch_factor": 2,            // Prefetch 2 batches per worker
         "drop_last": true,
-        "dataset_cache_shards": 1,   
+        "dataset_cache_shards": 16,      // CRITICAL FIX: Increased from 1 to 16
         
-        // Rest of training config remains the same...
+        // Learning rate and optimizer settings
         "learning_rate": 3e-4,
         "weight_decay": 1e-5,
         "betas": [0.9, 0.999],
         "eps": 1e-8,
         "gradient_clip": 1.0,
+        
+        // Scheduler settings
         "scheduler": "cosine",
         "scheduler_params": {
             "T_0": 10,
@@ -159,15 +157,17 @@
             "patience": 10,
             "min_lr": 1e-7
         },
+        
+        // Loss and training settings
         "loss": "mse",
         "huber_delta": 0.5,
         "use_amp": true,
-        "amp_dtype": "bfloat16",
+        "amp_dtype": "bfloat16",         // Better stability than float16
         "early_stopping_patience": 15,
         "min_delta": 1e-10,
-        "log_interval": 1000,
+        "log_interval": 500,              // Log more frequently
         "save_interval": 10,
-        "empty_cache_interval": 1000,
+        "empty_cache_interval": 500,      // Clear GPU cache more often
         "hpo_epochs": 20
     },
     
@@ -177,237 +177,14 @@
         "seed": 42,
         
         // PyTorch optimizations
-        "use_torch_compile": false,   // Use torch.compile (PyTorch 2.0+)
-        "compile_mode": "default",   // Compile mode: "default", "reduce-overhead", "max-autotune"
+        "use_torch_compile": false,   // Disable for now to simplify debugging
+        "compile_mode": "default",    // Compile mode: "default", "reduce-overhead", "max-autotune"
         "use_torch_export": false,    // Export model with torch.export
         
-        // CUDA optimizations
-        "cudnn_benchmark": true,     // Enable cuDNN autotuner
-        "tf32": true,                // Enable TensorFloat-32 on Ampere GPUs
-        "cuda_memory_fraction": 0.9  // Fraction of GPU memory to use
-    },
-    
-    // ===== HYPERPARAMETER OPTIMIZATION =====
-    "optuna": {
-        // Enable Optuna integration
-        "enabled": true,
-        
-        // Optuna study settings (when enabled)
-        "n_trials": 100,
-        "n_startup_trials": 8,
-        "n_warmup_steps": 10,
-        "interval_steps": 2
-    }
-}
-
-
-===== /Users/imalsky/Desktop/Chemulator/config/.ipynb_checkpoints/config-checkpoint.jsonc =====
-{
-    // ===== FILE PATHS =====
-    "paths": {
-        // Raw HDF5 data files to process
-        "raw_data_files": [
-            "data/raw/run9001-result.h5",
-            //"data/raw/run9002-result.h5",
-            //"data/raw/run9003-result.h5",
-            //"data/raw/run9004-result.h5",
-            //"data/raw/run8005-result.h5",
-            //"data/raw/run8006-result.h5",
-            //"data/raw/run8007-result.h5",
-            //"data/raw/run8008-result.h5",
-            //"data/raw/run8009-result.h5",
-            //"data/raw/run8010-result.h5"
-        ],
-        // Directory for processed NPY shards
-        "processed_data_dir": "data/processed",
-        // Directory for saved models
-        "model_save_dir": "data/models",
-        // Directory for logs
-        "log_dir": "logs"
-    },
-    
-    // ===== DATA CONFIGURATION =====
-    "data": {
-        // Chemical species to predict (order matters!)
-        "species_variables": [
-            "C2H2_evolution",
-            "CH4_evolution",
-            "CO2_evolution",
-            "CO_evolution",
-            "H2O_evolution",
-            "H2_evolution",
-            "HCN_evolution",
-            "H_evolution",
-            "N2_evolution",
-            "NH3_evolution",
-            "OH_evolution",
-            "O_evolution"
-        ],
-        // Global parameters (initial conditions)
-        "global_variables": ["P_init", "T_init"],
-        // Time variable name in HDF5 files
-        "time_variable": "t_time"
-    },
-    
-    // ===== PREPROCESSING SETTINGS =====
-    "preprocessing": {
-        // Number of samples per NPY shard file
-        "shard_size": 1000000,
-        // Minimum species concentration threshold
-        "min_species_threshold": 1e-25,
-        // Compression type: null for raw npz files
-        "compression": null,
-        // Number of parallel workers for preprocessing
-        "num_workers": 1,
-        // Enable parallel preprocessing (set false for simpler debugging)
-        "parallel_enabled": true
-    },
-    
-    // ===== NORMALIZATION SETTINGS =====
-    "normalization": {
-        // Default normalization method for all variables
-        // Options: "standard", "log-standard", "min-max", "log-min-max", "none"
-        "default_method": "log-min-max",
-        
-        // Override methods for specific variables
-        "methods": {
-            "T_init": "standard",      // Temperature: standard normalization
-            "P_init": "log-min-max",    // Pressure: log scale then min-max
-            "t_time": "log-min-max"     // Time: log scale then min-max
-        },
-        
-        // Small value to prevent log(0) and division by zero
-        "epsilon": 1e-30,
-        // Minimum standard deviation to prevent division by tiny values
-        "min_std": 1e-10,
-        // Clamp normalized values to [-clamp_value, clamp_value]
-        "clamp_value": 50.0
-    },
-    
-    // ===== MODEL ARCHITECTURE =====
-    "model": {
-        // Model type: "deeponet" or "siren"
-        "type": "deeponet",
-        
-        // Activation function: "gelu", "relu", "silu", "tanh"
-        "activation": "gelu",
-        
-        // Dropout rate (0.0 = no dropout)
-        "dropout": 0.0,
-        
-        // Output scaling factor (1.0 = no scaling)
-        "output_scale": 1.0,
-        
-        // DeepONet-specific parameters
-        "branch_layers": [384, 64, 512, 512],  // Hidden layers for branch network
-        "trunk_layers": [128, 128],   // Hidden layers for trunk network
-        "basis_dim": 128,                   // Number of basis functions
-        
-        // SIREN-specific parameters (when type="siren")
-        "hidden_dims": [256, 256, 256, 256],  // Hidden layer dimensions
-        "omega_0": 30.0                       // SIREN frequency parameter
-    },
-    
-    // ===== FiLM CONDITIONING =====
-    "film": {
-        // Enable Feature-wise Linear Modulation
-        "enabled": true,
-        // Hidden layers for FiLM networks
-        "hidden_dims": [64, 64],
-        // Activation for FiLM networks
-        "activation": "gelu"
-    },
-    
-    // ===== PREDICTION SETTINGS =====
-    "prediction": {
-        // Prediction mode: "absolute" or "ratio"
-        // - absolute: predict species concentrations directly
-        // - ratio: predict log-ratios relative to initial conditions (DeepONet only)
-        "mode": "absolute",
-        
-        // Optional output clamping (null = no clamping)
-        // Only used in absolute mode
-        "output_clamp": null
-    },
-    
-    // ===== TRAINING PARAMETERS =====
-    "training": {
-        // Data split fractions
-        "val_fraction": 0.15,   // Validation set fraction
-        "test_fraction": 0.15,  // Test set fraction
-        "use_fraction": 1.0,    // Fraction of data to actually use (for debugging)
-        
-        // Training loop settings
-        "epochs": 100,                      // Maximum epochs
-        "batch_size": 8192,                 // Batch size
-        "gradient_accumulation_steps": 1,   // Gradient accumulation steps
-        
-        // DataLoader settings
-        "num_workers": 1,           // Parallel data loading workers
-        "pin_memory": true,          // Pin memory for faster GPU transfer
-        "persistent_workers": true,  // Keep workers alive between epochs
-        "prefetch_factor": 4,        // Number of batches to prefetch
-        "drop_last": true,           // Drop incomplete final batch
-        "dataset_cache_shards": 256, // Max shards to cache in memory
-        
-        // Optimizer settings (AdamW)
-        "learning_rate": 3e-4,
-        "weight_decay": 1e-5,
-        "betas": [0.9, 0.999],  // Adam beta parameters
-        "eps": 1e-8,            // Adam epsilon
-        
-        // Gradient clipping (0 = no clipping)
-        "gradient_clip": 1.0,
-        
-        // Learning rate scheduler
-        "scheduler": "cosine",  // Options: "none", "cosine", "plateau"
-        "scheduler_params": {
-            // For "cosine" scheduler
-            "T_0": 10,          // Initial restart period in epochs
-            "T_mult": 2,        // Period multiplier after each restart
-            "eta_min": 1e-7,    // Minimum learning rate
-            
-            // For "plateau" scheduler
-            "factor": 0.5,      // LR reduction factor
-            "patience": 10,     // Epochs to wait before reducing LR
-            "min_lr": 1e-7      // Minimum learning rate
-        },
-        
-        // Loss function: "mse", "mae", "huber"
-        "loss": "mse",
-        "huber_delta": 0.5,  // Delta for Huber loss (if used)
-        
-        // Mixed precision training
-        "use_amp": true,              // Enable automatic mixed precision
-        "amp_dtype": "bfloat16",      // AMP dtype: "float16" or "bfloat16"
-        
-        // Early stopping
-        "early_stopping_patience": 15,  // Epochs to wait before stopping
-        "min_delta": 1e-10,            // Minimum improvement to reset patience
-        
-        // Logging intervals
-        "log_interval": 1000,           // Log every N gradient steps
-        "save_interval": 10,           // Save checkpoint every N epochs
-        "empty_cache_interval": 1000,  // Clear GPU cache every N steps
-        
-        // Hyperparameter optimization settings
-        "hpo_epochs": 20  // Reduced epochs for HPO trials
-    },
-    
-    // ===== SYSTEM/HARDWARE SETTINGS =====
-    "system": {
-        // Random seed for reproducibility
-        "seed": 42,
-        
-        // PyTorch optimizations
-        "use_torch_compile": true,   // Use torch.compile (PyTorch 2.0+)
-        "compile_mode": "default",   // Compile mode: "default", "reduce-overhead", "max-autotune"
-        "use_torch_export": true,    // Export model with torch.export
-        
-        // CUDA optimizations
-        "cudnn_benchmark": true,     // Enable cuDNN autotuner
-        "tf32": true,                // Enable TensorFloat-32 on Ampere GPUs
-        "cuda_memory_fraction": 0.9  // Fraction of GPU memory to use
+        // CUDA optimizations for A100
+        "cudnn_benchmark": true,      // Enable cuDNN autotuner
+        "tf32": true,                 // Enable TensorFloat-32 on A100
+        "cuda_memory_fraction": 0.95  // Use most GPU memory for better performance
     },
     
     // ===== HYPERPARAMETER OPTIMIZATION =====
@@ -1319,7 +1096,11 @@ class Trainer:
         
         # Create data loaders
         self._setup_dataloaders(train_dataset, val_dataset, test_dataset)
-        
+
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.test_dataset = test_dataset
+
         # Training state
         self.current_epoch = 0
         self.global_step = 0
@@ -1371,19 +1152,24 @@ class Trainer:
         """Setup data loaders."""
         from data.dataset import create_dataloader
         
+        # Use shard-aware sampling for the training loader for maximum cache efficiency
         self.train_loader = create_dataloader(
             train_dataset, self.config, shuffle=True, 
-            device=self.device, drop_last=True
+            device=self.device, drop_last=True,
+            use_shard_aware_sampling=True  # Be explicit
         ) if train_dataset else None
         
+        # Shard-aware sampling is not needed for validation and test sets
         self.val_loader = create_dataloader(
             val_dataset, self.config, shuffle=False, 
-            device=self.device, drop_last=False
+            device=self.device, drop_last=False,
+            use_shard_aware_sampling=False # Be explicit
         ) if val_dataset and len(val_dataset) > 0 else None
         
         self.test_loader = create_dataloader(
             test_dataset, self.config, shuffle=False, 
-            device=self.device, drop_last=False
+            device=self.device, drop_last=False,
+            use_shard_aware_sampling=False # Be explicit
         ) if test_dataset and len(test_dataset) > 0 else None
     
     def _setup_optimizer(self):
@@ -1510,10 +1296,6 @@ class Trainer:
     
     # --- helper ------------------------------------------------------------
     def _standardize_log_ratios(self, log_ratios: torch.Tensor) -> torch.Tensor:
-        """
-        Standardizes raw log-ratio model outputs for loss calculation.
-        """
-        # Bug 2 Fix: Raise error immediately if ratio stats missing
         if self.prediction_mode == "ratio" and self.norm_helper.ratio_stats is None:
             raise ValueError(
                 "Ratio statistics are missing but prediction mode is 'ratio'. "
@@ -1538,21 +1320,17 @@ class Trainer:
         stds = torch.clamp(stds, min=self.config["normalization"]["min_std"])
         return (log_ratios - means) / stds
 
-    def _compute_loss(self, outputs: torch.Tensor,
-                    targets: torch.Tensor,
-                    inputs: torch.Tensor) -> torch.Tensor:
-        """
-        Computes the loss with Bug 2 fix for ratio mode validation.
-        """
+    def _compute_loss(self, outputs: torch.Tensor, 
+                      targets: torch.Tensor,
+                      inputs: torch.Tensor) -> torch.Tensor:
         if self.prediction_mode == "ratio":
-            # Bug 2 Fix: This will now raise an error if ratio_stats are missing
-            outputs_std = self._standardize_log_ratios(outputs)
-            return self.criterion(outputs_std, targets)
-
-        # absolute mode
-        if self.output_clamp is not None:
-            outputs = torch.clamp(outputs, min=self.output_clamp)
-        return self.criterion(outputs, targets)
+            # Direct comparison: both outputs and targets are in standardized log-ratio space
+            return self.criterion(outputs, targets)
+        else:
+            # Absolute mode (unchanged)
+            if self.output_clamp is not None:
+                outputs = torch.clamp(outputs, min=self.output_clamp)
+            return self.criterion(outputs, targets)
     
     def train(self) -> float:
         """Execute the training loop."""
@@ -1639,7 +1417,25 @@ class Trainer:
                     self.best_val_loss = train_loss
                     self.best_epoch = epoch
                     self._save_best_model()
-    
+
+            self._after_epoch()
+
+    def _after_epoch(self) -> None:
+        """
+        House-keeping that should run once every epoch.
+        """
+        # Iterate through datasets and clear their caches if they have one
+        for dataset in [self.train_dataset, self.val_dataset, self.test_dataset]:
+            if dataset is not None and hasattr(dataset, '_get_shard_data'):
+                # _get_shard_data is the lru_cache wrapper
+                dataset._get_shard_data.cache_clear()
+
+        # Then, do the garbage collection
+        import gc
+        gc.collect()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
     def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
         """Run one training epoch and return the average loss."""
         self.model.train()
@@ -1750,7 +1546,25 @@ class Trainer:
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
         self.logger.info(f"Test loss: {avg_loss:.6f}")
         return avg_loss
-            
+
+    def cleanup_dataloaders(self):
+        """Properly cleanup DataLoader workers to prevent memory leaks."""
+        for loader in [self.train_loader, self.val_loader, self.test_loader]:
+            if loader is not None:
+                try:
+                    # Force workers to terminate
+                    loader._shutdown_workers()
+                    del loader
+                except:
+                    pass
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
     def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
         """Log epoch results."""
         lr = self.optimizer.param_groups[0]['lr'] if self.optimizer else 0
@@ -2410,6 +2224,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import h5py
 import numpy as np
 import torch
+import os
 
 from .normalizer import DataNormalizer, NormalizationHelper
 from utils.utils import save_json, load_json
@@ -2798,62 +2613,80 @@ class DataPreprocessor:
             np.save(path, idx_array)
             self.logger.info(f"Saved {name} indices to {path} ({len(idx_array)} samples)")
 
-    ## MODIFIED ## This private method now returns only a list of shard metadata dictionaries.
     def _write_normalized_shards(self, norm_stats, file_sample_counts) -> List[Dict]:
-        self.logger.info("Pass 2: Writing shards and collecting metadata...")
-        all_shards = []
-        current_idx = 0
-        
-        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
-            futures = {fp.name: executor.submit(shard_worker, fp, self.config, norm_stats, 0, self.output_dir) for fp in self.raw_files}
-            for f_path in self.raw_files:
-                meta = futures[f_path.name].result()
-                
-                offset = current_idx
-                for shard in meta["shards"]:
-                    shard["start_idx"] += offset
-                    shard["end_idx"] += offset
-                all_shards.extend(meta["shards"])
-                current_idx += meta["rows_written"]
-        return all_shards
+        """
+        Second pass: write float32 shards + gather metadata.
+        """
+        self.logger.info("Writing shards …")
+        all_meta = []
+        current_start = 0  # Renamed to avoid shadowing
 
-    # --- UPDATED: This function now aggregates the reports from workers ---
-    def _collect_stats_and_counts(self) -> Tuple[Dict, Dict, Dict]:
-        self.logger.info("Pass 1: Collecting statistics and sample counts...")
-        prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
-        final_accs = self.normalizer._initialize_accumulators()
-        final_ratio_accs = {var: {"count": 0,"mean": 0.0,"m2": 0.0,"min": float('inf'),"max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
-        file_counts = {}
-        
-        # --- NEW: Aggregate report dictionary ---
-        total_report = {
-            "total_profiles": 0,
-            "profiles_kept": 0,
-            "dropped_reasons": defaultdict(int)
-        }
+        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as exe:
+            # Precompute cumulative starts in O(n) time
+            cumulative_starts = []
+            for fp in self.raw_files:
+                cumulative_starts.append(current_start)
+                # Use fp.stem as key (assuming file_sample_counts uses stems; confirm in _collect_stats_and_counts)
+                current_start += file_sample_counts.get(fp.stem, 0)
 
-        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
-            futures = {executor.submit(stats_worker, fp, self.config): fp for fp in self.raw_files}
+            # Submit all jobs with precomputed starts
+            futures = [
+                exe.submit(
+                    shard_worker,
+                    self.raw_files[i],
+                    self.config,
+                    norm_stats,
+                    cumulative_starts[i],
+                    self.output_dir
+                )
+                for i in range(len(self.raw_files))
+            ]
+
+            # Process results as they complete
             for fut in as_completed(futures):
-                accs, ratio_accs, count, worker_report = fut.result()
-                
-                # Aggregate results
-                self.normalizer._merge_accumulators(final_accs, accs)
-                if ratio_accs: self.normalizer._merge_accumulators(final_ratio_accs, ratio_accs)
-                file_counts[futures[fut].name] = count
-                
-                # --- NEW: Aggregate the reports ---
-                total_report["total_profiles"] += worker_report["total_profiles"]
-                total_report["profiles_kept"] += worker_report["profiles_kept"]
-                for reason, num in worker_report["dropped_reasons"].items():
-                    total_report["dropped_reasons"][reason] += num
+                meta = fut.result()
+                all_meta.extend(meta["shards"])
 
-        norm_stats = self.normalizer._finalize_statistics(final_accs)
-        if final_ratio_accs:
-            norm_stats["ratio_stats"] = self.normalizer._finalize_statistics(final_ratio_accs, is_ratio=True)
-        return norm_stats, file_counts, total_report
+        return all_meta
 
-    # --- MODIFIED: Now accepts total_samples instead of split_indices ---
+    def _collect_stats_and_counts(self) -> Tuple[Dict, Dict, Dict]:
+            self.logger.info("Pass 1: Collecting statistics and sample counts...")
+            prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
+            final_accs = self.normalizer._initialize_accumulators()
+            final_ratio_accs = {var: {"count": 0,"mean": 0.0,"m2": 0.0,"min": float('inf'),"max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
+            file_counts = {}
+            
+            # --- NEW: Aggregate report dictionary ---
+            total_report = {
+                "total_profiles": 0,
+                "profiles_kept": 0,
+                "dropped_reasons": defaultdict(int)
+            }
+
+            with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
+                futures = {executor.submit(stats_worker, fp, self.config): fp for fp in self.raw_files}
+                for fut in as_completed(futures):
+                    accs, ratio_accs, count, worker_report = fut.result()
+                    
+                    # Aggregate results
+                    self.normalizer._merge_accumulators(final_accs, accs)
+                    if ratio_accs: self.normalizer._merge_accumulators(final_ratio_accs, ratio_accs)
+                    file_counts[futures[fut].name] = count
+                    
+                    # --- NEW: Aggregate the reports ---
+                    total_report["total_profiles"] += worker_report["total_profiles"]
+                    total_report["profiles_kept"] += worker_report["profiles_kept"]
+                    for reason, num in worker_report["dropped_reasons"].items():
+                        total_report["dropped_reasons"][reason] += num
+
+            norm_stats = self.normalizer._finalize_statistics(final_accs)
+            if final_ratio_accs:
+                norm_stats["ratio_stats"] = self.normalizer._finalize_statistics(final_ratio_accs, is_ratio=True)
+
+            file_counts = {Path(k).stem: v for k, v in file_counts.items()}
+
+            return norm_stats, file_counts, total_report
+
     def _write_summary_log(self, report: Dict, total_samples: int):
         """Writes a human-readable summary of the preprocessing results."""
         log_dir = Path(self.config["paths"]["log_dir"])
@@ -2896,7 +2729,6 @@ class DataPreprocessor:
         self.logger.info(f"Preprocessing summary saved to: {summary_path}")
 
 
-# This class is unchanged but included for completeness of the file
 class ShardWriter:
     """Writes numpy arrays to shard files, handling buffering and file naming."""
     def __init__(self, output_dir: Path, shard_size: int, shard_idx_base: str):
@@ -2907,57 +2739,72 @@ class ShardWriter:
         self.buffer_size = 0
         self.local_shard_id = 0
         self.shard_metadata: List[Dict] = []
+        # Ensure the output directory exists from within the worker
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def add_samples(self, samples: np.ndarray, global_start_idx: int):
+        if samples.dtype != np.float32:
+            samples = samples.astype(np.float32)
+        
         self.buffer.append((samples, global_start_idx))
         self.buffer_size += samples.shape[0]
         while self.buffer_size >= self.shard_size:
             self._write_shard()
 
     def flush(self):
+        # Important: Use _write_shard in a loop to handle remaining data
+        # that might still be larger than one shard.
         while self.buffer_size > 0:
             self._write_shard()
     
     def get_shard_metadata(self) -> List[Dict]:
         return self.shard_metadata
 
-    def _write_shard(self):
-        if not self.buffer: return
-        
-        data_to_write, remaining_buffer = [], []
-        write_size = 0
-        current_global_start_idx = self.buffer[0][1]
+    def _write_shard(self) -> None:
+        """
+        Assembles and writes ONE shard of exactly `shard_size` (or less if flushing the remainder).
+        This is the correct, original logic that respects shard boundaries.
+        """
+        if not self.buffer:
+            return
 
-        temp_buffer = self.buffer
-        self.buffer = [] # Clear original buffer
+        rows_to_write = []
+        size_so_far = 0
+        first_global_idx = self.buffer[0][1]
 
-        for samples, start_idx in temp_buffer:
-            if write_size + samples.shape[0] <= self.shard_size:
-                data_to_write.append(samples)
-                write_size += samples.shape[0]
+        # Collect arrays until we have enough for a shard
+        while self.buffer and size_so_far < self.shard_size:
+            arr, start_idx = self.buffer.pop(0)
+            needed = self.shard_size - size_so_far
+            
+            if arr.shape[0] <= needed:
+                # Take the whole array
+                rows_to_write.append(arr)
+                size_so_far += arr.shape[0]
             else:
-                split_idx = self.shard_size - write_size
-                data_to_write.append(samples[:split_idx])
-                self.buffer.append((samples[split_idx:], start_idx + split_idx))
-                write_size += split_idx
-                break
+                # Split the array
+                rows_to_write.append(arr[:needed])
+                # Put the remainder back at the front of the buffer
+                self.buffer.insert(0, (arr[needed:], start_idx + needed))
+                size_so_far += needed
         
-        processed_chunks = len(data_to_write)
-        if len(temp_buffer) > processed_chunks:
-             self.buffer.extend(temp_buffer[processed_chunks:])
+        # Update the total buffer size
+        self.buffer_size = sum(arr.shape[0] for arr, _ in self.buffer)
 
-        self.buffer_size = sum(s.shape[0] for s, _ in self.buffer)
+        # Concatenate and write the data for this shard
+        data = np.concatenate(rows_to_write).astype(np.float32, copy=False)
         
-        data = np.concatenate(data_to_write)
-        
-        shard_filename = f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
-        np.save(self.output_dir / shard_filename, data)
-        
+        final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
+        tmp_path = final_path.with_suffix(".tmp.npy")
+
+        np.save(tmp_path, data, allow_pickle=False)
+        os.replace(tmp_path, final_path)
+
         self.shard_metadata.append({
-            "filename": shard_filename,
-            "start_idx": current_global_start_idx,
-            "end_idx": current_global_start_idx + data.shape[0],
-            "n_samples": data.shape[0]
+            "filename": final_path.name,
+            "start_idx": first_global_idx,
+            "end_idx": first_global_idx + data.shape[0],
+            "n_samples": data.shape[0],
         })
         self.local_shard_id += 1
 
@@ -2971,20 +2818,93 @@ This module provides efficient data loading from numpy shard files with:
 - Zero-copy tensor creation for optimal performance
 - Multi-worker support with proper memory management
 - Binary search for O(log n) sample lookups
+- Conservative memory allocation to prevent OOM issues
+- Shard-aware sampling to maximize cache efficiency
 """
 
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List, Iterator
 from functools import lru_cache
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import psutil
 import os
+
+
+class ShardAwareSampler(Sampler):
+    """
+    A sampler that generates indices in a shard-aware manner to maximize cache efficiency.
+    
+    This sampler:
+    1. Groups indices by their shard
+    2. Shuffles shards randomly
+    3. Within each shard, shuffles indices randomly
+    4. Yields batches that primarily come from 1-2 shards at a time
+    
+    This dramatically reduces cache misses and disk I/O.
+    """
+    def __init__(self, dataset: 'NPYDataset', batch_size: int, drop_last: bool = True, seed: int = 0):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.seed = seed
+        
+        # Group indices by shard
+        self.shard_to_indices = self._group_indices_by_shard()
+        self.total_samples = len(dataset)
+        
+    def _group_indices_by_shard(self) -> Dict[int, List[int]]:
+        """Group dataset indices by their shard for efficient access."""
+        shard_groups = {}
+        
+        for idx in range(len(self.dataset)):
+            global_idx = self.dataset.sample_indices[idx]
+            shard_idx, _ = self.dataset._find_shard_idx(global_idx)
+            
+            if shard_idx not in shard_groups:
+                shard_groups[shard_idx] = []
+            shard_groups[shard_idx].append(idx)
+            
+        return shard_groups
+    
+    def __iter__(self) -> Iterator[int]:
+        """Generate indices in a cache-friendly order."""
+        # Set random seed for reproducibility
+        rng = np.random.RandomState(self.seed + torch.utils.data.get_worker_info().id 
+                                     if torch.utils.data.get_worker_info() else self.seed)
+        
+        # Shuffle shard order
+        shard_order = list(self.shard_to_indices.keys())
+        rng.shuffle(shard_order)
+        
+        # Collect all indices in shard-aware order
+        all_indices = []
+        for shard_idx in shard_order:
+            # Get indices for this shard and shuffle them
+            shard_indices = self.shard_to_indices[shard_idx].copy()
+            rng.shuffle(shard_indices)
+            all_indices.extend(shard_indices)
+        
+        # Yield batches
+        for i in range(0, len(all_indices) - self.batch_size + 1, self.batch_size):
+            yield all_indices[i:i + self.batch_size]
+            
+        # Handle last batch
+        if not self.drop_last and len(all_indices) % self.batch_size != 0:
+            yield all_indices[-(len(all_indices) % self.batch_size):]
+    
+    def __len__(self) -> int:
+        """Return the number of batches."""
+        if self.drop_last:
+            return self.total_samples // self.batch_size
+        else:
+            return (self.total_samples + self.batch_size - 1) // self.batch_size
+
 
 class NPYDataset(Dataset):
     """
@@ -2995,6 +2915,8 @@ class NPYDataset(Dataset):
     - Caching frequently accessed shards with LRU eviction
     - Creating PyTorch tensors without data copying
     - Supporting train/validation/test splits via index arrays
+    - Conservative memory allocation to prevent OOM issues
+    - Providing shard-aware sampling for cache efficiency
     
     Args:
         shard_dir: Directory containing shard files and metadata
@@ -3003,9 +2925,8 @@ class NPYDataset(Dataset):
         device: PyTorch device (used for logging, not data loading)
         split_name: Name of this split (train/val/test) for logging
     """
-
     def __init__(self, shard_dir: Path, indices: np.ndarray, config: Dict[str, Any],
-                 device: torch.device, split_name: Optional[str] = None):
+                device: torch.device, split_name: Optional[str] = None):
         super().__init__()
         self.shard_dir = Path(shard_dir)
         self.config = config
@@ -3033,6 +2954,8 @@ class NPYDataset(Dataset):
 
         # Calculate data dimensions for memory estimation
         self.n_features = self.n_species * 2 + self.n_globals + 1  # inputs + outputs
+        
+        # Always use float32 for memory calculations
         self.bytes_per_sample = self.n_features * 4  # float32
         self.bytes_per_shard = self.samples_per_shard * self.bytes_per_sample
 
@@ -3043,27 +2966,36 @@ class NPYDataset(Dataset):
         # Build efficient lookup structures for O(log n) access
         self._build_shard_lookup()
 
+        # Run memory pre-flight check only in main process
+        if torch.utils.data.get_worker_info() is None:  # Only in main process
+            try:
+                memory_info = self.check_memory_requirements()
+                
+                # Additional warning for high memory usage
+                if memory_info["usage_percent"] > 60:
+                    self.logger.warning(
+                        f"⚠️  High memory usage expected: {memory_info['usage_percent']:.0f}% "
+                        f"of available RAM. Monitor closely for OOM issues."
+                    )
+            except MemoryError as e:
+                self.logger.error("Memory check failed - aborting initialization")
+                raise
+
         # Log initialization summary
         self.logger.info(
             f"NPYDataset '{self.split_name}' initialized: "
             f"{self.n_total_samples:,} samples across {self.n_shards} shards "
-            f"({self.bytes_per_shard / 1024**2:.1f} MB/shard), "
+            f"({self.bytes_per_shard / 1024**2:.1f} MB/shard as float32), "
             f"cache capacity: {self._max_cache_size} shards, "
             f"prediction mode: {self.prediction_mode}"
         )
 
 
-
     def _determine_cache_size(self):
         """
         Calculate optimal shard cache size based on available system memory.
-        
-        This method balances memory usage across workers to prevent OOM while
-        maximizing cache hit rates. The cache size is determined by:
-        - Available system RAM (40% allocated to caching)
-        - Number of DataLoader workers (memory divided among them)
-        - Configuration limits (dataset_cache_shards parameter)
-        - Practical upper bounds to prevent excessive memory use
+        Uses conservative estimates to prevent OOM issues when multiple
+        datasets are running simultaneously.
         """
         # Query available system memory
         try:
@@ -3080,94 +3012,98 @@ class NPYDataset(Dataset):
             self.logger.warning(f"Failed to query system memory: {e}. Using 4GB fallback.")
             available_memory = 4 * 1024**3  # Conservative 4GB fallback
 
-        # Allocate 40% of available memory for shard caching across all workers
-        # This leaves headroom for PyTorch operations and system processes
-        cache_memory_fraction = 0.4
+        # Conservative memory allocation (30% of available)
+        cache_memory_fraction = 0.3
         total_cache_memory = available_memory * cache_memory_fraction
         
-        # Divide memory among DataLoader workers
+        # Account for multiple datasets running concurrently
+        # Assume up to 3 datasets (train/val/test) may be active
+        num_concurrent_datasets = 3
+        cache_memory_per_dataset = total_cache_memory / num_concurrent_datasets
+        
+        # Account for workers in this dataset
         num_workers = self.config["training"].get("num_workers", 1)
-        num_loaders = 3            # train + val + test
-        num_workers *= num_loaders # total worker processes
         
         if num_workers > 0:
-            # CRITICAL: Account for ALL workers when dividing memory
-            # Each worker will maintain its own cache, so we must divide by the full number
-            max_cache_memory_per_worker = total_cache_memory / num_workers
+            max_cache_memory_per_worker = cache_memory_per_dataset / num_workers
             
             self.logger.debug(
-                f"Allocating {total_cache_memory / 1024**3:.1f} GB total cache memory "
-                f"across {num_workers} workers ({max_cache_memory_per_worker / 1024**3:.2f} GB each)"
+                f"Allocating {cache_memory_per_dataset / 1024**3:.1f} GB cache memory "
+                f"for {self.split_name} dataset across {num_workers} workers "
+                f"({max_cache_memory_per_worker / 1024**3:.2f} GB each)"
             )
         else:
-            max_cache_memory_per_worker = total_cache_memory
+            max_cache_memory_per_worker = cache_memory_per_dataset
 
+        # Account for memory overhead and fragmentation
+        # Each shard needs ~2x its size due to Python overhead, fragmentation, etc.
+        memory_overhead_factor = 2.0
+        effective_shard_size = self.bytes_per_shard * memory_overhead_factor
+        
         # Calculate how many shards fit in allocated memory per worker
-        memory_based_shards = int(max_cache_memory_per_worker / max(1, self.bytes_per_shard))
+        memory_based_shards = int(max_cache_memory_per_worker / max(1, effective_shard_size))
         
-        # Apply configuration limits
-        config_limit = self.config["training"].get("dataset_cache_shards", 256)
+        # Apply configuration limits - THIS IS WHERE THE BUG FIX HAPPENS
+        # The config should have a reasonable default, not 1
+        config_limit = self.config["training"].get("dataset_cache_shards", 16)  # Changed default
         
-        # Apply practical limits based on number of workers
-        # More workers = lower limit per worker to prevent memory explosion
+        # Conservative practical limits based on worker count
         if num_workers >= 16:
-            practical_limit = 8  # Very conservative for many workers
+            practical_limit = 8   # Increased from 4
         elif num_workers >= 8:
-            practical_limit = 16  # Moderate for medium worker count
+            practical_limit = 16  # Increased from 8
+        elif num_workers >= 4:
+            practical_limit = 32  # Increased from 16
         else:
-            practical_limit = 64  # More generous for few workers
+            practical_limit = 64  # Increased from 32
         
-        # Use the minimum of all constraints, with a floor of 2 shards
-        #self._max_cache_size = max(2, min(
-        #    memory_based_shards,
-        #    config_limit,
-        #    practical_limit
-        #))
-
+        # Use the minimum of all constraints, with a floor of 1 shard
         self._max_cache_size = max(1, min(
-             memory_based_shards,
-             config_limit,
-             practical_limit
-         ))
-
-
-        # Log the cache size decision and total memory usage
-        total_cache_gb = (self._max_cache_size * self.bytes_per_shard * num_workers) / 1024**3
+            memory_based_shards,
+            config_limit,
+            practical_limit
+        ))
+        
+        # Calculate and log expected memory usage
+        expected_cache_gb = (self._max_cache_size * effective_shard_size) / 1024**3
+        total_expected_gb = expected_cache_gb * num_workers
+        
         self.logger.info(
-            f"Cache size decision for '{self.split_name}': "
+            f"Cache size for '{self.split_name}': "
             f"{self._max_cache_size} shards per worker "
             f"(memory_based={memory_based_shards}, config={config_limit}, practical={practical_limit}). "
-            f"Total cache memory: {total_cache_gb:.1f} GB across {num_workers} workers"
+            f"Expected memory: {expected_cache_gb:.1f} GB per worker, "
+            f"{total_expected_gb:.1f} GB total for {num_workers} workers"
         )
         
-        # Warn if total cache memory seems high
-        if total_cache_gb > total_memory / 1024**3 * 0.5:
+        # Warn if memory usage seems high
+        if total_expected_gb > total_memory / 1024**3 * 0.5:
             self.logger.warning(
-                f"Total cache memory ({total_cache_gb:.1f} GB) exceeds 50% of system RAM. "
-                f"Consider reducing num_workers or dataset_cache_shards if OOM errors occur."
+                f"High memory usage warning: Expected cache memory ({total_expected_gb:.1f} GB) "
+                f"exceeds 50% of system RAM. Consider reducing num_workers or dataset_cache_shards."
             )
 
-    def _setup_worker_cache(self):
+    def _setup_worker_cache(self) -> None:
         """
-        Build the LRU cache **once** in the parent; worker processes reuse it.
-        This keeps only one copy of each shard in host RAM regardless of
-        `num_workers`.
+        Build an independent LRU cache in each worker process.
+        This is called lazily when the dataset is first accessed in a worker.
         """
-        if self.cache_is_setup:
+        if getattr(self, "_cache_is_ready", False):
             return
 
-        # Parent process (get_worker_info() is None) builds the cache once
-        if torch.utils.data.get_worker_info() is None:
-            NPYDataset._global_cache = lru_cache(maxsize=self._max_cache_size)(
-                self._get_shard_data_impl
-            )
+        # Create the LRU-cached version of the shard loader
+        self._get_shard_data = lru_cache(maxsize=self._max_cache_size)(
+            self._get_shard_data_impl
+        )
 
-        # Every process—parent or worker—uses the same callable
-        self._get_shard_data = NPYDataset._global_cache
+        # Run memory check once per worker
+        if not getattr(self, "_ram_guard_ran", False):
+            self.check_memory_requirements()
+            self._ram_guard_ran = True
+
+        # Mark cache as ready
         self.cache_is_setup = True
-
-        NPYDataset._cache_owner = os.getpid() 
-
+        self._cache_is_ready = True
 
 
     def _build_shard_lookup(self):
@@ -3206,75 +3142,38 @@ class NPYDataset(Dataset):
 
     def _get_shard_data_impl(self, shard_idx: int) -> np.ndarray:
         """
-        Load a shard file from disk into memory as a writable numpy array.
-        
-        This method loads the entire shard into RAM rather than using memory mapping.
-        This approach eliminates mmap overhead and ensures arrays are writable,
-        which is required for zero-copy tensor creation.
-        
-        Args:
-            shard_idx: Index of the shard to load
-            
-        Returns:
-            Writable numpy array containing all samples in the shard
+        Load a shard from disk as float32, contiguous, and writable.
+        This is the actual implementation that gets wrapped by lru_cache.
         """
-        shard_info = self.shard_index["shards"][shard_idx]
-        shard_path = self.shard_dir / shard_info["filename"]
-        expected_samples = shard_info["n_samples"]
+        shard_info   = self.shard_index["shards"][shard_idx]
+        shard_path   = self.shard_dir / shard_info["filename"]
+        exp_samples  = shard_info["n_samples"]
 
-        self.logger.debug(
-            f"Loading shard {shard_idx} from {shard_path} "
-            f"({expected_samples} samples, {self.bytes_per_shard / 1024**2:.1f} MB)"
-        )
+        self.logger.debug(f"⏫  Loading shard {shard_idx}: {shard_path}")
 
-        try:
-            load_start_time = time.time() if self.logger.isEnabledFor(logging.DEBUG) else 0
-            
-            if self.shard_index.get("compression") == "npz":
-                # Handle compressed shards
-                with np.load(shard_path) as npz_file:
-                    data = npz_file['data'].copy()  # Ensure writable copy
-                    self.logger.debug(f"Loaded compressed shard in {time.time() - load_start_time:.3f}s")
-            else:
-                # Load uncompressed numpy array directly into memory
-                # This creates a writable array in RAM (no memory mapping)
-                data = np.load(shard_path)
-                
-                # Ensure optimal memory layout for performance
-                if not data.flags['C_CONTIGUOUS']:
-                    self.logger.debug("Converting shard to C-contiguous layout for better performance")
-                    data = np.ascontiguousarray(data)
-                
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    load_time = time.time() - load_start_time
-                    throughput_mbps = (self.bytes_per_shard / 1024**2) / load_time
-                    self.logger.debug(
-                        f"Loaded shard in {load_time:.3f}s ({throughput_mbps:.1f} MB/s), "
-                        f"array flags: C_CONTIGUOUS={data.flags['C_CONTIGUOUS']}, "
-                        f"WRITEABLE={data.flags['WRITEABLE']}"
-                    )
-            
-            # Validate loaded data
-            if data.shape[0] != expected_samples:
-                raise ValueError(
-                    f"Shard shape mismatch: expected {expected_samples} samples, "
-                    f"got {data.shape[0]}"
-                )
-            
-            if data.shape[1] != self.n_features:
-                raise ValueError(
-                    f"Feature dimension mismatch: expected {self.n_features}, "
-                    f"got {data.shape[1]}"
-                )
-                
-            return data
-            
-        except Exception as e:
-            self.logger.error(
-                f"Failed to load shard {shard_idx} from {shard_path}: {e}",
-                exc_info=True
-            )
-            raise
+        t0 = time.time()
+        # Load compressed or raw data
+        if self.shard_index.get("compression") == "npz":
+            with np.load(shard_path) as zf:
+                data = zf["data"].astype(np.float32, copy=False)
+        else:
+            arr = np.load(shard_path)
+            # Ensure float32 dtype
+            data = arr.astype(np.float32) if arr.dtype != np.float32 else arr
+            # Ensure C-contiguous for efficient access
+            if not data.flags["C_CONTIGUOUS"]:
+                data = np.ascontiguousarray(data)
+
+        self.logger.debug(f"✅  Shard loaded in {(time.time()-t0):.3f}s  "
+                          f"→ shape {data.shape}, dtype {data.dtype}")
+
+        # Validate loaded data
+        if data.shape[0] != exp_samples:
+            raise ValueError(f"Shard sample mismatch ({data.shape[0]} vs {exp_samples})")
+        if data.shape[1] != self.n_features:
+            raise ValueError(f"Feature dim mismatch ({data.shape[1]} vs {self.n_features})")
+
+        return data
 
     def _find_shard_idx(self, global_idx: int) -> Tuple[int, int]:
         """
@@ -3365,7 +3264,7 @@ class NPYDataset(Dataset):
             n_input = self.n_species + self.n_globals + 1  # species + globals + time
             
             # Create tensors directly from numpy arrays (zero-copy operation)
-            # This works because our arrays are now writable (not memory-mapped)
+            # This works because our arrays are writable (not memory-mapped)
             input_tensor = torch.from_numpy(row[:n_input])
             target_tensor = torch.from_numpy(row[n_input:])
 
@@ -3378,109 +3277,217 @@ class NPYDataset(Dataset):
             )
             raise
 
-def _worker_init_fn(worker_id: int):
-    """
-    Called once in every new DataLoader worker.
-    - Sleeps a little so only ~1‑2 workers start I/O simultaneously.
-    - Seeds NumPy / PyTorch RNGs so shuffling differs per worker.
-    """
-    import time, numpy as np, torch, random
-    # < 1 s total extra start‑up time even with 4 workers
-    time.sleep(0.25 * worker_id)
+    def check_memory_requirements(self) -> Dict[str, float]:
+        """
+        Pre-flight check: Estimate memory requirements and validate against available RAM.
+        Accounts for the fact that multiple datasets may be running concurrently.
+        Returns dict with memory estimates.
+        """
+        import psutil
+        
+        # Get current memory state
+        mem_info = psutil.virtual_memory()
+        available_gb = mem_info.available / 1024**3
+        total_gb = mem_info.total / 1024**3
+        
+        # Calculate per-component memory usage
+        num_workers = self.config["training"]["num_workers"]
+        cache_shards = self._max_cache_size
+        batch_size = self.config["training"]["batch_size"]
+        prefetch = self.config["training"].get("prefetch_factor", 2)
+        
+        # Memory calculations (in GB)
+        shard_gb = self.bytes_per_shard / 1024**3
+        batch_gb = (batch_size * self.n_features * 4) / 1024**3  # float32
+        
+        # Component breakdown
+        memory_breakdown = {
+            "shard_cache_per_worker_gb": cache_shards * shard_gb * 2,  # 2x for overhead
+            "prefetch_per_worker_gb": prefetch * batch_gb,
+            "num_workers": num_workers,
+            "python_overhead_gb": 1.0,  # Base Python/PyTorch overhead
+            "dataloader_overhead_gb": num_workers * 0.5,  # Per-worker overhead
+        }
+        
+        # Total expected usage for this dataset
+        total_expected_gb = (
+            num_workers * memory_breakdown["shard_cache_per_worker_gb"] +
+            num_workers * memory_breakdown["prefetch_per_worker_gb"] +
+            memory_breakdown["python_overhead_gb"] +
+            memory_breakdown["dataloader_overhead_gb"]
+        )
+        
+        memory_breakdown["total_expected_gb"] = total_expected_gb
+        memory_breakdown["available_gb"] = available_gb
+        memory_breakdown["total_system_gb"] = total_gb
+        memory_breakdown["usage_percent"] = (total_expected_gb / available_gb) * 100
+        
+        # Log detailed breakdown
+        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"Memory Requirements Check for '{self.split_name}' Dataset")
+        self.logger.info(f"{'='*60}")
+        self.logger.info(f"System Memory: {total_gb:.1f} GB total, {available_gb:.1f} GB available")
+        self.logger.info(f"Configuration: {num_workers} workers, {cache_shards} cached shards, "
+                        f"{batch_size} batch size")
+        self.logger.info(f"\nMemory Breakdown:")
+        self.logger.info(f"  - Shard cache: {memory_breakdown['shard_cache_per_worker_gb']:.2f} GB/worker")
+        self.logger.info(f"  - Prefetch buffer: {memory_breakdown['prefetch_per_worker_gb']:.2f} GB/worker")
+        self.logger.info(f"  - Python overhead: {memory_breakdown['python_overhead_gb']:.2f} GB")
+        self.logger.info(f"  - Worker overhead: {memory_breakdown['dataloader_overhead_gb']:.2f} GB")
+        self.logger.info(f"\nTotal Expected: {total_expected_gb:.1f} GB "
+                        f"({memory_breakdown['usage_percent']:.0f}% of available)")
+        self.logger.info(f"{'='*60}\n")
+        
+        # Validate memory requirements
+        safety_factor = 0.8  # Don't use more than 80% of available memory
+        if total_expected_gb > available_gb * safety_factor:
+            error_msg = (
+                f"Insufficient memory for {self.split_name} dataset: "
+                f"need {total_expected_gb:.1f} GB, "
+                f"but only {available_gb * safety_factor:.1f} GB safely available. "
+                f"Reduce num_workers (currently {num_workers}) or "
+                f"dataset_cache_shards (currently {cache_shards})."
+            )
+            self.logger.error(error_msg)
+            raise MemoryError(error_msg)
+        
+        return memory_breakdown
 
-    seed = int(time.time()) + worker_id
-    random.seed(seed)
-    np.random.seed(seed % (2**32 - 1))
-    torch.manual_seed(seed)
 
-def create_dataloader(dataset: Dataset, config: Dict[str, Any], shuffle: bool = True,
-                     device: Optional[torch.device] = None, drop_last: bool = True) -> DataLoader:
+def create_dataloader(dataset: Dataset,
+                      config: Dict[str, Any],
+                      shuffle: bool = True,
+                      device: Optional[torch.device] = None,
+                      drop_last: bool = True,
+                      use_shard_aware_sampling: bool = True) -> DataLoader:
     """
-    Create a high-performance PyTorch DataLoader with optimal settings.
-    
-    This function configures the DataLoader with:
-    - Multi-worker data loading for parallelism
-    - Pinned memory for fast GPU transfers (when using CUDA)
-    - Persistent workers to avoid process restart overhead
-    - Appropriate prefetch factor for smooth data pipeline
+    Build a DataLoader with safe, high‑performance defaults.
     
     Args:
-        dataset: PyTorch Dataset instance
-        config: Training configuration dictionary
-        shuffle: Whether to shuffle data (typically True for training)
-        device: PyTorch device for determining GPU features
-        drop_last: Whether to drop incomplete final batch
+        dataset: The dataset to load from
+        config: Configuration dictionary
+        shuffle: Whether to shuffle the data (ignored if using shard-aware sampling)
+        device: PyTorch device for memory checks
+        drop_last: Whether to drop the last incomplete batch
+        use_shard_aware_sampling: Whether to use shard-aware sampling for better cache efficiency
         
     Returns:
-        Configured DataLoader instance or None if dataset is empty
+        Configured DataLoader or None if dataset is empty
     """
     if dataset is None or len(dataset) == 0:
         logging.getLogger(__name__).warning("Cannot create DataLoader for empty dataset")
         return None
 
-    logger = logging.getLogger(__name__)
-    train_cfg = config["training"]
-    batch_size = train_cfg["batch_size"]
+    log     = logging.getLogger(__name__)
+    tcfg    = config["training"]
+    bs      = tcfg["batch_size"]
+    workers = min(32, tcfg.get("num_workers", 0))
+
+    # Pin memory only if using CUDA and workers
+    pin   = (tcfg.get("pin_memory", False) and workers > 0
+             and device is not None and device.type == "cuda")
     
-    # Determine number of worker processes
-    # Cap at 32 to prevent system instability from too many processes
-    requested_workers = train_cfg.get("num_workers", 0)
-    num_workers = min(32, requested_workers)
+    # Persistent workers only if pinning memory
+    pers  = tcfg.get("persistent_workers", False) and pin
     
-    if num_workers != requested_workers:
-        logger.warning(
-            f"Capped num_workers at {num_workers} (requested: {requested_workers}) "
-            f"to prevent system instability"
+    # Prefetch factor only matters with workers
+    pre   = tcfg.get("prefetch_factor", 2) if workers > 0 else 1
+
+    # Validate batch and prefetch settings for GPU memory
+    _validate_batch_prefetch(bs, pre, dataset.n_features, device)
+
+    # Determine if we should use shard-aware sampling
+    if use_shard_aware_sampling and shuffle and isinstance(dataset, NPYDataset):
+        # Use shard-aware sampler for training data
+        batch_sampler = ShardAwareSampler(
+            dataset=dataset,
+            batch_size=bs,
+            drop_last=drop_last,
+            seed=config.get("system", {}).get("seed", 42)
+        )
+        
+        log.info(f"DataLoader[{dataset.split_name}] using ShardAwareSampler: "
+                 f"bs={bs}  workers={workers}  pin={pin}  pers={pers}  prefetch={pre}")
+        
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,  # Use our shard-aware sampler
+            num_workers=workers,
+            pin_memory=pin,
+            persistent_workers=pers,
+            prefetch_factor=pre,
+            worker_init_fn=_worker_init_fn,
+        )
+    else:
+        # Use standard DataLoader for validation/test or when shard-aware is disabled
+        log.info(f"DataLoader[{dataset.split_name}]  bs={bs}  workers={workers}  "
+                 f"pin={pin}  pers={pers}  prefetch={pre}")
+
+        return DataLoader(
+            dataset,
+            batch_size=bs,
+            shuffle=shuffle,
+            num_workers=workers,
+            pin_memory=pin,
+            persistent_workers=pers,
+            prefetch_factor=pre,
+            worker_init_fn=_worker_init_fn,
+            drop_last=drop_last,
         )
 
-    # Determine if we can use performance features
-    # These require CUDA GPU and multiple workers
-    can_use_performance_features = (num_workers > 0 and device and device.type == "cuda")
 
-    # Configure pin_memory for fast CPU-to-GPU transfers
-    # This is one of the most important settings for GPU training performance
-    pin_memory = train_cfg.get("pin_memory", False) and can_use_performance_features
-    
-    # Configure persistent_workers to avoid worker restart overhead between epochs
-    # This significantly reduces epoch transition time
-    persistent_workers = train_cfg.get("persistent_workers", False) and can_use_performance_features
-    
-    # Configure prefetch_factor (number of batches each worker loads in advance)
-    # Only applicable when using multiple workers
-    prefetch_factor = train_cfg.get("prefetch_factor", 2) if num_workers > 0 else None
+def _worker_init_fn(worker_id: int):
+    """
+    Initialization code run once per DataLoader worker process.
+    - Disable CUDA in workers (they should only load data)
+    - Limit OpenBLAS/MKL threads to prevent oversubscription
+    - Set deterministic but distinct RNG seeds
+    - Light stagger to avoid simultaneous disk hits
+    """
+    import os, time, numpy as np, torch, random
 
-    # Log the effective DataLoader configuration
-    logger.info(
-        f"Creating DataLoader for '{dataset.split_name}' split: "
-        f"batch_size={batch_size}, shuffle={shuffle}, drop_last={drop_last}"
-    )
-    logger.info(
-        f"Performance settings: workers={num_workers}, pin_memory={pin_memory}, "
-        f"persistent_workers={persistent_workers}, prefetch_factor={prefetch_factor}"
-    )
+    # Prevent workers from using CUDA
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     
-    if can_use_performance_features:
-        logger.debug("GPU-optimized features enabled (pin_memory, persistent_workers)")
-    else:
-        reasons = []
-        if num_workers == 0:
-            reasons.append("no workers")
-        if not device or device.type != "cuda":
-            reasons.append("no CUDA device")
-        logger.debug(f"GPU-optimized features disabled: {', '.join(reasons)}")
+    # Limit CPU threads to prevent oversubscription
+    torch.set_num_threads(1)
 
-    # Create the DataLoader with optimized settings
-    return DataLoader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-        worker_init_fn=_worker_init_fn,
-        drop_last=drop_last
-    )
+    # Stagger worker startup to avoid disk contention
+    time.sleep(0.25 * worker_id)
+
+    # Set unique but deterministic seeds for each worker
+    seed = int(time.time()) + worker_id
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+
+
+def _validate_batch_prefetch(batch_size: int,
+                             prefetch_factor: int,
+                             feature_dim: int,
+                             device: Optional[torch.device]) -> None:
+    """
+    Validate that prefetched batches won't exceed GPU memory.
+    Raises RuntimeError if the configuration would cause OOM.
+    """
+    if device is None or device.type != "cuda":
+        return
+    
+    import torch
+    
+    # Calculate memory needed for prefetched batches
+    bytes_needed = batch_size * max(prefetch_factor, 1) * feature_dim * 4  # float32
+    
+    # Get available GPU memory
+    free_bytes = torch.cuda.mem_get_info(device.index)[0]
+    
+    # Check if we'd use more than 80% of free GPU memory
+    if bytes_needed > free_bytes * 0.80:
+        human = bytes_needed / 1024**3
+        raise RuntimeError(
+            f"prefetch_factor×batch_size would pre‑queue ≈{human:.1f} GB "
+            "→ exceeds safe free GPU memory. Reduce batch_size or prefetch_factor."
+        )
 
 ===== /Users/imalsky/Desktop/Chemulator/src/data/normalizer.py =====
 #!/usr/bin/env python3

@@ -61,7 +61,11 @@ class Trainer:
         
         # Create data loaders
         self._setup_dataloaders(train_dataset, val_dataset, test_dataset)
-        
+
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.test_dataset = test_dataset
+
         # Training state
         self.current_epoch = 0
         self.global_step = 0
@@ -113,19 +117,24 @@ class Trainer:
         """Setup data loaders."""
         from data.dataset import create_dataloader
         
+        # Use shard-aware sampling for the training loader for maximum cache efficiency
         self.train_loader = create_dataloader(
             train_dataset, self.config, shuffle=True, 
-            device=self.device, drop_last=True
+            device=self.device, drop_last=True,
+            use_shard_aware_sampling=True  # Be explicit
         ) if train_dataset else None
         
+        # Shard-aware sampling is not needed for validation and test sets
         self.val_loader = create_dataloader(
             val_dataset, self.config, shuffle=False, 
-            device=self.device, drop_last=False
+            device=self.device, drop_last=False,
+            use_shard_aware_sampling=False # Be explicit
         ) if val_dataset and len(val_dataset) > 0 else None
         
         self.test_loader = create_dataloader(
             test_dataset, self.config, shuffle=False, 
-            device=self.device, drop_last=False
+            device=self.device, drop_last=False,
+            use_shard_aware_sampling=False # Be explicit
         ) if test_dataset and len(test_dataset) > 0 else None
     
     def _setup_optimizer(self):
@@ -252,10 +261,6 @@ class Trainer:
     
     # --- helper ------------------------------------------------------------
     def _standardize_log_ratios(self, log_ratios: torch.Tensor) -> torch.Tensor:
-        """
-        Standardizes raw log-ratio model outputs for loss calculation.
-        """
-        # Bug 2 Fix: Raise error immediately if ratio stats missing
         if self.prediction_mode == "ratio" and self.norm_helper.ratio_stats is None:
             raise ValueError(
                 "Ratio statistics are missing but prediction mode is 'ratio'. "
@@ -280,21 +285,17 @@ class Trainer:
         stds = torch.clamp(stds, min=self.config["normalization"]["min_std"])
         return (log_ratios - means) / stds
 
-    def _compute_loss(self, outputs: torch.Tensor,
-                    targets: torch.Tensor,
-                    inputs: torch.Tensor) -> torch.Tensor:
-        """
-        Computes the loss with Bug 2 fix for ratio mode validation.
-        """
+    def _compute_loss(self, outputs: torch.Tensor, 
+                      targets: torch.Tensor,
+                      inputs: torch.Tensor) -> torch.Tensor:
         if self.prediction_mode == "ratio":
-            # Bug 2 Fix: This will now raise an error if ratio_stats are missing
-            outputs_std = self._standardize_log_ratios(outputs)
-            return self.criterion(outputs_std, targets)
-
-        # absolute mode
-        if self.output_clamp is not None:
-            outputs = torch.clamp(outputs, min=self.output_clamp)
-        return self.criterion(outputs, targets)
+            # Direct comparison: both outputs and targets are in standardized log-ratio space
+            return self.criterion(outputs, targets)
+        else:
+            # Absolute mode (unchanged)
+            if self.output_clamp is not None:
+                outputs = torch.clamp(outputs, min=self.output_clamp)
+            return self.criterion(outputs, targets)
     
     def train(self) -> float:
         """Execute the training loop."""
@@ -381,7 +382,25 @@ class Trainer:
                     self.best_val_loss = train_loss
                     self.best_epoch = epoch
                     self._save_best_model()
-    
+
+            self._after_epoch()
+
+    def _after_epoch(self) -> None:
+        """
+        House-keeping that should run once every epoch.
+        """
+        # Iterate through datasets and clear their caches if they have one
+        for dataset in [self.train_dataset, self.val_dataset, self.test_dataset]:
+            if dataset is not None and hasattr(dataset, '_get_shard_data'):
+                # _get_shard_data is the lru_cache wrapper
+                dataset._get_shard_data.cache_clear()
+
+        # Then, do the garbage collection
+        import gc
+        gc.collect()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
     def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
         """Run one training epoch and return the average loss."""
         self.model.train()

@@ -51,25 +51,24 @@
         "shard_size": 1000000,
         // Minimum species concentration threshold
         "min_value_threshold": 1e-25,
-        // Compression type: null for raw npz files
+        // Compression type: null for raw npy files (faster I/O)
         "compression": null,
         // Number of parallel workers for preprocessing
-        "num_workers": 8,
-        // Enable parallel preprocessing (set false for simpler debugging)
+        "num_workers": 24,
+        // Enable parallel preprocessing
         "parallel_enabled": true
     },
     
     // ===== NORMALIZATION SETTINGS =====
     "normalization": {
         // Default normalization method for all variables
-        // Options: "standard", "log-standard", "min-max", "log-min-max", "none"
         "default_method": "log-min-max",
         
         // Override methods for specific variables
         "methods": {
-            "T_init": "standard",      // Temperature: standard normalization
-            "P_init": "log-min-max",    // Pressure: log scale then min-max
-            "t_time": "log-min-max"     // Time: log scale then min-max
+            "T_init": "standard",
+            "P_init": "log-min-max",
+            "t_time": "log-min-max"
         },
         
         // Small value to prevent log(0) and division by zero
@@ -82,7 +81,7 @@
     
     // ===== MODEL ARCHITECTURE =====
     "model": {
-        // Model type: "deeponet" or "siren"
+        // Model type: "deeponet" or "siren" (both work with absolute mode)
         "type": "deeponet",
         
         // Activation function: "gelu", "relu", "silu", "tanh"
@@ -95,13 +94,13 @@
         "output_scale": 1.0,
         
         // DeepONet-specific parameters
-        "branch_layers": [384, 384, 384, 384],  // Hidden layers for branch network
-        "trunk_layers": [128, 128, 128, 128],   // Hidden layers for trunk network
-        "basis_dim": 128,                   // Number of basis functions
+        "branch_layers": [256, 256, 256],
+        "trunk_layers": [128, 128],
+        "basis_dim": 128,
         
         // SIREN-specific parameters (when type="siren")
-        "hidden_dims": [256, 256, 256, 256],  // Hidden layer dimensions
-        "omega_0": 30.0                       // SIREN frequency parameter
+        "hidden_dims": [256, 256, 256],
+        "omega_0": 30.0
     },
     
     // ===== FiLM CONDITIONING =====
@@ -109,65 +108,69 @@
         // Enable Feature-wise Linear Modulation
         "enabled": true,
         // Hidden layers for FiLM networks
-        "hidden_dims": [64, 64],
+        "hidden_dims": [64],
         // Activation for FiLM networks
         "activation": "gelu"
     },
     
     // ===== PREDICTION SETTINGS =====
     "prediction": {
-        // Prediction mode: "absolute" or "ratio"
-        // - absolute: predict species concentrations directly
-        // - ratio: predict log-ratios relative to initial conditions (DeepONet only)
+        // Prediction mode: ABSOLUTE ONLY for this config
         "mode": "absolute",
         
-        // Optional output clamping (null = no clamping)
-        // Only used in absolute mode
+        // Optional output clamping
         "output_clamp": null
     },
     
     // ===== TRAINING PARAMETERS =====
     "training": {
+        // Data splitting
         "val_fraction": 0.15,
         "test_fraction": 0.15,
         "use_fraction": 1.0,
         
-        "epochs": 100,
-        "batch_size": 1024,
-        "gradient_accumulation_steps": 8,
+        // Training duration
+        "epochs": 100,  // Full training epochs (not used in HPO)
+        "batch_size": 4096,
+        "gradient_accumulation_steps": 2,
         
-        "num_workers": 4,           
-        "pin_memory": false,        
-        "persistent_workers": false, 
-        "prefetch_factor": 1,      
+        // MEMORY-OPTIMIZED DATALOADER SETTINGS
+        "num_workers": 4,
+        "pin_memory": true,
+        "persistent_workers": true,
+        "prefetch_factor": 2,
         "drop_last": true,
-        "dataset_cache_shards": 1,   
+        "dataset_cache_shards": 32,
         
-        // Rest of training config remains the same...
-        "learning_rate": 3e-4,
+        // Learning rate and optimizer settings
+        "learning_rate": 3e-4,  // Starting LR for HPO
         "weight_decay": 1e-5,
         "betas": [0.9, 0.999],
         "eps": 1e-8,
         "gradient_clip": 1.0,
+        
+        // Scheduler settings - CRITICAL FOR LR DECAY
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 10,
-            "T_mult": 2,
-            "eta_min": 1e-7,
-            "factor": 0.5,
-            "patience": 10,
-            "min_lr": 1e-7
+            "T_0": 8,  // Restart every 8 epochs (5 cycles in 40 epochs)
+            "T_mult": 1,  // Keep cycle length constant
+            "eta_min": 1e-6  // ENSURES LR DROPS TO 1e-6
         },
+        
+        // Loss and training settings
         "loss": "mse",
         "huber_delta": 0.5,
         "use_amp": true,
         "amp_dtype": "bfloat16",
-        "early_stopping_patience": 15,
-        "min_delta": 1e-10,
-        "log_interval": 1000,
+        "early_stopping_patience": 8,  // Stop if no improvement for 8 epochs
+        "min_delta": 1e-8,
+        "log_interval": 100,
         "save_interval": 10,
-        "empty_cache_interval": 1000,
-        "hpo_epochs": 20
+        "empty_cache_interval": 500,
+        
+        // HPO-specific settings
+        "hpo_min_epochs": 10,  // Minimum epochs before pruning
+        "hpo_max_epochs": 40   // Maximum epochs for best trials
     },
     
     // ===== SYSTEM/HARDWARE SETTINGS =====
@@ -176,14 +179,14 @@
         "seed": 42,
         
         // PyTorch optimizations
-        "use_torch_compile": false,   // Use torch.compile (PyTorch 2.0+)
-        "compile_mode": "default",   // Compile mode: "default", "reduce-overhead", "max-autotune"
-        "use_torch_export": false,    // Export model with torch.export
+        "use_torch_compile": false,
+        "compile_mode": "default",
+        "use_torch_export": false,
         
-        // CUDA optimizations
-        "cudnn_benchmark": true,     // Enable cuDNN autotuner
-        "tf32": true,                // Enable TensorFloat-32 on Ampere GPUs
-        "cuda_memory_fraction": 0.9  // Fraction of GPU memory to use
+        // CUDA optimizations for A100
+        "cudnn_benchmark": true,
+        "tf32": true,
+        "cuda_memory_fraction": 0.90
     },
     
     // ===== HYPERPARAMETER OPTIMIZATION =====
@@ -191,10 +194,13 @@
         // Enable Optuna integration
         "enabled": true,
         
-        // Optuna study settings (when enabled)
-        "n_trials": 100,
-        "n_startup_trials": 8,
-        "n_warmup_steps": 10,
-        "interval_steps": 2
+        // Hyperband settings for 40-hour window
+        "algorithm": "hyperband",
+        "hyperband_min_resource": 10,  // 1.4 hours minimum
+        "hyperband_max_resource": 40,  // 5.5 hours maximum
+        "hyperband_reduction_factor": 3,  // Keep top 33% at each stage
+        
+        // Target number of trials for 40 hours
+        "n_trials": 50  // Conservative estimate with pruning
     }
 }

@@ -22,6 +22,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import h5py
 import numpy as np
 import torch
+import os
 
 from .normalizer import DataNormalizer, NormalizationHelper
 from utils.utils import save_json, load_json
@@ -410,62 +411,80 @@ class DataPreprocessor:
             np.save(path, idx_array)
             self.logger.info(f"Saved {name} indices to {path} ({len(idx_array)} samples)")
 
-    ## MODIFIED ## This private method now returns only a list of shard metadata dictionaries.
     def _write_normalized_shards(self, norm_stats, file_sample_counts) -> List[Dict]:
-        self.logger.info("Pass 2: Writing shards and collecting metadata...")
-        all_shards = []
-        current_idx = 0
-        
-        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
-            futures = {fp.name: executor.submit(shard_worker, fp, self.config, norm_stats, 0, self.output_dir) for fp in self.raw_files}
-            for f_path in self.raw_files:
-                meta = futures[f_path.name].result()
-                
-                offset = current_idx
-                for shard in meta["shards"]:
-                    shard["start_idx"] += offset
-                    shard["end_idx"] += offset
-                all_shards.extend(meta["shards"])
-                current_idx += meta["rows_written"]
-        return all_shards
+        """
+        Second pass: write float32 shards + gather metadata.
+        """
+        self.logger.info("Writing shards …")
+        all_meta = []
+        current_start = 0  # Renamed to avoid shadowing
 
-    # --- UPDATED: This function now aggregates the reports from workers ---
-    def _collect_stats_and_counts(self) -> Tuple[Dict, Dict, Dict]:
-        self.logger.info("Pass 1: Collecting statistics and sample counts...")
-        prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
-        final_accs = self.normalizer._initialize_accumulators()
-        final_ratio_accs = {var: {"count": 0,"mean": 0.0,"m2": 0.0,"min": float('inf'),"max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
-        file_counts = {}
-        
-        # --- NEW: Aggregate report dictionary ---
-        total_report = {
-            "total_profiles": 0,
-            "profiles_kept": 0,
-            "dropped_reasons": defaultdict(int)
-        }
+        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as exe:
+            # Precompute cumulative starts in O(n) time
+            cumulative_starts = []
+            for fp in self.raw_files:
+                cumulative_starts.append(current_start)
+                # Use fp.stem as key (assuming file_sample_counts uses stems; confirm in _collect_stats_and_counts)
+                current_start += file_sample_counts.get(fp.stem, 0)
 
-        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
-            futures = {executor.submit(stats_worker, fp, self.config): fp for fp in self.raw_files}
+            # Submit all jobs with precomputed starts
+            futures = [
+                exe.submit(
+                    shard_worker,
+                    self.raw_files[i],
+                    self.config,
+                    norm_stats,
+                    cumulative_starts[i],
+                    self.output_dir
+                )
+                for i in range(len(self.raw_files))
+            ]
+
+            # Process results as they complete
             for fut in as_completed(futures):
-                accs, ratio_accs, count, worker_report = fut.result()
-                
-                # Aggregate results
-                self.normalizer._merge_accumulators(final_accs, accs)
-                if ratio_accs: self.normalizer._merge_accumulators(final_ratio_accs, ratio_accs)
-                file_counts[futures[fut].name] = count
-                
-                # --- NEW: Aggregate the reports ---
-                total_report["total_profiles"] += worker_report["total_profiles"]
-                total_report["profiles_kept"] += worker_report["profiles_kept"]
-                for reason, num in worker_report["dropped_reasons"].items():
-                    total_report["dropped_reasons"][reason] += num
+                meta = fut.result()
+                all_meta.extend(meta["shards"])
 
-        norm_stats = self.normalizer._finalize_statistics(final_accs)
-        if final_ratio_accs:
-            norm_stats["ratio_stats"] = self.normalizer._finalize_statistics(final_ratio_accs, is_ratio=True)
-        return norm_stats, file_counts, total_report
+        return all_meta
 
-    # --- MODIFIED: Now accepts total_samples instead of split_indices ---
+    def _collect_stats_and_counts(self) -> Tuple[Dict, Dict, Dict]:
+            self.logger.info("Pass 1: Collecting statistics and sample counts...")
+            prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
+            final_accs = self.normalizer._initialize_accumulators()
+            final_ratio_accs = {var: {"count": 0,"mean": 0.0,"m2": 0.0,"min": float('inf'),"max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
+            file_counts = {}
+            
+            # --- NEW: Aggregate report dictionary ---
+            total_report = {
+                "total_profiles": 0,
+                "profiles_kept": 0,
+                "dropped_reasons": defaultdict(int)
+            }
+
+            with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
+                futures = {executor.submit(stats_worker, fp, self.config): fp for fp in self.raw_files}
+                for fut in as_completed(futures):
+                    accs, ratio_accs, count, worker_report = fut.result()
+                    
+                    # Aggregate results
+                    self.normalizer._merge_accumulators(final_accs, accs)
+                    if ratio_accs: self.normalizer._merge_accumulators(final_ratio_accs, ratio_accs)
+                    file_counts[futures[fut].name] = count
+                    
+                    # --- NEW: Aggregate the reports ---
+                    total_report["total_profiles"] += worker_report["total_profiles"]
+                    total_report["profiles_kept"] += worker_report["profiles_kept"]
+                    for reason, num in worker_report["dropped_reasons"].items():
+                        total_report["dropped_reasons"][reason] += num
+
+            norm_stats = self.normalizer._finalize_statistics(final_accs)
+            if final_ratio_accs:
+                norm_stats["ratio_stats"] = self.normalizer._finalize_statistics(final_ratio_accs, is_ratio=True)
+
+            file_counts = {Path(k).stem: v for k, v in file_counts.items()}
+
+            return norm_stats, file_counts, total_report
+
     def _write_summary_log(self, report: Dict, total_samples: int):
         """Writes a human-readable summary of the preprocessing results."""
         log_dir = Path(self.config["paths"]["log_dir"])
@@ -518,6 +537,8 @@ class ShardWriter:
         self.buffer_size = 0
         self.local_shard_id = 0
         self.shard_metadata: List[Dict] = []
+        # Ensure the output directory exists from within the worker
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def add_samples(self, samples: np.ndarray, global_start_idx: int):
         if samples.dtype != np.float32:
@@ -529,61 +550,58 @@ class ShardWriter:
             self._write_shard()
 
     def flush(self):
+        # Important: Use _write_shard in a loop to handle remaining data
+        # that might still be larger than one shard.
         while self.buffer_size > 0:
             self._write_shard()
     
     def get_shard_metadata(self) -> List[Dict]:
         return self.shard_metadata
 
-    def _write_shard(self):
-        if not self.buffer: return
-        
-        data_to_write, remaining_buffer = [], []
-        write_size = 0
-        current_global_start_idx = self.buffer[0][1]
+    def _write_shard(self) -> None:
+        """
+        Assembles and writes ONE shard of exactly `shard_size` (or less if flushing the remainder).
+        This is the correct, original logic that respects shard boundaries.
+        """
+        if not self.buffer:
+            return
 
-        temp_buffer = self.buffer
-        self.buffer = [] # Clear original buffer
+        rows_to_write = []
+        size_so_far = 0
+        first_global_idx = self.buffer[0][1]
 
-        for samples, start_idx in temp_buffer:
-            if write_size + samples.shape[0] <= self.shard_size:
-                data_to_write.append(samples)
-                write_size += samples.shape[0]
+        # Collect arrays until we have enough for a shard
+        while self.buffer and size_so_far < self.shard_size:
+            arr, start_idx = self.buffer.pop(0)
+            needed = self.shard_size - size_so_far
+            
+            if arr.shape[0] <= needed:
+                # Take the whole array
+                rows_to_write.append(arr)
+                size_so_far += arr.shape[0]
             else:
-                split_idx = self.shard_size - write_size
-                data_to_write.append(samples[:split_idx])
-                self.buffer.append((samples[split_idx:], start_idx + split_idx))
-                write_size += split_idx
-                break
+                # Split the array
+                rows_to_write.append(arr[:needed])
+                # Put the remainder back at the front of the buffer
+                self.buffer.insert(0, (arr[needed:], start_idx + needed))
+                size_so_far += needed
         
-        processed_chunks = len(data_to_write)
-        if len(temp_buffer) > processed_chunks:
-             self.buffer.extend(temp_buffer[processed_chunks:])
+        # Update the total buffer size
+        self.buffer_size = sum(arr.shape[0] for arr, _ in self.buffer)
 
-        self.buffer_size = sum(s.shape[0] for s, _ in self.buffer)
+        # Concatenate and write the data for this shard
+        data = np.concatenate(rows_to_write).astype(np.float32, copy=False)
         
-        # FIX: Ensure data is float32 before saving
-        data = np.concatenate(data_to_write).astype(np.float32)
-        
-        shard_filename = f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
-        shard_path = self.output_dir / shard_filename
-        
-        # Save with explicit float32 dtype
-        np.save(shard_path, data)
-        
-        # Log actual size for debugging
-        actual_size_mb = data.nbytes / 1024**2
-        logging.getLogger(__name__).debug(
-            f"Saved shard {shard_filename}: {data.shape[0]} samples, "
-            f"{actual_size_mb:.1f} MB, dtype: {data.dtype}"
-        )
-        
+        final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
+        tmp_path = final_path.with_suffix(".tmp.npy")
+
+        np.save(tmp_path, data, allow_pickle=False)
+        os.replace(tmp_path, final_path)
+
         self.shard_metadata.append({
-            "filename": shard_filename,
-            "start_idx": current_global_start_idx,
-            "end_idx": current_global_start_idx + data.shape[0],
+            "filename": final_path.name,
+            "start_idx": first_global_idx,
+            "end_idx": first_global_idx + data.shape[0],
             "n_samples": data.shape[0],
-            "dtype": "float32",  # Add dtype info to metadata
-            "size_mb": actual_size_mb
         })
         self.local_shard_id += 1

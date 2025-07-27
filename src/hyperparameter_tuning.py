@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
 Hyperparameter tuning for chemical kinetics models using Optuna.
-This version includes fixes for:
-1. Effective pruning during training via callbacks.
-2. Robust reconstruction of the best trial's configuration for saving.
+Optimized for ~40 hour runtime with aggressive but smart pruning.
 """
 
 import copy
@@ -15,6 +13,7 @@ from typing import Dict, Any, Optional, Callable
 import numpy as np
 import optuna
 from optuna.samplers import TPESampler
+from optuna.pruners import HyperbandPruner
 import torch
 
 from main import ChemicalKineticsPipeline
@@ -28,22 +27,21 @@ from utils.utils import setup_logging, seed_everything, ensure_directories, load
 
 class OptunaPruningCallback:
     """Callback to report intermediate values to Optuna for pruning."""
-    def __init__(self, trial: optuna.Trial):
+    def __init__(self, trial: optuna.Trial, min_epochs: int = 10):
         self.trial = trial
+        self.min_epochs = min_epochs  # Don't prune before this epoch
         
     def __call__(self, epoch: int, val_loss: float) -> bool:
         """
         Report intermediate value to Optuna and check if should prune.
-        
-        Args:
-            epoch: Current epoch number.
-            val_loss: Validation loss for this epoch.
-            
-        Returns:
-            True if the trial should be pruned, False otherwise.
+        Only allows pruning after min_epochs to avoid conflict with cosine warmup.
         """
         self.trial.report(val_loss, epoch)
         
+        # Don't prune during warmup period
+        if epoch < self.min_epochs:
+            return False
+            
         if self.trial.should_prune():
             return True
         return False
@@ -51,39 +49,43 @@ class OptunaPruningCallback:
 
 class OptunaTrialRunner:
     """Manages the execution of a single Optuna trial."""
-    def __init__(self, base_config_path: Path, mode_to_dir: Dict[str, Path]):
+    def __init__(self, base_config_path: Path):
         self.base_config_path = base_config_path
         self.base_config = load_json_config(base_config_path)
         self.device = setup_device()
         self.logger = logging.getLogger(__name__)
-        self.mode_to_dir = mode_to_dir
         self._pipelines = {}
+        
+        # Preprocess data for all possible modes upfront
+        self._prepare_all_modes()
 
-    def _get_pipeline_for_mode(self, mode: str) -> 'OptunaPipeline':
-        if mode not in self._pipelines:
-            self.logger.info(f"Loading pipeline for '{mode}' mode from preprocessed data.")
-            mode_config = copy.deepcopy(self.base_config)
-            mode_config["prediction"]["mode"] = mode
-            mode_config["paths"]["processed_data_dir"] = str(self.mode_to_dir[mode])
-            self._pipelines[mode] = OptunaPipeline(mode_config)
-        return self._pipelines[mode]
+    def _prepare_all_modes(self):
+        """Ensure data is preprocessed for all possible prediction modes."""
+        # For absolute-only config, just prepare absolute mode
+        mode = self.base_config["prediction"]["mode"]
+        self.logger.info(f"Preparing data for '{mode}' mode...")
+        
+        pipeline = ChemicalKineticsPipeline(self.base_config)
+        pipeline.normalize_only()
+        
+        self._pipelines[mode] = OptunaPipeline(self.base_config, pipeline.processed_dir)
 
     def run_trial(self, trial: optuna.Trial) -> float:
         """Configures and runs a single trial."""
         config = suggest_model_config(trial, self.base_config)
         prediction_mode = config["prediction"]["mode"]
-        pipeline = self._get_pipeline_for_mode(prediction_mode)
+        pipeline = self._pipelines[prediction_mode]
         return pipeline.execute_trial(config, trial)
 
 
 class OptunaPipeline:
     """Holds datasets and executes the training for a specific prediction mode."""
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], processed_dir: Path):
         self.config = config
         self.device = setup_device()
         self.logger = logging.getLogger(f"OptunaPipeline_{config['prediction']['mode']}")
         
-        self.processed_dir = Path(self.config["paths"]["processed_data_dir"])
+        self.processed_dir = processed_dir
         self.model_save_root = Path(self.config["paths"]["model_save_dir"])
         
         norm_stats_path = self.processed_dir / "normalization.json"
@@ -122,7 +124,17 @@ class OptunaPipeline:
             optimize_hardware(config["system"], self.device)
             model = create_model(config, self.device)
             
-            pruning_callback = OptunaPruningCallback(trial)
+            # Use dynamic epoch allocation from Hyperband
+            n_epochs = trial.user_attrs.get("n_epochs", config["training"]["hpo_max_epochs"])
+            config["training"]["epochs"] = n_epochs
+            
+            # Create pruning callback with minimum epochs
+            min_epochs = config["training"]["hpo_min_epochs"]
+            pruning_callback = OptunaPruningCallback(trial, min_epochs)
+            
+            # Log trial configuration
+            self.logger.info(f"Trial {trial.number}: {n_epochs} epochs allocated by Hyperband")
+            self.logger.info(f"Learning rate: {config['training']['learning_rate']:.2e}")
             
             trainer = PrunableTrainer(
                 model=model, train_dataset=self.train_dataset,
@@ -130,15 +142,15 @@ class OptunaPipeline:
                 config=config, save_dir=save_dir, device=self.device,
                 norm_helper=self.norm_helper, epoch_callback=pruning_callback
             )
-
-            config["training"]["epochs"] = min(
-                config["training"].get("hpo_epochs", 50), config["training"]["epochs"]
-            )
             
             best_val_loss = trainer.train()
 
             trial.set_user_attr("full_config", config)
+            trial.set_user_attr("final_lr", trainer.optimizer.param_groups[0]['lr'])
             save_json(config, save_dir / "config.json")
+            
+            self.logger.info(f"Trial {trial.number} completed. Best loss: {best_val_loss:.6f}, "
+                           f"Final LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
             
             return best_val_loss
             
@@ -180,10 +192,8 @@ class PrunableTrainer(Trainer):
             self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
 
             if self.epoch_callback:
-                # Use validation loss if available, otherwise fall back to training loss
                 loss_for_pruning = val_loss if self.has_validation and val_loss != float("inf") else train_loss
                 
-                # Report the loss and check if trial should be pruned
                 if self.epoch_callback(epoch, loss_for_pruning):
                     self.logger.info(f"Trial pruned at epoch {epoch} with loss {loss_for_pruning:.6f}")
                     raise optuna.TrialPruned()
@@ -201,7 +211,6 @@ class PrunableTrainer(Trainer):
                     self.logger.info(f"Early stopping triggered at epoch {epoch}")
                     break
             else:
-                # No validation set: save based on best training loss
                 if train_loss < (best_train_loss - self.min_delta):
                     best_train_loss = train_loss
                     self.best_val_loss = train_loss
@@ -213,168 +222,127 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     """Suggests a valid model and training configuration for a trial."""
     config = copy.deepcopy(base_config)
 
-    # First decide prediction mode
-    prediction_mode = trial.suggest_categorical("prediction_mode", ["absolute", "ratio"])
-    config["prediction"]["mode"] = prediction_mode
-
-    # Bug 4 Fix: Enforce model type based on prediction mode
-    if prediction_mode == "ratio":
-        # Ratio mode ONLY works with deeponet
-        model_type = "deeponet"
-        # Don't even suggest it as a hyperparameter
-    else:
-        # Absolute mode can use either model
-        model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
+    # For absolute-only mode
+    config["prediction"]["mode"] = "absolute"
     
+    # Model architecture choice
+    model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
     config["model"]["type"] = model_type
     
-    # Rest of the hyperparameter suggestions
+    # Common hyperparameters
     config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu"])
-    config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [1024, 2048, 4096, 8192])
+    config["training"]["learning_rate"] = trial.suggest_float("lr", 5e-5, 5e-4, log=True)
+    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [2048, 4096, 8192])
+    config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-4, log=True)
+    
+    # Gradient accumulation adjustment based on batch size
+    if config["training"]["batch_size"] <= 2048:
+        config["training"]["gradient_accumulation_steps"] = 4
+    elif config["training"]["batch_size"] <= 4096:
+        config["training"]["gradient_accumulation_steps"] = 2
+    else:
+        config["training"]["gradient_accumulation_steps"] = 1
 
     if model_type == "deeponet":
-        n_branch = trial.suggest_int("n_branch_layers", 2, 5)
-        config["model"]["branch_layers"] = [
-            trial.suggest_int(f"branch_layer_{i}", 64, 512, step=64) 
-            for i in range(n_branch)
-        ]
-        n_trunk = trial.suggest_int("n_trunk_layers", 2, 4)
-        config["model"]["trunk_layers"] = [
-            trial.suggest_int(f"trunk_layer_{i}", 64, 256, step=32) 
-            for i in range(n_trunk)
-        ]
-        config["model"]["basis_dim"] = trial.suggest_categorical("basis_dim", [64, 128, 256])
+        # Simplified architecture search
+        n_branch = trial.suggest_int("n_branch_layers", 2, 4)
+        branch_width = trial.suggest_categorical("branch_width", [128, 256, 384])
+        config["model"]["branch_layers"] = [branch_width] * n_branch
+        
+        n_trunk = trial.suggest_int("n_trunk_layers", 2, 3)
+        trunk_width = trial.suggest_categorical("trunk_width", [64, 128, 192])
+        config["model"]["trunk_layers"] = [trunk_width] * n_trunk
+        
+        config["model"]["basis_dim"] = trial.suggest_categorical("basis_dim", [64, 128, 192])
+        
     else:  # SIREN
-        n_layers = trial.suggest_int("n_hidden_layers", 3, 7)
-        config["model"]["hidden_dims"] = [
-            trial.suggest_int(f"hidden_dim_{i}", 128, 512, step=64) 
-            for i in range(n_layers)
-        ]
+        n_layers = trial.suggest_int("n_hidden_layers", 3, 5)
+        layer_width = trial.suggest_categorical("layer_width", [128, 256, 384])
+        config["model"]["hidden_dims"] = [layer_width] * n_layers
         config["model"]["omega_0"] = trial.suggest_float("omega_0", 20.0, 40.0)
 
-    if trial.suggest_categorical("use_film", [True, False]):
-        config["film"]["enabled"] = True
-        n_film = trial.suggest_int("film_n_layers", 1, 3)
-        config["film"]["hidden_dims"] = [
-            trial.suggest_int(f"film_layer_{i}", 64, 256, step=32) 
-            for i in range(n_film)
-        ]
-    else:
-        config["film"]["enabled"] = False
+    # FiLM configuration
+    use_film = trial.suggest_categorical("use_film", [True, False])
+    config["film"]["enabled"] = use_film
+    if use_film:
+        film_layers = trial.suggest_int("film_layers", 1, 2)
+        film_width = trial.suggest_categorical("film_width", [32, 64, 128])
+        config["film"]["hidden_dims"] = [film_width] * film_layers
+
+    # Loss function
+    config["training"]["loss"] = trial.suggest_categorical("loss", ["mse", "huber"])
+    if config["training"]["loss"] == "huber":
+        config["training"]["huber_delta"] = trial.suggest_float("huber_delta", 0.1, 1.0)
 
     return config
 
 
-def _reconstruct_config_from_params(base_config: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Reconstructs the full config dictionary from a flat dictionary of Optuna parameters.
-    This serves as a robust fallback for saving the best trial's configuration.
-    """
-    config = copy.deepcopy(base_config)
-    
-    # Simple direct mappings
-    config["prediction"]["mode"] = params.get("prediction_mode", config["prediction"]["mode"])
-    config["model"]["type"] = params.get("model_type", config["model"]["type"])
-    config["model"]["activation"] = params.get("activation", config["model"]["activation"])
-    config["training"]["learning_rate"] = params.get("lr", config["training"]["learning_rate"])
-    config["training"]["batch_size"] = params.get("batch_size", config["training"]["batch_size"])
-    config["film"]["enabled"] = params.get("use_film", config["film"]["enabled"])
-
-    # Conditional logic for model type
-    if config["prediction"]["mode"] == "ratio":
-        config["model"]["type"] = "deeponet"
-
-    # DeepONet specific parameters
-    if config["model"]["type"] == "deeponet":
-        if "n_branch_layers" in params:
-            n = params["n_branch_layers"]
-            config["model"]["branch_layers"] = [params[f"branch_layer_{i}"] for i in range(n)]
-        if "n_trunk_layers" in params:
-            n = params["n_trunk_layers"]
-            config["model"]["trunk_layers"] = [params[f"trunk_layer_{i}"] for i in range(n)]
-        if "basis_dim" in params:
-            config["model"]["basis_dim"] = params["basis_dim"]
-
-    # SIREN specific parameters
-    elif config["model"]["type"] == "siren":
-        if "n_hidden_layers" in params:
-            n = params["n_hidden_layers"]
-            config["model"]["hidden_dims"] = [params[f"hidden_dim_{i}"] for i in range(n)]
-        if "omega_0" in params:
-            config["model"]["omega_0"] = params["omega_0"]
-
-    # FiLM specific parameters
-    if config["film"]["enabled"]:
-        if "film_n_layers" in params:
-            n = params["film_n_layers"]
-            config["film"]["hidden_dims"] = [params[f"film_layer_{i}"] for i in range(n)]
-            
-    return config
-
-
-def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
+def optimize(config_path: Path, n_trials: int = 25, n_jobs: int = 1,
              study_name: str = "chemulator_hpo", pruner: Optional[optuna.pruners.BasePruner] = None):
     """
-    Main function to run Optuna optimization with fixed pruning and result saving.
+    Main function to run Optuna optimization with Hyperband for 40-hour runtime.
     """
     logger = logging.getLogger(__name__)
     base_config = load_json_config(config_path)
     
-    possible_modes = ["absolute", "ratio"]
-    mode_to_dir = {}
-    for mode in possible_modes:
-        logger.info(f"Preparing data for prediction mode: '{mode}'")
-        mode_config = copy.deepcopy(base_config)
-        mode_config["prediction"]["mode"] = mode
-        
-        # Construct the processed data directory path within the base processed_data_dir
-        base_processed_dir = Path(mode_config["paths"]["processed_data_dir"])
-        processed_dir = base_processed_dir / f"mode_{mode}"
-        mode_config["paths"]["processed_data_dir"] = str(processed_dir)
-        
-        # FIX: Directly instantiate pipeline with the mode-specific config dictionary
-        # This avoids redundant file reading and makes the intent clearer
-        pipeline = ChemicalKineticsPipeline(mode_config)
-        
-        # Update the processed_dir since it was set in setup_paths
-        pipeline.processed_dir = processed_dir
-        
-        # Preprocess the data for the current mode
-        pipeline.preprocess_data()
-        mode_to_dir[mode] = processed_dir
-
-    trial_runner = OptunaTrialRunner(config_path, mode_to_dir)
+    # Create trial runner which will prepare data
+    trial_runner = OptunaTrialRunner(config_path)
     objective = trial_runner.run_trial
 
+    # Use Hyperband pruner for efficient resource allocation
     if pruner is None:
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=8, n_warmup_steps=10, interval_steps=2)
+        min_resource = base_config["training"]["hpo_min_epochs"]
+        max_resource = base_config["training"]["hpo_max_epochs"]
+        
+        pruner = HyperbandPruner(
+            min_resource=min_resource,
+            max_resource=max_resource,
+            reduction_factor=3
+        )
+        
+        logger.info(f"Using Hyperband pruner: min={min_resource} epochs, max={max_resource} epochs")
 
     study = optuna.create_study(
-        direction="minimize", sampler=TPESampler(seed=42), pruner=pruner,
-        study_name=study_name, storage=f"sqlite:///{study_name}.db",
+        direction="minimize",
+        sampler=TPESampler(seed=42, n_startup_trials=5),
+        pruner=pruner,
+        study_name=study_name,
+        storage=f"sqlite:///{study_name}.db",
         load_if_exists=True
     )
 
+    # Log expected runtime
+    logger.info(f"Starting optimization with target {n_trials} trials")
+    logger.info(f"Expected runtime: ~40 hours with aggressive pruning")
+
     study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
 
-    # --- Save Results ---
+    # Save Results
     results_dir = Path("optuna_results")
     ensure_directories(results_dir)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-    # Retrieve the exact config, using the new reconstruction method as a fallback
     best_config = study.best_trial.user_attrs.get("full_config", {})
     if not best_config:
-        logger.warning("Could not retrieve full config from user_attrs. Reconstructing from best_params.")
-        best_config = _reconstruct_config_from_params(base_config, study.best_trial.params)
+        logger.warning("Could not retrieve full config from user_attrs.")
+
+    # Compute statistics
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+    
+    epoch_distribution = {}
+    for t in completed_trials + pruned_trials:
+        n_epochs = t.user_attrs.get("n_epochs", "unknown")
+        epoch_distribution[n_epochs] = epoch_distribution.get(n_epochs, 0) + 1
 
     best_results = {
         "best_value": study.best_value,
         "best_params": study.best_trial.params,
         "best_config": best_config,
-        "n_trials_completed": len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
-        "n_trials_pruned": len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]),
+        "n_trials_completed": len(completed_trials),
+        "n_trials_pruned": len(pruned_trials),
+        "epoch_distribution": epoch_distribution,
+        "best_trial_final_lr": study.best_trial.user_attrs.get("final_lr", "unknown"),
         "study_db": f"{study_name}.db"
     }
     
@@ -384,7 +352,11 @@ def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
     print("OPTIMIZATION COMPLETE")
     print("="*60)
     print(f"Best validation loss: {best_results['best_value']:.6f}")
+    print(f"Best trial final LR: {best_results['best_trial_final_lr']}")
     print(f"Trials: {best_results['n_trials_completed']} completed, {best_results['n_trials_pruned']} pruned")
+    print("\nEpoch distribution:")
+    for epochs, count in sorted(epoch_distribution.items()):
+        print(f"  {epochs} epochs: {count} trials")
     print("\nBest parameters:")
     for key, value in best_results['best_params'].items():
         print(f"  {key}: {value}")
