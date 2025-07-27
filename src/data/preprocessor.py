@@ -101,10 +101,22 @@ class CorePreprocessor:
     def process_file_for_stats(self, file_path: Path) -> Tuple[Dict, Dict, int, Dict]:
         """Worker logic for Pass 1: compute stats, counts, and a validation report."""
         accumulators = self.normalizer._initialize_accumulators()
-        ratio_accumulators = {
-            var: {"count": 0, "mean": 0.0, "m2": 0.0, "min": float("inf"), "max": float("-inf")}
-            for var in self.species_vars
-        } if self.prediction_mode == "ratio" else {}
+        ratio_accumulators = {}
+        if self.prediction_mode == "ratio":
+            for var in self.species_vars:
+                # Get the normalization method for this specific variable
+                method = self.normalizer._get_method(var)
+                
+                # Only create an accumulator if the method is NOT "none"
+                if method != "none":
+                    ratio_accumulators[var] = {
+                        "method": method,  # The CRITICAL fix: Add the method key
+                        "count": 0,
+                        "mean": 0.0,
+                        "m2": 0.0,
+                        "min": float("inf"),
+                        "max": float("-inf")
+                    }
         
         valid_sample_count = 0
         
