@@ -29,7 +29,7 @@ class OptunaPruningCallback:
     """Callback to report intermediate values to Optuna for pruning."""
     def __init__(self, trial: optuna.Trial, min_epochs: int = 10):
         self.trial = trial
-        self.min_epochs = min_epochs  # Don't prune before this epoch
+        self.min_epochs = min_epochs
         
     def __call__(self, epoch: int, val_loss: float) -> bool:
         """
@@ -150,7 +150,7 @@ class OptunaPipeline:
             save_json(config, save_dir / "config.json")
             
             self.logger.info(f"Trial {trial.number} completed. Best loss: {best_val_loss:.6f}, "
-                           f"Final LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
+                             f"Final LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
             
             return best_val_loss
             
@@ -228,15 +228,24 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     # Model architecture choice
     model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
     config["model"]["type"] = model_type
+
+
     
-    # Common hyperparameters
-    config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu"])
-    config["training"]["learning_rate"] = trial.suggest_float("lr", 5e-5, 5e-4, log=True)
-    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [2048, 4096, 8192])
-    config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-4, log=True)
     
-    # Gradient accumulation adjustment based on batch size
-    if config["training"]["batch_size"] <= 2048:
+    # Common hyperparameters - EXPANDED SEARCH SPACE
+    config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu", "tanh"])
+    config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
+    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [1024, 4096])
+    config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+    config["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.1, step=0.05)
+    
+    # Scheduler parameters
+    config["training"]["scheduler_params"]["T_0"] = trial.suggest_categorical("cosine_T_0", [10])
+    
+    # Gradient accumulation adjustment
+    if config["training"]["batch_size"] <= 1024:
+        config["training"]["gradient_accumulation_steps"] = 8
+    elif config["training"]["batch_size"] <= 2048:
         config["training"]["gradient_accumulation_steps"] = 4
     elif config["training"]["batch_size"] <= 4096:
         config["training"]["gradient_accumulation_steps"] = 2
@@ -244,35 +253,59 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
         config["training"]["gradient_accumulation_steps"] = 1
 
     if model_type == "deeponet":
-        # Simplified architecture search
-        n_branch = trial.suggest_int("n_branch_layers", 2, 4)
-        branch_width = trial.suggest_categorical("branch_width", [128, 256, 384])
-        config["model"]["branch_layers"] = [branch_width] * n_branch
+        # More flexible architecture search
+        n_branch = trial.suggest_int("n_branch_layers", 2, 5)
+        branch_layers = []
+        for i in range(n_branch):
+            if i == 0:
+                width = trial.suggest_categorical(f"branch_layer_{i}", [256, 384, 512])
+            else:
+                # Allow different widths per layer
+                width = trial.suggest_categorical(f"branch_layer_{i}", [128, 256, 384])
+            branch_layers.append(width)
+        config["model"]["branch_layers"] = branch_layers
         
-        n_trunk = trial.suggest_int("n_trunk_layers", 2, 3)
-        trunk_width = trial.suggest_categorical("trunk_width", [64, 128, 192])
-        config["model"]["trunk_layers"] = [trunk_width] * n_trunk
+        n_trunk = trial.suggest_int("n_trunk_layers", 2, 4)
+        trunk_layers = []
+        for i in range(n_trunk):
+            width = trial.suggest_categorical(f"trunk_layer_{i}", [64, 128, 192])
+            trunk_layers.append(width)
+        config["model"]["trunk_layers"] = trunk_layers
         
-        config["model"]["basis_dim"] = trial.suggest_categorical("basis_dim", [64, 128, 192])
+        config["model"]["basis_dim"] = trial.suggest_categorical("basis_dim", [64, 128, 256])
+        config["model"]["output_scale"] = trial.suggest_categorical("output_scale", [0.1, 1.0, 10.0])
         
     else:  # SIREN
-        n_layers = trial.suggest_int("n_hidden_layers", 3, 5)
-        layer_width = trial.suggest_categorical("layer_width", [128, 256, 384])
-        config["model"]["hidden_dims"] = [layer_width] * n_layers
-        config["model"]["omega_0"] = trial.suggest_float("omega_0", 20.0, 40.0)
+        n_layers = trial.suggest_int("n_hidden_layers", 3, 6)
+        hidden_dims = []
+        for i in range(n_layers):
+            if i == 0:
+                width = trial.suggest_categorical(f"hidden_dim_{i}", [256, 384, 512])
+            else:
+                width = trial.suggest_categorical(f"hidden_dim_{i}", [128, 256, 384])
+            hidden_dims.append(width)
+        config["model"]["hidden_dims"] = hidden_dims
+        config["model"]["omega_0"] = trial.suggest_float("omega_0", 10.0, 50.0)  # Wider range
 
     # FiLM configuration
     use_film = trial.suggest_categorical("use_film", [True, False])
     config["film"]["enabled"] = use_film
     if use_film:
-        film_layers = trial.suggest_int("film_layers", 1, 2)
-        film_width = trial.suggest_categorical("film_width", [32, 64, 128])
-        config["film"]["hidden_dims"] = [film_width] * film_layers
+        film_layers = trial.suggest_int("film_layers", 1, 3)
+        film_widths = []
+        for i in range(film_layers):
+            width = trial.suggest_categorical(f"film_width_{i}", [32, 64, 128])
+            film_widths.append(width)
+        config["film"]["hidden_dims"] = film_widths
+        config["film"]["activation"] = trial.suggest_categorical("film_activation", ["gelu", "relu"])
 
     # Loss function
-    config["training"]["loss"] = trial.suggest_categorical("loss", ["mse", "huber"])
+    config["training"]["loss"] = trial.suggest_categorical("loss", ["mse"])
     if config["training"]["loss"] == "huber":
-        config["training"]["huber_delta"] = trial.suggest_float("huber_delta", 0.1, 1.0)
+        config["training"]["huber_delta"] = trial.suggest_float("huber_delta", 0.1, 2.0)
+
+    # Gradient clipping
+    config["training"]["gradient_clip"] = trial.suggest_categorical("gradient_clip", [1.0])
 
     return config
 

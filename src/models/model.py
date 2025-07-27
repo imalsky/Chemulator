@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Model definitions for chemical kinetics neural networks with ratio mode support.
-Fixed issues:
-1. FiLM layer initialization only zeros weights when beta is used
+Includes dropout regularization for both SIREN and DeepONet architectures.
 """
 
 import logging
@@ -13,6 +12,7 @@ from typing import Dict, Any, List, Optional
 import torch
 import torch.nn as nn
 from torch.export import Dim
+
 
 class FiLMLayer(nn.Module):
     """Feature-wise Linear Modulation layer."""
@@ -71,7 +71,7 @@ class FiLMLayer(nn.Module):
 
 
 class FiLMSIREN(nn.Module):
-    """SIREN with FiLM conditioning for chemical kinetics."""
+    """SIREN with FiLM conditioning and dropout for chemical kinetics."""
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
 
@@ -82,6 +82,10 @@ class FiLMSIREN(nn.Module):
 
         # SIREN parameters
         self.omega_0 = config["model"].get("omega_0", 30.0)
+        
+        # Dropout
+        dropout_rate = config["model"].get("dropout", 0.0)
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
 
         # FiLM configuration
         film_config = config.get("film", {})
@@ -110,7 +114,7 @@ class FiLMSIREN(nn.Module):
                     activation=film_config.get("activation", "gelu")
                 )
 
-                # CORRECTED: Only zero weights if beta is used, otherwise it's frozen
+                # Initialize FiLM to identity mapping
                 with torch.no_grad():
                     final_layer = film_layer.film_net[-1]
                     if film_layer.use_beta:
@@ -151,7 +155,7 @@ class FiLMSIREN(nn.Module):
             nn.init.uniform_(self.output_layer.weight, -bound, bound)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with FiLM conditioning."""
+        """Forward pass with FiLM conditioning and dropout."""
         # Extract components
         initial_conditions = x[:, :-1]  # All but time
         
@@ -167,15 +171,19 @@ class FiLMSIREN(nn.Module):
             
             # SIREN activation (sine)
             h = torch.sin(self.omega_0 * h)
+            
+            # Apply dropout after activation (except on last hidden layer)
+            if self.dropout is not None and i < len(self.layers) - 1:
+                h = self.dropout(h)
         
-        # Output
+        # Output (no dropout on output layer)
         output = self.output_layer(h)
         
         return output
 
 
 class FiLMDeepONet(nn.Module):
-    """Deep Operator Network with FiLM conditioning for ratio mode."""
+    """Deep Operator Network with FiLM conditioning and dropout."""
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         
@@ -189,6 +197,10 @@ class FiLMDeepONet(nn.Module):
         self.basis_dim = config["model"]["basis_dim"]
         self.activation = self._get_activation(config["model"].get("activation", "gelu"))
         self.output_scale = config["model"].get("output_scale", 1.0)
+        
+        # Dropout
+        dropout_rate = config["model"].get("dropout", 0.0)
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
         
         # FiLM configuration
         film_config = config.get("film", {})
@@ -229,7 +241,7 @@ class FiLMDeepONet(nn.Module):
                             output_dim: int, condition_dim: Optional[int] = None,
                             film_config: Optional[Dict] = None, bias: bool = True) -> nn.Module:
         """
-        Build an MLP with optional FiLM layers.
+        Build an MLP with optional FiLM layers and dropout.
 
         Args:
             input_dim: Input dimension for the MLP.
@@ -262,31 +274,43 @@ class FiLMDeepONet(nn.Module):
 
             output_layer = nn.Linear(prev_dim, output_dim, bias=bias)
 
-            class MLPWithFiLM(nn.Module):
-                def __init__(self, layers, film_layers, output_layer, activation):
+            class MLPWithFiLMAndDropout(nn.Module):
+                def __init__(self, layers, film_layers, output_layer, activation, dropout):
                     super().__init__()
                     self.layers = layers
                     self.film_layers = film_layers
                     self.output_layer = output_layer
                     self.activation = activation
+                    self.dropout = dropout
 
                 def forward(self, x, condition):
                     h = x
-                    for layer, film_layer in zip(self.layers, self.film_layers):
+                    for i, (layer, film_layer) in enumerate(zip(self.layers, self.film_layers)):
                         h = layer(h)
                         h = film_layer(h, condition)
                         h = self.activation(h)
+                        
+                        # Apply dropout after activation (except on last hidden layer)
+                        if self.dropout is not None and i < len(self.layers) - 1:
+                            h = self.dropout(h)
+                            
                     return self.output_layer(h)
 
-            return MLPWithFiLM(layers, film_layers, output_layer, self.activation)
+            return MLPWithFiLMAndDropout(layers, film_layers, output_layer, self.activation, self.dropout)
 
         else:
-            # Build standard MLP
+            # Build standard MLP with dropout
             layers = []
             prev_dim = input_dim
 
-            for dim in hidden_layers:
-                layers.extend([nn.Linear(prev_dim, dim, bias=bias), self.activation])
+            for i, dim in enumerate(hidden_layers):
+                layers.append(nn.Linear(prev_dim, dim, bias=bias))
+                layers.append(self.activation)
+                
+                # Add dropout after activation (except on last hidden layer)
+                if self.dropout is not None and i < len(hidden_layers) - 1:
+                    layers.append(self.dropout)
+                    
                 prev_dim = dim
 
             layers.append(nn.Linear(prev_dim, output_dim, bias=bias))
@@ -329,7 +353,7 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     model_type = config["model"]["type"].lower()
     prediction_mode = config.get("prediction", {}).get("mode", "absolute")
     
-    # Bug 4 Fix: Enforce mode-model compatibility
+    # Enforce mode-model compatibility
     if prediction_mode == "ratio" and model_type != "deeponet":
         raise ValueError(
             f"Prediction mode 'ratio' is only compatible with model type 'deeponet', "
@@ -346,16 +370,20 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     
     model = model.to(device)
     
+    # Log model configuration
+    logger = logging.getLogger(__name__)
+    logger.info(f"Created {model_type} model with dropout={config['model'].get('dropout', 0.0)}")
+    
     # Compile model if enabled and supported
     if config["system"].get("use_torch_compile", False) and hasattr(torch, 'compile'):
         compile_mode = config["system"].get("compile_mode", "default")
-        logging.info(f"Compiling model with mode='{compile_mode}'...")
+        logger.info(f"Compiling model with mode='{compile_mode}'...")
         
         try:
             model = torch.compile(model, mode=compile_mode)
-            logging.info("Model compilation successful")
+            logger.info("Model compilation successful")
         except Exception as e:
-            logging.warning(f"Model compilation failed: {e}")
+            logger.warning(f"Model compilation failed: {e}")
     
     return model
 
