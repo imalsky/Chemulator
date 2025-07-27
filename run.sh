@@ -6,11 +6,11 @@
 # This script ensures data normalization is completed and saved before training.
 # 
 # Usage:
-#   sbatch chemulator_job.sh [train|tune] [--trials N]
+#   sbatch run.sh [train|tune] [--trials N]
 # 
 # Examples:
-#   sbatch chemulator_job.sh train              # Normalize then train
-#   sbatch chemulator_job.sh tune --trials 100  # Normalize then tune with 100 trials
+#   sbatch run.sh train              # Normalize then train
+#   sbatch run.sh tune --trials 100  # Normalize then tune with 100 trials
 # ==============================================================================
 
 # --- SLURM DIRECTIVES ---
@@ -33,7 +33,7 @@ set -e  # Exit on error
 
 # Parse command line arguments
 MODE="${1:-train}"  # Default to train if not specified
-TRIALS=100          # Default trials for tuning
+TRIALS=200          # Default trials for tuning
 
 # Parse additional arguments
 shift || true  # Shift past the mode argument
