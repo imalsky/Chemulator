@@ -135,10 +135,10 @@
         "gradient_accumulation_steps": 2,
         
         // MEMORY-OPTIMIZED DATALOADER SETTINGS
-        "num_workers": 4,
+        "num_workers": 8,
         "pin_memory": true,
         "persistent_workers": true,
-        "prefetch_factor": 2,
+        "prefetch_factor": 4,
         "drop_last": true,
         "dataset_cache_shards": 32,
         
@@ -152,9 +152,9 @@
         // Scheduler settings - CRITICAL FOR LR DECAY
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 8,  // Restart every 8 epochs (5 cycles in 40 epochs)
-            "T_mult": 1,  // Keep cycle length constant
-            "eta_min": 1e-6  // ENSURES LR DROPS TO 1e-6
+            "T_0": 10,  // Restart every 8 epochs (5 cycles in 40 epochs)
+            "T_mult": 2,  // Keep cycle length constant
+            "eta_min": 1e-8  // ENSURES LR DROPS TO 1e-8
         },
         
         // Loss and training settings
@@ -162,7 +162,7 @@
         "huber_delta": 0.5,
         "use_amp": true,
         "amp_dtype": "bfloat16",
-        "early_stopping_patience": 8,  // Stop if no improvement for 8 epochs
+        "early_stopping_patience": 10,  // Stop if no improvement for 8 epochs
         "min_delta": 1e-8,
         "log_interval": 100,
         "save_interval": 10,
