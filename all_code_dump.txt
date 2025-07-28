@@ -1,3 +1,523 @@
+===== /Users/imalsky/Desktop/Chemulator/test/benchmark_inference.py =====
+# testing/advanced_benchmark.py
+import json
+import time
+from pathlib import Path
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import os
+
+# --- Configuration ---
+# Set to True to enable torch.compile (slower on Apple Silicon, faster on server CPUs)
+USE_TORCH_COMPILE = False
+MODEL_DIR = Path(__file__).parent.parent / 'data' / 'models' / "deeponet_20250722_142346"
+
+# Benchmark settings
+WARMUP_RUNS = 100
+LATENCY_BENCHMARK_RUNS = 1000
+THROUGHPUT_BENCHMARK_RUNS = 500
+BATCH_SIZES_TO_TEST = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+# ---------------------
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+def load_config(model_dir):
+    """Loads the configuration file."""
+    return json.loads((model_dir / 'config.json').read_text())
+
+def load_exported_model(model_dir, use_compile, device):
+    """Loads the exported model and optionally compiles it."""
+    exported_path = model_dir / 'exported_model.pt'
+    if not exported_path.exists():
+        raise FileNotFoundError(f"This script requires 'exported_model.pt'. File not found in {model_dir}")
+
+    print(f"Loading exported model from: {exported_path}")
+    ep = torch.export.load(str(exported_path))
+    model = ep.module().to(device)
+
+    if use_compile:
+        print("Applying torch.compile...")
+        model = torch.compile(model)
+    else:
+        print("Skipping torch.compile for local eager-mode benchmark.")
+    
+    return model
+
+def benchmark_latency(model, input_dim, device):
+    """Measures single-core, single-item inference latency."""
+    print("\n--- Part 1: Single-Core Latency Benchmark ---")
+    print("Forcing 1 CPU thread to measure the fastest possible single-request latency.")
+    
+    original_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    
+    dummy_input = torch.randn(1, input_dim, device=device)
+    timings_us = []
+
+    with torch.no_grad():
+        for _ in range(LATENCY_BENCHMARK_RUNS):
+            start_time = time.perf_counter()
+            _ = model(dummy_input)
+            end_time = time.perf_counter()
+            timings_us.append((end_time - start_time) * 1_000_000) # Convert to microseconds
+    
+    # Restore original thread count
+    torch.set_num_threads(original_threads)
+
+    print(f"\nLatency for a single prediction (Batch Size 1, Single Core):")
+    print(f"  Average: {np.mean(timings_us):.2f} µs")
+    print(f"  Median:  {np.median(timings_us):.2f} µs")
+    print(f"  Min:     {np.min(timings_us):.2f} µs")
+    print(f"  Max:     {np.max(timings_us):.2f} µs")
+    
+def benchmark_throughput(model, input_dim, device):
+    """Measures multi-core throughput across various batch sizes."""
+    print("\n--- Part 2: Multi-Core Throughput & Latency Benchmark ---")
+    print(f"Using all {torch.get_num_threads()} CPU threads to measure max throughput.")
+
+    results = []
+    print("\n" + "-"*80)
+    print(f"{'Batch Size':<12} | {'Avg Latency/Prediction (µs)':<30} | {'Throughput (predictions/sec)':<30}")
+    print("-" * 80)
+
+    for batch_size in BATCH_SIZES_TO_TEST:
+        dummy_input = torch.randn(batch_size, input_dim, device=device)
+        timings_s = []
+
+        with torch.no_grad():
+            for _ in range(THROUGHPUT_BENCHMARK_RUNS):
+                start_time = time.perf_counter()
+                _ = model(dummy_input)
+                end_time = time.perf_counter()
+                timings_s.append(end_time - start_time)
+        
+        total_time_s = sum(timings_s)
+        avg_batch_time_s = total_time_s / THROUGHPUT_BENCHMARK_RUNS
+        
+        # Latency per prediction in this batched context
+        latency_per_pred_us = (avg_batch_time_s / batch_size) * 1_000_000
+        
+        # Total predictions per second
+        throughput = (batch_size * THROUGHPUT_BENCHMARK_RUNS) / total_time_s
+        
+        results.append(latency_per_pred_us)
+        print(f"{batch_size:<12} | {latency_per_pred_us:<30.2f} | {throughput:,.0f}")
+    
+    print("-" * 80)
+    return results
+
+def plot_results(batch_sizes, latencies_us, save_path):
+    """Plots latency vs. batch size with results in microseconds."""
+    plt.style.use('seaborn-v0_8-whitegrid')
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    ax.plot(batch_sizes, latencies_us, marker='o', linestyle='-', color='b')
+    
+    ax.set_xscale('log', base=2)
+    ax.set_yscale('log')
+    ax.set_xlabel('Batch Size (log scale)')
+    ax.set_ylabel('Latency per Prediction (µs, log scale)')
+    ax.set_title(f'Model Inference Latency vs. Batch Size (torch.compile: {USE_TORCH_COMPILE})')
+    
+    from matplotlib.ticker import ScalarFormatter
+    ax.xaxis.set_major_formatter(ScalarFormatter())
+    
+    ax.grid(True, which="both", ls="--")
+    
+    for i, txt in enumerate(latencies_us):
+        ax.annotate(f'{txt:.1f} µs', (batch_sizes[i], latencies_us[i]), textcoords="offset points", xytext=(5,-15), ha='left', fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    print(f"\nBenchmark plot saved to: {save_path}")
+    plt.show()
+
+def main():
+    if not MODEL_DIR.exists():
+        raise ValueError(f"Model directory not found: {MODEL_DIR}")
+    
+    # --- 1. System and Model Setup ---
+    # Apply low-level optimizations first
+    torch.set_flush_denormal(True)
+    
+    config = load_config(MODEL_DIR)
+    device = torch.device('cpu')
+    
+    num_threads = torch.get_num_threads()
+    torch.set_num_threads(num_threads)
+    print(f"Using {num_threads} CPU threads for multi-core tests.")
+
+    model = load_exported_model(MODEL_DIR, USE_TORCH_COMPILE, device)
+    
+    input_dim = len(config['data']['species_variables']) + len(config['data']['global_variables']) + 1
+
+    # --- 2. Comprehensive Warmup ---
+    print(f"\n--- Performing {WARMUP_RUNS} Warmup Runs ---")
+    start_warmup = time.perf_counter()
+    with torch.no_grad():
+        for _ in range(WARMUP_RUNS):
+            dummy_input = torch.randn(BATCH_SIZES_TO_TEST[-1], input_dim, device=device)
+            _ = model(dummy_input)
+    print(f"Warmup complete in {time.perf_counter() - start_warmup:.2f} seconds.")
+
+    # --- 3. Run Benchmarks ---
+    benchmark_latency(model, input_dim, device)
+    throughout_results = benchmark_throughput(model, input_dim, device)
+    
+    # --- 4. Plot Throughput Results ---
+    plots_dir = MODEL_DIR / 'plots'
+    plots_dir.mkdir(exist_ok=True)
+    save_path = plots_dir / f'advanced_benchmark_compile_{USE_TORCH_COMPILE}.png'
+    plot_results(BATCH_SIZES_TO_TEST, throughout_results, save_path)
+
+
+if __name__ == '__main__':
+    main()
+
+===== /Users/imalsky/Desktop/Chemulator/test/plot_predictions.py =====
+#!/usr/bin/env python3
+"""
+Plots model predictions against ground truth for a RANDOMLY SELECTED,
+VERIFIED test case from the pre-defined test set.
+
+This script robustly identifies a true test sample by:
+1. Loading the test_indices.npy file.
+2. Picking a random sample index from this file.
+3. Using shard_index.json to trace the sample back to its original HDF5 file
+   and profile name (gname) by matching initial conditions.
+4. Loading the full ground truth profile and generating a comparison plot.
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+import logging
+import random
+import bisect
+import hashlib
+
+# Add the project root to the Python path to allow importing from 'src'
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+import h5py
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import os
+
+# --- -------------------------------------------------- ---
+# ---              USER CONFIGURATION AREA              ---
+# --- -------------------------------------------------- ---
+
+# SET THE NAME OF THE TRAINED MODEL FOLDER YOU WANT TO PLOT
+MODEL_FOLDER_NAME = "deeponet"  # <-- CHANGE THIS
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+
+# --- Global Paths ---
+ROOT = Path(__file__).resolve().parent.parent
+MODEL_DIR = ROOT / 'data' / 'models' / MODEL_FOLDER_NAME
+
+# --- Basic Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | %(message)s')
+
+
+def load_model_and_config(model_dir: Path, device: torch.device) -> tuple[torch.nn.Module, dict, 'NormalizationHelper']:
+    """
+    Loads the configuration, model, and normalization helper from a model directory.
+    """
+    from src.models.model import create_model
+    from src.data.normalizer import NormalizationHelper
+
+    # Load Configuration
+    logging.info(f"Loading configuration from {model_dir}")
+    config_path = model_dir / 'config.json'
+    config = json.loads(config_path.read_text())
+
+    # Disable compilation
+    config["system"]["use_torch_compile"] = False
+
+    # Load model from checkpoint
+    logging.info("--> Loading model from standard checkpoint (best_model.pt)...")
+    checkpoint_path = model_dir / 'best_model.pt'
+    model = create_model(config, device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    # Fix for loading state_dict from compiled model
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    
+    model.eval()
+    logging.info("Model loaded and set to evaluation mode.")
+
+    # Load Normalization Helper
+    prediction_mode = config['prediction']['mode']
+    processed_data_dir = ROOT / config['paths']['processed_data_dir']
+    norm_stats_path = processed_data_dir / 'normalization.json'
+    norm_stats = json.loads(norm_stats_path.read_text())
+    norm_helper = NormalizationHelper(
+        stats=norm_stats, device=device,
+        species_vars=config['data']['species_variables'],
+        global_vars=config['data']['global_variables'],
+        time_var=config['data']['time_variable'], config=config
+    )
+    logging.info("Normalization helper created.")
+    
+    return model, config, norm_helper
+
+
+def find_source_profile_info(sample_index: int, processed_data_dir: Path, norm_helper, config) -> tuple[Path, str]:
+    """
+    Traces a global sample index back to its source HDF5 file and group name (gname).
+    """
+    logging.info(f"Tracing origin of global sample index: {sample_index}...")
+    
+    shard_index_path = processed_data_dir / 'shard_index.json'
+    shard_index = json.loads(shard_index_path.read_text())
+    shards_meta = shard_index['shards']
+    
+    shard_starts = [s['start_idx'] for s in shards_meta]
+    shard_idx = bisect.bisect_right(shard_starts, sample_index) - 1
+    
+    target_shard_meta = shards_meta[shard_idx]
+    shard_filename = target_shard_meta['filename']
+    logging.info(f"Sample found in shard: {shard_filename}")
+
+    match = re.search(r"shard_(run\d+-result)_", shard_filename)
+    
+    raw_filename = f"{match.group(1)}.h5"
+    raw_filepath = ROOT / 'data' / 'raw' / raw_filename
+    logging.info(f"Inferred source HDF5 file: {raw_filepath}")
+
+    shard_path = processed_data_dir / shard_filename
+    shard_data = np.load(shard_path)
+    
+    local_index = sample_index - target_shard_meta['start_idx']
+    sample_row = shard_data[local_index]
+    
+    n_species = shard_index['n_species']
+    n_globals = shard_index['n_globals']
+    initial_conditions_sample = sample_row[:n_species + n_globals]
+    
+    all_matching_indices = np.where(np.all(np.isclose(shard_data[:, :n_species + n_globals], initial_conditions_sample), axis=1))[0]
+    
+    p_init_norm, t_init_norm = initial_conditions_sample[n_species], initial_conditions_sample[n_species+1]
+
+    # Denormalize p and t
+    def denormalize_var(norm_val, var_name):
+        method = norm_helper.methods[var_name]
+        var_stats = norm_helper.per_key_stats[var_name]
+        if method == 'standard':
+            return norm_val * var_stats['std'] + var_stats['mean']
+        elif method == 'log-standard':
+            log_val = norm_val * var_stats['log_std'] + var_stats['log_mean']
+            return 10 ** log_val
+        elif method == 'min-max':
+            return norm_val * (var_stats['max'] - var_stats['min']) + var_stats['min']
+        elif method == 'log-min-max':
+            log_val = norm_val * (var_stats['max'] - var_stats['min']) + var_stats['min']
+            return 10 ** log_val
+
+    p_init_raw = denormalize_var(p_init_norm, 'P_init')
+    t_init_raw = denormalize_var(t_init_norm, 'T_init')
+
+    with h5py.File(raw_filepath, 'r') as f:
+        for gname in f.keys():
+            match = re.search(r"_P_([0-9.eE+-]+)_T_([0-9.eE+-]+)", gname)
+            if match:
+                p_val_gname, t_val_gname = float(match.group(1)), float(match.group(2))
+                if np.isclose(t_init_raw, t_val_gname, rtol=1e-3, atol=1e-2) and np.isclose(p_init_raw, p_val_gname, rtol=1e-3, atol=1e-2):
+                     logging.info(f"Heuristic match found! gname: {gname}")
+                     return raw_filepath, gname
+
+    # Fallback
+    with h5py.File(raw_filepath, 'r') as f:
+        test_fraction = shard_index.get("test_fraction", 0.15)
+        for gname in f.keys():
+             split_hash = hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()
+             p = int(split_hash[:8], 16) / 0xFFFFFFFF
+             if p < test_fraction:
+                 logging.warning(f"Could not find exact gname match. Falling back to first available test group: {gname}")
+                 return raw_filepath, gname
+
+    raise ValueError(f"Could not find a matching gname in {raw_filepath.name}")
+
+
+def extract_full_profile(raw_filepath: Path, gname: str, config: dict) -> np.ndarray:
+    """Extracts a complete data profile from a specific HDF5 file and group."""
+    with h5py.File(raw_filepath, 'r') as f:
+        h5_group = f[gname]
+        
+        species_vars = config['data']['species_variables']
+        global_vars = config['data']['global_variables']
+        time_var = config['data']['time_variable']
+
+        globals_dict = {}
+        matches = re.findall(r"_([A-Z])_([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", gname)
+        for label, value in matches:
+            key = f"{label}_init"
+            if key in global_vars:
+                globals_dict[key] = float(value)
+
+        var_order = species_vars + global_vars + [time_var]
+        n_t = h5_group[time_var].shape[0]
+        profile = np.zeros((n_t, len(var_order)), dtype=np.float32)
+
+        for i, var in enumerate(var_order):
+            profile[:, i] = h5_group.get(var, globals_dict.get(var))
+            
+    return profile
+
+
+def make_predictions(model: torch.nn.Module, profile: np.ndarray, config: dict, norm_helper: 'NormalizationHelper') -> np.ndarray:
+    """Generates model predictions for an entire profile using efficient batching."""
+    device = next(model.parameters()).device
+    n_species = len(config['data']['species_variables'])
+    n_t = profile.shape[0]
+
+    profile_t = torch.from_numpy(profile).to(device)
+    norm_prof = norm_helper.normalize_profile(profile_t)
+    
+    pred_raw = np.zeros((n_t, n_species), dtype=np.float32)
+    pred_raw[0] = profile[0, :n_species]
+
+    initial_conditions_norm = norm_prof[0, :-1]
+    times_to_predict_norm = norm_prof[1:, -1:]
+    num_predictions = times_to_predict_norm.shape[0]
+
+    predictions = torch.zeros(num_predictions, n_species, device=device)
+    batch_size = 2
+    for start in range(0, num_predictions, batch_size):
+        end = min(start + batch_size, num_predictions)
+        sub_times = times_to_predict_norm[start:end]
+        sub_input = torch.cat([
+            initial_conditions_norm.unsqueeze(0).expand(end - start, -1),
+            sub_times
+        ], dim=1)
+        predictions[start:end] = model(sub_input)
+
+    profile_pred_norm = torch.zeros_like(norm_prof)
+    profile_pred_norm[0, :] = norm_prof[0, :]
+    profile_pred_norm[1:, :n_species] = predictions
+    profile_pred_norm[1:, n_species:] = norm_prof[1:, n_species:]
+    pred_denorm = norm_helper.denormalize_profile(profile_pred_norm)
+    pred_raw = pred_denorm[:, :n_species].detach().cpu().numpy()
+
+    return pred_raw
+
+
+def plot_profile(true_profile: np.ndarray, pred_species_raw: np.ndarray, config: dict, gname: str, save_path: Path):
+    """Generates and saves a log-log plot of species evolution."""
+    species_vars = config['data']['species_variables']
+    times = true_profile[:, -1]
+    true_species_raw = true_profile[:, :len(species_vars)]
+    
+    fig, ax = plt.subplots(figsize=(14, 9), dpi=120)
+    colors = plt.cm.get_cmap('tab20', len(species_vars))
+
+    for i, species in enumerate(species_vars):
+        ax.plot(times, true_species_raw[:, i], color=colors(i), linestyle='-', linewidth=2.5, label=f'{species} (True)')
+        ax.plot(times, pred_species_raw[:, i], color=colors(i), linestyle='--', linewidth=2, label=f'{species} (Pred)')
+        ax.plot(times[0], true_species_raw[0, i], 'o', color=colors(i), markersize=8, markeredgecolor='black', zorder=5)
+
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel('Time (s)', fontsize=14)
+    ax.set_ylabel('Abundance', fontsize=14)
+    ax.set_title(f'Prediction vs. Truth for Profile: {gname}', fontsize=16)
+    ax.grid(True, which='both', linestyle=':', linewidth=0.5)
+    ax.legend(bbox_to_anchor=(1.04, 1), loc='upper left')
+    
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
+    plt.savefig(save_path)
+    plt.close()
+    logging.info(f"Plot saved successfully to {save_path}")
+
+
+def main():
+    """Main execution function."""
+    device = torch.device('cpu')
+    
+    model, config, norm_helper = load_model_and_config(MODEL_DIR, device)
+    
+    prediction_mode = config['prediction']['mode']
+    processed_data_dir = ROOT / config['paths']['processed_data_dir']
+
+    test_indices_path = processed_data_dir / 'test_indices.npy'
+    test_indices = np.load(test_indices_path)
+    random_test_index = random.choice(test_indices)
+    
+    raw_filepath, gname = find_source_profile_info(random_test_index, processed_data_dir, norm_helper, config)
+    
+    logging.info(f"Extracting ground truth for '{gname}' from {raw_filepath.name}...")
+    true_profile = extract_full_profile(raw_filepath, gname, config)
+
+    logging.info(f"Generating predictions for profile '{gname}'...")
+    predicted_species = make_predictions(model, true_profile, config, norm_helper)
+    
+    plots_dir = MODEL_DIR / 'plots'
+    plots_dir.mkdir(exist_ok=True)
+    save_path = plots_dir / f'test_prediction_{gname}.png'
+    
+    plot_profile(true_profile, predicted_species, config, gname, save_path)
+
+
+if __name__ == '__main__':
+    main()
+
+===== /Users/imalsky/Desktop/Chemulator/test/plot_losses.py =====
+# testing/plot_losses.py
+import json
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+ROOT = Path(__file__).parent.parent
+
+def get_latest_model_dir():
+    model_path = ROOT / 'data' / 'models'
+    dirs = [d for d in model_path.iterdir() if d.is_dir()]
+    return max(dirs, key=lambda d: d.stat().st_ctime) if dirs else None
+
+MODEL_DIR = get_latest_model_dir()
+
+def main():
+    if not MODEL_DIR:
+        raise ValueError("No model directory found")
+    
+    log_path = MODEL_DIR / 'training_log.json'
+    if not log_path.exists():
+        raise FileNotFoundError(f"Training log not found in {MODEL_DIR}")
+    
+    history = json.loads(log_path.read_text())
+    epochs = history['epochs']
+    
+    epoch_nums = [e['epoch'] for e in epochs]
+    train_losses = [e['train_loss'] for e in epochs]
+    val_losses = [e['val_loss'] for e in epochs if 'val_loss' in e]
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(epoch_nums, train_losses, 'b-', label='Train Loss')
+    if val_losses:
+        plt.plot(epoch_nums[:len(val_losses)], val_losses, 'r-', label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training vs Validation Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    plots_dir = MODEL_DIR / 'plots'
+    plots_dir.mkdir(exist_ok=True)
+    save_path = plots_dir / 'loss_curve.png'
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Plot saved to {save_path}")
+
+if __name__ == '__main__':
+    main()
+
 ===== /Users/imalsky/Desktop/Chemulator/config/config.jsonc =====
 {
     // ===== FILE PATHS =====
@@ -8,7 +528,12 @@
             "data/raw/run9002-result.h5",
             "data/raw/run9003-result.h5",
             "data/raw/run9004-result.h5",
-            "data/raw/run9005-result.h5"
+            "data/raw/run9005-result.h5",
+            "data/raw/run9006-result.h5",
+            "data/raw/run9007-result.h5",
+            "data/raw/run9008-result.h5",
+            "data/raw/run9009-result.h5",
+            "data/raw/run9010-result.h5"
         ],
         // Directory for processed NPY shards
         "processed_data_dir": "data/processed",
@@ -47,25 +572,24 @@
         "shard_size": 1000000,
         // Minimum species concentration threshold
         "min_value_threshold": 1e-25,
-        // Compression type: null for raw npz files
+        // Compression type: null for raw npy files (faster I/O)
         "compression": null,
         // Number of parallel workers for preprocessing
-        "num_workers": 16,
-        // Enable parallel preprocessing (set false for simpler debugging)
+        "num_workers": 24,
+        // Enable parallel preprocessing
         "parallel_enabled": true
     },
     
     // ===== NORMALIZATION SETTINGS =====
     "normalization": {
         // Default normalization method for all variables
-        // Options: "standard", "log-standard", "min-max", "log-min-max", "none"
         "default_method": "log-min-max",
         
         // Override methods for specific variables
         "methods": {
-            "T_init": "standard",      // Temperature: standard normalization
-            "P_init": "log-min-max",    // Pressure: log scale then min-max
-            "t_time": "log-min-max"     // Time: log scale then min-max
+            "T_init": "standard",
+            "P_init": "log-min-max",
+            "t_time": "log-min-max"
         },
         
         // Small value to prevent log(0) and division by zero
@@ -73,12 +597,13 @@
         // Minimum standard deviation to prevent division by tiny values
         "min_std": 1e-10,
         // Clamp normalized values to [-clamp_value, clamp_value]
-        "clamp_value": 50.0
+        "clamp_value": 30.0
     },
     
     // ===== MODEL ARCHITECTURE =====
     "model": {
-        // Model type: "deeponet" or "siren"
+        // Model type: "deeponet" or "siren
+        // Both work with absolute mode, ratio only with deeponet
         "type": "deeponet",
         
         // Activation function: "gelu", "relu", "silu", "tanh"
@@ -91,13 +616,13 @@
         "output_scale": 1.0,
         
         // DeepONet-specific parameters
-        "branch_layers": [384, 384, 384, 384],  // Hidden layers for branch network
-        "trunk_layers": [128, 128, 128, 128],   // Hidden layers for trunk network
-        "basis_dim": 128,                       // Number of basis functions
+        "branch_layers": [256, 256, 256],
+        "trunk_layers": [128, 128],
+        "basis_dim": 128,
         
         // SIREN-specific parameters (when type="siren")
-        "hidden_dims": [256, 256, 256, 256],  // Hidden layer dimensions
-        "omega_0": 30.0                       // SIREN frequency parameter
+        "hidden_dims": [256, 256, 256],
+        "omega_0": 30.0
     },
     
     // ===== FiLM CONDITIONING =====
@@ -105,43 +630,43 @@
         // Enable Feature-wise Linear Modulation
         "enabled": true,
         // Hidden layers for FiLM networks
-        "hidden_dims": [64, 64],
+        "hidden_dims": [64],
         // Activation for FiLM networks
         "activation": "gelu"
     },
     
     // ===== PREDICTION SETTINGS =====
     "prediction": {
-        // Prediction mode: "absolute" or "ratio"
-        // - absolute: predict species concentrations directly
-        // - ratio: predict log-ratios relative to initial conditions (DeepONet only)
+        // Prediction mode: ABSOLUTE ONLY for this config
         "mode": "absolute",
         
-        // Optional output clamping (null = no clamping)
-        // Only used in absolute mode
+        // Optional output clamping
         "output_clamp": null
     },
     
-    // ===== TRAINING PARAMETERS - OPTIMIZED FOR A100 =====
+    // ===== TRAINING PARAMETERS =====
     "training": {
+        // Data splitting
         "val_fraction": 0.15,
         "test_fraction": 0.15,
         "use_fraction": 1.0,
         
-        "epochs": 100,
-        "batch_size": 2048,              // Increased for better GPU utilization
-        "gradient_accumulation_steps": 4, // Reduced from 8 for more frequent updates
+        // Training duration
+        "epochs": 100,  // Full training epochs (not used in HPO)
+        "batch_size": 4096,
+        "gradient_accumulation_steps": 2,
         
         // MEMORY-OPTIMIZED DATALOADER SETTINGS
-        "num_workers": 2,                // Reduced from 4 to prevent OOM
-        "pin_memory": true,              // Enable for faster GPU transfer
-        "persistent_workers": true,      // Keep workers alive between epochs
-        "prefetch_factor": 2,            // Prefetch 2 batches per worker
+        // I think I finally got this to stop breaking with OOM
+        "num_workers": 8,
+        "pin_memory": true,
+        "persistent_workers": true,
+        "prefetch_factor": 4,
         "drop_last": true,
-        "dataset_cache_shards": 16,      // CRITICAL FIX: Increased from 1 to 16
+        "dataset_cache_shards": 32,
         
         // Learning rate and optimizer settings
-        "learning_rate": 3e-4,
+        "learning_rate": 3e-4,  // Starting LR for HPO
         "weight_decay": 1e-5,
         "betas": [0.9, 0.999],
         "eps": 1e-8,
@@ -150,25 +675,27 @@
         // Scheduler settings
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 10,
-            "T_mult": 2,
-            "eta_min": 1e-7,
-            "factor": 0.5,
-            "patience": 10,
-            "min_lr": 1e-7
+            "T_0": 10,  // How often to restart learning
+            "T_mult": 2,  // Geometric increase
+            "eta_min": 1e-8  // Drop to this learning rate
         },
         
         // Loss and training settings
         "loss": "mse",
         "huber_delta": 0.5,
         "use_amp": true,
-        "amp_dtype": "bfloat16",         // Better stability than float16
-        "early_stopping_patience": 15,
-        "min_delta": 1e-10,
-        "log_interval": 500,              // Log more frequently
+        "amp_dtype": "bfloat16",
+        "early_stopping_patience": 10,
+        "min_delta": 1e-8,
+        "log_interval": 100,
         "save_interval": 10,
-        "empty_cache_interval": 500,      // Clear GPU cache more often
-        "hpo_epochs": 20
+        "empty_cache_interval": 500,
+        
+        // HPO-specific settings
+        // Minimum epochs before pruning
+        "hpo_min_epochs": 10,  
+        // Maximum epochs for best trials
+        "hpo_max_epochs": 40  
     },
     
     // ===== SYSTEM/HARDWARE SETTINGS =====
@@ -177,14 +704,14 @@
         "seed": 42,
         
         // PyTorch optimizations
-        "use_torch_compile": false,   // Disable for now to simplify debugging
-        "compile_mode": "default",    // Compile mode: "default", "reduce-overhead", "max-autotune"
-        "use_torch_export": false,    // Export model with torch.export
+        "use_torch_compile": true,
+        "compile_mode": "default",
+        "use_torch_export": true,
         
         // CUDA optimizations for A100
-        "cudnn_benchmark": true,      // Enable cuDNN autotuner
-        "tf32": true,                 // Enable TensorFloat-32 on A100
-        "cuda_memory_fraction": 0.95  // Use most GPU memory for better performance
+        "cudnn_benchmark": true,
+        "tf32": true,
+        "cuda_memory_fraction": 0.90
     },
     
     // ===== HYPERPARAMETER OPTIMIZATION =====
@@ -192,11 +719,14 @@
         // Enable Optuna integration
         "enabled": true,
         
-        // Optuna study settings (when enabled)
-        "n_trials": 100,
-        "n_startup_trials": 8,
-        "n_warmup_steps": 10,
-        "interval_steps": 2
+        // Hyperband settings for 40-hour window
+        "algorithm": "hyperband",
+        "hyperband_min_resource": 10,  // 1.4 hours minimum
+        "hyperband_max_resource": 40,  // 5.5 hours maximum
+        "hyperband_reduction_factor": 3,  // Keep top 33% at each stage
+        
+        // Target number of trials for 40 hours
+        "n_trials": 50  // Conservative estimate with pruning
     }
 }
 
@@ -206,17 +736,11 @@ import logging
 import sys
 import time
 from pathlib import Path
-import shutil
 import torch
-from torch.profiler import profile, ProfilerActivity, schedule
-from torch.profiler import tensorboard_trace_handler
-from typing import Dict, Any, Optional, Callable, Union
+from typing import Dict, Any, Union
+import hashlib
+import json
 
-# ============================ START: CRITICAL FIX BLOCK ===========================
-# This must be the first major action in the script to configure PyTorch's
-# multiprocessing behavior BEFORE any DataLoader workers are ever created.
-
-# 1. Set up basic logging IMMEDIATELY to see all messages.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
@@ -231,27 +755,19 @@ try:
     logging.info("SUCCESS: Set multiprocessing sharing strategy to 'file_system'.")
 except RuntimeError:
     logging.warning("Could not set multiprocessing sharing strategy (already set or not supported).")
-# ============================= END: CRITICAL FIX BLOCK ============================
-
 
 import numpy as np
-
 from utils.hardware import setup_device, optimize_hardware
 from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
 from data.preprocessor import DataPreprocessor
 from data.dataset import NPYDataset
 from models.model import create_model
 from training.trainer import Trainer
-import hashlib
-import json
 from data.normalizer import NormalizationHelper
-
-import torch.multiprocessing
-
 
 
 class ChemicalKineticsPipeline:
-    """Simplified training pipeline for chemical kinetics prediction."""
+    """Training pipeline for chemical kinetics prediction."""
     def __init__(self, config_or_path: Union[Path, Dict[str, Any]]):
         """
         Initialize the pipeline with either a config file path or a config dictionary.
@@ -259,27 +775,26 @@ class ChemicalKineticsPipeline:
         Args:
             config_or_path: Either a Path to a config file or a config dictionary
         """
-        # FIX: Accept either a path or a dictionary for more flexible initialization
         if isinstance(config_or_path, (Path, str)):
-            # Load configuration from file
             self.config = load_json_config(Path(config_or_path))
         elif isinstance(config_or_path, dict):
-            # Use provided configuration dictionary directly
             self.config = config_or_path
         else:
             raise TypeError(f"config_or_path must be a Path, str, or dict, not {type(config_or_path)}")
         
-        # Setup paths
+        # Get prediction mode
+        self.prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
+        
+        # Setup paths with mode-specific directories
         self.setup_paths()
         
         # Setup logging
-        log_file = self.log_dir / f"pipeline_{time.strftime('%Y%m%d_%H%M%S')}.log"
+        log_file = self.log_dir / f"pipeline_{self.prediction_mode}_{time.strftime('%Y%m%d_%H%M%S')}.log"
         setup_logging(log_file=log_file)
         
         self.logger = logging.getLogger(__name__)
-        self.logger.info(f"sdfasfsadfasdf Chemical Kinetics Pipeline initialized")
+        self.logger.info(f"Chemical Kinetics Pipeline initialized - Mode: {self.prediction_mode}")
         
-
         seed_everything(self.config["system"]["seed"])
         
         # Setup hardware
@@ -287,56 +802,128 @@ class ChemicalKineticsPipeline:
         optimize_hardware(self.config["system"], self.device)
         
     def setup_paths(self):
-        """Create directory structure."""
+        """Create directory structure with mode-specific paths."""
         paths = self.config["paths"]
         
         # Create run directory
         model_type = self.config["model"]["type"]
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{timestamp}"
+        self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{self.prediction_mode}_{timestamp}"
         
         # Convert paths
         self.raw_data_files = [Path(f) for f in paths["raw_data_files"]]
-        self.processed_dir = Path(paths["processed_data_dir"])
+        
+        # Mode-specific processed directory
+        base_processed_dir = Path(paths["processed_data_dir"])
+        self.processed_dir = base_processed_dir / f"mode_{self.prediction_mode}"
+        
         self.log_dir = Path(paths["log_dir"])
         
         # Create directories
         ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
 
-    def _clean_old_shards(self):
-        """Remove old shard files from the processed directory."""
-        self.logger.info("Cleaning old shard files...")
+    def _compute_data_hash(self) -> str:
+        """
+        Compute a hash of data-critical parameters.
+        Only includes parameters that affect the actual data content.
+        """
+        data_params = {
+            "raw_files": sorted([str(f) for f in self.raw_data_files]),
+            "species_variables": self.config["data"]["species_variables"],
+            "global_variables": self.config["data"]["global_variables"],
+            "time_variable": self.config["data"]["time_variable"],
+            "min_value_threshold": self.config["preprocessing"]["min_value_threshold"],
+            "use_fraction": self.config["training"]["use_fraction"],
+            "prediction_mode": self.prediction_mode,
+            "epsilon": self.config["normalization"]["epsilon"],
+            "normalization_methods": self.config["normalization"].get("methods", {}),
+            "default_norm_method": self.config["normalization"]["default_method"],
+        }
         
-        # Remove all .npy and .npz shard files
-        shard_patterns = ["shard_*.npy", "shard_*.npz"]
-        removed_count = 0
+        # Create stable JSON string
+        hash_str = json.dumps(data_params, sort_keys=True)
+        return hashlib.sha256(hash_str.encode()).hexdigest()[:16]
+
+    def normalize_only(self):
+        """Run only the data preprocessing and normalization step."""
+        self.logger.info("Running data normalization only...")
         
-        for pattern in shard_patterns:
-            for shard_file in self.processed_dir.glob(pattern):
-                try:
-                    shard_file.unlink()
-                    removed_count += 1
-                except Exception as e:
-                    self.logger.warning(f"Failed to remove {shard_file}: {e}")
+        # Check if data already exists with correct hash
+        current_hash = self._compute_data_hash()
+        hash_file = self.processed_dir / "data_hash.json"
         
-        if removed_count > 0:
-            self.logger.info(f"Removed {removed_count} old shard files")
+        regenerate = True
+        if hash_file.exists():
+            saved_hash_data = load_json(hash_file)
+            if saved_hash_data.get("hash") == current_hash:
+                self.logger.info("Data already preprocessed with matching hash. Skipping regeneration.")
+                regenerate = False
+            else:
+                self.logger.info("Data hash mismatch. Regenerating data...")
+                self._clean_all_processed_data()
         
-        # Also remove old index files to ensure clean state
-        old_files = ["normalization.json", "shard_index.json", 
-                     "train_indices.npy", "val_indices.npy", "test_indices.npy"]
-        for filename in old_files:
-            filepath = self.processed_dir / filename
-            if filepath.exists():
-                try:
-                    filepath.unlink()
-                except Exception as e:
-                    self.logger.warning(f"Failed to remove {filepath}: {e}")
+        if regenerate:
+            preprocessor = DataPreprocessor(
+                raw_files=self.raw_data_files,
+                output_dir=self.processed_dir,
+                config=self.config
+            )
+            
+            missing = [p for p in self.raw_data_files if not p.exists()]
+            if missing:
+                raise FileNotFoundError(f"Missing raw data files: {missing}")
+            
+            # Process to shards and compute normalization
+            preprocessor.process_to_npy_shards()
+            
+            # Save the hash
+            save_json({
+                "hash": current_hash,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": self.prediction_mode
+            }, hash_file)
+            
+            self.logger.info(f"Data normalization complete. Files saved to: {self.processed_dir}")
+        
+        # Generate split indices
+        self._generate_or_validate_splits()
+
+    def _generate_or_validate_splits(self):
+        """Generate or validate train/val/test split indices."""
+        split_config = {
+            "val_fraction": self.config["training"]["val_fraction"],
+            "test_fraction": self.config["training"]["test_fraction"],
+            "use_fraction": self.config["training"]["use_fraction"],
+            "seed": self.config["system"]["seed"]
+        }
+        current_split_hash = hashlib.sha256(
+            json.dumps(split_config, sort_keys=True).encode('utf-8')
+        ).hexdigest()[:16]
+        
+        split_hash_path = self.processed_dir / "split_hash.json"
+        
+        regenerate_splits = True
+        if split_hash_path.exists():
+            saved_split_hash = load_json(split_hash_path).get("hash")
+            if saved_split_hash == current_split_hash:
+                self.logger.info("Split configuration matches. Reusing existing splits.")
+                regenerate_splits = False
+        
+        if regenerate_splits:
+            self.logger.info("Generating new train/val/test splits...")
+            preprocessor = DataPreprocessor(
+                raw_files=self.raw_data_files,
+                output_dir=self.processed_dir,
+                config=self.config
+            )
+            preprocessor.generate_split_indices()
+            save_json({"hash": current_split_hash}, split_hash_path)
 
     def _clean_all_processed_data(self):
-        """Remove ALL processed files, including shards and indices."""
+        """Remove ALL processed files."""
         self.logger.info("Cleaning ALL old processed files...")
-        if not self.processed_dir.exists(): return
+        if not self.processed_dir.exists():
+            return
         
         patterns = ["shard_*.npy", "shard_*.npz", "*.json", "*_indices.npy"]
         removed_count = 0
@@ -348,101 +935,29 @@ class ChemicalKineticsPipeline:
                     removed_count += 1
                 except Exception as e:
                     self.logger.warning(f"Failed to remove {file}: {e}")
+        
         self.logger.info(f"Removed {removed_count} old files from {self.processed_dir}")
 
-    def _clean_split_files(self):
-        """Remove only split-related files."""
-        self.logger.info("Cleaning old split index files...")
-        files_to_remove = ["train_indices.npy", "val_indices.npy", "test_indices.npy", "split_hash.json"]
-        removed_count = 0
-        for filename in files_to_remove:
-            filepath = self.processed_dir / filename
-            if filepath.exists():
-                try:
-                    filepath.unlink()
-                    removed_count += 1
-                except Exception as e:
-                    self.logger.warning(f"Failed to remove {filepath}: {e}")
-        self.logger.info(f"Removed {removed_count} old split files.")
-
     def preprocess_data(self):
-        """
-        MODIFIED: This version bypasses the hash check and only regenerates
-        data if the processed directory is empty.
-        """
-        self.logger.warning("Using a modified preprocess_data function that bypasses hash checking.")
-        
-        # --- Check if essential files exist ---
-        # We will assume if the main index and normalization stats are present, the data is good.
-        shard_index_path = self.processed_dir / "shard_index.json"
-        norm_path = self.processed_dir / "normalization.json"
-        
-        regenerate_core_data = True
-        if shard_index_path.exists() and norm_path.exists():
-            self.logger.info("Found existing shard_index.json. SKIPPING core data regeneration.")
-            regenerate_core_data = False
-        else:
-            self.logger.info("Could not find existing processed data. Regenerating from scratch.")
-            self._clean_all_processed_data()
-
-        if regenerate_core_data:
-            preprocessor = DataPreprocessor(
-                raw_files=self.raw_data_files,
-                output_dir=self.processed_dir,
-                config=self.config
-            )
-            missing = [p for p in self.raw_data_files if not p.exists()]
-            if missing:
-                raise FileNotFoundError(f"Missing raw data files: {missing}")
-            
-            preprocessor.process_to_npy_shards()
-            # We don't save a hash file because we aren't checking it
-            self.logger.info("Finished core data generation.")
-
-        # --- The second part for train/val/test splits remains the same ---
-        # This part has its own simple hash check that should work fine.
-        split_config = {
-            "val_fraction": self.config["training"]["val_fraction"],
-            "test_fraction": self.config["training"]["test_fraction"],
-            "use_fraction": self.config["training"]["use_fraction"]
-        }
-        current_split_hash = hashlib.sha256(json.dumps(split_config, sort_keys=True).encode('utf-8')).hexdigest()
-        split_hash_path = self.processed_dir / "split_hash.json"
-        
-        regenerate_splits = True
-        if split_hash_path.exists():
-            if not regenerate_core_data:
-                saved_split_hash = load_json(split_hash_path).get("hash")
-                if saved_split_hash == current_split_hash:
-                    self.logger.info("Split hash matches. Reusing existing train/val/test indices.")
-                    regenerate_splits = False
-                else:
-                    self.logger.info("Split hash mismatch. Regenerating train/val/test indices.")
-                    self._clean_split_files()
-            else:
-                self._clean_split_files()
-        else:
-            self.logger.info("Split hash not found. Generating new train/val/test indices.")
-            self._clean_split_files()
-
-        if regenerate_splits:
-            preprocessor = DataPreprocessor( # Re-instantiate in case it wasn't created above
-                raw_files=self.raw_data_files,
-                output_dir=self.processed_dir,
-                config=self.config
-            )
-            preprocessor.generate_split_indices()
-            save_json({"hash": current_split_hash}, split_hash_path)
+        """Preprocess data with proper hash checking."""
+        self.logger.info(f"Preprocessing data for {self.prediction_mode} mode...")
+        self.normalize_only()
 
     def train_model(self):
-        """Train the neural network model with data loader cache warm-up."""
+        """Train the neural network model."""
         self.logger.info("Starting model training...")
 
-        # Enforce mode-model compatibility before proceeding
+        # Ensure data is preprocessed
+        self.preprocess_data()
+
+        # Enforce mode-model compatibility
         prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
         model_type = self.config["model"]["type"]
         if prediction_mode == "ratio" and model_type != "deeponet":
-            raise ValueError(f"Prediction mode 'ratio' is only compatible with model type 'deeponet', but '{model_type}' was specified.")
+            raise ValueError(
+                f"Prediction mode 'ratio' is only compatible with model type 'deeponet', "
+                f"but '{model_type}' was specified."
+            )
 
         # Save config for this run
         save_json(self.config, self.run_save_dir / "config.json")
@@ -493,7 +1008,7 @@ class ChemicalKineticsPipeline:
             split_name="test"
         ) if len(test_indices) > 0 else None
         
-        # Initialize trainer with norm_helper
+        # Initialize trainer
         trainer = Trainer(
             model=model,
             train_dataset=train_dataset,
@@ -504,6 +1019,8 @@ class ChemicalKineticsPipeline:
             device=self.device,
             norm_helper=norm_helper
         )
+        
+        # Warm up cache
         _ = train_dataset[0]
 
         # Train model
@@ -526,24 +1043,18 @@ class ChemicalKineticsPipeline:
         save_json(results, self.run_save_dir / "results.json")
     
     def run(self):
-        """Execute the pipeline."""
+        """Execute the full training pipeline."""
         try:
-            # Step 1: Preprocess data
-            self.preprocess_data()
-            
-            # Step 2: Train model
             self.train_model()
-            
             self.logger.info("Pipeline completed successfully!")
             self.logger.info(f"Results saved in: {self.run_save_dir}")
-            
         except Exception as e:
             self.logger.error(f"Pipeline failed: {e}", exc_info=True)
             sys.exit(1)
 
 
 def main():
-    """Main entry point."""
+    """Main entry point with multiple operation modes."""
     import argparse
     parser = argparse.ArgumentParser(description="Chemical Kinetics Neural Network Training")
     parser.add_argument(
@@ -552,17 +1063,37 @@ def main():
         default=Path("config/config.jsonc"),
         help="Path to configuration file"
     )
+    
+    # Operation mode arguments (mutually exclusive)
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Only preprocess and normalize the data"
+    )
+    mode_group.add_argument(
+        "--train",
+        action="store_true",
+        help="Train a model using the configuration"
+    )
+    mode_group.add_argument(
+        "--tune",
+        action="store_true",
+        help="Run hyperparameter optimization"
+    )
+    
+    # Hyperparameter tuning specific arguments
     parser.add_argument(
         "--trials",
         type=int,
-        default=None,
-        help="Number of Optuna hyperparameter optimization trials (default: normal training)"
+        default=100,
+        help="Number of Optuna trials for hyperparameter optimization"
     )
     parser.add_argument(
         "--study-name",
         type=str,
         default="chemical_kinetics_opt",
-        help="Name for Optuna study (used with --trials)"
+        help="Name for Optuna study"
     )
     
     args = parser.parse_args()
@@ -571,68 +1102,52 @@ def main():
     if not args.config.exists():
         print(f"Error: Configuration file not found: {args.config}", file=sys.stderr)
         sys.exit(1)
-
-    # Profiler setup: Activities (CPU + CUDA if available)
-    activities = [ProfilerActivity.CPU]
-    if torch.cuda.is_available():
-        activities.append(ProfilerActivity.CUDA)
-
-    # Schedule for long runs: Profile cycles to reduce overhead
-    my_schedule = schedule(wait=1, warmup=1, active=3, repeat=2)  # Adjust as needed
-
-    # Wrap the entire pipeline (normal or Optuna)
-    with profile(
-        activities=activities,
-        schedule=my_schedule,
-        on_trace_ready=tensorboard_trace_handler("./logs/profiler"),  # Export to TensorBoard
-        record_shapes=True,  # Optional: Track tensor shapes
-        profile_memory=True,  # Optional: Track memory (adds slight overhead)
-        with_stack=True  # Optional: Stack traces for debugging
-    ) as prof:
-        # Run with or without hyperparameter optimization
-        if args.trials:
-            # Ensure optuna is installed
-            try:
-                import optuna
-            except ImportError:
-                print("Installing optuna...")
-                import subprocess
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "optuna"])
-            
-            # Import and run optimization
-            from hyperparameter_tuning import optimize
-            
-            print(f"Starting hyperparameter optimization with {args.trials} trials...")
-            study = optimize(
-                config_path=args.config,
-                n_trials=args.trials,
-                n_jobs=1,  # Always use 1 for GPU training
-                study_name=args.study_name
-            )
-            
-            # Print results
-            print("\n" + "="*60)
-            print("Optimization Complete")
-            print("="*60)
-            print(f"Best validation loss: {study.best_value:.6f}")
-            print(f"Best trial: {study.best_trial.number}")
-            print("\nBest parameters:")
-            for key, value in study.best_params.items():
-                print(f"  {key}: {value}")
-            
-            # Show trial statistics
-            completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-            pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
-            print(f"\nTrials: {completed} completed, {pruned} pruned")
-            print(f"\nBest configuration saved to: optuna_results/")
-            
-            prof.step()  # Step after Optuna (if using schedule)
-            
-        else:
-            # Normal training
-            pipeline = ChemicalKineticsPipeline(args.config)
-            pipeline.run()
-            prof.step()  # Step after run (if using schedule)
+    
+    # Execute based on mode
+    if args.normalize:
+        # Just normalize data
+        pipeline = ChemicalKineticsPipeline(args.config)
+        pipeline.normalize_only()
+        print("\nData normalization complete!")
+        
+    elif args.train:
+        # Train model
+        pipeline = ChemicalKineticsPipeline(args.config)
+        pipeline.run()
+        
+    elif args.tune:
+        # Run hyperparameter optimization
+        try:
+            import optuna
+        except ImportError:
+            print("Installing optuna...")
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "optuna"])
+        
+        from hyperparameter_tuning import optimize
+        
+        print(f"Starting hyperparameter optimization with {args.trials} trials...")
+        study = optimize(
+            config_path=args.config,
+            n_trials=args.trials,
+            n_jobs=1,
+            study_name=args.study_name
+        )
+        
+        # Print results
+        print("\n" + "="*60)
+        print("Optimization Complete")
+        print("="*60)
+        print(f"Best validation loss: {study.best_value:.6f}")
+        print(f"Best trial: {study.best_trial.number}")
+        print("\nBest parameters:")
+        for key, value in study.best_params.items():
+            print(f"  {key}: {value}")
+        
+        completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+        pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
+        print(f"\nTrials: {completed} completed, {pruned} pruned")
+        print(f"\nBest configuration saved to: optuna_results/")
 
 
 if __name__ == "__main__":
@@ -642,9 +1157,7 @@ if __name__ == "__main__":
 #!/usr/bin/env python3
 """
 Hyperparameter tuning for chemical kinetics models using Optuna.
-This version includes fixes for:
-1. Effective pruning during training via callbacks.
-2. Robust reconstruction of the best trial's configuration for saving.
+Optimized for ~40 hour runtime with aggressive but smart pruning.
 """
 
 import copy
@@ -656,6 +1169,7 @@ from typing import Dict, Any, Optional, Callable
 import numpy as np
 import optuna
 from optuna.samplers import TPESampler
+from optuna.pruners import HyperbandPruner
 import torch
 
 from main import ChemicalKineticsPipeline
@@ -669,22 +1183,21 @@ from utils.utils import setup_logging, seed_everything, ensure_directories, load
 
 class OptunaPruningCallback:
     """Callback to report intermediate values to Optuna for pruning."""
-    def __init__(self, trial: optuna.Trial):
+    def __init__(self, trial: optuna.Trial, min_epochs: int = 10):
         self.trial = trial
+        self.min_epochs = min_epochs
         
     def __call__(self, epoch: int, val_loss: float) -> bool:
         """
         Report intermediate value to Optuna and check if should prune.
-        
-        Args:
-            epoch: Current epoch number.
-            val_loss: Validation loss for this epoch.
-            
-        Returns:
-            True if the trial should be pruned, False otherwise.
+        Only allows pruning after min_epochs to avoid conflict with cosine warmup.
         """
         self.trial.report(val_loss, epoch)
         
+        # Don't prune during warmup period
+        if epoch < self.min_epochs:
+            return False
+            
         if self.trial.should_prune():
             return True
         return False
@@ -692,39 +1205,43 @@ class OptunaPruningCallback:
 
 class OptunaTrialRunner:
     """Manages the execution of a single Optuna trial."""
-    def __init__(self, base_config_path: Path, mode_to_dir: Dict[str, Path]):
+    def __init__(self, base_config_path: Path):
         self.base_config_path = base_config_path
         self.base_config = load_json_config(base_config_path)
         self.device = setup_device()
         self.logger = logging.getLogger(__name__)
-        self.mode_to_dir = mode_to_dir
         self._pipelines = {}
+        
+        # Preprocess data for all possible modes upfront
+        self._prepare_all_modes()
 
-    def _get_pipeline_for_mode(self, mode: str) -> 'OptunaPipeline':
-        if mode not in self._pipelines:
-            self.logger.info(f"Loading pipeline for '{mode}' mode from preprocessed data.")
-            mode_config = copy.deepcopy(self.base_config)
-            mode_config["prediction"]["mode"] = mode
-            mode_config["paths"]["processed_data_dir"] = str(self.mode_to_dir[mode])
-            self._pipelines[mode] = OptunaPipeline(mode_config)
-        return self._pipelines[mode]
+    def _prepare_all_modes(self):
+        """Ensure data is preprocessed for all possible prediction modes."""
+        # For absolute-only config, just prepare absolute mode
+        mode = self.base_config["prediction"]["mode"]
+        self.logger.info(f"Preparing data for '{mode}' mode...")
+        
+        pipeline = ChemicalKineticsPipeline(self.base_config)
+        pipeline.normalize_only()
+        
+        self._pipelines[mode] = OptunaPipeline(self.base_config, pipeline.processed_dir)
 
     def run_trial(self, trial: optuna.Trial) -> float:
         """Configures and runs a single trial."""
         config = suggest_model_config(trial, self.base_config)
         prediction_mode = config["prediction"]["mode"]
-        pipeline = self._get_pipeline_for_mode(prediction_mode)
+        pipeline = self._pipelines[prediction_mode]
         return pipeline.execute_trial(config, trial)
 
 
 class OptunaPipeline:
     """Holds datasets and executes the training for a specific prediction mode."""
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], processed_dir: Path):
         self.config = config
         self.device = setup_device()
         self.logger = logging.getLogger(f"OptunaPipeline_{config['prediction']['mode']}")
         
-        self.processed_dir = Path(self.config["paths"]["processed_data_dir"])
+        self.processed_dir = processed_dir
         self.model_save_root = Path(self.config["paths"]["model_save_dir"])
         
         norm_stats_path = self.processed_dir / "normalization.json"
@@ -763,7 +1280,17 @@ class OptunaPipeline:
             optimize_hardware(config["system"], self.device)
             model = create_model(config, self.device)
             
-            pruning_callback = OptunaPruningCallback(trial)
+            # Use dynamic epoch allocation from Hyperband
+            n_epochs = trial.user_attrs.get("n_epochs", config["training"]["hpo_max_epochs"])
+            config["training"]["epochs"] = n_epochs
+            
+            # Create pruning callback with minimum epochs
+            min_epochs = config["training"]["hpo_min_epochs"]
+            pruning_callback = OptunaPruningCallback(trial, min_epochs)
+            
+            # Log trial configuration
+            self.logger.info(f"Trial {trial.number}: {n_epochs} epochs allocated by Hyperband")
+            self.logger.info(f"Learning rate: {config['training']['learning_rate']:.2e}")
             
             trainer = PrunableTrainer(
                 model=model, train_dataset=self.train_dataset,
@@ -771,15 +1298,15 @@ class OptunaPipeline:
                 config=config, save_dir=save_dir, device=self.device,
                 norm_helper=self.norm_helper, epoch_callback=pruning_callback
             )
-
-            config["training"]["epochs"] = min(
-                config["training"].get("hpo_epochs", 50), config["training"]["epochs"]
-            )
             
             best_val_loss = trainer.train()
 
             trial.set_user_attr("full_config", config)
+            trial.set_user_attr("final_lr", trainer.optimizer.param_groups[0]['lr'])
             save_json(config, save_dir / "config.json")
+            
+            self.logger.info(f"Trial {trial.number} completed. Best loss: {best_val_loss:.6f}, "
+                             f"Final LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
             
             return best_val_loss
             
@@ -821,10 +1348,8 @@ class PrunableTrainer(Trainer):
             self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
 
             if self.epoch_callback:
-                # Use validation loss if available, otherwise fall back to training loss
                 loss_for_pruning = val_loss if self.has_validation and val_loss != float("inf") else train_loss
                 
-                # Report the loss and check if trial should be pruned
                 if self.epoch_callback(epoch, loss_for_pruning):
                     self.logger.info(f"Trial pruned at epoch {epoch} with loss {loss_for_pruning:.6f}")
                     raise optuna.TrialPruned()
@@ -842,7 +1367,6 @@ class PrunableTrainer(Trainer):
                     self.logger.info(f"Early stopping triggered at epoch {epoch}")
                     break
             else:
-                # No validation set: save based on best training loss
                 if train_loss < (best_train_loss - self.min_delta):
                     best_train_loss = train_loss
                     self.best_val_loss = train_loss
@@ -854,168 +1378,160 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     """Suggests a valid model and training configuration for a trial."""
     config = copy.deepcopy(base_config)
 
-    # First decide prediction mode
-    prediction_mode = trial.suggest_categorical("prediction_mode", ["absolute", "ratio"])
-    config["prediction"]["mode"] = prediction_mode
-
-    # Bug 4 Fix: Enforce model type based on prediction mode
-    if prediction_mode == "ratio":
-        # Ratio mode ONLY works with deeponet
-        model_type = "deeponet"
-        # Don't even suggest it as a hyperparameter
-    else:
-        # Absolute mode can use either model
-        model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
+    # For absolute-only mode
+    config["prediction"]["mode"] = "absolute"
     
+    # Model architecture choice
+    model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
     config["model"]["type"] = model_type
+
+
     
-    # Rest of the hyperparameter suggestions
-    config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu"])
+    
+    # Common hyperparameters - EXPANDED SEARCH SPACE
+    config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu", "tanh"])
     config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [1024, 2048, 4096, 8192])
+    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [1024, 4096])
+    config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+    config["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.1, step=0.05)
+    
+    # Scheduler parameters
+    config["training"]["scheduler_params"]["T_0"] = trial.suggest_categorical("cosine_T_0", [10])
+    
+    # Gradient accumulation adjustment
+    if config["training"]["batch_size"] <= 1024:
+        config["training"]["gradient_accumulation_steps"] = 8
+    elif config["training"]["batch_size"] <= 2048:
+        config["training"]["gradient_accumulation_steps"] = 4
+    elif config["training"]["batch_size"] <= 4096:
+        config["training"]["gradient_accumulation_steps"] = 2
+    else:
+        config["training"]["gradient_accumulation_steps"] = 1
 
     if model_type == "deeponet":
+        # More flexible architecture search
         n_branch = trial.suggest_int("n_branch_layers", 2, 5)
-        config["model"]["branch_layers"] = [
-            trial.suggest_int(f"branch_layer_{i}", 64, 512, step=64) 
-            for i in range(n_branch)
-        ]
+        branch_layers = []
+        for i in range(n_branch):
+            if i == 0:
+                width = trial.suggest_categorical(f"branch_layer_{i}", [256, 384, 512])
+            else:
+                # Allow different widths per layer
+                width = trial.suggest_categorical(f"branch_layer_{i}", [128, 256, 384])
+            branch_layers.append(width)
+        config["model"]["branch_layers"] = branch_layers
+        
         n_trunk = trial.suggest_int("n_trunk_layers", 2, 4)
-        config["model"]["trunk_layers"] = [
-            trial.suggest_int(f"trunk_layer_{i}", 64, 256, step=32) 
-            for i in range(n_trunk)
-        ]
+        trunk_layers = []
+        for i in range(n_trunk):
+            width = trial.suggest_categorical(f"trunk_layer_{i}", [64, 128, 192])
+            trunk_layers.append(width)
+        config["model"]["trunk_layers"] = trunk_layers
+        
         config["model"]["basis_dim"] = trial.suggest_categorical("basis_dim", [64, 128, 256])
+        config["model"]["output_scale"] = trial.suggest_categorical("output_scale", [0.1, 1.0, 10.0])
+        
     else:  # SIREN
-        n_layers = trial.suggest_int("n_hidden_layers", 3, 7)
-        config["model"]["hidden_dims"] = [
-            trial.suggest_int(f"hidden_dim_{i}", 128, 512, step=64) 
-            for i in range(n_layers)
-        ]
-        config["model"]["omega_0"] = trial.suggest_float("omega_0", 20.0, 40.0)
+        n_layers = trial.suggest_int("n_hidden_layers", 3, 6)
+        hidden_dims = []
+        for i in range(n_layers):
+            if i == 0:
+                width = trial.suggest_categorical(f"hidden_dim_{i}", [256, 384, 512])
+            else:
+                width = trial.suggest_categorical(f"hidden_dim_{i}", [128, 256, 384])
+            hidden_dims.append(width)
+        config["model"]["hidden_dims"] = hidden_dims
+        config["model"]["omega_0"] = trial.suggest_float("omega_0", 10.0, 50.0)  # Wider range
 
-    if trial.suggest_categorical("use_film", [True, False]):
-        config["film"]["enabled"] = True
-        n_film = trial.suggest_int("film_n_layers", 1, 3)
-        config["film"]["hidden_dims"] = [
-            trial.suggest_int(f"film_layer_{i}", 64, 256, step=32) 
-            for i in range(n_film)
-        ]
-    else:
-        config["film"]["enabled"] = False
+    # FiLM configuration
+    use_film = trial.suggest_categorical("use_film", [True, False])
+    config["film"]["enabled"] = use_film
+    if use_film:
+        film_layers = trial.suggest_int("film_layers", 1, 3)
+        film_widths = []
+        for i in range(film_layers):
+            width = trial.suggest_categorical(f"film_width_{i}", [32, 64, 128])
+            film_widths.append(width)
+        config["film"]["hidden_dims"] = film_widths
+        config["film"]["activation"] = trial.suggest_categorical("film_activation", ["gelu", "relu"])
+
+    # Loss function
+    config["training"]["loss"] = trial.suggest_categorical("loss", ["mse"])
+    if config["training"]["loss"] == "huber":
+        config["training"]["huber_delta"] = trial.suggest_float("huber_delta", 0.1, 2.0)
+
+    # Gradient clipping
+    config["training"]["gradient_clip"] = trial.suggest_categorical("gradient_clip", [1.0])
 
     return config
 
 
-def _reconstruct_config_from_params(base_config: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Reconstructs the full config dictionary from a flat dictionary of Optuna parameters.
-    This serves as a robust fallback for saving the best trial's configuration.
-    """
-    config = copy.deepcopy(base_config)
-    
-    # Simple direct mappings
-    config["prediction"]["mode"] = params.get("prediction_mode", config["prediction"]["mode"])
-    config["model"]["type"] = params.get("model_type", config["model"]["type"])
-    config["model"]["activation"] = params.get("activation", config["model"]["activation"])
-    config["training"]["learning_rate"] = params.get("lr", config["training"]["learning_rate"])
-    config["training"]["batch_size"] = params.get("batch_size", config["training"]["batch_size"])
-    config["film"]["enabled"] = params.get("use_film", config["film"]["enabled"])
-
-    # Conditional logic for model type
-    if config["prediction"]["mode"] == "ratio":
-        config["model"]["type"] = "deeponet"
-
-    # DeepONet specific parameters
-    if config["model"]["type"] == "deeponet":
-        if "n_branch_layers" in params:
-            n = params["n_branch_layers"]
-            config["model"]["branch_layers"] = [params[f"branch_layer_{i}"] for i in range(n)]
-        if "n_trunk_layers" in params:
-            n = params["n_trunk_layers"]
-            config["model"]["trunk_layers"] = [params[f"trunk_layer_{i}"] for i in range(n)]
-        if "basis_dim" in params:
-            config["model"]["basis_dim"] = params["basis_dim"]
-
-    # SIREN specific parameters
-    elif config["model"]["type"] == "siren":
-        if "n_hidden_layers" in params:
-            n = params["n_hidden_layers"]
-            config["model"]["hidden_dims"] = [params[f"hidden_dim_{i}"] for i in range(n)]
-        if "omega_0" in params:
-            config["model"]["omega_0"] = params["omega_0"]
-
-    # FiLM specific parameters
-    if config["film"]["enabled"]:
-        if "film_n_layers" in params:
-            n = params["film_n_layers"]
-            config["film"]["hidden_dims"] = [params[f"film_layer_{i}"] for i in range(n)]
-            
-    return config
-
-
-def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
+def optimize(config_path: Path, n_trials: int = 25, n_jobs: int = 1,
              study_name: str = "chemulator_hpo", pruner: Optional[optuna.pruners.BasePruner] = None):
     """
-    Main function to run Optuna optimization with fixed pruning and result saving.
+    Main function to run Optuna optimization with Hyperband for 40-hour runtime.
     """
     logger = logging.getLogger(__name__)
     base_config = load_json_config(config_path)
     
-    possible_modes = ["absolute", "ratio"]
-    mode_to_dir = {}
-    for mode in possible_modes:
-        logger.info(f"Preparing data for prediction mode: '{mode}'")
-        mode_config = copy.deepcopy(base_config)
-        mode_config["prediction"]["mode"] = mode
-        
-        # Construct the processed data directory path within the base processed_data_dir
-        base_processed_dir = Path(mode_config["paths"]["processed_data_dir"])
-        processed_dir = base_processed_dir / f"mode_{mode}"
-        mode_config["paths"]["processed_data_dir"] = str(processed_dir)
-        
-        # FIX: Directly instantiate pipeline with the mode-specific config dictionary
-        # This avoids redundant file reading and makes the intent clearer
-        pipeline = ChemicalKineticsPipeline(mode_config)
-        
-        # Update the processed_dir since it was set in setup_paths
-        pipeline.processed_dir = processed_dir
-        
-        # Preprocess the data for the current mode
-        pipeline.preprocess_data()
-        mode_to_dir[mode] = processed_dir
-
-    trial_runner = OptunaTrialRunner(config_path, mode_to_dir)
+    # Create trial runner which will prepare data
+    trial_runner = OptunaTrialRunner(config_path)
     objective = trial_runner.run_trial
 
+    # Use Hyperband pruner for efficient resource allocation
     if pruner is None:
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=8, n_warmup_steps=10, interval_steps=2)
+        min_resource = base_config["training"]["hpo_min_epochs"]
+        max_resource = base_config["training"]["hpo_max_epochs"]
+        
+        pruner = HyperbandPruner(
+            min_resource=min_resource,
+            max_resource=max_resource,
+            reduction_factor=3
+        )
+        
+        logger.info(f"Using Hyperband pruner: min={min_resource} epochs, max={max_resource} epochs")
 
     study = optuna.create_study(
-        direction="minimize", sampler=TPESampler(seed=42), pruner=pruner,
-        study_name=study_name, storage=f"sqlite:///{study_name}.db",
+        direction="minimize",
+        sampler=TPESampler(seed=42, n_startup_trials=5),
+        pruner=pruner,
+        study_name=study_name,
+        storage=f"sqlite:///{study_name}.db",
         load_if_exists=True
     )
 
+    # Log expected runtime
+    logger.info(f"Starting optimization with target {n_trials} trials")
+    logger.info(f"Expected runtime: ~40 hours with aggressive pruning")
+
     study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
 
-    # --- Save Results ---
+    # Save Results
     results_dir = Path("optuna_results")
     ensure_directories(results_dir)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-    # Retrieve the exact config, using the new reconstruction method as a fallback
     best_config = study.best_trial.user_attrs.get("full_config", {})
     if not best_config:
-        logger.warning("Could not retrieve full config from user_attrs. Reconstructing from best_params.")
-        best_config = _reconstruct_config_from_params(base_config, study.best_trial.params)
+        logger.warning("Could not retrieve full config from user_attrs.")
+
+    # Compute statistics
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+    
+    epoch_distribution = {}
+    for t in completed_trials + pruned_trials:
+        n_epochs = t.user_attrs.get("n_epochs", "unknown")
+        epoch_distribution[n_epochs] = epoch_distribution.get(n_epochs, 0) + 1
 
     best_results = {
         "best_value": study.best_value,
         "best_params": study.best_trial.params,
         "best_config": best_config,
-        "n_trials_completed": len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
-        "n_trials_pruned": len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]),
+        "n_trials_completed": len(completed_trials),
+        "n_trials_pruned": len(pruned_trials),
+        "epoch_distribution": epoch_distribution,
+        "best_trial_final_lr": study.best_trial.user_attrs.get("final_lr", "unknown"),
         "study_db": f"{study_name}.db"
     }
     
@@ -1025,7 +1541,11 @@ def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
     print("OPTIMIZATION COMPLETE")
     print("="*60)
     print(f"Best validation loss: {best_results['best_value']:.6f}")
+    print(f"Best trial final LR: {best_results['best_trial_final_lr']}")
     print(f"Trials: {best_results['n_trials_completed']} completed, {best_results['n_trials_pruned']} pruned")
+    print("\nEpoch distribution:")
+    for epochs, count in sorted(epoch_distribution.items()):
+        print(f"  {epochs} epochs: {count} trials")
     print("\nBest parameters:")
     for key, value in best_results['best_params'].items():
         print(f"  {key}: {value}")
@@ -1036,18 +1556,13 @@ def optimize(config_path: Path, n_trials: int = 100, n_jobs: int = 1,
 #!/usr/bin/env python3
 """
 Training pipeline for chemical kinetics models.
-Fixed issues:
-1. Correct scheduler stepping with gradient accumulation
-2. Removed all MAE calculations
-3. Fixed ratio mode loss calculation
-4. Fixed no-validation logic
 """
 
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 import math
 
 import torch
@@ -1131,7 +1646,7 @@ class Trainer:
         
     def trainer_init_validation(self):
         """Add this to Trainer.__init__ after self.prediction_mode is set"""
-        # Bug 2 Fix: Validate ratio mode requirements at initialization
+        # Validate ratio mode requirements at initialization
         if self.prediction_mode == "ratio":
             if not hasattr(self.norm_helper, 'ratio_stats') or self.norm_helper.ratio_stats is None:
                 raise ValueError(
@@ -1371,7 +1886,7 @@ class Trainer:
         return self.best_val_loss
     
     def _run_training_loop(self):
-        """Main training loop with fix for no-validation saving."""
+        """Main training loop"""
         best_train_loss = float("inf")
         
         for epoch in range(1, self.train_config["epochs"] + 1):
@@ -1738,7 +2253,7 @@ def ensure_directories(*paths: Union[str, Path]) -> None:
 ===== /Users/imalsky/Desktop/Chemulator/src/utils/hardware.py =====
 #!/usr/bin/env python3
 """
-Simplified hardware detection and optimization utilities.
+Hardware detection and optimization utilities.
 """
 
 import logging
@@ -1800,8 +2315,7 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
 #!/usr/bin/env python3
 """
 Model definitions for chemical kinetics neural networks with ratio mode support.
-Fixed issues:
-1. FiLM layer initialization only zeros weights when beta is used
+Includes dropout regularization for both SIREN and DeepONet architectures.
 """
 
 import logging
@@ -1812,6 +2326,7 @@ from typing import Dict, Any, List, Optional
 import torch
 import torch.nn as nn
 from torch.export import Dim
+
 
 class FiLMLayer(nn.Module):
     """Feature-wise Linear Modulation layer."""
@@ -1870,7 +2385,7 @@ class FiLMLayer(nn.Module):
 
 
 class FiLMSIREN(nn.Module):
-    """SIREN with FiLM conditioning for chemical kinetics."""
+    """SIREN with FiLM conditioning and dropout for chemical kinetics."""
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
 
@@ -1881,6 +2396,10 @@ class FiLMSIREN(nn.Module):
 
         # SIREN parameters
         self.omega_0 = config["model"].get("omega_0", 30.0)
+        
+        # Dropout
+        dropout_rate = config["model"].get("dropout", 0.0)
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
 
         # FiLM configuration
         film_config = config.get("film", {})
@@ -1909,7 +2428,7 @@ class FiLMSIREN(nn.Module):
                     activation=film_config.get("activation", "gelu")
                 )
 
-                # CORRECTED: Only zero weights if beta is used, otherwise it's frozen
+                # Initialize FiLM to identity mapping
                 with torch.no_grad():
                     final_layer = film_layer.film_net[-1]
                     if film_layer.use_beta:
@@ -1950,7 +2469,7 @@ class FiLMSIREN(nn.Module):
             nn.init.uniform_(self.output_layer.weight, -bound, bound)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with FiLM conditioning."""
+        """Forward pass with FiLM conditioning and dropout."""
         # Extract components
         initial_conditions = x[:, :-1]  # All but time
         
@@ -1966,15 +2485,19 @@ class FiLMSIREN(nn.Module):
             
             # SIREN activation (sine)
             h = torch.sin(self.omega_0 * h)
+            
+            # Apply dropout after activation (except on last hidden layer)
+            if self.dropout is not None and i < len(self.layers) - 1:
+                h = self.dropout(h)
         
-        # Output
+        # Output (no dropout on output layer)
         output = self.output_layer(h)
         
         return output
 
 
 class FiLMDeepONet(nn.Module):
-    """Deep Operator Network with FiLM conditioning for ratio mode."""
+    """Deep Operator Network with FiLM conditioning and dropout."""
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         
@@ -1988,6 +2511,10 @@ class FiLMDeepONet(nn.Module):
         self.basis_dim = config["model"]["basis_dim"]
         self.activation = self._get_activation(config["model"].get("activation", "gelu"))
         self.output_scale = config["model"].get("output_scale", 1.0)
+        
+        # Dropout
+        dropout_rate = config["model"].get("dropout", 0.0)
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
         
         # FiLM configuration
         film_config = config.get("film", {})
@@ -2028,7 +2555,7 @@ class FiLMDeepONet(nn.Module):
                             output_dim: int, condition_dim: Optional[int] = None,
                             film_config: Optional[Dict] = None, bias: bool = True) -> nn.Module:
         """
-        Build an MLP with optional FiLM layers.
+        Build an MLP with optional FiLM layers and dropout.
 
         Args:
             input_dim: Input dimension for the MLP.
@@ -2061,31 +2588,43 @@ class FiLMDeepONet(nn.Module):
 
             output_layer = nn.Linear(prev_dim, output_dim, bias=bias)
 
-            class MLPWithFiLM(nn.Module):
-                def __init__(self, layers, film_layers, output_layer, activation):
+            class MLPWithFiLMAndDropout(nn.Module):
+                def __init__(self, layers, film_layers, output_layer, activation, dropout):
                     super().__init__()
                     self.layers = layers
                     self.film_layers = film_layers
                     self.output_layer = output_layer
                     self.activation = activation
+                    self.dropout = dropout
 
                 def forward(self, x, condition):
                     h = x
-                    for layer, film_layer in zip(self.layers, self.film_layers):
+                    for i, (layer, film_layer) in enumerate(zip(self.layers, self.film_layers)):
                         h = layer(h)
                         h = film_layer(h, condition)
                         h = self.activation(h)
+                        
+                        # Apply dropout after activation (except on last hidden layer)
+                        if self.dropout is not None and i < len(self.layers) - 1:
+                            h = self.dropout(h)
+                            
                     return self.output_layer(h)
 
-            return MLPWithFiLM(layers, film_layers, output_layer, self.activation)
+            return MLPWithFiLMAndDropout(layers, film_layers, output_layer, self.activation, self.dropout)
 
         else:
-            # Build standard MLP
+            # Build standard MLP with dropout
             layers = []
             prev_dim = input_dim
 
-            for dim in hidden_layers:
-                layers.extend([nn.Linear(prev_dim, dim, bias=bias), self.activation])
+            for i, dim in enumerate(hidden_layers):
+                layers.append(nn.Linear(prev_dim, dim, bias=bias))
+                layers.append(self.activation)
+                
+                # Add dropout after activation (except on last hidden layer)
+                if self.dropout is not None and i < len(hidden_layers) - 1:
+                    layers.append(self.dropout)
+                    
                 prev_dim = dim
 
             layers.append(nn.Linear(prev_dim, output_dim, bias=bias))
@@ -2128,7 +2667,7 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     model_type = config["model"]["type"].lower()
     prediction_mode = config.get("prediction", {}).get("mode", "absolute")
     
-    # Bug 4 Fix: Enforce mode-model compatibility
+    # Enforce mode-model compatibility
     if prediction_mode == "ratio" and model_type != "deeponet":
         raise ValueError(
             f"Prediction mode 'ratio' is only compatible with model type 'deeponet', "
@@ -2145,16 +2684,20 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     
     model = model.to(device)
     
+    # Log model configuration
+    logger = logging.getLogger(__name__)
+    logger.info(f"Created {model_type} model with dropout={config['model'].get('dropout', 0.0)}")
+    
     # Compile model if enabled and supported
     if config["system"].get("use_torch_compile", False) and hasattr(torch, 'compile'):
         compile_mode = config["system"].get("compile_mode", "default")
-        logging.info(f"Compiling model with mode='{compile_mode}'...")
+        logger.info(f"Compiling model with mode='{compile_mode}'...")
         
         try:
             model = torch.compile(model, mode=compile_mode)
-            logging.info("Model compilation successful")
+            logger.info("Model compilation successful")
         except Exception as e:
-            logging.warning(f"Model compilation failed: {e}")
+            logger.warning(f"Model compilation failed: {e}")
     
     return model
 
@@ -2205,12 +2748,6 @@ def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path)
 Chemical kinetics data preprocessor.
 This version uses a highly efficient, parallelized, two-pass process with an
 architecture that minimizes inter-process communication (IPC) and memory overhead.
-
---- UPDATED FEATURES ---
-- Stricter Filtering: Drops entire profiles if they contain any non-finite values (NaN/inf)
-  or any species value below a configurable 'min_value_threshold'.
-- Summary Reporting: Generates a human-readable summary log detailing how many
-  profiles were processed, kept, and dropped (with reasons).
 """
 
 import hashlib
@@ -2258,7 +2795,7 @@ class CorePreprocessor:
         self.normalizer = DataNormalizer(config)
         self.norm_stats = norm_stats or {}
         
-        # Create index mappings for robust variable ordering (Bug 3 fix)
+        # Create index mappings for robust variable ordering
         self._create_index_mappings()
         
         if norm_stats:
@@ -2268,7 +2805,7 @@ class CorePreprocessor:
             )
     
     def _create_index_mappings(self):
-        """Create index mappings for robust variable access (Bug 3 fix)."""
+        """Create index mappings for robust variable access"""
         self.var_to_idx = {var: i for i, var in enumerate(self.var_order)}
         self.species_indices = [self.var_to_idx[var] for var in self.species_vars]
         self.global_indices = [self.var_to_idx[var] for var in self.global_vars]
@@ -2303,10 +2840,22 @@ class CorePreprocessor:
     def process_file_for_stats(self, file_path: Path) -> Tuple[Dict, Dict, int, Dict]:
         """Worker logic for Pass 1: compute stats, counts, and a validation report."""
         accumulators = self.normalizer._initialize_accumulators()
-        ratio_accumulators = {
-            var: {"count": 0, "mean": 0.0, "m2": 0.0, "min": float("inf"), "max": float("-inf")}
-            for var in self.species_vars
-        } if self.prediction_mode == "ratio" else {}
+        ratio_accumulators = {}
+        if self.prediction_mode == "ratio":
+            for var in self.species_vars:
+                # Get the normalization method for this specific variable
+                method = self.normalizer._get_method(var)
+                
+                # Only create an accumulator if the method is NOT "none"
+                if method != "none":
+                    ratio_accumulators[var] = {
+                        "method": method,
+                        "count": 0,
+                        "mean": 0.0,
+                        "m2": 0.0,
+                        "min": float("inf"),
+                        "max": float("-inf")
+                    }
         
         valid_sample_count = 0
         
@@ -2388,12 +2937,12 @@ class CorePreprocessor:
         }
 
     def _update_stats_for_profile(self, profile, n_t, accumulators, ratio_accumulators):
-        """Updated method with Bug 1 fix: consistent normalization in both modes."""
+        """Consistent normalization in both modes."""
         import logging
         logger = logging.getLogger(__name__)
         
         if self.prediction_mode == "ratio":
-            # Bug 1 Fix: Use full profiles for all variables in ratio mode
+            # Use full profiles for all variables in ratio mode
             for var, acc in accumulators.items():
                 idx = acc["index"]
                 method = acc["method"]
@@ -2409,20 +2958,20 @@ class CorePreprocessor:
                         vec = np.log10(np.maximum(vec, self.normalizer.epsilon))
                     self.normalizer._update_single_accumulator(acc, vec, var)
             
-            # Compute ratio statistics correctly with proper indices (Bug 3 fix)
+            # Compute ratio statistics correctly with proper indices
             initial = profile[0, self.species_indices]
             future = profile[1:, self.species_indices]
             
             ratios = future / np.maximum(initial[None, :], self.normalizer.epsilon)
             
-            # Bug 5 Fix: Add logging for extreme values
+            # Add logging for extreme values
             if np.any(ratios < self.normalizer.epsilon):
                 n_below = np.sum(ratios < self.normalizer.epsilon)
                 logger.warning(f"Found {n_below} ratio values below epsilon {self.normalizer.epsilon}")
             
             log_ratios = np.log10(np.maximum(ratios, self.normalizer.epsilon))
             
-            # Bug 5 Fix: Log if clipping is needed
+            # Log if clipping is needed
             if np.any(np.abs(log_ratios) > self.norm_cfg.get("clamp_value", 50.0)):
                 n_clamped = np.sum(np.abs(log_ratios) > self.norm_cfg.get("clamp_value", 50.0))
                 logger.warning(f"Clamping {n_clamped} extreme log-ratio values")
@@ -2467,14 +3016,14 @@ class CorePreprocessor:
         return profile
 
     def _profile_to_samples(self, norm_prof, n_t):
-        """Updated method with Bug 3 fix: use proper indices."""
+        """Get samples"""
         if n_t <= 1:
             return None
         
         n_inputs = self.n_species + self.n_globals + 1
         samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
         
-        # Use proper variable ordering (Bug 3 fix)
+        # Use proper variable ordering
         samples[:, :self.n_species] = norm_prof[0, self.species_indices]  # Initial species
         samples[:, self.n_species:self.n_species + self.n_globals] = norm_prof[0, self.global_indices]  # Globals
         samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]  # Time
@@ -2483,7 +3032,7 @@ class CorePreprocessor:
         return samples
 
     def _profile_to_samples_ratio(self, raw_prof, n_t, ratio_stats):
-        """Updated method with Bug 3 fix: use proper indices."""
+        """Use proper indices for samples in ratio mode"""
         import logging
         logger = logging.getLogger(__name__)
         
@@ -2496,7 +3045,7 @@ class CorePreprocessor:
         # Normalize the profile
         norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(raw_prof)).numpy()
         
-        # Use proper variable ordering (Bug 3 fix)
+        # Use proper variable ordering
         samples[:, :self.n_species] = norm_prof[0, self.species_indices]  # Initial species
         samples[:, self.n_species:self.n_species + self.n_globals] = norm_prof[0, self.global_indices]  # Globals
         samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]  # Time
@@ -2506,7 +3055,7 @@ class CorePreprocessor:
         future = raw_prof[1:, self.species_indices]
         ratios = future / np.maximum(initial[None, :], self.norm_cfg["epsilon"])
         
-        # Bug 5 Fix: Log extreme values before processing
+        # Log extreme values before processing
         if np.any(ratios == 0):
             logger.warning(f"Found {np.sum(ratios == 0)} zero ratios - will be clamped to epsilon")
         
@@ -2517,7 +3066,7 @@ class CorePreprocessor:
         stds = np.array([ratio_stats[v]["std"] for v in self.species_vars], dtype=np.float32)
         std_log_ratios = (log_ratios - means) / np.maximum(stds, self.norm_cfg["min_std"])
         
-        # Bug 5 Fix: Log if clamping occurs
+        # Log if clamping occurs
         clamp_val = self.norm_cfg.get("clamp_value", 50.0)
         if np.any(np.abs(std_log_ratios) > clamp_val):
             n_clamped = np.sum(np.abs(std_log_ratios) > clamp_val)
@@ -2828,13 +3377,10 @@ import time
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List, Iterator
 from functools import lru_cache
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
 import psutil
-import os
-
 
 class ShardAwareSampler(Sampler):
     """
@@ -3043,7 +3589,7 @@ class NPYDataset(Dataset):
         # Calculate how many shards fit in allocated memory per worker
         memory_based_shards = int(max_cache_memory_per_worker / max(1, effective_shard_size))
         
-        # Apply configuration limits - THIS IS WHERE THE BUG FIX HAPPENS
+        # Apply configuration limits
         # The config should have a reasonable default, not 1
         config_limit = self.config["training"].get("dataset_cache_shards", 16)  # Changed default
         
@@ -3328,7 +3874,7 @@ class NPYDataset(Dataset):
         self.logger.info(f"{'='*60}")
         self.logger.info(f"System Memory: {total_gb:.1f} GB total, {available_gb:.1f} GB available")
         self.logger.info(f"Configuration: {num_workers} workers, {cache_shards} cached shards, "
-                        f"{batch_size} batch size")
+                         f"{batch_size} batch size")
         self.logger.info(f"\nMemory Breakdown:")
         self.logger.info(f"  - Shard cache: {memory_breakdown['shard_cache_per_worker_gb']:.2f} GB/worker")
         self.logger.info(f"  - Prefetch buffer: {memory_breakdown['prefetch_per_worker_gb']:.2f} GB/worker")
@@ -3473,8 +4019,6 @@ def _validate_batch_prefetch(batch_size: int,
     if device is None or device.type != "cuda":
         return
     
-    import torch
-    
     # Calculate memory needed for prefetched batches
     bytes_needed = batch_size * max(prefetch_factor, 1) * feature_dim * 4  # float32
     
@@ -3504,11 +4048,9 @@ from typing import Dict, List, Any, Optional
 import numpy as np
 import torch
 
-
-DEFAULT_EPSILON = 1e-20
+DEFAULT_EPSILON = 1e-30
 DEFAULT_MIN_STD = 1e-10
 DEFAULT_CLAMP = 50.0
-
 
 class DataNormalizer:
     """Calculates normalization statistics with robust data validation."""

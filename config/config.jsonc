@@ -76,12 +76,13 @@
         // Minimum standard deviation to prevent division by tiny values
         "min_std": 1e-10,
         // Clamp normalized values to [-clamp_value, clamp_value]
-        "clamp_value": 50.0
+        "clamp_value": 30.0
     },
     
     // ===== MODEL ARCHITECTURE =====
     "model": {
-        // Model type: "deeponet" or "siren" (both work with absolute mode)
+        // Model type: "deeponet" or "siren
+        // Both work with absolute mode, ratio only with deeponet
         "type": "deeponet",
         
         // Activation function: "gelu", "relu", "silu", "tanh"
@@ -135,6 +136,7 @@
         "gradient_accumulation_steps": 2,
         
         // MEMORY-OPTIMIZED DATALOADER SETTINGS
+        // I think I finally got this to stop breaking with OOM
         "num_workers": 8,
         "pin_memory": true,
         "persistent_workers": true,
@@ -149,12 +151,12 @@
         "eps": 1e-8,
         "gradient_clip": 1.0,
         
-        // Scheduler settings - CRITICAL FOR LR DECAY
+        // Scheduler settings
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 10,  // Restart every 8 epochs (5 cycles in 40 epochs)
-            "T_mult": 2,  // Keep cycle length constant
-            "eta_min": 1e-8  // ENSURES LR DROPS TO 1e-8
+            "T_0": 10,  // How often to restart learning
+            "T_mult": 2,  // Geometric increase
+            "eta_min": 1e-8  // Drop to this learning rate
         },
         
         // Loss and training settings
@@ -162,15 +164,17 @@
         "huber_delta": 0.5,
         "use_amp": true,
         "amp_dtype": "bfloat16",
-        "early_stopping_patience": 10,  // Stop if no improvement for 8 epochs
+        "early_stopping_patience": 10,
         "min_delta": 1e-8,
         "log_interval": 100,
         "save_interval": 10,
         "empty_cache_interval": 500,
         
         // HPO-specific settings
-        "hpo_min_epochs": 10,  // Minimum epochs before pruning
-        "hpo_max_epochs": 40   // Maximum epochs for best trials
+        // Minimum epochs before pruning
+        "hpo_min_epochs": 10,  
+        // Maximum epochs for best trials
+        "hpo_max_epochs": 40  
     },
     
     // ===== SYSTEM/HARDWARE SETTINGS =====
@@ -179,9 +183,9 @@
         "seed": 42,
         
         // PyTorch optimizations
-        "use_torch_compile": false,
+        "use_torch_compile": true,
         "compile_mode": "default",
-        "use_torch_export": false,
+        "use_torch_export": true,
         
         // CUDA optimizations for A100
         "cudnn_benchmark": true,

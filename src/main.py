@@ -3,17 +3,11 @@ import logging
 import sys
 import time
 from pathlib import Path
-import shutil
 import torch
-from typing import Dict, Any, Optional, Callable, Union
+from typing import Dict, Any, Union
 import hashlib
 import json
 
-# ============================ START: CRITICAL FIX BLOCK ===========================
-# This must be the first major action in the script to configure PyTorch's
-# multiprocessing behavior BEFORE any DataLoader workers are ever created.
-
-# 1. Set up basic logging IMMEDIATELY to see all messages.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
@@ -28,10 +22,8 @@ try:
     logging.info("SUCCESS: Set multiprocessing sharing strategy to 'file_system'.")
 except RuntimeError:
     logging.warning("Could not set multiprocessing sharing strategy (already set or not supported).")
-# ============================= END: CRITICAL FIX BLOCK ============================
 
 import numpy as np
-
 from utils.hardware import setup_device, optimize_hardware
 from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
 from data.preprocessor import DataPreprocessor

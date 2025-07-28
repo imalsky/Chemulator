@@ -7,6 +7,7 @@
 # 
 # Usage:
 #   sbatch run.sh [train|tune] [--trials N]
+#   
 # 
 # Examples:
 #   sbatch run.sh train              # Normalize then train
