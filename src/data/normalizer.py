@@ -12,11 +12,9 @@ from typing import Dict, List, Any, Optional
 import numpy as np
 import torch
 
-
-DEFAULT_EPSILON = 1e-20
+DEFAULT_EPSILON = 1e-30
 DEFAULT_MIN_STD = 1e-10
 DEFAULT_CLAMP = 50.0
-
 
 class DataNormalizer:
     """Calculates normalization statistics with robust data validation."""

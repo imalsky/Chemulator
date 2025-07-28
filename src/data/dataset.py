@@ -17,13 +17,10 @@ import time
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List, Iterator
 from functools import lru_cache
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
 import psutil
-import os
-
 
 class ShardAwareSampler(Sampler):
     """
@@ -232,7 +229,7 @@ class NPYDataset(Dataset):
         # Calculate how many shards fit in allocated memory per worker
         memory_based_shards = int(max_cache_memory_per_worker / max(1, effective_shard_size))
         
-        # Apply configuration limits - THIS IS WHERE THE BUG FIX HAPPENS
+        # Apply configuration limits
         # The config should have a reasonable default, not 1
         config_limit = self.config["training"].get("dataset_cache_shards", 16)  # Changed default
         
@@ -517,7 +514,7 @@ class NPYDataset(Dataset):
         self.logger.info(f"{'='*60}")
         self.logger.info(f"System Memory: {total_gb:.1f} GB total, {available_gb:.1f} GB available")
         self.logger.info(f"Configuration: {num_workers} workers, {cache_shards} cached shards, "
-                        f"{batch_size} batch size")
+                         f"{batch_size} batch size")
         self.logger.info(f"\nMemory Breakdown:")
         self.logger.info(f"  - Shard cache: {memory_breakdown['shard_cache_per_worker_gb']:.2f} GB/worker")
         self.logger.info(f"  - Prefetch buffer: {memory_breakdown['prefetch_per_worker_gb']:.2f} GB/worker")
@@ -661,8 +658,6 @@ def _validate_batch_prefetch(batch_size: int,
     """
     if device is None or device.type != "cuda":
         return
-    
-    import torch
     
     # Calculate memory needed for prefetched batches
     bytes_needed = batch_size * max(prefetch_factor, 1) * feature_dim * 4  # float32

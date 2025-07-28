@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
 Training pipeline for chemical kinetics models.
-Fixed issues:
-1. Correct scheduler stepping with gradient accumulation
-2. Removed all MAE calculations
-3. Fixed ratio mode loss calculation
-4. Fixed no-validation logic
 """
 
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 import math
 
 import torch
@@ -96,7 +91,7 @@ class Trainer:
         
     def trainer_init_validation(self):
         """Add this to Trainer.__init__ after self.prediction_mode is set"""
-        # Bug 2 Fix: Validate ratio mode requirements at initialization
+        # Validate ratio mode requirements at initialization
         if self.prediction_mode == "ratio":
             if not hasattr(self.norm_helper, 'ratio_stats') or self.norm_helper.ratio_stats is None:
                 raise ValueError(
@@ -336,7 +331,7 @@ class Trainer:
         return self.best_val_loss
     
     def _run_training_loop(self):
-        """Main training loop with fix for no-validation saving."""
+        """Main training loop"""
         best_train_loss = float("inf")
         
         for epoch in range(1, self.train_config["epochs"] + 1):

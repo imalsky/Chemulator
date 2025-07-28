@@ -3,12 +3,6 @@
 Chemical kinetics data preprocessor.
 This version uses a highly efficient, parallelized, two-pass process with an
 architecture that minimizes inter-process communication (IPC) and memory overhead.
-
---- UPDATED FEATURES ---
-- Stricter Filtering: Drops entire profiles if they contain any non-finite values (NaN/inf)
-  or any species value below a configurable 'min_value_threshold'.
-- Summary Reporting: Generates a human-readable summary log detailing how many
-  profiles were processed, kept, and dropped (with reasons).
 """
 
 import hashlib
@@ -56,7 +50,7 @@ class CorePreprocessor:
         self.normalizer = DataNormalizer(config)
         self.norm_stats = norm_stats or {}
         
-        # Create index mappings for robust variable ordering (Bug 3 fix)
+        # Create index mappings for robust variable ordering
         self._create_index_mappings()
         
         if norm_stats:
@@ -66,7 +60,7 @@ class CorePreprocessor:
             )
     
     def _create_index_mappings(self):
-        """Create index mappings for robust variable access (Bug 3 fix)."""
+        """Create index mappings for robust variable access"""
         self.var_to_idx = {var: i for i, var in enumerate(self.var_order)}
         self.species_indices = [self.var_to_idx[var] for var in self.species_vars]
         self.global_indices = [self.var_to_idx[var] for var in self.global_vars]
@@ -110,7 +104,7 @@ class CorePreprocessor:
                 # Only create an accumulator if the method is NOT "none"
                 if method != "none":
                     ratio_accumulators[var] = {
-                        "method": method,  # The CRITICAL fix: Add the method key
+                        "method": method,
                         "count": 0,
                         "mean": 0.0,
                         "m2": 0.0,
@@ -198,12 +192,12 @@ class CorePreprocessor:
         }
 
     def _update_stats_for_profile(self, profile, n_t, accumulators, ratio_accumulators):
-        """Updated method with Bug 1 fix: consistent normalization in both modes."""
+        """Consistent normalization in both modes."""
         import logging
         logger = logging.getLogger(__name__)
         
         if self.prediction_mode == "ratio":
-            # Bug 1 Fix: Use full profiles for all variables in ratio mode
+            # Use full profiles for all variables in ratio mode
             for var, acc in accumulators.items():
                 idx = acc["index"]
                 method = acc["method"]
@@ -219,20 +213,20 @@ class CorePreprocessor:
                         vec = np.log10(np.maximum(vec, self.normalizer.epsilon))
                     self.normalizer._update_single_accumulator(acc, vec, var)
             
-            # Compute ratio statistics correctly with proper indices (Bug 3 fix)
+            # Compute ratio statistics correctly with proper indices
             initial = profile[0, self.species_indices]
             future = profile[1:, self.species_indices]
             
             ratios = future / np.maximum(initial[None, :], self.normalizer.epsilon)
             
-            # Bug 5 Fix: Add logging for extreme values
+            # Add logging for extreme values
             if np.any(ratios < self.normalizer.epsilon):
                 n_below = np.sum(ratios < self.normalizer.epsilon)
                 logger.warning(f"Found {n_below} ratio values below epsilon {self.normalizer.epsilon}")
             
             log_ratios = np.log10(np.maximum(ratios, self.normalizer.epsilon))
             
-            # Bug 5 Fix: Log if clipping is needed
+            # Log if clipping is needed
             if np.any(np.abs(log_ratios) > self.norm_cfg.get("clamp_value", 50.0)):
                 n_clamped = np.sum(np.abs(log_ratios) > self.norm_cfg.get("clamp_value", 50.0))
                 logger.warning(f"Clamping {n_clamped} extreme log-ratio values")
@@ -277,14 +271,14 @@ class CorePreprocessor:
         return profile
 
     def _profile_to_samples(self, norm_prof, n_t):
-        """Updated method with Bug 3 fix: use proper indices."""
+        """Get samples"""
         if n_t <= 1:
             return None
         
         n_inputs = self.n_species + self.n_globals + 1
         samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
         
-        # Use proper variable ordering (Bug 3 fix)
+        # Use proper variable ordering
         samples[:, :self.n_species] = norm_prof[0, self.species_indices]  # Initial species
         samples[:, self.n_species:self.n_species + self.n_globals] = norm_prof[0, self.global_indices]  # Globals
         samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]  # Time
@@ -293,7 +287,7 @@ class CorePreprocessor:
         return samples
 
     def _profile_to_samples_ratio(self, raw_prof, n_t, ratio_stats):
-        """Updated method with Bug 3 fix: use proper indices."""
+        """Use proper indices for samples in ratio mode"""
         import logging
         logger = logging.getLogger(__name__)
         
@@ -306,7 +300,7 @@ class CorePreprocessor:
         # Normalize the profile
         norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(raw_prof)).numpy()
         
-        # Use proper variable ordering (Bug 3 fix)
+        # Use proper variable ordering
         samples[:, :self.n_species] = norm_prof[0, self.species_indices]  # Initial species
         samples[:, self.n_species:self.n_species + self.n_globals] = norm_prof[0, self.global_indices]  # Globals
         samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]  # Time
@@ -316,7 +310,7 @@ class CorePreprocessor:
         future = raw_prof[1:, self.species_indices]
         ratios = future / np.maximum(initial[None, :], self.norm_cfg["epsilon"])
         
-        # Bug 5 Fix: Log extreme values before processing
+        # Log extreme values before processing
         if np.any(ratios == 0):
             logger.warning(f"Found {np.sum(ratios == 0)} zero ratios - will be clamped to epsilon")
         
@@ -327,7 +321,7 @@ class CorePreprocessor:
         stds = np.array([ratio_stats[v]["std"] for v in self.species_vars], dtype=np.float32)
         std_log_ratios = (log_ratios - means) / np.maximum(stds, self.norm_cfg["min_std"])
         
-        # Bug 5 Fix: Log if clamping occurs
+        # Log if clamping occurs
         clamp_val = self.norm_cfg.get("clamp_value", 50.0)
         if np.any(np.abs(std_log_ratios) > clamp_val):
             n_clamped = np.sum(np.abs(std_log_ratios) > clamp_val)

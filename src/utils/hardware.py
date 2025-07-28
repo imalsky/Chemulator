@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simplified hardware detection and optimization utilities.
+Hardware detection and optimization utilities.
 """
 
 import logging
