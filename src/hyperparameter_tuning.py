@@ -61,7 +61,6 @@ class OptunaTrialRunner:
 
     def _prepare_all_modes(self):
         """Ensure data is preprocessed for all possible prediction modes."""
-        # For absolute-only config, just prepare absolute mode
         mode = self.base_config["prediction"]["mode"]
         self.logger.info(f"Preparing data for '{mode}' mode...")
         
@@ -103,14 +102,21 @@ class OptunaPipeline:
         self._load_datasets()
 
     def _load_datasets(self):
-        """Loads datasets from the mode-specific directory."""
+        """Load split-specific datasets."""
         self.logger.info(f"Loading datasets from: {self.processed_dir}")
-        train_indices = np.load(self.processed_dir / "train_indices.npy")
-        val_indices = np.load(self.processed_dir / "val_indices.npy")
         
-        self.train_dataset = NPYDataset(self.processed_dir, train_indices, self.config, self.device, "train")
-        self.val_dataset = NPYDataset(self.processed_dir, val_indices, self.config, self.device, "validation")
-        self.logger.info(f"Datasets loaded: train={len(self.train_dataset)}, val={len(self.val_dataset)}")
+        # Much simpler - no indices needed!
+        self.train_dataset = NPYDataset(
+            self.processed_dir, "train", self.config, self.device
+        )
+        self.val_dataset = NPYDataset(
+            self.processed_dir, "validation", self.config, self.device
+        )
+        
+        self.logger.info(
+            f"Datasets loaded: train={len(self.train_dataset)}, "
+            f"val={len(self.val_dataset)}"
+        )
 
     def execute_trial(self, config: Dict[str, Any], trial: optuna.Trial) -> float:
         """Runs a single trial's training and evaluation with pruning."""
@@ -223,10 +229,10 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     config = copy.deepcopy(base_config)
 
     # For absolute-only mode
-    config["prediction"]["mode"] = "absolute"
+    config["prediction"]["mode"] = "ratio"
     
     # Model architecture choice
-    model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
+    model_type = trial.suggest_categorical("model_type", ["deeponet"])
     config["model"]["type"] = model_type
 
 
@@ -235,7 +241,7 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     # Common hyperparameters - EXPANDED SEARCH SPACE
     config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu", "tanh"])
     config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [1024, 4096])
+    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [16384])
     config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
     config["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.1, step=0.05)
     

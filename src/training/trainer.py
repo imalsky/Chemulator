@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
 Training pipeline for chemical kinetics models.
+Fixed issues:
+1. Correct scheduler stepping with gradient accumulation
+2. Removed all MAE calculations
+3. Fixed ratio mode loss calculation
+4. Fixed no-validation logic
 """
 
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 import math
 
 import torch
@@ -91,7 +96,7 @@ class Trainer:
         
     def trainer_init_validation(self):
         """Add this to Trainer.__init__ after self.prediction_mode is set"""
-        # Validate ratio mode requirements at initialization
+        # Bug 2 Fix: Validate ratio mode requirements at initialization
         if self.prediction_mode == "ratio":
             if not hasattr(self.norm_helper, 'ratio_stats') or self.norm_helper.ratio_stats is None:
                 raise ValueError(
@@ -331,7 +336,7 @@ class Trainer:
         return self.best_val_loss
     
     def _run_training_loop(self):
-        """Main training loop"""
+        """Main training loop with fix for no-validation saving."""
         best_train_loss = float("inf")
         
         for epoch in range(1, self.train_config["epochs"] + 1):
@@ -344,7 +349,6 @@ class Trainer:
             # Validate if available
             val_loss, val_metrics = self._validate()
 
-            # CORRECTED: Only step epoch-based schedulers here.
             # Batch-based schedulers are handled correctly in _train_epoch.
             if self.scheduler and not self.scheduler_step_on_batch:
                 if isinstance(self.scheduler, ReduceLROnPlateau) and self.has_validation:
@@ -384,12 +388,6 @@ class Trainer:
         """
         House-keeping that should run once every epoch.
         """
-        # Iterate through datasets and clear their caches if they have one
-        for dataset in [self.train_dataset, self.val_dataset, self.test_dataset]:
-            if dataset is not None and hasattr(dataset, '_get_shard_data'):
-                # _get_shard_data is the lru_cache wrapper
-                dataset._get_shard_data.cache_clear()
-
         # Then, do the garbage collection
         import gc
         gc.collect()
@@ -448,12 +446,12 @@ class Trainer:
             total_loss += loss.item() * inputs.size(0)
             total_samples += inputs.size(0)
 
-            if self.global_step > 0 and self.global_step % self.log_interval == 0:
-                self.logger.info(
-                    f"Epoch {self.current_epoch} | "
-                    f"Batch {batch_idx + 1}/{len(self.train_loader)} | "
-                    f"Loss: {total_loss / total_samples:.3e}"
-                )
+            #if self.global_step > 0 and self.global_step % self.log_interval == 0:
+            #    self.logger.info(
+            #        f"Epoch {self.current_epoch} | "
+            #        f"Batch {batch_idx + 1}/{len(self.train_loader)} | "
+            #        f"Loss: {total_loss / total_samples:.3e}"
+            #    )
         
         return total_loss / total_samples, {}
 
