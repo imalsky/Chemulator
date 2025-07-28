@@ -112,48 +112,45 @@ class ChemicalKineticsPipeline:
         return hashlib.sha256(hash_str.encode()).hexdigest()[:16]
 
     def normalize_only(self):
-        """Run only the data preprocessing and normalization step."""
-        self.logger.info("Running data normalization only...")
-        
-        # Check if data already exists with correct hash
-        current_hash = self._compute_data_hash()
-        hash_file = self.processed_dir / "data_hash.json"
-        
-        regenerate = True
-        if hash_file.exists():
-            saved_hash_data = load_json(hash_file)
-            if saved_hash_data.get("hash") == current_hash:
-                self.logger.info("Data already preprocessed with matching hash. Skipping regeneration.")
-                regenerate = False
-            else:
-                self.logger.info("Data hash mismatch. Regenerating data...")
-                self._clean_all_processed_data()
-        
-        if regenerate:
-            preprocessor = DataPreprocessor(
-                raw_files=self.raw_data_files,
-                output_dir=self.processed_dir,
-                config=self.config
-            )
+            """Run only the data preprocessing and normalization step."""
+            self.logger.info("Running data normalization only...")
             
-            missing = [p for p in self.raw_data_files if not p.exists()]
-            if missing:
-                raise FileNotFoundError(f"Missing raw data files: {missing}")
+            # Check if data already exists with correct hash
+            current_hash = self._compute_data_hash()
+            hash_file = self.processed_dir / "data_hash.json"
             
-            # Process to shards and compute normalization
-            preprocessor.process_to_npy_shards()
+            regenerate = True
+            if hash_file.exists():
+                saved_hash_data = load_json(hash_file)
+                if saved_hash_data.get("hash") == current_hash:
+                    self.logger.info("Data already preprocessed with matching hash. Skipping regeneration.")
+                    regenerate = False
+                else:
+                    self.logger.info("Data hash mismatch. Regenerating data...")
+                    self._clean_all_processed_data()
             
-            # Save the hash
-            save_json({
-                "hash": current_hash,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "mode": self.prediction_mode
-            }, hash_file)
-            
-            self.logger.info(f"Data normalization complete. Files saved to: {self.processed_dir}")
-        
-        # Generate split indices
-        self._generate_or_validate_splits()
+            if regenerate:
+                preprocessor = DataPreprocessor(
+                    raw_files=self.raw_data_files,
+                    output_dir=self.processed_dir,
+                    config=self.config
+                )
+                
+                missing = [p for p in self.raw_data_files if not p.exists()]
+                if missing:
+                    raise FileNotFoundError(f"Missing raw data files: {missing}")
+                
+                # Process to shards and compute normalization
+                preprocessor.process_to_npy_shards()
+                
+                # Save the hash
+                save_json({
+                    "hash": current_hash,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "mode": self.prediction_mode
+                }, hash_file)
+                
+                self.logger.info(f"Data normalization complete. Files saved to: {self.processed_dir}")
 
     def _generate_or_validate_splits(self):
         """Generate or validate train/val/test split indices."""
@@ -248,32 +245,26 @@ class ChemicalKineticsPipeline:
         )
 
         # Create datasets
-        train_indices = np.load(self.processed_dir / "train_indices.npy")
         train_dataset = NPYDataset(
             shard_dir=self.processed_dir,
-            indices=train_indices,
+            split_name="train",
             config=self.config,
-            device=self.device,
-            split_name="train"
+            device=self.device
         )
         
-        val_indices = np.load(self.processed_dir / "val_indices.npy")
         val_dataset = NPYDataset(
             shard_dir=self.processed_dir,
-            indices=val_indices,
+            split_name="validation",
             config=self.config,
-            device=self.device,
-            split_name="validation"
-        ) if len(val_indices) > 0 else None
+            device=self.device
+        ) if self.config["training"]["val_fraction"] > 0 else None
         
-        test_indices = np.load(self.processed_dir / "test_indices.npy")
         test_dataset = NPYDataset(
             shard_dir=self.processed_dir,
-            indices=test_indices,
+            split_name="test",
             config=self.config,
-            device=self.device,
-            split_name="test"
-        ) if len(test_indices) > 0 else None
+            device=self.device
+        ) if self.config["training"]["test_fraction"] > 0 else None
         
         # Initialize trainer
         trainer = Trainer(

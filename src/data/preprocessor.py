@@ -152,43 +152,103 @@ class CorePreprocessor:
 
         return accumulators, ratio_accumulators, valid_sample_count, report
 
-    # --- UPDATED: Pass 2 now also uses the strict validation ---
-    def process_file_for_shards(self, file_path: Path, output_dir: Path, start_idx: int) -> Dict[str, Any]:
-        """Worker logic for Pass 2: process a file, write shards, and return metadata."""
-        shard_idx_base = f"{file_path.stem}_{start_idx}"
-        shard_writer = ShardWriter(output_dir, self.proc_cfg["shard_size"], shard_idx_base)
+    def process_file_for_shards(self, file_path: Path, output_dir: Path) -> Dict[str, Any]:
+        """Process file and write to split-specific shard directories."""
+        # Create separate shard writers for each split
+        shard_writers = {
+            "train": ShardWriter(
+                output_dir / "train", 
+                self.proc_cfg["shard_size"], 
+                file_path.stem
+            ),
+            "validation": ShardWriter(
+                output_dir / "validation",
+                self.proc_cfg["shard_size"],
+                file_path.stem
+            ),
+            "test": ShardWriter(
+                output_dir / "test",
+                self.proc_cfg["shard_size"], 
+                file_path.stem
+            )
+        }
         
-        splits = {"train": [], "validation": [], "test": []}
-        current_idx = start_idx
-        ratio_stats = self.norm_stats.get("ratio_stats", {})
+        # Track samples per split
+        split_counts = {"train": 0, "validation": 0, "test": 0}
         
+        # Process file
         with h5py.File(file_path, "r") as f:
             for gname in sorted(f.keys()):
-                # --- NEW: Re-validate to ensure consistency between passes ---
+                # Validation checks
                 is_valid, _ = self._is_profile_valid(f[gname])
                 if not is_valid:
                     continue
                 
+                # Use fraction check
                 use_fraction = self.train_cfg["use_fraction"]
-                if use_fraction < 1.0 and int(hashlib.sha256(gname.encode('utf-8')).hexdigest()[:8], 16) / 0xFFFFFFFF >= use_fraction:
+                if use_fraction < 1.0:
+                    hash_val = int(hashlib.sha256(gname.encode('utf-8')).hexdigest()[:8], 16) / 0xFFFFFFFF
+                    if hash_val >= use_fraction:
+                        continue
+                
+                # Process profile
+                grp = f[gname]
+                n_t = grp[self.time_var].shape[0]
+                if n_t <= 1:
+                    continue
+                    
+                profile = self._extract_profile(grp, gname, n_t)
+                if profile is None:
                     continue
                 
-                result = self._process_single_group(f[gname], gname, ratio_stats)
-                if result is None:
-                    continue
+                # Determine split
+                p = int(hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+                test_frac = self.train_cfg["test_fraction"]
+                val_frac = self.train_cfg["val_fraction"]
                 
-                samples, split_key = result
-                n_written = samples.shape[0]
-                shard_writer.add_samples(samples, current_idx)
+                if p < test_frac:
+                    split_key = "test"
+                elif p < test_frac + val_frac:
+                    split_key = "validation"
+                else:
+                    split_key = "train"
                 
-                splits[split_key].extend(range(current_idx, current_idx + n_written))
-                current_idx += n_written
-
-        shard_writer.flush()
+                # Convert profile to samples
+                if self.prediction_mode == "ratio":
+                    samples = self._profile_to_samples_ratio(
+                        profile, n_t, self.norm_stats.get("ratio_stats", {})
+                    )
+                else:
+                    norm_prof = self.norm_helper.normalize_profile(
+                        torch.from_numpy(profile)
+                    ).numpy()
+                    samples = self._profile_to_samples(norm_prof, n_t)
+                
+                if samples is not None:
+                    # Add to appropriate writer - no need to track indices
+                    shard_writers[split_key].add_samples(samples)
+                    split_counts[split_key] += samples.shape[0]
+        
+        # Flush all writers
+        for writer in shard_writers.values():
+            writer.flush()
+        
+        # Return metadata
         return {
-            "shards": shard_writer.get_shard_metadata(),
-            "splits": splits,
-            "rows_written": current_idx - start_idx,
+            "splits": {
+                "train": {
+                    "shards": shard_writers["train"].get_shard_metadata(),
+                    "samples_written": split_counts["train"]
+                },
+                "validation": {
+                    "shards": shard_writers["validation"].get_shard_metadata(),
+                    "samples_written": split_counts["validation"]
+                },
+                "test": {
+                    "shards": shard_writers["test"].get_shard_metadata(),
+                    "samples_written": split_counts["test"]
+                }
+            }
         }
 
     def _update_stats_for_profile(self, profile, n_t, accumulators, ratio_accumulators):
@@ -353,33 +413,34 @@ class DataPreprocessor:
         self.parallel = self.num_workers > 1 and len(self.raw_files) > 1
 
     def process_to_npy_shards(self) -> None:
-        """## MODIFIED ## Main entry point. Now ONLY creates core data (shards, normalization, index)."""
+        """Main entry point - creates split-specific shard directories."""
         start_time = time.time()
         self.logger.info(f"Starting core data preprocessing with {len(self.raw_files)} files...")
         
+        # Collect statistics
         norm_stats, file_sample_counts, summary_report = self._collect_stats_and_counts()
         save_json(norm_stats, self.output_dir / "normalization.json")
 
-        all_shards = self._write_normalized_shards(norm_stats, file_sample_counts)
+        # Write split-specific shards
+        split_metadata = self._write_normalized_shards(norm_stats, file_sample_counts)
         
-        total_samples = sum(s['n_samples'] for s in all_shards)
+        # Save split-aware shard index
         shard_index = {
             "n_species": len(self.config["data"]["species_variables"]),
             "n_globals": len(self.config["data"]["global_variables"]),
             "samples_per_shard": self.config["preprocessing"]["shard_size"],
             "compression": self.config["preprocessing"].get("compression"),
             "prediction_mode": self.config.get("prediction", {}).get("mode", "absolute"),
-            "shards": sorted(all_shards, key=lambda x: x['start_idx']),
-            "n_shards": len(all_shards),
-            "total_samples": total_samples,
-            "split_files": { "train": "train_indices.npy", "validation": "val_indices.npy", "test": "test_indices.npy" }
+            "splits": split_metadata,
+            "total_samples": sum(meta["total_samples"] for meta in split_metadata.values())
         }
         save_json(shard_index, self.output_dir / "shard_index.json")
 
-        self._write_summary_log(summary_report, total_samples)
+        self._write_summary_log(summary_report, shard_index["total_samples"])
         self.logger.info(f"Core data preprocessing completed in {time.time() - start_time:.1f}s")
+        
+
     
-    ## NEW FUNCTION ##
     def generate_split_indices(self) -> None:
         """Generates train/val/test split indices from an existing shard_index.json. This is a very fast operation."""
         self.logger.info("Generating new train/val/test split indices...")
@@ -417,41 +478,68 @@ class DataPreprocessor:
             np.save(path, idx_array)
             self.logger.info(f"Saved {name} indices to {path} ({len(idx_array)} samples)")
 
-    def _write_normalized_shards(self, norm_stats, file_sample_counts) -> List[Dict]:
-        """
-        Second pass: write float32 shards + gather metadata.
-        """
-        self.logger.info("Writing shards …")
-        all_meta = []
-        current_start = 0  # Renamed to avoid shadowing
-
+    def _write_normalized_shards(self, norm_stats, file_sample_counts) -> Dict[str, List[Dict]]:
+        """Second pass: write split-specific shards to separate directories."""
+        self.logger.info("Writing split-specific shards...")
+        
+        # Create split directories
+        split_dirs = {
+            "train": self.processed_dir / "train",
+            "validation": self.processed_dir / "validation", 
+            "test": self.processed_dir / "test"
+        }
+        for split_name, dir_path in split_dirs.items():
+            dir_path.mkdir(exist_ok=True)
+            self.logger.info(f"Created {split_name} directory: {dir_path}")
+        
+        # Initialize split metadata
+        split_metadata = {
+            "train": {"shards": [], "total_samples": 0},
+            "validation": {"shards": [], "total_samples": 0},
+            "test": {"shards": [], "total_samples": 0}
+        }
+        
+        # Process each file
         with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as exe:
-            # Precompute cumulative starts in O(n) time
-            cumulative_starts = []
-            for fp in self.raw_files:
-                cumulative_starts.append(current_start)
-                # Use fp.stem as key (assuming file_sample_counts uses stems; confirm in _collect_stats_and_counts)
-                current_start += file_sample_counts.get(fp.stem, 0)
-
-            # Submit all jobs with precomputed starts
-            futures = [
-                exe.submit(
-                    shard_worker,
-                    self.raw_files[i],
+            futures = []
+            
+            for file_path in self.raw_files:
+                future = exe.submit(
+                    shard_worker_split_aware,  # New worker function
+                    file_path,
                     self.config,
                     norm_stats,
-                    cumulative_starts[i],
-                    self.output_dir
+                    self.processed_dir
                 )
-                for i in range(len(self.raw_files))
-            ]
-
-            # Process results as they complete
-            for fut in as_completed(futures):
-                meta = fut.result()
-                all_meta.extend(meta["shards"])
-
-        return all_meta
+                futures.append((future, file_path))
+            
+            # Collect results
+            for future, file_path in futures:
+                result = future.result()
+                
+                # Aggregate metadata by split
+                for split_name in ["train", "validation", "test"]:
+                    split_meta = result["splits"][split_name]
+                    split_metadata[split_name]["shards"].extend(split_meta["shards"])
+                    split_metadata[split_name]["total_samples"] += split_meta["samples_written"]
+        
+        # Sort shards within each split and assign global indices
+        for split_name, meta in split_metadata.items():
+            # Sort shards by filename
+            meta["shards"].sort(key=lambda x: x["filename"])
+            
+            # Assign sequential start/end indices
+            current_idx = 0
+            for shard in meta["shards"]:
+                shard["start_idx"] = current_idx
+                shard["end_idx"] = current_idx + shard["n_samples"]
+                current_idx = shard["end_idx"]
+            
+            self.logger.info(f"{split_name}: {len(meta['shards'])} shards, {meta['total_samples']:,} samples")
+        
+        return split_metadata
+     
+    
 
     def _collect_stats_and_counts(self) -> Tuple[Dict, Dict, Dict]:
             self.logger.info("Pass 1: Collecting statistics and sample counts...")
@@ -539,63 +627,51 @@ class ShardWriter:
         self.output_dir = output_dir
         self.shard_size = shard_size
         self.shard_idx_base = shard_idx_base
-        self.buffer: List[Tuple[np.ndarray, int]] = []
+        self.buffer: List[np.ndarray] = []
         self.buffer_size = 0
         self.local_shard_id = 0
         self.shard_metadata: List[Dict] = []
-        # Ensure the output directory exists from within the worker
+        
+        # Ensure the output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def add_samples(self, samples: np.ndarray, global_start_idx: int):
+    def add_samples(self, samples: np.ndarray):
+        """Simplified add_samples without tracking global indices."""
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
         
-        self.buffer.append((samples, global_start_idx))
+        self.buffer.append(samples)
         self.buffer_size += samples.shape[0]
+        
         while self.buffer_size >= self.shard_size:
             self._write_shard()
 
-    def flush(self):
-        # Important: Use _write_shard in a loop to handle remaining data
-        # that might still be larger than one shard.
-        while self.buffer_size > 0:
-            self._write_shard()
-    
-    def get_shard_metadata(self) -> List[Dict]:
-        return self.shard_metadata
-
     def _write_shard(self) -> None:
-        """
-        Assembles and writes ONE shard of exactly `shard_size` (or less if flushing the remainder).
-        This is the correct, original logic that respects shard boundaries.
-        """
+        """Write one shard of exactly shard_size samples (or less if flushing)."""
         if not self.buffer:
             return
 
         rows_to_write = []
         size_so_far = 0
-        first_global_idx = self.buffer[0][1]
 
         # Collect arrays until we have enough for a shard
         while self.buffer and size_so_far < self.shard_size:
-            arr, start_idx = self.buffer.pop(0)
+            arr = self.buffer.pop(0)
             needed = self.shard_size - size_so_far
             
             if arr.shape[0] <= needed:
-                # Take the whole array
                 rows_to_write.append(arr)
                 size_so_far += arr.shape[0]
             else:
                 # Split the array
                 rows_to_write.append(arr[:needed])
-                # Put the remainder back at the front of the buffer
-                self.buffer.insert(0, (arr[needed:], start_idx + needed))
+                self.buffer.insert(0, arr[needed:])
                 size_so_far += needed
         
-        # Update the total buffer size
-        self.buffer_size = sum(arr.shape[0] for arr, _ in self.buffer)
+        # Update buffer size
+        self.buffer_size = sum(arr.shape[0] for arr in self.buffer)
 
-        # Concatenate and write the data for this shard
+        # Write shard
         data = np.concatenate(rows_to_write).astype(np.float32, copy=False)
         
         final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
@@ -606,8 +682,13 @@ class ShardWriter:
 
         self.shard_metadata.append({
             "filename": final_path.name,
-            "start_idx": first_global_idx,
-            "end_idx": first_global_idx + data.shape[0],
             "n_samples": data.shape[0],
         })
+        
         self.local_shard_id += 1
+
+
+def shard_worker_split_aware(file_path, config, norm_stats, output_dir):
+    """Worker function that creates split-specific shards."""
+    processor = CorePreprocessor(config, norm_stats)
+    return processor.process_file_for_shards(Path(file_path), Path(output_dir))   

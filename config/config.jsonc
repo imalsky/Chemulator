@@ -94,7 +94,7 @@
         "output_scale": 1.0,
         
         // DeepONet-specific parameters
-        "branch_layers": [256, 256, 256],
+        "branch_layers": [256, 256, 256, 256, 256],
         "trunk_layers": [128, 128],
         "basis_dim": 128,
         
@@ -131,16 +131,16 @@
         
         // Training duration
         "epochs": 100,  // Full training epochs (not used in HPO)
-        "batch_size": 4096,
-        "gradient_accumulation_steps": 1,
+        "batch_size": 8192,
+        "gradient_accumulation_steps": 16,
         
         // MEMORY-OPTIMIZED DATALOADER SETTINGS
-        "num_workers": 64,
+        "num_workers": 4,
         "pin_memory": true,
         "persistent_workers": true,
-        "prefetch_factor": 4,
+        "prefetch_factor": 2,
         "drop_last": true,
-        "dataset_cache_shards": 64,
+        "dataset_cache_shards": 16,
         
         // Learning rate and optimizer settings
         "learning_rate": 3e-4,  // Starting LR for HPO
@@ -158,7 +158,7 @@
         },
         
         // Loss and training settings
-        "loss": "mse",
+        "loss": "huber",
         "huber_delta": 0.5,
         "use_amp": true,
         "amp_dtype": "bfloat16",

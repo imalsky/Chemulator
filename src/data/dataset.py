@@ -48,18 +48,34 @@ class ShardAwareSampler(Sampler):
         self.total_samples = len(dataset)
         
     def _group_indices_by_shard(self) -> Dict[int, List[int]]:
-        """Group dataset indices by their shard for efficient access."""
-        shard_groups = {}
-        
-        for idx in range(len(self.dataset)):
-            global_idx = self.dataset.sample_indices[idx]
-            shard_idx, _ = self.dataset._find_shard_idx(global_idx)
+            """
+            Group dataset indices by their shard using robust binary search.
+            This correctly handles shards of variable sizes.
+            """
+            shard_groups = {}
+            if not len(self.dataset):
+                return shard_groups
+
+            # Get the start indices of all shards in this split
+            shard_starts = self.dataset._shard_starts
             
-            if shard_idx not in shard_groups:
-                shard_groups[shard_idx] = []
-            shard_groups[shard_idx].append(idx)
+            # Use numpy's highly optimized searchsorted to find the
+            # shard index for every sample in the dataset in one go.
+            all_shard_indices = np.searchsorted(
+                shard_starts, 
+                np.arange(len(self.dataset)), 
+                side='right'
+            ) - 1
             
-        return shard_groups
+            # Now, group the dataset indices by their calculated shard index
+            for dataset_idx, shard_idx in enumerate(all_shard_indices):
+                # The key must be an integer for dictionary access
+                shard_idx_int = int(shard_idx)
+                if shard_idx_int not in shard_groups:
+                    shard_groups[shard_idx_int] = []
+                shard_groups[shard_idx_int].append(dataset_idx)
+                
+            return shard_groups
     
     def __iter__(self) -> Iterator[int]:
         """Generate indices in a cache-friendly order."""
@@ -114,69 +130,58 @@ class NPYDataset(Dataset):
         device: PyTorch device (used for logging, not data loading)
         split_name: Name of this split (train/val/test) for logging
     """
-    def __init__(self, shard_dir: Path, indices: np.ndarray, config: Dict[str, Any],
-                device: torch.device, split_name: Optional[str] = None):
+    def __init__(self, shard_dir: Path, split_name: str, config: Dict[str, Any], device: torch.device):
+        """Initialize dataset for a specific split - much simpler!"""
         super().__init__()
         self.shard_dir = Path(shard_dir)
+        self.split_dir = self.shard_dir / split_name
+        self.split_name = split_name
         self.config = config
         self.device = device
-        self.split_name = split_name or "unknown"
         self.logger = logging.getLogger(__name__)
 
-        # Load and validate shard index metadata
-        shard_index_path = self.shard_dir / "shard_index.json"
-        self.logger.debug(f"Loading shard index from {shard_index_path}")
-        
-        with open(shard_index_path) as f:
-            self.shard_index = json.load(f)
+        # Verify split directory exists
+        if not self.split_dir.exists():
+            raise FileNotFoundError(f"Split directory not found: {self.split_dir}")
 
-        # Extract data dimensions and configuration
+        # Load shard index metadata
+        shard_index_path = self.shard_dir / "shard_index.json"
+        with open(shard_index_path) as f:
+            full_index = json.load(f)
+        
+        self.shard_index = full_index
+        self.split_info = full_index["splits"][split_name]
+        
+        # Extract dimensions
         self.n_species = self.shard_index["n_species"]
         self.n_globals = self.shard_index["n_globals"]
         self.samples_per_shard = self.shard_index["samples_per_shard"]
         self.prediction_mode = self.shard_index.get("prediction_mode", "absolute")
-        self.n_shards = self.shard_index["n_shards"]
-
-        # Validate and store sample indices for this split
-        self.sample_indices = indices
-        self.n_total_samples = len(indices) if indices is not None else self.shard_index["total_samples"]
-
-        # Calculate data dimensions for memory estimation
-        self.n_features = self.n_species * 2 + self.n_globals + 1  # inputs + outputs
+        self.n_features = self.n_species * 2 + self.n_globals + 1
         
-        # Always use float32 for memory calculations
+        # Get shard info for this split
+        self.shards = self.split_info["shards"]
+        self.n_shards = len(self.shards)
+        self.n_total_samples = self.split_info["total_samples"]
+        
+        # Build lookup arrays for O(log n) access
+        self._shard_starts = np.array([s["start_idx"] for s in self.shards])
+        self._shard_ends = np.array([s["end_idx"] for s in self.shards])
+        
+        # Memory calculations
         self.bytes_per_sample = self.n_features * 4  # float32
         self.bytes_per_shard = self.samples_per_shard * self.bytes_per_sample
-
-        # Initialize caching system (deferred for multiprocessing compatibility)
+        
+        # Initialize caching
         self.cache_is_setup = False
         self._determine_cache_size()
-
-        # Build efficient lookup structures for O(log n) access
-        self._build_shard_lookup()
-
-        # Run memory pre-flight check only in main process
-        if torch.utils.data.get_worker_info() is None:  # Only in main process
-            try:
-                memory_info = self.check_memory_requirements()
-                
-                # Additional warning for high memory usage
-                if memory_info["usage_percent"] > 60:
-                    self.logger.warning(
-                        f"⚠️  High memory usage expected: {memory_info['usage_percent']:.0f}% "
-                        f"of available RAM. Monitor closely for OOM issues."
-                    )
-            except MemoryError as e:
-                self.logger.error("Memory check failed - aborting initialization")
-                raise
-
-        # Log initialization summary
+        
+        # Log initialization
         self.logger.info(
             f"NPYDataset '{self.split_name}' initialized: "
             f"{self.n_total_samples:,} samples across {self.n_shards} shards "
-            f"({self.bytes_per_shard / 1024**2:.1f} MB/shard as float32), "
-            f"cache capacity: {self._max_cache_size} shards, "
-            f"prediction mode: {self.prediction_mode}"
+            f"({self.bytes_per_shard / 1024**2:.1f} MB/shard), "
+            f"cache capacity: {self._max_cache_size} shards"
         )
 
 
@@ -232,18 +237,16 @@ class NPYDataset(Dataset):
         # Calculate how many shards fit in allocated memory per worker
         memory_based_shards = int(max_cache_memory_per_worker / max(1, effective_shard_size))
         
-        # Apply configuration limits - THIS IS WHERE THE BUG FIX HAPPENS
-        # The config should have a reasonable default, not 1
         config_limit = self.config["training"].get("dataset_cache_shards", 16)  # Changed default
         
         if num_workers >= 16:
             practical_limit = 64
         elif num_workers >= 8:
-            practical_limit = 128
-        elif num_workers >= 4:
             practical_limit = 256
-        else:
+        elif num_workers >= 4:
             practical_limit = 512
+        else:
+            practical_limit = 1024
         
         # Use the minimum of all constraints, with a floor of 1 shard
         self._max_cache_size = max(1, min(
@@ -280,9 +283,7 @@ class NPYDataset(Dataset):
             return
 
         # Create the LRU-cached version of the shard loader
-        self._get_shard_data = lru_cache(maxsize=self._max_cache_size)(
-            self._get_shard_data_impl
-        )
+        self._get_shard_data = lru_cache(maxsize=self._max_cache_size)(self._get_shard_data_impl)
 
         # Run memory check once per worker
         if not getattr(self, "_ram_guard_ran", False):
@@ -294,68 +295,29 @@ class NPYDataset(Dataset):
         self._cache_is_ready = True
 
 
-    def _build_shard_lookup(self):
-        """
-        Build efficient lookup structures for O(log n) sample access.
-        
-        Creates arrays of shard boundaries to enable binary search when
-        mapping global sample indices to (shard_index, local_index) pairs.
-        Also validates that shards are contiguous and properly ordered.
-        """
-        self.logger.debug("Building shard lookup tables for efficient indexing")
-        
-        # Extract start and end indices for each shard
-        self._shard_starts = np.array([s["start_idx"] for s in self.shard_index["shards"]])
-        self._shard_ends = np.array([s["end_idx"] for s in self.shard_index["shards"]])
-
-        # Validate shard integrity
-        if len(self._shard_starts) > 1:
-            # Check that shards are contiguous (no gaps)
-            gaps_check = np.all(self._shard_starts[1:] == self._shard_ends[:-1])
-            if not gaps_check:
-                gap_indices = np.where(self._shard_starts[1:] != self._shard_ends[:-1])[0]
-                self.logger.error(f"Non-contiguous shards detected at indices: {gap_indices}")
-                raise ValueError("Shards must be contiguous")
-            
-            # Check that shards are properly sorted
-            sort_check = np.all(self._shard_starts[:-1] < self._shard_starts[1:])
-            if not sort_check:
-                self.logger.error("Shards are not properly sorted by start index")
-                raise ValueError("Shards must be sorted by start index")
-        
-        self.logger.debug(
-            f"Shard lookup tables built: {len(self._shard_starts)} shards, "
-            f"sample range [{self._shard_starts[0]}, {self._shard_ends[-1]})"
-        )
-
     def _get_shard_data_impl(self, shard_idx: int) -> np.ndarray:
-        """
-        Load a shard from disk as float32, contiguous, and writable.
-        This is the actual implementation that gets wrapped by lru_cache.
-        """
-        shard_info   = self.shard_index["shards"][shard_idx]
-        shard_path   = self.shard_dir / shard_info["filename"]
-        exp_samples  = shard_info["n_samples"]
+        """Load a shard from the split-specific directory."""
+        shard_info = self.shards[shard_idx]
+        shard_path = self.split_dir / shard_info["filename"]
+        exp_samples = shard_info["n_samples"]
 
-        self.logger.debug(f"⏫  Loading shard {shard_idx}: {shard_path}")
+        self.logger.debug(f"Loading shard {shard_idx} from {self.split_name}: {shard_path}")
 
         t0 = time.time()
-        # Load compressed or raw data
+        
+        # Load data
         if self.shard_index.get("compression") == "npz":
             with np.load(shard_path) as zf:
                 data = zf["data"].astype(np.float32, copy=False)
         else:
             arr = np.load(shard_path)
-            # Ensure float32 dtype
             data = arr.astype(np.float32) if arr.dtype != np.float32 else arr
-            # Ensure C-contiguous for efficient access
             if not data.flags["C_CONTIGUOUS"]:
                 data = np.ascontiguousarray(data)
 
-        self.logger.debug(f"✅  Shard loaded in {(time.time()-t0):.3f}s  "
-                          f"→ shape {data.shape}, dtype {data.dtype}")
+        self.logger.debug(f"Shard loaded in {(time.time()-t0):.3f}s")
 
-        # Validate loaded data
+        # Validate
         if data.shape[0] != exp_samples:
             raise ValueError(f"Shard sample mismatch ({data.shape[0]} vs {exp_samples})")
         if data.shape[1] != self.n_features:
@@ -363,104 +325,45 @@ class NPYDataset(Dataset):
 
         return data
 
-    def _find_shard_idx(self, global_idx: int) -> Tuple[int, int]:
-        """
-        Map a global sample index to its shard and local offset using binary search.
-        
-        Args:
-            global_idx: Global index across all samples
-            
-        Returns:
-            Tuple of (shard_index, local_index_within_shard)
-        """
-        # Binary search to find which shard contains this global index
-        # searchsorted with side='right' finds the insertion point, so we subtract 1
-        shard_idx = np.searchsorted(self._shard_starts, global_idx, side='right') - 1
-
-        # Validate shard index bounds
-        if not (0 <= shard_idx < len(self._shard_starts)):
-            self.logger.error(
-                f"Sample index {global_idx} not found in any shard. "
-                f"Valid range: [{self._shard_starts[0]}, {self._shard_ends[-1]})"
-            )
-            raise IndexError(f"Sample index {global_idx} not found in any shard")
-
-        # Calculate local index within the shard
-        local_idx = global_idx - self._shard_starts[shard_idx]
-
-        # Validate local index bounds
-        shard_size = self._shard_ends[shard_idx] - self._shard_starts[shard_idx]
-        if not (0 <= local_idx < shard_size):
-            self.logger.error(
-                f"Invalid local index {local_idx} for shard {shard_idx} "
-                f"(shard size: {shard_size})"
-            )
-            raise IndexError(f"Sample index {global_idx} not in shard {shard_idx} bounds")
-
-        return shard_idx, local_idx
-
     def __len__(self) -> int:
         """Return the total number of samples in this dataset split."""
         return self.n_total_samples
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Load a single sample from the dataset.
-        
-        This method:
-        1. Maps the split-specific index to a global index
-        2. Finds which shard contains the sample (binary search)
-        3. Loads the shard data (with caching)
-        4. Creates PyTorch tensors without copying data
-        
-        Args:
-            idx: Index within this dataset split
-            
-        Returns:
-            Tuple of (input_tensor, target_tensor)
-        """
-        # Initialize cache on first access (lazy initialization for multiprocessing)
+        """Load a single sample - much simpler without index translation!"""
+        # Initialize cache on first access
         if not self.cache_is_setup:
             self._setup_worker_cache()
 
-        # Validate index bounds
+        # Validate index
         if not (0 <= idx < self.n_total_samples):
             raise IndexError(f"Index {idx} out of range [0, {self.n_total_samples})")
 
-        global_idx = -1  # Initialize for error reporting
         try:
-            # Map split-specific index to global index
-            global_idx = self.sample_indices[idx]
-
-            # Find shard and local offset
-            shard_idx, local_idx = self._find_shard_idx(global_idx)
-
+            # Find shard using binary search
+            shard_idx = np.searchsorted(self._shard_starts, idx, side='right') - 1
+            
+            # Calculate local index within shard
+            local_idx = idx - self._shard_starts[shard_idx]
+            
             # Load shard data (may hit cache)
             shard_data = self._get_shard_data(shard_idx)
-
-            # Additional bounds check (defensive programming)
-            if not (0 <= local_idx < shard_data.shape[0]):
-                raise IndexError(
-                    f"Local index {local_idx} out of bounds for shard {shard_idx} "
-                    f"with size {shard_data.shape[0]}"
-                )
-
+            
             # Extract the sample row
             row = shard_data[local_idx]
-
-            # Split into input and target features
-            n_input = self.n_species + self.n_globals + 1  # species + globals + time
             
-            # Create tensors directly from numpy arrays (zero-copy operation)
-            # This works because our arrays are writable (not memory-mapped)
+            # Split into input and target
+            n_input = self.n_species + self.n_globals + 1
+            
+            # Create tensors (zero-copy)
             input_tensor = torch.from_numpy(row[:n_input])
             target_tensor = torch.from_numpy(row[n_input:])
-
+            
             return input_tensor, target_tensor
 
         except Exception as e:
             self.logger.error(
-                f"Error accessing sample idx={idx} (global_idx={global_idx}): {e}",
+                f"Error accessing sample idx={idx} in {self.split_name}: {e}",
                 exc_info=True
             )
             raise
