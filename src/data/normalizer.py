@@ -75,7 +75,7 @@ class DataNormalizer:
             below_epsilon = vec < self.epsilon
             if np.any(below_epsilon):
                 self.logger.warning(
-                    f"Variable '{var_name}' has {below_epsilon.sum()} values below epsilon {self.epsilon}. "
+                    f"Variable '{var_name}' has {below_epsilon.sum()} values below epsilon {self.epsilon} "
                     f"Min value: {vec.min():.2e}"
                 )
             vec = np.log10(np.maximum(vec, self.epsilon))

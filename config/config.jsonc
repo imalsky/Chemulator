@@ -4,15 +4,15 @@
         // Raw HDF5 data files to process
         "raw_data_files": [
             "data/raw/run9001-result.h5",
-            "data/raw/run9002-result.h5",
-            "data/raw/run9003-result.h5",
-            "data/raw/run9004-result.h5",
-            "data/raw/run9005-result.h5",
-            "data/raw/run9006-result.h5",
-            "data/raw/run9007-result.h5",
-            "data/raw/run9008-result.h5",
-            "data/raw/run9009-result.h5",
-            "data/raw/run9010-result.h5"
+            //"data/raw/run9002-result.h5",
+            //"data/raw/run9003-result.h5",
+            //"data/raw/run9004-result.h5",
+            //"data/raw/run9005-result.h5",
+            //"data/raw/run9006-result.h5",
+            //"data/raw/run9007-result.h5",
+            //"data/raw/run9008-result.h5",
+            //"data/raw/run9009-result.h5",
+            //"data/raw/run9010-result.h5"
         ],
         // Directory for processed NPY shards
         "processed_data_dir": "data/processed",
@@ -54,7 +54,7 @@
         // Compression type: null for raw npy files (faster I/O)
         "compression": null,
         // Number of parallel workers for preprocessing
-        "num_workers": 24,
+        "num_workers": 4,
         // Enable parallel preprocessing
         "parallel_enabled": true
     },
@@ -71,8 +71,8 @@
             "t_time": "log-min-max"
         },
         
-        // Small value to prevent log(0) and division by zero
-        "epsilon": 1e-30,
+        // This needs to be fixed
+        "epsilon": 1e-38,
         // Minimum standard deviation to prevent division by tiny values
         "min_std": 1e-10,
         // Clamp normalized values to [-clamp_value, clamp_value]
@@ -85,7 +85,7 @@
         "type": "deeponet",
         
         // Activation function: "gelu", "relu", "silu", "tanh"
-        "activation": "gelu",
+        "activation": "tanh",
         
         // Dropout rate (0.0 = no dropout)
         "dropout": 0.0,
@@ -94,9 +94,9 @@
         "output_scale": 1.0,
         
         // DeepONet-specific parameters
-        "branch_layers": [256, 256, 256, 256, 256],
-        "trunk_layers": [128, 128],
-        "basis_dim": 128,
+        "branch_layers": [512, 512, 512, 512],
+        "trunk_layers": [64, 64, 64, 64],
+        "basis_dim": 32,
         
         // SIREN-specific parameters (when type="siren")
         "hidden_dims": [256, 256, 256],
@@ -106,7 +106,7 @@
     // ===== FiLM CONDITIONING =====
     "film": {
         // Enable Feature-wise Linear Modulation
-        "enabled": true,
+        "enabled": false,
         // Hidden layers for FiLM networks
         "hidden_dims": [64],
         // Activation for FiLM networks
@@ -116,7 +116,8 @@
     // ===== PREDICTION SETTINGS =====
     "prediction": {
         // Prediction mode: ABSOLUTE ONLY for this config
-        "mode": "ratio",
+        // ratio mode is still in progress
+        "mode": "absolute",
         
         // Optional output clamping
         "output_clamp": null
@@ -131,19 +132,19 @@
         
         // Training duration
         "epochs": 100,  // Full training epochs (not used in HPO)
-        "batch_size": 8192,
-        "gradient_accumulation_steps": 16,
+        "batch_size": 16384,
+        "gradient_accumulation_steps": 1,
         
         // MEMORY-OPTIMIZED DATALOADER SETTINGS
-        "num_workers": 4,
+        "num_workers": 8,
         "pin_memory": true,
         "persistent_workers": true,
         "prefetch_factor": 2,
         "drop_last": true,
-        "dataset_cache_shards": 16,
+        "dataset_cache_shards": 64,
         
         // Learning rate and optimizer settings
-        "learning_rate": 3e-4,  // Starting LR for HPO
+        "learning_rate": 5e-4,  // Starting LR for HPO
         "weight_decay": 1e-5,
         "betas": [0.9, 0.999],
         "eps": 1e-8,
@@ -152,13 +153,13 @@
         // Scheduler settings - CRITICAL FOR LR DECAY
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 10,  // Restart every 8 epochs (5 cycles in 40 epochs)
+            "T_0": 50,  // Restart every 8 epochs (5 cycles in 40 epochs)
             "T_mult": 2,  // Keep cycle length constant
             "eta_min": 1e-8  // ENSURES LR DROPS TO 1e-8
         },
         
         // Loss and training settings
-        "loss": "huber",
+        "loss": "mse",
         "huber_delta": 0.5,
         "use_amp": true,
         "amp_dtype": "bfloat16",
