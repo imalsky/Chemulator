@@ -414,20 +414,20 @@ class NPYDataset(Dataset):
         memory_breakdown["usage_percent"] = (total_expected_gb / available_gb) * 100
         
         # Log detailed breakdown
-        self.logger.info(f"\n{'='*60}")
-        self.logger.info(f"Memory Requirements Check for '{self.split_name}' Dataset")
-        self.logger.info(f"{'='*60}")
-        self.logger.info(f"System Memory: {total_gb:.1f} GB total, {available_gb:.1f} GB available")
-        self.logger.info(f"Configuration: {num_workers} workers, {cache_shards} cached shards, "
-                        f"{batch_size} batch size")
-        self.logger.info(f"\nMemory Breakdown:")
-        self.logger.info(f"  - Shard cache: {memory_breakdown['shard_cache_per_worker_gb']:.2f} GB/worker")
-        self.logger.info(f"  - Prefetch buffer: {memory_breakdown['prefetch_per_worker_gb']:.2f} GB/worker")
-        self.logger.info(f"  - Python overhead: {memory_breakdown['python_overhead_gb']:.2f} GB")
-        self.logger.info(f"  - Worker overhead: {memory_breakdown['dataloader_overhead_gb']:.2f} GB")
-        self.logger.info(f"\nTotal Expected: {total_expected_gb:.1f} GB "
-                        f"({memory_breakdown['usage_percent']:.0f}% of available)")
-        self.logger.info(f"{'='*60}\n")
+        #self.logger.info(f"\n{'='*60}")
+        #self.logger.info(f"Memory Requirements Check for '{self.split_name}' Dataset")
+        #self.logger.info(f"{'='*60}")
+        #self.logger.info(f"System Memory: {total_gb:.1f} GB total, {available_gb:.1f} GB available")
+        #self.logger.info(f"Configuration: {num_workers} workers, {cache_shards} cached shards, "
+        #                f"{batch_size} batch size")
+        #self.logger.info(f"\nMemory Breakdown:")
+        #self.logger.info(f"  - Shard cache: {memory_breakdown['shard_cache_per_worker_gb']:.2f} GB/worker")
+        #self.logger.info(f"  - Prefetch buffer: {memory_breakdown['prefetch_per_worker_gb']:.2f} GB/worker")
+        #self.logger.info(f"  - Python overhead: {memory_breakdown['python_overhead_gb']:.2f} GB")
+        #self.logger.info(f"  - Worker overhead: {memory_breakdown['dataloader_overhead_gb']:.2f} GB")
+        #self.logger.info(f"\nTotal Expected: {total_expected_gb:.1f} GB "
+        #                f"({memory_breakdown['usage_percent']:.0f}% of available)")
+        #self.logger.info(f"{'='*60}\n")
         
         # Validate memory requirements
         safety_factor = 0.8  # Don't use more than 80% of available memory

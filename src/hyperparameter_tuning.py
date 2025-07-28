@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable
 
-import numpy as np
 import optuna
 from optuna.samplers import TPESampler
 from optuna.pruners import HyperbandPruner
@@ -105,13 +104,8 @@ class OptunaPipeline:
         """Load split-specific datasets."""
         self.logger.info(f"Loading datasets from: {self.processed_dir}")
         
-        # Much simpler - no indices needed!
-        self.train_dataset = NPYDataset(
-            self.processed_dir, "train", self.config, self.device
-        )
-        self.val_dataset = NPYDataset(
-            self.processed_dir, "validation", self.config, self.device
-        )
+        self.train_dataset = NPYDataset(self.processed_dir, "train", self.config, self.device)
+        self.val_dataset = NPYDataset(self.processed_dir, "validation", self.config, self.device)
         
         self.logger.info(
             f"Datasets loaded: train={len(self.train_dataset)}, "
@@ -228,27 +222,24 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     """Suggests a valid model and training configuration for a trial."""
     config = copy.deepcopy(base_config)
 
-    # For absolute-only mode
-    config["prediction"]["mode"] = "ratio"
+    #config["prediction"]["mode"] = "absolute"
     
     # Model architecture choice
     model_type = trial.suggest_categorical("model_type", ["deeponet"])
     config["model"]["type"] = model_type
-
-
-    
     
     # Common hyperparameters - EXPANDED SEARCH SPACE
     config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu", "tanh"])
-    config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [16384])
-    config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+    #config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
+    #config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [16384])
+    #config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
     config["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.1, step=0.05)
     
     # Scheduler parameters
-    config["training"]["scheduler_params"]["T_0"] = trial.suggest_categorical("cosine_T_0", [10])
+    #config["training"]["scheduler_params"]["T_0"] = trial.suggest_categorical("cosine_T_0", [10])
     
     # Gradient accumulation adjustment
+    """
     if config["training"]["batch_size"] <= 1024:
         config["training"]["gradient_accumulation_steps"] = 8
     elif config["training"]["batch_size"] <= 2048:
@@ -257,6 +248,7 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
         config["training"]["gradient_accumulation_steps"] = 2
     else:
         config["training"]["gradient_accumulation_steps"] = 1
+    """
 
     if model_type == "deeponet":
         # More flexible architecture search
@@ -281,7 +273,8 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
         config["model"]["basis_dim"] = trial.suggest_categorical("basis_dim", [64, 128, 256])
         config["model"]["output_scale"] = trial.suggest_categorical("output_scale", [0.1, 1.0, 10.0])
         
-    else:  # SIREN
+    # Siren
+    else: 
         n_layers = trial.suggest_int("n_hidden_layers", 3, 6)
         hidden_dims = []
         for i in range(n_layers):
@@ -291,7 +284,7 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
                 width = trial.suggest_categorical(f"hidden_dim_{i}", [128, 256, 384])
             hidden_dims.append(width)
         config["model"]["hidden_dims"] = hidden_dims
-        config["model"]["omega_0"] = trial.suggest_float("omega_0", 10.0, 50.0)  # Wider range
+        config["model"]["omega_0"] = trial.suggest_float("omega_0", 10.0, 50.0)
 
     # FiLM configuration
     use_film = trial.suggest_categorical("use_film", [True, False])
@@ -319,7 +312,7 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
 def optimize(config_path: Path, n_trials: int = 25, n_jobs: int = 1,
              study_name: str = "chemulator_hpo", pruner: Optional[optuna.pruners.BasePruner] = None):
     """
-    Main function to run Optuna optimization with Hyperband for 40-hour runtime.
+    Main function to run Optuna optimization with Hyperband for 40-hoaur runtime.
     """
     logger = logging.getLogger(__name__)
     base_config = load_json_config(config_path)

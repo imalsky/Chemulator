@@ -21,10 +21,8 @@ import os
 from .normalizer import DataNormalizer, NormalizationHelper
 from utils.utils import save_json, load_json
 
-
-# ##############################################################################
-# LIGHTWEIGHT WORKER-SIDE IMPLEMENTATION
-# ##############################################################################
+DEFAULT_EPSILON_MIN = 1e-38
+DEFAULT_EPSILON_MAX = 1e38
 
 class CorePreprocessor:
     """A lightweight helper class containing only the logic needed within a worker."""
@@ -71,12 +69,12 @@ class CorePreprocessor:
         Checks if a profile is valid according to strict criteria.
         Returns (is_valid, reason_for_failure_or_success).
         """
-        # 1. Check for missing datasets
+        # Validate every variable (species + globals + time)
         required_keys = self.species_vars + [self.time_var]
         if not set(required_keys).issubset(group.keys()):
             return False, "missing_keys"
 
-        # 2. Check each dataset for NaNs, Infs, and value thresholds
+        # Check each dataset for NaNs, Infs, and value thresholds
         for var in required_keys:
             try:
                 data = group[var][:]
@@ -86,69 +84,80 @@ class CorePreprocessor:
             if not np.all(np.isfinite(data)):
                 return False, "non_finite"
 
-            if var in self.species_vars:
-                if np.any(data < self.min_value_threshold):
-                    return False, "below_threshold"
-        
+            # Drop profile if any value is less than or equal to threshold
+            if np.any(data <= self.min_value_threshold):
+                return False, "below_threshold"
+
         return True, "valid"
     
-    def process_file_for_stats(self, file_path: Path) -> Tuple[Dict, Dict, int, Dict]:
-        """Worker logic for Pass 1: compute stats, counts, and a validation report."""
+    def process_file_for_stats(
+        self, file_path: Path
+    ) -> Tuple[Dict[str, Dict], Dict[str, Dict], int, Dict]:
         accumulators = self.normalizer._initialize_accumulators()
-        ratio_accumulators = {}
+
+        ratio_accumulators: Dict[str, Dict[str, Any]] = {}
         if self.prediction_mode == "ratio":
-            for var in self.species_vars:
-                # Get the normalization method for this specific variable
-                method = self.normalizer._get_method(var)
-                
-                # Only create an accumulator if the method is NOT "none"
-                if method != "none":
-                    ratio_accumulators[var] = {
-                        "method": method,
-                        "count": 0,
-                        "mean": 0.0,
-                        "m2": 0.0,
-                        "min": float("inf"),
-                        "max": float("-inf")
-                    }
-        
+            for v in self.species_vars:
+                raw_method = self.normalizer._get_method(v)
+                ratio_method = raw_method[4:] if raw_method.startswith("log-") else raw_method
+                ratio_accumulators[v] = {
+                    "method": ratio_method,
+                    "count": 0,
+                    "mean": 0.0,
+                    "m2":   0.0,
+                    "min":  float("inf"),
+                    "max":  float("-inf"),
+                }
+
         valid_sample_count = 0
-        
-        # --- NEW: Reporting dictionary for this worker ---
         report = {
-            "total_profiles": 0,
-            "profiles_kept": 0,
-            "dropped_reasons": defaultdict(int)
+            "total_profiles":   0,
+            "profiles_kept":    0,
+            "dropped_reasons":  defaultdict(int),
         }
-        
+
         with h5py.File(file_path, "r") as f:
             for gname in sorted(f.keys()):
                 report["total_profiles"] += 1
                 grp = f[gname]
-                
-                # --- NEW: Use the stricter validation function ---
-                is_valid, reason = self._is_profile_valid(grp)
-                if not is_valid:
+
+                # dataset‑level validation
+                is_ok, reason = self._is_profile_valid(grp)
+                if not is_ok:
                     report["dropped_reasons"][reason] += 1
                     continue
 
-                use_fraction = self.train_cfg["use_fraction"]
-                if use_fraction < 1.0 and int(hashlib.sha256(gname.encode('utf-8')).hexdigest()[:8], 16) / 0xFFFFFFFF >= use_fraction:
-                    continue
+                # deterministic down‑sampling
+                if self.train_cfg["use_fraction"] < 1.0:
+                    h = int(hashlib.sha256(gname.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+                    if h >= self.train_cfg["use_fraction"]:
+                        continue
 
                 n_t = grp[self.time_var].shape[0]
                 if n_t <= 1:
                     report["dropped_reasons"]["too_few_timesteps"] += 1
                     continue
-                
+
+                # assemble full profile (species + globals + time)
                 profile = self._extract_profile(grp, gname, n_t)
                 if profile is None:
                     report["dropped_reasons"]["extract_profile_failed"] += 1
                     continue
-                
+
+                # final profile‑level check
+                if (np.any(~np.isfinite(profile)) or
+                    np.any(profile <= self.min_value_threshold)):
+                    report["dropped_reasons"]["below_threshold"] += 1
+                    continue
+
+                # update statistics
                 report["profiles_kept"] += 1
                 valid_sample_count += (n_t - 1)
-                self._update_stats_for_profile(profile, n_t, accumulators, ratio_accumulators)
+                self._update_stats_for_profile(
+                    profile, n_t,
+                    accumulators,
+                    ratio_accumulators,
+                )
 
         return accumulators, ratio_accumulators, valid_sample_count, report
 
@@ -200,7 +209,11 @@ class CorePreprocessor:
                 profile = self._extract_profile(grp, gname, n_t)
                 if profile is None:
                     continue
-                
+
+                if (np.any(~np.isfinite(profile)) or
+                    np.any(profile <= self.min_value_threshold)):
+                    continue
+
                 # Determine split
                 p = int(hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
                 test_frac = self.train_cfg["test_fraction"]
@@ -264,13 +277,11 @@ class CorePreprocessor:
                 
                 # Use full profile data for all variables (not just initial timestep)
                 if var == self.time_var and n_t > 1:
-                    vec = profile[1:, idx]  # Time starts from t=1
+                    vec = profile[1:, idx]
                 else:
-                    vec = profile[:, idx]   # Full profile for species and globals
+                    vec = profile[:, idx]
                 
                 if vec.size > 0:
-                    if method.startswith("log-"):
-                        vec = np.log10(np.maximum(vec, self.normalizer.epsilon))
                     self.normalizer._update_single_accumulator(acc, vec, var)
             
             # Compute ratio statistics correctly with proper indices
@@ -278,25 +289,14 @@ class CorePreprocessor:
             future = profile[1:, self.species_indices]
             
             ratios = future / np.maximum(initial[None, :], self.normalizer.epsilon)
-            
-            # Add logging for extreme values
-            if np.any(ratios < self.normalizer.epsilon):
-                n_below = np.sum(ratios < self.normalizer.epsilon)
-                logger.warning(f"Found {n_below} ratio values below epsilon {self.normalizer.epsilon}")
-            
-            log_ratios = np.log10(np.maximum(ratios, self.normalizer.epsilon))
-            
-            # Log if clipping is needed
-            if np.any(np.abs(log_ratios) > self.norm_cfg.get("clamp_value", 50.0)):
-                n_clamped = np.sum(np.abs(log_ratios) > self.norm_cfg.get("clamp_value", 50.0))
-                logger.warning(f"Clamping {n_clamped} extreme log-ratio values")
-            
+            ratios = np.clip(ratios, -DEFAULT_EPSILON_MAX, DEFAULT_EPSILON_MAX)
+            log_ratios = np.sign(ratios) * np.log10( np.clip(np.abs(ratios), DEFAULT_EPSILON_MIN, DEFAULT_EPSILON_MAX))
+
+
             for i, var_name in enumerate(self.species_vars):
-                self.normalizer._update_single_accumulator(
-                    ratio_accumulators[var_name], log_ratios[:, i], var_name
-                )
+                self.normalizer._update_single_accumulator(ratio_accumulators[var_name], log_ratios[:, i], var_name)
         else:
-            # Absolute mode - existing logic is correct
+            # Absolute mode
             for var, acc in accumulators.items():
                 idx = acc["index"]
                 vec = profile[1:, idx] if (var == self.time_var and n_t > 1) else profile[:, idx]
@@ -338,74 +338,94 @@ class CorePreprocessor:
         n_inputs = self.n_species + self.n_globals + 1
         samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
         
-        # Use proper variable ordering
-        samples[:, :self.n_species] = norm_prof[0, self.species_indices]  # Initial species
-        samples[:, self.n_species:self.n_species + self.n_globals] = norm_prof[0, self.global_indices]  # Globals
-        samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]  # Time
-        samples[:, n_inputs:] = norm_prof[1:, self.species_indices]  # Target species
+        # Initial species
+        samples[:, :self.n_species] = norm_prof[0, self.species_indices] 
+
+        # Globals
+        samples[:, self.n_species:self.n_species + self.n_globals] = norm_prof[0, self.global_indices]
+
+        # Time
+        samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]
+
+        # Target species
+        samples[:, n_inputs:] = norm_prof[1:, self.species_indices]
         
         return samples
 
-    def _profile_to_samples_ratio(self, raw_prof, n_t, ratio_stats):
-        """Use proper indices for samples in ratio mode"""
+    def _profile_to_samples_ratio(
+        self, raw_prof: np.ndarray, n_t: int, ratio_stats: Dict[str, Dict]
+    ) -> Optional[np.ndarray]:
+        """
+        Build (n_t‑1) samples for ratio‑prediction mode.
+        raw_prof is **unnormalised** profile array  shape = (n_t, n_vars)
+        ratio_stats contains mean/std/min/max for log‑ratios (already computed)
+        """
         import logging
         logger = logging.getLogger(__name__)
-        
+
         if n_t <= 1:
             return None
         
-        n_inputs = self.n_species + self.n_globals + 1
-        samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
-        
-        # Normalize the profile
+        n_inputs  = self.n_species + self.n_globals + 1
+        samples   = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
+
         norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(raw_prof)).numpy()
-        
-        # Use proper variable ordering
-        samples[:, :self.n_species] = norm_prof[0, self.species_indices]  # Initial species
-        samples[:, self.n_species:self.n_species + self.n_globals] = norm_prof[0, self.global_indices]  # Globals
-        samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]  # Time
-        
-        # Compute log-ratios with proper indices
+        samples[:, :self.n_species]                   = norm_prof[0, self.species_indices]
+        samples[:, self.n_species:self.n_species+self.n_globals] = norm_prof[0, self.global_indices]
+        samples[:, n_inputs - 1]                      = norm_prof[1:, self.time_idx]
+
         initial = raw_prof[0, self.species_indices]
-        future = raw_prof[1:, self.species_indices]
+        future  = raw_prof[1:, self.species_indices]
+
         ratios = future / np.maximum(initial[None, :], self.norm_cfg["epsilon"])
-        
-        # Log extreme values before processing
-        if np.any(ratios == 0):
-            logger.warning(f"Found {np.sum(ratios == 0)} zero ratios - will be clamped to epsilon")
-        
-        log_ratios = np.log10(np.clip(ratios, 1e-38, 1e38))
-        
-        # Standardize log-ratios
-        means = np.array([ratio_stats[v]["mean"] for v in self.species_vars], dtype=np.float32)
-        stds = np.array([ratio_stats[v]["std"] for v in self.species_vars], dtype=np.float32)
-        std_log_ratios = (log_ratios - means) / np.maximum(stds, self.norm_cfg["min_std"])
-        
-        # Log if clamping occurs
-        clamp_val = self.norm_cfg.get("clamp_value", 50.0)
-        if np.any(np.abs(std_log_ratios) > clamp_val):
-            n_clamped = np.sum(np.abs(std_log_ratios) > clamp_val)
-            logger.warning(f"Clamping {n_clamped} standardized log-ratio values to [-{clamp_val}, {clamp_val}]")
-        
-        samples[:, n_inputs:] = np.clip(std_log_ratios, -clamp_val, clamp_val)
-        
+        ratios = np.clip(ratios, -DEFAULT_EPSILON_MAX, DEFAULT_EPSILON_MAX)
+        log_ratios = np.sign(ratios) * np.log10(np.clip(np.abs(ratios), DEFAULT_EPSILON_MIN, DEFAULT_EPSILON_MAX))
+
+        methods_cfg = self.norm_cfg.get("methods", {})
+        default_m   = self.norm_cfg.get("default_method", "standard")
+        clamp_val   = self.norm_cfg.get("clamp_value", 50.0)
+        min_std     = self.norm_cfg.get("min_std", 1e-10)
+
+        normd = np.empty_like(log_ratios, dtype=np.float32)
+
+        for i, var in enumerate(self.species_vars):
+            method = methods_cfg.get(var, default_m)
+            if method.startswith("log-"):
+                method = method[4:]
+
+            stats = ratio_stats[var]
+
+            if method == "min-max":
+                rng = max(stats["max"] - stats["min"], self.norm_cfg["epsilon"])
+                normd[:, i] = (log_ratios[:, i] - stats["min"]) / rng
+            else:
+                std = max(stats["std"], min_std)
+                normd[:, i] = (log_ratios[:, i] - stats["mean"]) / std
+
+        if np.any(np.abs(normd) > clamp_val):
+            n_clamped = np.sum(np.abs(normd) > clamp_val)
+            logger.warning(f"Clamping {n_clamped} normalised log‑ratio values to ±{clamp_val}")
+
+        samples[:, n_inputs:] = np.clip(normd, -clamp_val, clamp_val)
         return samples
 
 def stats_worker(file_path, config):
     return CorePreprocessor(config).process_file_for_stats(Path(file_path))
 
-def shard_worker(file_path, config, norm_stats, start_idx, output_dir):
-    return CorePreprocessor(config, norm_stats).process_file_for_shards(Path(file_path), Path(output_dir), start_idx)
-
-# ##############################################################################
-# MAIN PARENT PREPROCESSOR CLASS
-# ##############################################################################
+def shard_worker(file_path, config, norm_stats, output_dir):
+    """Legacy helper kept for completeness; matches shard_worker_split_aware signature."""
+    processor = CorePreprocessor(config, norm_stats)
+    return processor.process_file_for_shards(Path(file_path), Path(output_dir))
 
 class DataPreprocessor:
     """Main parent class to orchestrate parallel data preprocessing."""
     def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
         self.raw_files = sorted(raw_files)
         self.output_dir = output_dir
+
+        self.processed_dir = self.output_dir / "processed"
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+
         self.config = config
         self.logger = logging.getLogger(__name__)
         self.normalizer = DataNormalizer(config)
@@ -439,8 +459,6 @@ class DataPreprocessor:
         self._write_summary_log(summary_report, shard_index["total_samples"])
         self.logger.info(f"Core data preprocessing completed in {time.time() - start_time:.1f}s")
         
-
-    
     def generate_split_indices(self) -> None:
         """Generates train/val/test split indices from an existing shard_index.json. This is a very fast operation."""
         self.logger.info("Generating new train/val/test split indices...")
@@ -505,7 +523,7 @@ class DataPreprocessor:
             
             for file_path in self.raw_files:
                 future = exe.submit(
-                    shard_worker_split_aware,  # New worker function
+                    shard_worker_split_aware,
                     file_path,
                     self.config,
                     norm_stats,
@@ -539,45 +557,42 @@ class DataPreprocessor:
         
         return split_metadata
      
-    
-
     def _collect_stats_and_counts(self) -> Tuple[Dict, Dict, Dict]:
-            self.logger.info("Pass 1: Collecting statistics and sample counts...")
-            prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
-            final_accs = self.normalizer._initialize_accumulators()
-            final_ratio_accs = {var: {"count": 0,"mean": 0.0,"m2": 0.0,"min": float('inf'),"max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
-            file_counts = {}
-            
-            # --- NEW: Aggregate report dictionary ---
-            total_report = {
-                "total_profiles": 0,
-                "profiles_kept": 0,
-                "dropped_reasons": defaultdict(int)
-            }
+        self.logger.info("Pass 1: Collecting statistics and sample counts...")
+        prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
+        final_accs = self.normalizer._initialize_accumulators()
+        final_ratio_accs = {var: {"count": 0,"mean": 0.0,"m2": 0.0,"min": float('inf'),"max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
+        file_counts = {}
+        
+        total_report = {
+            "total_profiles": 0,
+            "profiles_kept": 0,
+            "dropped_reasons": defaultdict(int)
+        }
 
-            with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
-                futures = {executor.submit(stats_worker, fp, self.config): fp for fp in self.raw_files}
-                for fut in as_completed(futures):
-                    accs, ratio_accs, count, worker_report = fut.result()
-                    
-                    # Aggregate results
-                    self.normalizer._merge_accumulators(final_accs, accs)
-                    if ratio_accs: self.normalizer._merge_accumulators(final_ratio_accs, ratio_accs)
-                    file_counts[futures[fut].name] = count
-                    
-                    # --- NEW: Aggregate the reports ---
-                    total_report["total_profiles"] += worker_report["total_profiles"]
-                    total_report["profiles_kept"] += worker_report["profiles_kept"]
-                    for reason, num in worker_report["dropped_reasons"].items():
-                        total_report["dropped_reasons"][reason] += num
+        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
+            futures = {executor.submit(stats_worker, fp, self.config): fp for fp in self.raw_files}
+            for fut in as_completed(futures):
+                accs, ratio_accs, count, worker_report = fut.result()
+                
+                # Aggregate results
+                self.normalizer._merge_accumulators(final_accs, accs)
+                if ratio_accs: self.normalizer._merge_accumulators(final_ratio_accs, ratio_accs)
+                file_counts[futures[fut].name] = count
+                
+                # --- NEW: Aggregate the reports ---
+                total_report["total_profiles"] += worker_report["total_profiles"]
+                total_report["profiles_kept"] += worker_report["profiles_kept"]
+                for reason, num in worker_report["dropped_reasons"].items():
+                    total_report["dropped_reasons"][reason] += num
 
-            norm_stats = self.normalizer._finalize_statistics(final_accs)
-            if final_ratio_accs:
-                norm_stats["ratio_stats"] = self.normalizer._finalize_statistics(final_ratio_accs, is_ratio=True)
+        norm_stats = self.normalizer._finalize_statistics(final_accs)
+        if final_ratio_accs:
+            norm_stats["ratio_stats"] = self.normalizer._finalize_statistics(final_ratio_accs, is_ratio=True)
 
-            file_counts = {Path(k).stem: v for k, v in file_counts.items()}
+        file_counts = {Path(k).stem: v for k, v in file_counts.items()}
 
-            return norm_stats, file_counts, total_report
+        return norm_stats, file_counts, total_report
 
     def _write_summary_log(self, report: Dict, total_samples: int):
         """Writes a human-readable summary of the preprocessing results."""
@@ -687,7 +702,32 @@ class ShardWriter:
         
         self.local_shard_id += 1
 
+    def flush(self) -> None:
+        """Write out any rows left in the buffer (< shard_size)."""
+        if self.buffer_size == 0:
+            return
+        
+        # write whatever is left as a final shard
+        rows_to_write = self.buffer
+        self.buffer = []
+        self.buffer_size = 0
 
+        data = np.concatenate(rows_to_write).astype(np.float32, copy=False)
+        final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
+        tmp_path   = final_path.with_suffix(".tmp.npy")
+        np.save(tmp_path, data, allow_pickle=False)
+        os.replace(tmp_path, final_path)
+
+        self.shard_metadata.append({
+            "filename": final_path.name,
+            "n_samples": data.shape[0],
+        })
+        self.local_shard_id += 1
+
+    def get_shard_metadata(self) -> List[Dict]:
+        """Return metadata collected for all shards."""
+        return list(self.shard_metadata)
+    
 def shard_worker_split_aware(file_path, config, norm_stats, output_dir):
     """Worker function that creates split-specific shards."""
     processor = CorePreprocessor(config, norm_stats)
