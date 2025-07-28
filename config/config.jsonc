@@ -76,13 +76,12 @@
         // Minimum standard deviation to prevent division by tiny values
         "min_std": 1e-10,
         // Clamp normalized values to [-clamp_value, clamp_value]
-        "clamp_value": 30.0
+        "clamp_value": 50.0
     },
     
     // ===== MODEL ARCHITECTURE =====
     "model": {
-        // Model type: "deeponet" or "siren
-        // Both work with absolute mode, ratio only with deeponet
+        // Model type: "deeponet" or "siren" (both work with absolute mode)
         "type": "deeponet",
         
         // Activation function: "gelu", "relu", "silu", "tanh"
@@ -117,7 +116,7 @@
     // ===== PREDICTION SETTINGS =====
     "prediction": {
         // Prediction mode: ABSOLUTE ONLY for this config
-        "mode": "absolute",
+        "mode": "ratio",
         
         // Optional output clamping
         "output_clamp": null
@@ -133,16 +132,15 @@
         // Training duration
         "epochs": 100,  // Full training epochs (not used in HPO)
         "batch_size": 4096,
-        "gradient_accumulation_steps": 2,
+        "gradient_accumulation_steps": 1,
         
         // MEMORY-OPTIMIZED DATALOADER SETTINGS
-        // I think I finally got this to stop breaking with OOM
-        "num_workers": 8,
+        "num_workers": 64,
         "pin_memory": true,
         "persistent_workers": true,
         "prefetch_factor": 4,
         "drop_last": true,
-        "dataset_cache_shards": 32,
+        "dataset_cache_shards": 64,
         
         // Learning rate and optimizer settings
         "learning_rate": 3e-4,  // Starting LR for HPO
@@ -151,12 +149,12 @@
         "eps": 1e-8,
         "gradient_clip": 1.0,
         
-        // Scheduler settings
+        // Scheduler settings - CRITICAL FOR LR DECAY
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 10,  // How often to restart learning
-            "T_mult": 2,  // Geometric increase
-            "eta_min": 1e-8  // Drop to this learning rate
+            "T_0": 10,  // Restart every 8 epochs (5 cycles in 40 epochs)
+            "T_mult": 2,  // Keep cycle length constant
+            "eta_min": 1e-8  // ENSURES LR DROPS TO 1e-8
         },
         
         // Loss and training settings
@@ -164,17 +162,15 @@
         "huber_delta": 0.5,
         "use_amp": true,
         "amp_dtype": "bfloat16",
-        "early_stopping_patience": 10,
+        "early_stopping_patience": 10,  // Stop if no improvement for 8 epochs
         "min_delta": 1e-8,
         "log_interval": 100,
         "save_interval": 10,
         "empty_cache_interval": 500,
         
         // HPO-specific settings
-        // Minimum epochs before pruning
-        "hpo_min_epochs": 10,  
-        // Maximum epochs for best trials
-        "hpo_max_epochs": 40  
+        "hpo_min_epochs": 10,  // Minimum epochs before pruning
+        "hpo_max_epochs": 40   // Maximum epochs for best trials
     },
     
     // ===== SYSTEM/HARDWARE SETTINGS =====
@@ -205,6 +201,6 @@
         "hyperband_reduction_factor": 3,  // Keep top 33% at each stage
         
         // Target number of trials for 40 hours
-        "n_trials": 50  // Conservative estimate with pruning
+        "n_trials": 100  // Conservative estimate with pruning
     }
 }
