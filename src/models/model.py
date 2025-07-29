@@ -2,12 +2,17 @@
 """
 Model definitions for chemical kinetics neural networks with ratio mode support.
 Includes dropout regularization for both SIREN and DeepONet architectures.
+
+FIXES:
+1. Dynamic export parameter name detection for SIREN vs DeepONet
+2. Support for per-layer FiLM activation functions
+3. More efficient tensor operations
 """
 
 import logging
 import math
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -15,24 +20,33 @@ from torch.export import Dim
 
 
 class FiLMLayer(nn.Module):
-    """Feature-wise Linear Modulation layer."""
+    """Feature-wise Linear Modulation layer with custom activation support."""
     
     def __init__(self, condition_dim: int, feature_dim: int, 
-                 hidden_dims: List[int], activation: str = "gelu", use_beta: bool = True):
+                 hidden_dims: List[int], activation: Union[str, List[str]] = "gelu", 
+                 use_beta: bool = True):
         super().__init__()
         
         self.use_beta = use_beta
         out_multiplier = 2 if use_beta else 1
         
+        # Handle activation specification
+        if isinstance(activation, str):
+            activations = [activation] * len(hidden_dims)
+        else:
+            if len(activation) != len(hidden_dims):
+                raise ValueError(f"Number of activations ({len(activation)}) must match hidden_dims ({len(hidden_dims)})")
+            activations = activation
+        
         # Build FiLM MLP
         layers = []
         prev_dim = condition_dim
         
-        # Hidden layers
-        for dim in hidden_dims:
+        # Hidden layers with per-layer activation
+        for dim, act in zip(hidden_dims, activations):
             layers.extend([
                 nn.Linear(prev_dim, dim),
-                self._get_activation(activation)
+                self._get_activation(act)
             ])
             prev_dim = dim
         
@@ -47,24 +61,31 @@ class FiLMLayer(nn.Module):
             "gelu": nn.GELU(),
             "relu": nn.ReLU(),
             "tanh": nn.Tanh(),
-            "silu": nn.SiLU()
+            "silu": nn.SiLU(),
+            "leakyrelu": nn.LeakyReLU(0.2),
+            "elu": nn.ELU()
         }
-        return activations.get(name.lower(), nn.GELU())
+        if name.lower() not in activations:
+            raise ValueError(f"Unknown activation: {name}")
+        return activations[name.lower()]
     
     def forward(self, features: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
         """Apply FiLM modulation."""
         # Generate gamma and beta
         params = self.film_net(condition)
+        
         if self.use_beta:
             gamma, beta = params.chunk(2, dim=-1)
         else:
             gamma = params
             beta = torch.zeros_like(gamma)
         
-        # Reshape for broadcasting
-        shape = [gamma.size(0)] + [1] * (features.dim() - 2) + [self.feature_dim]
-        gamma = gamma.view(*shape)
-        beta = beta.view(*shape)
+        # Efficient reshaping for broadcasting
+        # Only add dimensions where needed
+        if features.dim() > 2:
+            shape = [gamma.size(0)] + [1] * (features.dim() - 2) + [self.feature_dim]
+            gamma = gamma.view(*shape)
+            beta = beta.view(*shape)
         
         # Apply modulation: gamma * features + beta
         return gamma * features + beta
@@ -101,17 +122,27 @@ class FiLMSIREN(nn.Module):
         prev_dim = input_dim
         condition_dim = self.num_species + self.num_globals
 
+        # Get FiLM activations - support per-layer specification
+        film_activations = film_config.get("activations", film_config.get("activation", "gelu"))
+        if isinstance(film_activations, str):
+            film_activations = [film_activations] * len(self.hidden_dims)
+        elif isinstance(film_activations, list) and len(film_activations) != len(self.hidden_dims):
+            # If list but wrong length, repeat the pattern
+            film_activations = (film_activations * len(self.hidden_dims))[:len(self.hidden_dims)]
+
         for i, dim in enumerate(self.hidden_dims):
             # Main layer
             self.layers.append(nn.Linear(prev_dim, dim))
 
-            # FiLM layer with SIREN-compatible initialization
+            # FiLM layer with per-layer activation
             if self.use_film:
+                layer_activation = film_activations[i] if isinstance(film_activations, list) else film_activations
                 film_layer = FiLMLayer(
                     condition_dim=condition_dim,
                     feature_dim=dim,
                     hidden_dims=film_config.get("hidden_dims", [128, 128]),
-                    activation=film_config.get("activation", "gelu")
+                    activation=layer_activation,
+                    use_beta=True
                 )
 
                 # Initialize FiLM to identity mapping
@@ -141,18 +172,18 @@ class FiLMSIREN(nn.Module):
             # First layer
             if len(self.layers) > 0:
                 fan_in = self.layers[0].in_features
-                nn.init.uniform_(self.layers[0].weight, -1.0 / fan_in, 1.0 / fan_in)
+                self.layers[0].weight.uniform_(-1.0 / fan_in, 1.0 / fan_in)
             
             # Hidden layers
             for layer in self.layers[1:]:
                 fan_in = layer.in_features
                 bound = math.sqrt(6.0 / fan_in) / self.omega_0
-                nn.init.uniform_(layer.weight, -bound, bound)
+                layer.weight.uniform_(-bound, bound)
             
             # Output layer
             fan_in = self.output_layer.in_features
             bound = math.sqrt(6.0 / fan_in) / self.omega_0
-            nn.init.uniform_(self.output_layer.weight, -bound, bound)
+            self.output_layer.weight.uniform_(-bound, bound)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with FiLM conditioning and dropout."""
@@ -233,7 +264,9 @@ class FiLMDeepONet(nn.Module):
             "gelu": nn.GELU(),
             "relu": nn.ReLU(),
             "tanh": nn.Tanh(),
-            "silu": nn.SiLU()
+            "silu": nn.SiLU(),
+            "leakyrelu": nn.LeakyReLU(0.2),
+            "elu": nn.ELU()
         }
         return activations.get(name.lower(), nn.GELU())
     
@@ -242,7 +275,7 @@ class FiLMDeepONet(nn.Module):
                             film_config: Optional[Dict] = None, bias: bool = True) -> nn.Module:
         """
         Build an MLP with optional FiLM layers and dropout.
-
+        
         Args:
             input_dim: Input dimension for the MLP.
             hidden_layers: List of hidden layer dimensions.
@@ -257,16 +290,24 @@ class FiLMDeepONet(nn.Module):
             layers = nn.ModuleList()
             film_layers = nn.ModuleList()
 
+            # Get FiLM activations
+            film_activations = film_config.get("activations", film_config.get("activation", "gelu"))
+            if isinstance(film_activations, str):
+                film_activations = [film_activations] * len(hidden_layers)
+            elif isinstance(film_activations, list) and len(film_activations) != len(hidden_layers):
+                film_activations = (film_activations * len(hidden_layers))[:len(hidden_layers)]
+
             prev_dim = input_dim
-            for dim in hidden_layers:
+            for i, dim in enumerate(hidden_layers):
                 layers.append(nn.Linear(prev_dim, dim, bias=bias))
 
+                layer_activation = film_activations[i] if isinstance(film_activations, list) else film_activations
                 film_layers.append(
                     FiLMLayer(
                         condition_dim=condition_dim,
                         feature_dim=dim,
                         hidden_dims=film_config.get("hidden_dims", [128, 128]),
-                        activation=film_config.get("activation", "gelu"),
+                        activation=layer_activation,
                         use_beta=True
                     )
                 )
@@ -407,9 +448,23 @@ def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path)
                 # A large but finite number is sufficient.
                 batch_dim = Dim("batch", min=1, max=16384)
                 
-                # The key MUST match the argument name in the model's forward() method.
-                # For FiLMDeepONet, the signature is `forward(self, inputs: ...)`.
-                dynamic_shapes = {"inputs": {0: batch_dim}}
+                # Detect the correct parameter name based on model type
+                # Check the forward method signature
+                import inspect
+                sig = inspect.signature(model.forward)
+                param_names = list(sig.parameters.keys())
+                # Remove 'self' from parameter names
+                param_names = [p for p in param_names if p != 'self']
+                
+                if not param_names:
+                    raise ValueError("Could not determine forward method parameter names")
+                
+                # Use the first parameter name (should be 'x' for SIREN, 'inputs' for DeepONet)
+                param_name = param_names[0]
+                logger.info(f"Detected forward method parameter name: '{param_name}'")
+                
+                # Create dynamic shapes dict with the correct parameter name
+                dynamic_shapes = {param_name: {0: batch_dim}}
                 
                 # Export the model with dynamic batch dimension
                 exported_program = torch.export.export(

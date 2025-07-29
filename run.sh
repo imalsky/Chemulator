@@ -52,6 +52,6 @@ fi
 nvidia-smi
 
 # Run your Python script
-python src/main.py --normalize
+python src/main.py --train
 
 echo "Job completed successfully."

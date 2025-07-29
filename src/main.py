@@ -207,6 +207,23 @@ class ChemicalKineticsPipeline:
         self.logger.info(f"Preprocessing data for {self.prediction_mode} mode...")
         self.normalize_only()
 
+    def _log_memory_status(self):
+        """Log current memory status for debugging."""
+        import psutil
+        
+        # CPU memory
+        mem = psutil.virtual_memory()
+        self.logger.info(f"System memory: {mem.total/1024**3:.1f}GB total, "
+                         f"{mem.available/1024**3:.1f}GB available ({mem.percent:.1f}% used)")
+        
+        # GPU memory if available
+        if self.device.type == "cuda":
+            free_mem, total_mem = torch.cuda.mem_get_info(self.device.index)
+            used_mem = total_mem - free_mem
+            self.logger.info(f"GPU memory: {total_mem/1024**3:.1f}GB total, "
+                             f"{free_mem/1024**3:.1f}GB free, "
+                             f"{used_mem/1024**3:.1f}GB used")
+
     def train_model(self):
         """Train the neural network model."""
         self.logger.info("Starting model training...")
@@ -243,6 +260,9 @@ class ChemicalKineticsPipeline:
             self.config["data"]["time_variable"],
             self.config
         )
+        
+        # Log memory status before creating datasets
+        self._log_memory_status()
 
         # Create datasets
         train_dataset = NPYDataset(
@@ -252,6 +272,13 @@ class ChemicalKineticsPipeline:
             device=self.device
         )
         
+        # Log cache status
+        cache_info = train_dataset.get_cache_info()
+        if cache_info and cache_info.get("type") == "gpu":
+            self.logger.info(f"✓ GPU caching enabled for train set: {cache_info['size_gb']:.1f}GB loaded to GPU")
+        else:
+            self.logger.info(f"CPU caching mode for train set: {self.config['training']['num_workers']} workers")
+
         val_dataset = NPYDataset(
             shard_dir=self.processed_dir,
             split_name="validation",
@@ -279,7 +306,8 @@ class ChemicalKineticsPipeline:
         )
         
         # Warm up cache
-        _ = train_dataset[0]
+        if len(train_dataset) > 0:
+            _ = train_dataset[0]
 
         # Train model
         best_val_loss = trainer.train()
@@ -309,7 +337,6 @@ class ChemicalKineticsPipeline:
         except Exception as e:
             self.logger.error(f"Pipeline failed: {e}", exc_info=True)
             sys.exit(1)
-
 
 def main():
     """Main entry point with multiple operation modes."""
