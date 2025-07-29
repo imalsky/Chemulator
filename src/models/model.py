@@ -402,7 +402,7 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
             # A100-optimized compilation
             compile_options = {
                 "mode": compile_mode,
-                "fullgraph": True,
+                "fullgraph": False,
                 "dynamic": False,
             }
             
