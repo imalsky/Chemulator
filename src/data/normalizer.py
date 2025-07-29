@@ -15,6 +15,9 @@ import torch
 DEFAULT_EPSILON = 1e-30
 DEFAULT_MIN_STD = 1e-10
 DEFAULT_CLAMP = 50.0
+# Safe epsilon for float32
+SAFE_EPSILON = 1e-38
+MIN_RANGE = 1e-10
 
 class DataNormalizer:
     """Calculates normalization statistics with robust data validation."""
@@ -54,7 +57,7 @@ class DataNormalizer:
     
     def _update_single_accumulator(self, acc: Dict[str, Any], vec: np.ndarray, var_name: str):
         """
-        Vectorized update for one accumulator, including all validation and logging.
+        Vectorized update for one accumulator with safe epsilon handling.
         """
         if vec.size == 0:
             return
@@ -70,17 +73,18 @@ class DataNormalizer:
                 self.logger.warning(f"Variable '{var_name}' has no finite values after filtering, skipping.")
                 return
 
-        # 2. Handle log-transformations with validation checks
+        # 2. Handle log-transformations with safe epsilon
         if acc["method"].startswith("log-"):
-            below_epsilon = vec < self.epsilon
+            below_epsilon = vec < SAFE_EPSILON
             if np.any(below_epsilon):
                 self.logger.warning(
-                    f"Variable '{var_name}' has {below_epsilon.sum()} values below epsilon {self.epsilon} "
+                    f"Variable '{var_name}' has {below_epsilon.sum()} values below epsilon {SAFE_EPSILON} "
                     f"Min value: {vec.min():.2e}"
                 )
-            vec = np.log10(np.maximum(vec, self.epsilon))
+            vec = np.log10(np.maximum(vec, SAFE_EPSILON))
             
-            if vec.min() < -30 or vec.max() > 30:
+            # Check for extreme values after log transform
+            if vec.min() < -25 or vec.max() > 25:
                 self.logger.warning(
                     f"Variable '{var_name}' has extreme log values: [{vec.min():.1f}, {vec.max():.1f}]"
                 )
@@ -131,20 +135,29 @@ class DataNormalizer:
             main_acc["max"] = max(main_acc["max"], other_acc["max"])
         
     def _finalize_statistics(self, accumulators: Dict[str, Dict[str, Any]], is_ratio: bool = False) -> Dict[str, Any]:
-        """Finalize statistics from accumulators."""
+        """Finalize statistics from accumulators with improved numerical stability."""
         stats = { "per_key_stats": {} }
         if not is_ratio:
             stats["normalization_methods"] = {}
-
+        
         for var, acc in accumulators.items():
             method = acc.get("method", "standard")
             if not is_ratio:
                 stats["normalization_methods"][var] = method
             
-            if method == "none": continue
+            if method == "none":
+                continue
+            
+            # Check if we have any valid samples
+            if acc["count"] == 0:
+                self.logger.warning(f"Variable '{var}' has no valid samples. Setting normalization to 'none'.")
+                if not is_ratio:
+                    stats["normalization_methods"][var] = "none"
+                continue
             
             var_stats = {"method": method}
             
+            # Calculate std with safeguards
             if acc["count"] > 1:
                 variance = acc["m2"] / (acc["count"] - 1)
                 std = max(math.sqrt(variance), self.min_std)
@@ -154,10 +167,22 @@ class DataNormalizer:
             if "standard" in method:
                 mean_key, std_key = ("log_mean", "log_std") if "log" in method else ("mean", "std")
                 var_stats[mean_key], var_stats[std_key] = acc["mean"], std
+                
+                # Warn if std is very small (constant variable)
+                if std < MIN_RANGE:
+                    self.logger.warning(f"Variable '{var}' appears constant (std={std:.2e}). Consider using 'none' normalization.")
+                    
             elif "min-max" in method:
                 var_stats["min"], var_stats["max"] = acc["min"], acc["max"]
-                if acc["max"] - acc["min"] < self.epsilon:
-                    var_stats["max"] = acc["min"] + 1.0
+                
+                # Handle constant or near-constant variables
+                range_val = acc["max"] - acc["min"]
+                if range_val < MIN_RANGE:
+                    self.logger.warning(f"Variable '{var}' has very small range ({range_val:.2e}). Adjusting to prevent instability.")
+                    # Expand the range artificially to prevent division by tiny numbers
+                    center = (acc["max"] + acc["min"]) / 2
+                    var_stats["min"] = center - MIN_RANGE / 2
+                    var_stats["max"] = center + MIN_RANGE / 2
             
             if is_ratio:
                 stats[var] = {"mean": acc["mean"], "std": std, "min": acc["min"], "max": acc["max"], "count": acc["count"]}
@@ -165,10 +190,13 @@ class DataNormalizer:
                 stats["per_key_stats"][var] = var_stats
 
         if not is_ratio:
+            # Set any missing variables to "none" normalization
             for var in self.all_vars:
                 if var not in stats["normalization_methods"]:
+                    self.logger.warning(f"Variable '{var}' not found in statistics. Setting normalization to 'none'.")
                     stats["normalization_methods"][var] = "none"
-            stats["epsilon"] = self.epsilon
+            
+            stats["epsilon"] = SAFE_EPSILON  # Use safe epsilon
             stats["clamp_value"] = self.norm_config.get("clamp_value", DEFAULT_CLAMP)
         
         return stats
