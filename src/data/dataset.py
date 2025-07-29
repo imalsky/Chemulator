@@ -9,11 +9,11 @@ import logging
 import time
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
-
+import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-
+import math
 
 class NPYDataset(Dataset):
     """
@@ -69,87 +69,57 @@ class NPYDataset(Dataset):
         self._try_gpu_cache()
         
     def _try_gpu_cache(self):
-        """Try to load entire dataset to GPU memory with fallback."""
-        # Check if GPU caching is enabled
+        """Load the entire split to GPU memory; fall back to CPU if needed."""
         gpu_cache_setting = self.config.get("training", {}).get("gpu_cache_dataset", "auto")
-        
-        if gpu_cache_setting == False:
+        if gpu_cache_setting is False:
             self.logger.info(f"GPU caching disabled for {self.split_name}")
             self.cpu_fallback = True
             return
-            
-        # Only attempt on CUDA devices
+
         if self.device.type != "cuda":
             self.logger.info(f"GPU caching not available on {self.device.type}")
             self.cpu_fallback = True
             return
-            
-        # Check available memory
-        free_mem, total_mem = torch.cuda.mem_get_info(self.device.index)
-        needed_gb = self.total_bytes / 1024**3
-        free_gb = free_mem / 1024**3
-        
-        # Need some buffer for operations (using 85% is a safe value)
-        if needed_gb > free_gb * 0.85:
+
+        free_mem, _ = torch.cuda.mem_get_info(self.device.index)
+        needed_gb = self.total_bytes / 1024 ** 3
+        free_gb   = free_mem       / 1024 ** 3
+        if needed_gb > free_gb * 0.85:     
             self.logger.warning(
                 f"Insufficient GPU memory for {self.split_name}: "
-                f"need {needed_gb:.1f}GB, have {free_gb:.1f}GB free. "
-                f"Falling back to CPU loading."
+                f"need {needed_gb:.1f} GB, have {free_gb:.1f} GB.  Falling back to CPU."
             )
             self.cpu_fallback = True
             return
-            
-        # Try to load to GPU
-        self.logger.info(f"Loading {self.split_name} dataset to GPU ({needed_gb:.1f}GB)...")
-        start_time = time.time()
-        
-        try:
-            # Pre-allocate GPU tensor
-            self.gpu_cache = torch.empty(
-                (self.n_total_samples, self.n_features),
-                dtype=torch.float32,
-                device=self.device
+
+        self.logger.info(f"Loading {self.split_name} dataset to GPU ({needed_gb:.1f} GB)…")
+        start = time.time()
+
+        self.gpu_cache = torch.empty(
+            (self.n_total_samples, self.n_features),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        cur = 0
+        for shard in self.shards:
+            shard_path = self.split_dir / shard["filename"]
+            if self.shard_index.get("compression") == "npz":
+                with np.load(shard_path) as zf:
+                    data = zf["data"].astype(np.float32, copy=False)
+            else:
+                data = np.load(shard_path).astype(np.float32, copy=False)
+
+            n = data.shape[0]
+            self.gpu_cache[cur:cur + n] = torch.from_numpy(data).pin_memory().to(
+                self.device, non_blocking=True
             )
-            
-            # Load each shard
-            current_idx = 0
-            for shard_info in self.shards:
-                shard_path = self.split_dir / shard_info["filename"]
-                
-                # Load shard
-                if self.shard_index.get("compression") == "npz":
-                    with np.load(shard_path) as zf:
-                        data = zf["data"].astype(np.float32, copy=False)
-                else:
-                    data = np.load(shard_path).astype(np.float32, copy=False)
-                
-                # Copy to GPU
-                n_samples = data.shape[0]
-                
-                # =============================================================
-                # FIXED: Added .pin_memory() to enable true non_blocking copy
-                # =============================================================
-                pinned_tensor = torch.from_numpy(data).pin_memory()
-                self.gpu_cache[current_idx:current_idx + n_samples] = pinned_tensor.to(
-                    self.device, non_blocking=True
-                )
-                current_idx += n_samples
-            
-            # Ensure all transfers complete
-            torch.cuda.synchronize()
-            
-            load_time = time.time() - start_time
-            throughput = needed_gb / load_time
-            self.logger.info(
-                f"GPU cache loaded successfully in {load_time:.1f}s ({throughput:.1f} GB/s)"
-            )
-            
-        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-            self.logger.warning(f"GPU caching failed: {e}. Using CPU fallback.")
-            self.gpu_cache = None
-            self.cpu_fallback = True
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
+            cur += n
+            del data                  
+
+        torch.cuda.synchronize()
+        t = time.time() - start
+        self.logger.info(f"GPU cache loaded in {t:.1f}s ({needed_gb/t:.1f} GB/s)")
 
     def _load_shard_cpu(self, shard_idx: int) -> np.ndarray:
         """Load a shard from disk (CPU fallback)."""
@@ -237,76 +207,83 @@ def create_dataloader(dataset: Dataset,
                       shuffle: bool = True,
                       device: Optional[torch.device] = None,
                       drop_last: bool = True,
-                      **kwargs) -> DataLoader:
+                      **_) -> DataLoader:
     """
-    Create DataLoader with proper handling of GPU cache and CPU fallback.
-    
-    Args:
-        dataset: The dataset to load from
-        config: Configuration dictionary
-        shuffle: Whether to shuffle the data
-        device: PyTorch device
-        drop_last: Whether to drop the last incomplete batch
-        
-    Returns:
-        Configured DataLoader
+    Build a DataLoader that never loops Python‑side over 32 768 items.
+    If the dataset lives on the GPU, we wrap it in GPUBatchDataset so each
+    __getitem__ delivers a full batch slice in one shot.
     """
     if dataset is None or len(dataset) == 0:
         logging.getLogger(__name__).warning("Cannot create DataLoader for empty dataset")
         return None
 
-    log = logging.getLogger(__name__)
+    log  = logging.getLogger(__name__)
     tcfg = config["training"]
-    bs = tcfg["batch_size"]
-    
-    # Check if using GPU cache
-    is_gpu_cached = hasattr(dataset, 'gpu_cache') and dataset.gpu_cache is not None
-    is_cpu_fallback = hasattr(dataset, 'cpu_fallback') and dataset.cpu_fallback
-    
-    if is_gpu_cached:
-        # GPU mode: no workers needed
-        log.info(f"DataLoader[{dataset.split_name}] GPU mode: bs={bs}")
-        
-        return DataLoader(
-            dataset,
-            batch_size=bs,
-            shuffle=shuffle,
-            num_workers=0,  # MUST be 0 for GPU cache
-            pin_memory=False,  # Already on GPU
-            drop_last=drop_last,
-        )
-    elif is_cpu_fallback:
-        # CPU fallback mode
-        log.warning(f"DataLoader[{dataset.split_name}] CPU fallback mode: bs={bs}")
-        
-        # ==============================================================
-        # FIXED: Correct logic for determining number of workers.
-        # Use a sane default if not specified in the config.
-        # ==============================================================
-        num_workers_from_config = tcfg.get("num_workers")
-        if num_workers_from_config is None:
-            # If the key doesn't exist, default to a reasonable number.
-            import os
-            num_workers = min(16, os.cpu_count() or 1)
-        else:
-            # Use the value from the config file if it exists.
-            num_workers = num_workers_from_config
-        
-        log.info(f"Using {num_workers} workers for CPU fallback data loading.")
+    bs   = tcfg["batch_size"]
 
+    is_gpu_cached  = getattr(dataset, "gpu_cache", None) is not None
+    is_cpu_fallback = getattr(dataset, "cpu_fallback", False)
+
+    # ---------- GPU‑cached fast path ----------
+    if is_gpu_cached:
+        log.info(f"DataLoader[{dataset.split_name}] GPU‑batch mode: bs={bs}")
+
+        class GPUBatchDataset(torch.utils.data.Dataset):
+            def __init__(self, gpu_tensor: torch.Tensor, n_inputs: int,
+                         batch_size: int, shuffle_batches: bool):
+                self.gpu_tensor  = gpu_tensor
+                self.n_inputs    = n_inputs
+                self.batch_size  = batch_size
+                self.shuffle     = shuffle_batches
+                self.total       = gpu_tensor.size(0)
+                self.n_batches   = math.ceil(self.total / batch_size)
+                self.permutation = None
+
+            def __len__(self):
+                return self.n_batches
+
+            def __getitem__(self, batch_idx: int):
+                if self.shuffle:
+                    if self.permutation is None or batch_idx == 0:
+                        self.permutation = torch.randperm(
+                            self.total, device=self.gpu_tensor.device
+                        )
+                    idx = self.permutation
+                else:
+                    idx = None  # straight slice
+
+                start = batch_idx * self.batch_size
+                end   = min(start + self.batch_size, self.total)
+
+                if idx is None:
+                    batch = self.gpu_tensor[start:end]
+                else:
+                    batch = self.gpu_tensor.index_select(0, idx[start:end])
+
+                return batch[:, :self.n_inputs], batch[:, self.n_inputs:]
+
+        gpu_ds = GPUBatchDataset(
+            dataset.gpu_cache, dataset.n_inputs, bs, shuffle
+        )
         return DataLoader(
-            dataset,
-            batch_size=bs,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=(device and device.type == "cuda"),
-            drop_last=drop_last,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=2 if num_workers > 0 else None,
+            gpu_ds,
+            batch_size=None,          # dataset already returns a full batch
+            shuffle=False,            # handled inside GPUBatchDataset
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False,
         )
-    else:
-        # This shouldn't happen but handle it
-        raise RuntimeError(
-            f"Dataset {dataset.split_name if hasattr(dataset, 'split_name') else 'unknown'} "
-            "is neither GPU-cached nor in CPU fallback mode. Check dataset initialization."
-        )
+
+    # ---------- CPU fallback ----------
+    log.warning(f"DataLoader[{dataset.split_name}] CPU fallback mode: bs={bs}")
+    workers = tcfg.get("num_workers") or min(16, (os.cpu_count() or 1))
+    return DataLoader(
+        dataset,
+        batch_size=bs,
+        shuffle=shuffle,
+        num_workers=workers,
+        pin_memory=(device and device.type == "cuda"),
+        drop_last=drop_last,
+        persistent_workers=(workers > 0),
+        prefetch_factor=2 if workers > 0 else None,
+    )

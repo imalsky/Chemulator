@@ -11,11 +11,11 @@
             "data/raw/run9003-result.h5",
             "data/raw/run9004-result.h5",
             "data/raw/run9005-result.h5",
-            //"data/raw/run9006-result.h5",
-            //"data/raw/run9007-result.h5",
-            //"data/raw/run9008-result.h5",
-            //"data/raw/run9009-result.h5",
-            //"data/raw/run9010-result.h5"
+            "data/raw/run9006-result.h5",
+            "data/raw/run9007-result.h5",
+            "data/raw/run9008-result.h5",
+            "data/raw/run9009-result.h5",
+            "data/raw/run9010-result.h5"
         ],
         // Directory for processed NPY shards
         "processed_data_dir": "data/processed",
