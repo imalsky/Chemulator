@@ -82,7 +82,7 @@
     // ===== MODEL ARCHITECTURE =====
     "model": {
         // Model type: "deeponet" or "siren" (both work with absolute mode)
-        "type": "deeponet",
+        "type": "siren",
         
         // Activation function: "gelu", "relu", "silu", "tanh"
         "activation": "gelu",
@@ -99,7 +99,7 @@
         "basis_dim": 32,
         
         // SIREN-specific parameters (when type="siren")
-        "hidden_dims": [256, 256, 256],
+        "hidden_dims": [512, 512, 512, 512],
         "omega_0": 30.0
     },
     
@@ -109,8 +109,9 @@
         "enabled": true,
         // Hidden layers for FiLM networks
         "hidden_dims": [64, 64, 64, 64],
-        // Activation for FiLM networks
+        // Activation for FiLM networks (can be string or list)
         "activation": "gelu"
+        // For per-layer activations use: "activations": ["gelu", "relu", "silu", "gelu"]
     },
     
     // ===== PREDICTION SETTINGS =====
@@ -131,31 +132,40 @@
         "use_fraction": 1.0,
         
         // Training duration
-        "epochs": 50,  // Full training epochs (not used in HPO)
-        "batch_size": 16384,
+        "epochs": 50,
+        
+        // BATCH SIZE - Increase for GPU mode
+        "batch_size": 16384,  // Use 65536 or higher on A100
         "gradient_accumulation_steps": 1,
         
-        // MEMORY-OPTIMIZED DATALOADER SETTINGS
-        "num_workers": 8,
+        // GPU CACHING SETTINGS (NEW)
+        // Options: "auto" (default), true, false
+        // "auto" = use GPU cache if enough memory available
+        "gpu_cache_dataset": "auto",
+        
+        // DATALOADER SETTINGS - Adjust based on mode
+        // For GPU mode: set num_workers=0
+        // For CPU mode: set num_workers=4-8
+        "num_workers": 4,
         "pin_memory": true,
         "persistent_workers": true,
         "prefetch_factor": 2,
         "drop_last": true,
-        "dataset_cache_shards": 64,
+        "dataset_cache_shards": 64,  // Only used in CPU mode
         
         // Learning rate and optimizer settings
-        "learning_rate": 5e-4,  // Starting LR for HPO
+        "learning_rate": 5e-4,
         "weight_decay": 1e-5,
         "betas": [0.9, 0.999],
         "eps": 1e-8,
         "gradient_clip": 1.0,
         
-        // Scheduler settings - CRITICAL FOR LR DECAY
+        // Scheduler settings
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 50,  // Restart every 8 epochs (5 cycles in 40 epochs)
-            "T_mult": 2,  // Keep cycle length constant
-            "eta_min": 1e-8  // ENSURES LR DROPS TO 1e-8
+            "T_0": 50,
+            "T_mult": 2,
+            "eta_min": 1e-8
         },
         
         // Loss and training settings
@@ -163,15 +173,15 @@
         "huber_delta": 0.5,
         "use_amp": true,
         "amp_dtype": "bfloat16",
-        "early_stopping_patience": 10,  // Stop if no improvement for 8 epochs
+        "early_stopping_patience": 10,
         "min_delta": 1e-8,
         "log_interval": 100,
         "save_interval": 10,
         "empty_cache_interval": 500,
         
         // HPO-specific settings
-        "hpo_min_epochs": 10,  // Minimum epochs before pruning
-        "hpo_max_epochs": 40   // Maximum epochs for best trials
+        "hpo_min_epochs": 10,
+        "hpo_max_epochs": 40
     },
     
     // ===== SYSTEM/HARDWARE SETTINGS =====
@@ -195,13 +205,33 @@
         // Enable Optuna integration
         "enabled": true,
         
-        // Hyperband settings for 40-hour window
+        // Hyperband settings
         "algorithm": "hyperband",
-        "hyperband_min_resource": 10,  // 1.4 hours minimum
-        "hyperband_max_resource": 40,  // 5.5 hours maximum
-        "hyperband_reduction_factor": 3,  // Keep top 33% at each stage
+        "hyperband_min_resource": 10,
+        "hyperband_max_resource": 40,
+        "hyperband_reduction_factor": 3,
         
-        // Target number of trials for 40 hours
-        "n_trials": 100  // Conservative estimate with pruning
+        // Target number of trials
+        "n_trials": 100
     }
 }
+
+// ===== CONFIGURATION PROFILES =====
+// 
+// FOR LOCAL MACHINE (CPU or small GPU):
+// - Set batch_size: 1024-4096
+// - Set num_workers: 2-4
+// - Set dataset_cache_shards: 8-16
+// - Set gpu_cache_dataset: false
+// - Consider smaller model: hidden_dims: [128, 128, 128]
+//
+// FOR A100 GPU (High memory):
+// - Set batch_size: 65536 or higher
+// - Set num_workers: 0 (when using GPU cache)
+// - Set gpu_cache_dataset: "auto" or true
+// - Can use larger model: hidden_dims: [512, 512, 512, 512]
+//
+// GPU caching will automatically activate when:
+// - gpu_cache_dataset is "auto" or true
+// - Device is CUDA
+// - Dataset fits in 80% of available GPU memory

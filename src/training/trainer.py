@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
 Training pipeline for chemical kinetics models.
-Fixed issues:
-1. Correct scheduler stepping with gradient accumulation
-2. Removed all MAE calculations
-3. Fixed ratio mode loss calculation
-4. Fixed no-validation logic
 """
 
 import json
@@ -399,9 +394,12 @@ class Trainer:
         self.model.train()
         total_loss, total_samples = 0.0, 0
         
+        gpu_cached = hasattr(self.train_loader.dataset, "gpu_cache") and self.train_loader.dataset.gpu_cache is not None
+        
         for batch_idx, (inputs, targets) in enumerate(self.train_loader):
-            inputs  = inputs.to(self.device,  non_blocking=True)
-            targets = targets.to(self.device, non_blocking=True)
+            if not gpu_cached:
+                inputs  = inputs.to(self.device,  non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
 
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
@@ -445,13 +443,6 @@ class Trainer:
 
             total_loss += loss.item() * inputs.size(0)
             total_samples += inputs.size(0)
-
-            #if self.global_step > 0 and self.global_step % self.log_interval == 0:
-            #    self.logger.info(
-            #        f"Epoch {self.current_epoch} | "
-            #        f"Batch {batch_idx + 1}/{len(self.train_loader)} | "
-            #        f"Loss: {total_loss / total_samples:.3e}"
-            #    )
         
         return total_loss / total_samples, {}
 
@@ -464,10 +455,13 @@ class Trainer:
         total_loss = 0.0
         total_samples = 0
         
+        gpu_cached = hasattr(self.val_loader.dataset, "gpu_cache") and self.val_loader.dataset.gpu_cache is not None
+        
         with torch.no_grad():
             for inputs, targets in self.val_loader:
-                inputs = inputs.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
+                if not gpu_cached:
+                    inputs = inputs.to(self.device, non_blocking=True)
+                    targets = targets.to(self.device, non_blocking=True)
 
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(inputs)
@@ -489,10 +483,13 @@ class Trainer:
         total_loss = 0.0
         total_samples = 0
         
+        gpu_cached = hasattr(self.test_loader.dataset, "gpu_cache") and self.test_loader.dataset.gpu_cache is not None
+        
         with torch.no_grad():
             for inputs, targets in self.test_loader:
-                inputs = inputs.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
+                if not gpu_cached:
+                    inputs = inputs.to(self.device, non_blocking=True)
+                    targets = targets.to(self.device, non_blocking=True)
 
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     outputs = self.model(inputs)
@@ -504,24 +501,6 @@ class Trainer:
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
         self.logger.info(f"Test loss: {avg_loss:.6f}")
         return avg_loss
-
-    def cleanup_dataloaders(self):
-        """Properly cleanup DataLoader workers to prevent memory leaks."""
-        for loader in [self.train_loader, self.val_loader, self.test_loader]:
-            if loader is not None:
-                try:
-                    # Force workers to terminate
-                    loader._shutdown_workers()
-                    del loader
-                except:
-                    pass
-        
-        # Force garbage collection
-        import gc
-        gc.collect()
-        
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
 
     def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
         """Log epoch results."""
@@ -566,8 +545,6 @@ class Trainer:
                 example_inputs, _ = next(iter(example_loader))
                 example_inputs = example_inputs.to(self.device)
                 
-                # Note: We pass the full batch, but export_model will handle
-                # making the batch dimension dynamic
                 export_path = self.save_dir / "exported_model.pt"
                 
                 # Log the shape being used for export

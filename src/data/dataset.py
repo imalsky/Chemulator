@@ -8,6 +8,7 @@ Key improvements:
 - Shard-aware sampling to maximize cache hits
 - Lazy cache initialization per worker
 - Cross-platform compatibility (macOS/Linux)
+- GPU caching for high-memory GPUs (NEW)
 """
 
 import json
@@ -81,6 +82,7 @@ class NPYDataset(Dataset):
     """
     Optimized PyTorch Dataset with efficient shard caching.
     Designed to work with multiprocessing on both Linux and macOS.
+    Now includes optional GPU caching for high-memory GPUs.
     """
     def __init__(self, shard_dir: Path, split_name: str, config: Dict[str, Any], 
                  device: torch.device):
@@ -125,20 +127,86 @@ class NPYDataset(Dataset):
         # Memory calculations
         self.bytes_per_sample = self.n_features * 4  # float32
         self.bytes_per_shard = self.samples_per_shard * self.bytes_per_sample
+        self.total_bytes = self.n_total_samples * self.bytes_per_sample
         
-        # Determine cache size but don't create cache yet
-        self._determine_cache_size()
+        # Check if we should use GPU caching
+        self.gpu_cache = None
+        self._try_gpu_cache()
         
-        # Cache will be created lazily per worker
-        self._worker_cache = None
-        self._worker_id = None
+        # If not using GPU cache, setup CPU caching
+        if self.gpu_cache is None:
+            self._determine_cache_size()
+            self._worker_cache = None
+            self._worker_id = None
         
+        cache_status = "GPU-cached" if self.gpu_cache is not None else f"CPU-cached ({self._max_cache_size} shards)"
         self.logger.info(
             f"NPYDataset '{self.split_name}' initialized: "
             f"{self.n_total_samples:,} samples across {self.n_shards} shards "
-            f"({self.bytes_per_shard / 1024**2:.1f} MB/shard), "
-            f"cache capacity: {self._max_cache_size} shards"
+            f"({self.total_bytes / 1024**3:.1f} GB total), {cache_status}"
         )
+
+    def _try_gpu_cache(self):
+        """Try to load entire dataset to GPU if enabled and enough memory available."""
+        # Check if GPU caching is enabled in config
+        if not self.config.get("training", {}).get("gpu_cache_dataset", "auto") in ["auto", True]:
+            return
+            
+        # Only attempt on CUDA devices
+        if self.device.type != "cuda":
+            return
+            
+        # Check available GPU memory
+        free_mem, total_mem = torch.cuda.mem_get_info(self.device.index)
+        free_gb = free_mem / 1024**3
+        needed_gb = self.total_bytes / 1024**3
+        
+        # Need at least 20% buffer for model and operations
+        if needed_gb > free_gb * 0.8:
+            self.logger.info(
+                f"Not enough GPU memory for {self.split_name}: "
+                f"need {needed_gb:.1f}GB, have {free_gb:.1f}GB free"
+            )
+            return
+            
+        # Load entire dataset to GPU
+        self.logger.info(f"Loading {self.split_name} dataset to GPU ({needed_gb:.1f}GB)...")
+        start_time = time.time()
+        
+        try:
+            # Pre-allocate GPU tensor
+            self.gpu_cache = torch.empty(
+                (self.n_total_samples, self.n_features),
+                dtype=torch.float32,
+                device=self.device
+            )
+            
+            # Load each shard
+            current_idx = 0
+            for shard_info in self.shards:
+                shard_path = self.split_dir / shard_info["filename"]
+                
+                # Load shard
+                if self.shard_index.get("compression") == "npz":
+                    with np.load(shard_path) as zf:
+                        data = zf["data"]
+                else:
+                    data = np.load(shard_path)
+                
+                # Copy to GPU
+                n_samples = data.shape[0]
+                self.gpu_cache[current_idx:current_idx + n_samples] = torch.from_numpy(data)
+                current_idx += n_samples
+            
+            load_time = time.time() - start_time
+            self.logger.info(
+                f"GPU cache loaded in {load_time:.1f}s ({needed_gb/load_time:.1f} GB/s)"
+            )
+            
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            self.logger.warning(f"GPU caching failed: {e}. Falling back to CPU caching.")
+            self.gpu_cache = None
+            torch.cuda.empty_cache()
 
     def _determine_cache_size(self):
         """Calculate optimal shard cache size based on available system memory."""
@@ -285,6 +353,12 @@ class NPYDataset(Dataset):
         Returns:
             Tuple of (input, target) tensors
         """
+        # Fast path: GPU cache
+        if self.gpu_cache is not None:
+            row = self.gpu_cache[idx]
+            return row[:self.n_inputs], row[self.n_inputs:]
+        
+        # CPU path: load from shards
         # Get sample location
         shard_idx, local_idx = self._get_sample_location(idx)
         
@@ -301,7 +375,9 @@ class NPYDataset(Dataset):
 
     def get_cache_info(self) -> Optional[Dict[str, Any]]:
         """Get cache statistics if available."""
-        if self._worker_cache is not None:
+        if self.gpu_cache is not None:
+            return {"type": "gpu", "size_gb": self.total_bytes / 1024**3}
+        elif self._worker_cache is not None:
             return self._worker_cache.info()
         return None
 
@@ -313,6 +389,16 @@ class NPYDataset(Dataset):
         mem_info = psutil.virtual_memory()
         available_gb = mem_info.available / 1024**3
         total_gb = mem_info.total / 1024**3
+        
+        # If using GPU cache, requirements are minimal
+        if self.gpu_cache is not None:
+            return {
+                "mode": "gpu_cached",
+                "gpu_memory_gb": self.total_bytes / 1024**3,
+                "cpu_memory_gb": 0.1,  # Minimal CPU usage
+                "available_gb": available_gb,
+                "total_system_gb": total_gb
+            }
         
         # Calculate per-component memory usage
         num_workers = self.config["training"]["num_workers"]
@@ -326,6 +412,7 @@ class NPYDataset(Dataset):
         
         # Component breakdown
         memory_breakdown = {
+            "mode": "cpu_cached",
             "shard_cache_per_worker_gb": cache_shards * shard_gb * 2,  # 2x for overhead
             "prefetch_per_worker_gb": prefetch * batch_gb,
             "num_workers": num_workers,
@@ -473,6 +560,25 @@ def create_dataloader(dataset: Dataset,
     log = logging.getLogger(__name__)
     tcfg = config["training"]
     bs = tcfg["batch_size"]
+    
+    # Check if using GPU cache
+    is_gpu_cached = hasattr(dataset, 'gpu_cache') and dataset.gpu_cache is not None
+    
+    if is_gpu_cached:
+        # GPU-cached: no workers needed
+        log.info(f"DataLoader[{dataset.split_name}] GPU-cached mode: "
+                 f"bs={bs} workers=0 pin=False")
+        
+        return DataLoader(
+            dataset,
+            batch_size=bs,
+            shuffle=shuffle,
+            num_workers=0,  # No workers for GPU cache
+            pin_memory=False,  # Already on GPU
+            drop_last=drop_last,
+        )
+    
+    # CPU mode: use workers
     workers = min(32, tcfg.get("num_workers", 0))
 
     # Pin memory only if using CUDA and workers
