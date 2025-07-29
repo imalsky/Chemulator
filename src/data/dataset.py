@@ -2,136 +2,89 @@
 """
 High-performance dataset implementation for chemical kinetics training.
 
-This module provides efficient data loading from numpy shard files with:
-- Intelligent memory-based caching with LRU eviction
-- Zero-copy tensor creation for optimal performance
-- Multi-worker support with proper memory management
-- Binary search for O(log n) sample lookups
-- Conservative memory allocation to prevent OOM issues
-- Shard-aware sampling to maximize cache efficiency
+OPTIMIZED VERSION: Implements efficient shard caching and batch loading.
+Key improvements:
+- Efficient shard caching without threading locks (pickle-friendly)
+- Shard-aware sampling to maximize cache hits
+- Lazy cache initialization per worker
+- Cross-platform compatibility (macOS/Linux)
 """
 
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, List, Iterator
-from functools import lru_cache
+from typing import Dict, Any, Tuple, Optional, List, Iterator, Union
+from collections import OrderedDict
+import bisect
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader, Sampler, BatchSampler
 import psutil
 import os
 
 
-class ShardAwareSampler(Sampler):
+class SimpleLRUCache:
     """
-    A sampler that generates indices in a shard-aware manner to maximize cache efficiency.
-    
-    This sampler:
-    1. Groups indices by their shard
-    2. Shuffles shards randomly
-    3. Within each shard, shuffles indices randomly
-    4. Yields batches that primarily come from 1-2 shards at a time
-    
-    This dramatically reduces cache misses and disk I/O.
+    A simple, pickle-friendly LRU cache implementation.
+    No thread locks needed since each worker process is separate.
     """
-    def __init__(self, dataset: 'NPYDataset', batch_size: int, drop_last: bool = True, seed: int = 0):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.seed = seed
-        
-        # Group indices by shard
-        self.shard_to_indices = self._group_indices_by_shard()
-        self.total_samples = len(dataset)
-        
-    def _group_indices_by_shard(self) -> Dict[int, List[int]]:
-            """
-            Group dataset indices by their shard using robust binary search.
-            This correctly handles shards of variable sizes.
-            """
-            shard_groups = {}
-            if not len(self.dataset):
-                return shard_groups
-
-            # Get the start indices of all shards in this split
-            shard_starts = self.dataset._shard_starts
-            
-            # Use numpy's highly optimized searchsorted to find the
-            # shard index for every sample in the dataset in one go.
-            all_shard_indices = np.searchsorted(
-                shard_starts, 
-                np.arange(len(self.dataset)), 
-                side='right'
-            ) - 1
-            
-            # Now, group the dataset indices by their calculated shard index
-            for dataset_idx, shard_idx in enumerate(all_shard_indices):
-                # The key must be an integer for dictionary access
-                shard_idx_int = int(shard_idx)
-                if shard_idx_int not in shard_groups:
-                    shard_groups[shard_idx_int] = []
-                shard_groups[shard_idx_int].append(dataset_idx)
-                
-            return shard_groups
+    def __init__(self, maxsize: int):
+        self.maxsize = maxsize
+        self.cache = OrderedDict()
+        self.hits = 0
+        self.misses = 0
     
-    def __iter__(self) -> Iterator[int]:
-        """Generate indices in a cache-friendly order."""
-        # Set random seed for reproducibility
-        rng = np.random.RandomState(self.seed + torch.utils.data.get_worker_info().id 
-                                     if torch.utils.data.get_worker_info() else self.seed)
-        
-        # Shuffle shard order
-        shard_order = list(self.shard_to_indices.keys())
-        rng.shuffle(shard_order)
-        
-        # Collect all indices in shard-aware order
-        all_indices = []
-        for shard_idx in shard_order:
-            # Get indices for this shard and shuffle them
-            shard_indices = self.shard_to_indices[shard_idx].copy()
-            rng.shuffle(shard_indices)
-            all_indices.extend(shard_indices)
-        
-        # Yield batches
-        for i in range(0, len(all_indices) - self.batch_size + 1, self.batch_size):
-            yield all_indices[i:i + self.batch_size]
-            
-        # Handle last batch
-        if not self.drop_last and len(all_indices) % self.batch_size != 0:
-            yield all_indices[-(len(all_indices) % self.batch_size):]
+    def get(self, key: int) -> Optional[np.ndarray]:
+        """Get item from cache, updating LRU order."""
+        if key in self.cache:
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
+            self.hits += 1
+            return self.cache[key]
+        self.misses += 1
+        return None
     
-    def __len__(self) -> int:
-        """Return the number of batches."""
-        if self.drop_last:
-            return self.total_samples // self.batch_size
+    def put(self, key: int, value: np.ndarray) -> None:
+        """Put item in cache, evicting LRU item if necessary."""
+        if key in self.cache:
+            # Update and move to end
+            self.cache[key] = value
+            self.cache.move_to_end(key)
         else:
-            return (self.total_samples + self.batch_size - 1) // self.batch_size
+            # Add new item
+            self.cache[key] = value
+            if len(self.cache) > self.maxsize:
+                # Remove least recently used
+                self.cache.popitem(last=False)
+    
+    def clear(self):
+        """Clear the cache."""
+        self.cache.clear()
+        self.hits = 0
+        self.misses = 0
+    
+    def info(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        total = self.hits + self.misses
+        return {
+            "size": len(self.cache),
+            "maxsize": self.maxsize,
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": self.hits / total if total > 0 else 0
+        }
 
 
 class NPYDataset(Dataset):
     """
-    PyTorch Dataset for loading chemical kinetics data from numpy shard files.
-    
-    This dataset efficiently handles large-scale data by:
-    - Loading entire shards into memory for fast access (no mmap overhead)
-    - Caching frequently accessed shards with LRU eviction
-    - Creating PyTorch tensors without data copying
-    - Supporting train/validation/test splits via index arrays
-    - Conservative memory allocation to prevent OOM issues
-    - Providing shard-aware sampling for cache efficiency
-    
-    Args:
-        shard_dir: Directory containing shard files and metadata
-        indices: Array of global sample indices for this split
-        config: Training configuration dictionary
-        device: PyTorch device (used for logging, not data loading)
-        split_name: Name of this split (train/val/test) for logging
+    Optimized PyTorch Dataset with efficient shard caching.
+    Designed to work with multiprocessing on both Linux and macOS.
     """
-    def __init__(self, shard_dir: Path, split_name: str, config: Dict[str, Any], device: torch.device):
-        """Initialize dataset for a specific split - much simpler!"""
+    def __init__(self, shard_dir: Path, split_name: str, config: Dict[str, Any], 
+                 device: torch.device):
+        """Initialize dataset for a specific split."""
         super().__init__()
         self.shard_dir = Path(shard_dir)
         self.split_dir = self.shard_dir / split_name
@@ -158,6 +111,7 @@ class NPYDataset(Dataset):
         self.samples_per_shard = self.shard_index["samples_per_shard"]
         self.prediction_mode = self.shard_index.get("prediction_mode", "absolute")
         self.n_features = self.n_species * 2 + self.n_globals + 1
+        self.n_inputs = self.n_species + self.n_globals + 1
         
         # Get shard info for this split
         self.shards = self.split_info["shards"]
@@ -172,11 +126,13 @@ class NPYDataset(Dataset):
         self.bytes_per_sample = self.n_features * 4  # float32
         self.bytes_per_shard = self.samples_per_shard * self.bytes_per_sample
         
-        # Initialize caching
-        self.cache_is_setup = False
+        # Determine cache size but don't create cache yet
         self._determine_cache_size()
         
-        # Log initialization
+        # Cache will be created lazily per worker
+        self._worker_cache = None
+        self._worker_id = None
+        
         self.logger.info(
             f"NPYDataset '{self.split_name}' initialized: "
             f"{self.n_total_samples:,} samples across {self.n_shards} shards "
@@ -184,14 +140,8 @@ class NPYDataset(Dataset):
             f"cache capacity: {self._max_cache_size} shards"
         )
 
-
     def _determine_cache_size(self):
-        """
-        Calculate optimal shard cache size based on available system memory.
-        Uses conservative estimates to prevent OOM issues when multiple
-        datasets are running simultaneously.
-        """
-        # Query available system memory
+        """Calculate optimal shard cache size based on available system memory."""
         try:
             mem_info = psutil.virtual_memory()
             available_memory = mem_info.available
@@ -204,14 +154,13 @@ class NPYDataset(Dataset):
             )
         except Exception as e:
             self.logger.warning(f"Failed to query system memory: {e}. Using 4GB fallback.")
-            available_memory = 4 * 1024**3  # Conservative 4GB fallback
+            available_memory = 4 * 1024**3
 
         # Conservative memory allocation (30% of available)
         cache_memory_fraction = 0.3
         total_cache_memory = available_memory * cache_memory_fraction
         
         # Account for multiple datasets running concurrently
-        # Assume up to 3 datasets (train/val/test) may be active
         num_concurrent_datasets = 3
         cache_memory_per_dataset = total_cache_memory / num_concurrent_datasets
         
@@ -230,14 +179,13 @@ class NPYDataset(Dataset):
             max_cache_memory_per_worker = cache_memory_per_dataset
 
         # Account for memory overhead and fragmentation
-        # Each shard needs ~2x its size due to Python overhead, fragmentation, etc.
         memory_overhead_factor = 2.0
         effective_shard_size = self.bytes_per_shard * memory_overhead_factor
         
         # Calculate how many shards fit in allocated memory per worker
         memory_based_shards = int(max_cache_memory_per_worker / max(1, effective_shard_size))
         
-        config_limit = self.config["training"].get("dataset_cache_shards", 16)  # Changed default
+        config_limit = self.config["training"].get("dataset_cache_shards", 16)
         
         if num_workers >= 16:
             practical_limit = 64
@@ -248,61 +196,46 @@ class NPYDataset(Dataset):
         else:
             practical_limit = 1024
         
-        # Use the minimum of all constraints, with a floor of 1 shard
+        # Use the minimum of all constraints
         self._max_cache_size = max(1, min(
             memory_based_shards,
             config_limit,
             practical_limit
         ))
+
+    def _setup_worker(self):
+        """Initialize cache and worker-specific state. Called lazily on first access."""
+        if self._worker_cache is not None:
+            return  # Already initialized
+            
+        # Get worker info
+        worker_info = torch.utils.data.get_worker_info()
+        self._worker_id = worker_info.id if worker_info else -1
         
-        # Calculate and log expected memory usage
-        expected_cache_gb = (self._max_cache_size * effective_shard_size) / 1024**3
-        total_expected_gb = expected_cache_gb * num_workers
+        # Create cache for this worker
+        self._worker_cache = SimpleLRUCache(self._max_cache_size)
         
-        self.logger.info(
-            f"Cache size for '{self.split_name}': "
-            f"{self._max_cache_size} shards per worker "
-            f"(memory_based={memory_based_shards}, config={config_limit}, practical={practical_limit}). "
-            f"Expected memory: {expected_cache_gb:.1f} GB per worker, "
-            f"{total_expected_gb:.1f} GB total for {num_workers} workers"
-        )
+        self.logger.debug(f"Initialized cache for worker {self._worker_id} "
+                         f"with capacity {self._max_cache_size} shards")
+
+    def _get_shard_data(self, shard_idx: int) -> np.ndarray:
+        """Get shard data with caching."""
+        # Ensure worker is initialized
+        if self._worker_cache is None:
+            self._setup_worker()
         
-        # Warn if memory usage seems high
-        if total_expected_gb > total_memory / 1024**3 * 0.5:
-            self.logger.warning(
-                f"High memory usage warning: Expected cache memory ({total_expected_gb:.1f} GB) "
-                f"exceeds 50% of system RAM. Consider reducing num_workers or dataset_cache_shards."
-            )
-
-    def _setup_worker_cache(self) -> None:
-        """
-        Build an independent LRU cache in each worker process.
-        This is called lazily when the dataset is first accessed in a worker.
-        """
-        if getattr(self, "_cache_is_ready", False):
-            return
-
-        # Create the LRU-cached version of the shard loader
-        self._get_shard_data = lru_cache(maxsize=self._max_cache_size)(self._get_shard_data_impl)
-
-        # Run memory check once per worker
-        if not getattr(self, "_ram_guard_ran", False):
-            self.check_memory_requirements()
-            self._ram_guard_ran = True
-
-        # Mark cache as ready
-        self.cache_is_setup = True
-        self._cache_is_ready = True
-
-
-    def _get_shard_data_impl(self, shard_idx: int) -> np.ndarray:
-        """Load a shard from the split-specific directory."""
+        # Try to get from cache
+        data = self._worker_cache.get(shard_idx)
+        if data is not None:
+            return data
+        
+        # Load from disk
         shard_info = self.shards[shard_idx]
         shard_path = self.split_dir / shard_info["filename"]
         exp_samples = shard_info["n_samples"]
-
-        self.logger.debug(f"Loading shard {shard_idx} from {self.split_name}: {shard_path}")
-
+        
+        self.logger.debug(f"Worker {self._worker_id} loading shard {shard_idx}: {shard_path}")
+        
         t0 = time.time()
         
         # Load data
@@ -314,68 +247,68 @@ class NPYDataset(Dataset):
             data = arr.astype(np.float32) if arr.dtype != np.float32 else arr
             if not data.flags["C_CONTIGUOUS"]:
                 data = np.ascontiguousarray(data)
-
-        self.logger.debug(f"Shard loaded in {(time.time()-t0):.3f}s")
-
+        
+        self.logger.debug(f"Shard {shard_idx} loaded in {(time.time()-t0):.3f}s")
+        
         # Validate
         if data.shape[0] != exp_samples:
             raise ValueError(f"Shard sample mismatch ({data.shape[0]} vs {exp_samples})")
         if data.shape[1] != self.n_features:
             raise ValueError(f"Feature dim mismatch ({data.shape[1]} vs {self.n_features})")
-
+        
+        # Store in cache
+        self._worker_cache.put(shard_idx, data)
+        
         return data
 
+    def _get_sample_location(self, idx: int) -> Tuple[int, int]:
+        """Get (shard_idx, local_idx) for a global index."""
+        if not (0 <= idx < self.n_total_samples):
+            raise IndexError(f"Index {idx} out of range [0, {self.n_total_samples})")
+        
+        # Binary search to find the shard
+        shard_idx = np.searchsorted(self._shard_starts, idx, side='right') - 1
+        local_idx = idx - self._shard_starts[shard_idx]
+        return int(shard_idx), int(local_idx)
+
     def __len__(self) -> int:
-        """Return the total number of samples in this dataset split."""
+        """Return the total number of samples."""
         return self.n_total_samples
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load a single sample - much simpler without index translation!"""
-        # Initialize cache on first access
-        if not self.cache_is_setup:
-            self._setup_worker_cache()
+        """
+        Get a single sample by index.
+        
+        Args:
+            idx: Sample index
+            
+        Returns:
+            Tuple of (input, target) tensors
+        """
+        # Get sample location
+        shard_idx, local_idx = self._get_sample_location(idx)
+        
+        # Load shard and extract sample
+        shard_data = self._get_shard_data(shard_idx)
+        row = shard_data[local_idx]
+        
+        # Split into input and target
+        # Create copies to ensure tensors own their memory
+        input_tensor = torch.from_numpy(row[:self.n_inputs].copy())
+        target_tensor = torch.from_numpy(row[self.n_inputs:].copy())
+        
+        return input_tensor, target_tensor
 
-        # Validate index
-        if not (0 <= idx < self.n_total_samples):
-            raise IndexError(f"Index {idx} out of range [0, {self.n_total_samples})")
-
-        try:
-            # Find shard using binary search
-            shard_idx = np.searchsorted(self._shard_starts, idx, side='right') - 1
-            
-            # Calculate local index within shard
-            local_idx = idx - self._shard_starts[shard_idx]
-            
-            # Load shard data (may hit cache)
-            shard_data = self._get_shard_data(shard_idx)
-            
-            # Extract the sample row
-            row = shard_data[local_idx]
-            
-            # Split into input and target
-            n_input = self.n_species + self.n_globals + 1
-            
-            # Create tensors (zero-copy)
-            input_tensor = torch.from_numpy(row[:n_input])
-            target_tensor = torch.from_numpy(row[n_input:])
-            
-            return input_tensor, target_tensor
-
-        except Exception as e:
-            self.logger.error(
-                f"Error accessing sample idx={idx} in {self.split_name}: {e}",
-                exc_info=True
-            )
-            raise
+    def get_cache_info(self) -> Optional[Dict[str, Any]]:
+        """Get cache statistics if available."""
+        if self._worker_cache is not None:
+            return self._worker_cache.info()
+        return None
 
     def check_memory_requirements(self) -> Dict[str, float]:
         """
         Pre-flight check: Estimate memory requirements and validate against available RAM.
-        Accounts for the fact that multiple datasets may be running concurrently.
-        Returns dict with memory estimates.
         """
-        import psutil
-        
         # Get current memory state
         mem_info = psutil.virtual_memory()
         available_gb = mem_info.available / 1024**3
@@ -413,22 +346,6 @@ class NPYDataset(Dataset):
         memory_breakdown["total_system_gb"] = total_gb
         memory_breakdown["usage_percent"] = (total_expected_gb / available_gb) * 100
         
-        # Log detailed breakdown
-        #self.logger.info(f"\n{'='*60}")
-        #self.logger.info(f"Memory Requirements Check for '{self.split_name}' Dataset")
-        #self.logger.info(f"{'='*60}")
-        #self.logger.info(f"System Memory: {total_gb:.1f} GB total, {available_gb:.1f} GB available")
-        #self.logger.info(f"Configuration: {num_workers} workers, {cache_shards} cached shards, "
-        #                f"{batch_size} batch size")
-        #self.logger.info(f"\nMemory Breakdown:")
-        #self.logger.info(f"  - Shard cache: {memory_breakdown['shard_cache_per_worker_gb']:.2f} GB/worker")
-        #self.logger.info(f"  - Prefetch buffer: {memory_breakdown['prefetch_per_worker_gb']:.2f} GB/worker")
-        #self.logger.info(f"  - Python overhead: {memory_breakdown['python_overhead_gb']:.2f} GB")
-        #self.logger.info(f"  - Worker overhead: {memory_breakdown['dataloader_overhead_gb']:.2f} GB")
-        #self.logger.info(f"\nTotal Expected: {total_expected_gb:.1f} GB "
-        #                f"({memory_breakdown['usage_percent']:.0f}% of available)")
-        #self.logger.info(f"{'='*60}\n")
-        
         # Validate memory requirements
         safety_factor = 0.8  # Don't use more than 80% of available memory
         if total_expected_gb > available_gb * safety_factor:
@@ -443,6 +360,90 @@ class NPYDataset(Dataset):
             raise MemoryError(error_msg)
         
         return memory_breakdown
+
+
+class ShardAwareSampler(Sampler):
+    """
+    A sampler that generates indices in a shard-aware manner to maximize cache efficiency.
+    
+    This sampler:
+    1. Groups indices by their shard
+    2. Shuffles shards randomly
+    3. Within each shard, shuffles indices randomly
+    4. Yields batches that primarily come from 1-2 shards at a time
+    
+    This dramatically reduces cache misses and disk I/O.
+    """
+    def __init__(self, dataset: NPYDataset, batch_size: int, drop_last: bool = True, seed: int = 0):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.seed = seed
+        
+        # Group indices by shard
+        self.shard_to_indices = self._group_indices_by_shard()
+        self.total_samples = len(dataset)
+        
+    def _group_indices_by_shard(self) -> Dict[int, List[int]]:
+        """
+        Group dataset indices by their shard using robust binary search.
+        """
+        shard_groups = {}
+        if not len(self.dataset):
+            return shard_groups
+
+        # Get the start indices of all shards in this split
+        shard_starts = self.dataset._shard_starts
+        
+        # Use numpy's highly optimized searchsorted
+        all_shard_indices = np.searchsorted(
+            shard_starts, 
+            np.arange(len(self.dataset)), 
+            side='right'
+        ) - 1
+        
+        # Group the dataset indices by their calculated shard index
+        for dataset_idx, shard_idx in enumerate(all_shard_indices):
+            shard_idx_int = int(shard_idx)
+            if shard_idx_int not in shard_groups:
+                shard_groups[shard_idx_int] = []
+            shard_groups[shard_idx_int].append(dataset_idx)
+                
+        return shard_groups
+    
+    def __iter__(self) -> Iterator[int]:
+        """Generate indices in a cache-friendly order."""
+        # Set random seed for reproducibility
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        rng = np.random.RandomState(self.seed + worker_id)
+        
+        # Shuffle shard order
+        shard_order = list(self.shard_to_indices.keys())
+        rng.shuffle(shard_order)
+        
+        # Collect all indices in shard-aware order
+        all_indices = []
+        for shard_idx in shard_order:
+            # Get indices for this shard and shuffle them
+            shard_indices = self.shard_to_indices[shard_idx].copy()
+            rng.shuffle(shard_indices)
+            all_indices.extend(shard_indices)
+        
+        # Yield batches
+        for i in range(0, len(all_indices) - self.batch_size + 1, self.batch_size):
+            yield all_indices[i:i + self.batch_size]
+            
+        # Handle last batch
+        if not self.drop_last and len(all_indices) % self.batch_size != 0:
+            yield all_indices[-(len(all_indices) % self.batch_size):]
+    
+    def __len__(self) -> int:
+        """Return the number of batches."""
+        if self.drop_last:
+            return self.total_samples // self.batch_size
+        else:
+            return (self.total_samples + self.batch_size - 1) // self.batch_size
 
 
 def create_dataloader(dataset: Dataset,
@@ -469,23 +470,24 @@ def create_dataloader(dataset: Dataset,
         logging.getLogger(__name__).warning("Cannot create DataLoader for empty dataset")
         return None
 
-    log     = logging.getLogger(__name__)
-    tcfg    = config["training"]
-    bs      = tcfg["batch_size"]
+    log = logging.getLogger(__name__)
+    tcfg = config["training"]
+    bs = tcfg["batch_size"]
     workers = min(32, tcfg.get("num_workers", 0))
 
     # Pin memory only if using CUDA and workers
-    pin   = (tcfg.get("pin_memory", False) and workers > 0
-             and device is not None and device.type == "cuda")
+    pin = (tcfg.get("pin_memory", False) and workers > 0
+           and device is not None and device.type == "cuda")
     
     # Persistent workers only if pinning memory
-    pers  = tcfg.get("persistent_workers", False) and pin
+    pers = tcfg.get("persistent_workers", False) and pin
     
     # Prefetch factor only matters with workers
-    pre   = tcfg.get("prefetch_factor", 2) if workers > 0 else 1
+    pre = tcfg.get("prefetch_factor", 2) if workers > 0 else 1
 
     # Validate batch and prefetch settings for GPU memory
-    _validate_batch_prefetch(bs, pre, dataset.n_features, device)
+    if hasattr(dataset, 'n_features'):
+        _validate_batch_prefetch(bs, pre, dataset.n_features, device)
 
     # Determine if we should use shard-aware sampling
     if use_shard_aware_sampling and shuffle and isinstance(dataset, NPYDataset):
@@ -498,11 +500,11 @@ def create_dataloader(dataset: Dataset,
         )
         
         log.info(f"DataLoader[{dataset.split_name}] using ShardAwareSampler: "
-                 f"bs={bs}  workers={workers}  pin={pin}  pers={pers}  prefetch={pre}")
+                 f"bs={bs} workers={workers} pin={pin} pers={pers} prefetch={pre}")
         
         return DataLoader(
             dataset,
-            batch_sampler=batch_sampler,  # Use our shard-aware sampler
+            batch_sampler=batch_sampler,
             num_workers=workers,
             pin_memory=pin,
             persistent_workers=pers,
@@ -511,8 +513,8 @@ def create_dataloader(dataset: Dataset,
         )
     else:
         # Use standard DataLoader for validation/test or when shard-aware is disabled
-        log.info(f"DataLoader[{dataset.split_name}]  bs={bs}  workers={workers}  "
-                 f"pin={pin}  pers={pers}  prefetch={pre}")
+        log.info(f"DataLoader[{dataset.split_name if hasattr(dataset, 'split_name') else 'unknown'}]: "
+                 f"bs={bs} workers={workers} pin={pin} pers={pers} prefetch={pre}")
 
         return DataLoader(
             dataset,
@@ -564,8 +566,6 @@ def _validate_batch_prefetch(batch_size: int,
     if device is None or device.type != "cuda":
         return
     
-    import torch
-    
     # Calculate memory needed for prefetched batches
     bytes_needed = batch_size * max(prefetch_factor, 1) * feature_dim * 4  # float32
     
@@ -577,5 +577,5 @@ def _validate_batch_prefetch(batch_size: int,
         human = bytes_needed / 1024**3
         raise RuntimeError(
             f"prefetch_factor×batch_size would pre‑queue ≈{human:.1f} GB "
-            "→ exceeds safe free GPU memory. Reduce batch_size or prefetch_factor."
+            "exceeds safe free GPU memory. Reduce batch_size or prefetch_factor."
         )

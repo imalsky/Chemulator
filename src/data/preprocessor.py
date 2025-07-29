@@ -423,7 +423,7 @@ class DataPreprocessor:
         self.raw_files = sorted(raw_files)
         self.output_dir = output_dir
 
-        self.processed_dir = self.output_dir / "processed"
+        self.processed_dir = self.output_dir
         self.processed_dir.mkdir(parents=True, exist_ok=True)
 
         self.config = config
