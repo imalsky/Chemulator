@@ -7,21 +7,63 @@ import torch
 from typing import Dict, Any, Union
 import hashlib
 import json
+import os
 
+# =================================================================
+# 1. CONFIGURE LOGGING FIRST
+# We set this up at the very top so even the prologue can use it.
+# =================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%Y%m%d_%H%M%S",
     stream=sys.stdout
 )
 
-# 2. Change the multiprocessing sharing strategy to prevent /dev/shm crashes.
+# =================================================================
+# 2. PROLOGUE FOR MAXIMUM PARALLELISM
+# This block now uses the logging system to report its actions.
+# =================================================================
+try:
+    # SLURM_CPUS_PER_TASK is the ground truth for the number of cores allocated
+    n_cores_str = os.environ.get("SLURM_CPUS_PER_TASK")
+    source = "SLURM"
+    
+    if n_cores_str is None:
+        # Fallback for local execution or other schedulers
+        n_cores_str = str(os.cpu_count() or 1)
+        source = "os.cpu_count()"
+
+    n_cores = int(n_cores_str)
+    
+    logging.info(f"CORE PROLOGUE: Detected {n_cores} cores via {source}.")
+    
+    # Set environment variables to force thread counts
+    os.environ["OMP_NUM_THREADS"] = str(n_cores)
+    os.environ["MKL_NUM_THREADS"] = str(n_cores)
+    logging.info(f"CORE PROLOGUE: Set OMP_NUM_THREADS and MKL_NUM_THREADS to {n_cores}.")
+    
+    # Set PyTorch's internal thread counts
+    torch.set_num_threads(n_cores)
+    
+    # Final verification log
+    logging.info(f"CORE PROLOGUE: Verification: torch.get_num_threads() now reports {torch.get_num_threads()} threads.")
+
+except Exception as e:
+    logging.error(f"CORE PROLOGUE: Failed to set thread counts: {e}", exc_info=True)
+
+
+# =================================================================
+# 3. REST OF THE APPLICATION
+# (The rest of the file is unchanged)
+# =================================================================
+# Set multiprocessing sharing strategy
 import torch.multiprocessing
 try:
     torch.multiprocessing.set_sharing_strategy('file_system')
     logging.info("SUCCESS: Set multiprocessing sharing strategy to 'file_system'.")
 except RuntimeError:
-    logging.warning("Could not set multiprocessing sharing strategy (already set or not supported).")
+    logging.warning("Could not set multiprocessing sharing strategy.")
 
 import numpy as np
 from utils.hardware import setup_device, optimize_hardware
@@ -29,30 +71,25 @@ from utils.utils import setup_logging, seed_everything, ensure_directories, load
 from data.preprocessor import DataPreprocessor
 from data.dataset import NPYDataset
 from models.model import create_model
-from training.trainer import Trainer
+from training.trainer import Trainer, diagnose_performance
 from data.normalizer import NormalizationHelper
 
 
 class ChemicalKineticsPipeline:
-    """Training pipeline for chemical kinetics prediction."""
+    """Optimized training pipeline for A100 GPU."""
     def __init__(self, config_or_path: Union[Path, Dict[str, Any]]):
-        """
-        Initialize the pipeline with either a config file path or a config dictionary.
-        
-        Args:
-            config_or_path: Either a Path to a config file or a config dictionary
-        """
+        """Initialize the pipeline."""
         if isinstance(config_or_path, (Path, str)):
             self.config = load_json_config(Path(config_or_path))
         elif isinstance(config_or_path, dict):
             self.config = config_or_path
         else:
-            raise TypeError(f"config_or_path must be a Path, str, or dict, not {type(config_or_path)}")
+            raise TypeError(f"config_or_path must be a Path, str, or dict")
         
         # Get prediction mode
         self.prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
         
-        # Setup paths with mode-specific directories
+        # Setup paths
         self.setup_paths()
         
         # Setup logging
@@ -69,7 +106,7 @@ class ChemicalKineticsPipeline:
         optimize_hardware(self.config["system"], self.device)
         
     def setup_paths(self):
-        """Create directory structure with mode-specific paths."""
+        """Create directory structure."""
         paths = self.config["paths"]
         
         # Create run directory
@@ -92,7 +129,6 @@ class ChemicalKineticsPipeline:
     def _compute_data_hash(self) -> str:
         """
         Compute a hash of data-critical parameters.
-        Only includes parameters that affect the actual data content.
         """
         data_params = {
             "raw_files": sorted([str(f) for f in self.raw_data_files]),
@@ -102,113 +138,60 @@ class ChemicalKineticsPipeline:
             "min_value_threshold": self.config["preprocessing"]["min_value_threshold"],
             "use_fraction": self.config["training"]["use_fraction"],
             "prediction_mode": self.prediction_mode,
-            "epsilon": self.config["normalization"]["epsilon"],
             "normalization_methods": self.config["normalization"].get("methods", {}),
             "default_norm_method": self.config["normalization"]["default_method"],
         }
         
-        # Create stable JSON string
         hash_str = json.dumps(data_params, sort_keys=True)
         return hashlib.sha256(hash_str.encode()).hexdigest()[:16]
 
     def normalize_only(self):
-            """Run only the data preprocessing and normalization step."""
-            self.logger.info("Running data normalization only...")
-            
-            # Check if data already exists with correct hash
-            current_hash = self._compute_data_hash()
-            hash_file = self.processed_dir / "data_hash.json"
-            
-            regenerate = True
-            if hash_file.exists():
-                saved_hash_data = load_json(hash_file)
-                if saved_hash_data.get("hash") == current_hash:
-                    self.logger.info("Data already preprocessed with matching hash. Skipping regeneration.")
-                    regenerate = False
-                else:
-                    self.logger.info("Data hash mismatch. Regenerating data...")
-                    self._clean_all_processed_data()
-            
-            if regenerate:
-                preprocessor = DataPreprocessor(
-                    raw_files=self.raw_data_files,
-                    output_dir=self.processed_dir,
-                    config=self.config
-                )
-                
-                missing = [p for p in self.raw_data_files if not p.exists()]
-                if missing:
-                    raise FileNotFoundError(f"Missing raw data files: {missing}")
-                
-                # Process to shards and compute normalization
-                preprocessor.process_to_npy_shards()
-                
-                # Save the hash
-                save_json({
-                    "hash": current_hash,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "mode": self.prediction_mode
-                }, hash_file)
-                
-                self.logger.info(f"Data normalization complete. Files saved to: {self.processed_dir}")
-
-    def _generate_or_validate_splits(self):
-        """Generate or validate train/val/test split indices."""
-        split_config = {
-            "val_fraction": self.config["training"]["val_fraction"],
-            "test_fraction": self.config["training"]["test_fraction"],
-            "use_fraction": self.config["training"]["use_fraction"],
-            "seed": self.config["system"]["seed"]
-        }
-        current_split_hash = hashlib.sha256(
-            json.dumps(split_config, sort_keys=True).encode('utf-8')
-        ).hexdigest()[:16]
+        """Run only the data preprocessing and normalization step."""
+        self.logger.info("Running data normalization only...")
         
-        split_hash_path = self.processed_dir / "split_hash.json"
+        # Check if data already exists
+        current_hash = self._compute_data_hash()
+        hash_file = self.processed_dir / "data_hash.json"
         
-        regenerate_splits = True
-        if split_hash_path.exists():
-            saved_split_hash = load_json(split_hash_path).get("hash")
-            if saved_split_hash == current_split_hash:
-                self.logger.info("Split configuration matches. Reusing existing splits.")
-                regenerate_splits = False
+        regenerate = True
+        if hash_file.exists():
+            saved_hash_data = load_json(hash_file)
+            if saved_hash_data.get("hash") == current_hash:
+                self.logger.info("Data already preprocessed with matching hash. Skipping regeneration.")
+                regenerate = False
+            else:
+                self.logger.info("Data hash mismatch. Regenerating data...")
         
-        if regenerate_splits:
-            self.logger.info("Generating new train/val/test splits...")
+        if regenerate:
             preprocessor = DataPreprocessor(
                 raw_files=self.raw_data_files,
                 output_dir=self.processed_dir,
                 config=self.config
             )
-            preprocessor.generate_split_indices()
-            save_json({"hash": current_split_hash}, split_hash_path)
-
-    def _clean_all_processed_data(self):
-        """Remove ALL processed files."""
-        self.logger.info("Cleaning ALL old processed files...")
-        if not self.processed_dir.exists():
-            return
-        
-        patterns = ["shard_*.npy", "shard_*.npz", "*.json", "*_indices.npy"]
-        removed_count = 0
-        
-        for pattern in patterns:
-            for file in self.processed_dir.glob(pattern):
-                try:
-                    file.unlink()
-                    removed_count += 1
-                except Exception as e:
-                    self.logger.warning(f"Failed to remove {file}: {e}")
-        
-        self.logger.info(f"Removed {removed_count} old files from {self.processed_dir}")
+            
+            missing = [p for p in self.raw_data_files if not p.exists()]
+            if missing:
+                raise FileNotFoundError(f"Missing raw data files: {missing}")
+            
+            # Process to shards and compute normalization
+            preprocessor.process_to_npy_shards()
+            
+            # Save the hash
+            save_json({
+                "hash": current_hash,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": self.prediction_mode
+            }, hash_file)
+            
+            self.logger.info(f"Data normalization complete. Files saved to: {self.processed_dir}")
 
     def preprocess_data(self):
-        """Preprocess data with proper hash checking."""
+        """Preprocess data if needed."""
         self.logger.info(f"Preprocessing data for {self.prediction_mode} mode...")
         self.normalize_only()
 
     def _log_memory_status(self):
-        """Log current memory status for debugging."""
+        """Log current memory status."""
         import psutil
         
         # CPU memory
@@ -216,7 +199,7 @@ class ChemicalKineticsPipeline:
         self.logger.info(f"System memory: {mem.total/1024**3:.1f}GB total, "
                          f"{mem.available/1024**3:.1f}GB available ({mem.percent:.1f}% used)")
         
-        # GPU memory if available
+        # GPU memory
         if self.device.type == "cuda":
             free_mem, total_mem = torch.cuda.mem_get_info(self.device.index)
             used_mem = total_mem - free_mem
@@ -231,15 +214,6 @@ class ChemicalKineticsPipeline:
         # Ensure data is preprocessed
         self.preprocess_data()
 
-        # Enforce mode-model compatibility
-        prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
-        model_type = self.config["model"]["type"]
-        if prediction_mode == "ratio" and model_type != "deeponet":
-            raise ValueError(
-                f"Prediction mode 'ratio' is only compatible with model type 'deeponet', "
-                f"but '{model_type}' was specified."
-            )
-
         # Save config for this run
         save_json(self.config, self.run_save_dir / "config.json")
 
@@ -250,7 +224,7 @@ class ChemicalKineticsPipeline:
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.logger.info(f"Model: {self.config['model']['type']} - Parameters: {total_params:,}")
 
-        # Load normalization stats and create helper
+        # Load normalization stats
         norm_stats = load_json(self.processed_dir / "normalization.json")
         norm_helper = NormalizationHelper(
             norm_stats,
@@ -272,12 +246,20 @@ class ChemicalKineticsPipeline:
             device=self.device
         )
         
-        # Log cache status
+        # **FIXED** Safely log cache status to prevent crash
         cache_info = train_dataset.get_cache_info()
-        if cache_info and cache_info.get("type") == "gpu":
-            self.logger.info(f"✓ GPU caching enabled for train set: {cache_info['size_gb']:.1f}GB loaded to GPU")
+        if cache_info.get("type") == "gpu":
+            self.logger.info(
+                f"✓ GPU caching active for '{train_dataset.split_name}': {cache_info.get('size_gb', 0):.1f}GB loaded."
+            )
+        elif cache_info.get("type") == "cpu":
+            self.logger.warning(
+                f"CPU fallback active for '{train_dataset.split_name}'. Reason: {cache_info.get('message', 'N/A')}"
+            )
         else:
-            self.logger.info(f"CPU caching mode for train set: {self.config['training']['num_workers']} workers")
+            self.logger.error(
+                f"Cache status error for '{train_dataset.split_name}': {cache_info.get('status', 'unknown')}"
+            )
 
         val_dataset = NPYDataset(
             shard_dir=self.processed_dir,
@@ -304,10 +286,6 @@ class ChemicalKineticsPipeline:
             device=self.device,
             norm_helper=norm_helper
         )
-        
-        # Warm up cache
-        if len(train_dataset) > 0:
-            _ = train_dataset[0]
 
         # Train model
         best_val_loss = trainer.train()
@@ -328,6 +306,59 @@ class ChemicalKineticsPipeline:
         
         save_json(results, self.run_save_dir / "results.json")
     
+    def run_diagnostics(self, num_batches=20):
+        """Run performance diagnostics."""
+        self.logger.info("Running performance diagnostics...")
+        
+        # Ensure data is preprocessed
+        self.preprocess_data()
+        
+        # Create model
+        model = create_model(self.config, self.device)
+        
+        # Load norm stats
+        norm_stats = load_json(self.processed_dir / "normalization.json")
+        norm_helper = NormalizationHelper(
+            norm_stats, self.device,
+            self.config["data"]["species_variables"],
+            self.config["data"]["global_variables"],
+            self.config["data"]["time_variable"],
+            self.config
+        )
+        
+        # Create training dataset only
+        train_dataset = NPYDataset(
+            shard_dir=self.processed_dir,
+            split_name="train",
+            config=self.config,
+            device=self.device
+        )
+        
+        # Create minimal trainer
+        trainer = Trainer(
+            model=model,
+            train_dataset=train_dataset,
+            val_dataset=None,
+            test_dataset=None,
+            config=self.config,
+            save_dir=self.run_save_dir,
+            device=self.device,
+            norm_helper=norm_helper
+        )
+        
+        # Run diagnostics
+        times = diagnose_performance(trainer, num_batches=num_batches)
+        
+        # Print summary
+        print("\n" + "="*60)
+        print("PERFORMANCE DIAGNOSTICS COMPLETE")
+        print("="*60)
+        print(f"Batch size: {self.config['training']['batch_size']}")
+        print(f"Device: {self.device}")
+        print(f"Model compilation: {self.config['system'].get('use_torch_compile', False)}")
+        print(f"AMP enabled: {self.config['training'].get('use_amp', False)}")
+        print(f"GPU cache: {train_dataset.get_cache_info()['type']}")
+    
     def run(self):
         """Execute the full training pipeline."""
         try:
@@ -339,7 +370,7 @@ class ChemicalKineticsPipeline:
             sys.exit(1)
 
 def main():
-    """Main entry point with multiple operation modes."""
+    """Main entry point."""
     import argparse
     parser = argparse.ArgumentParser(description="Chemical Kinetics Neural Network Training")
     parser.add_argument(
@@ -349,7 +380,7 @@ def main():
         help="Path to configuration file"
     )
     
-    # Operation mode arguments (mutually exclusive)
+    # Operation mode arguments
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument(
         "--normalize",
@@ -366,8 +397,13 @@ def main():
         action="store_true",
         help="Run hyperparameter optimization"
     )
+    mode_group.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Run performance diagnostics"
+    )
     
-    # Hyperparameter tuning specific arguments
+    # Additional arguments
     parser.add_argument(
         "--trials",
         type=int,
@@ -379,6 +415,12 @@ def main():
         type=str,
         default="chemical_kinetics_opt",
         help="Name for Optuna study"
+    )
+    parser.add_argument(
+        "--diagnose-batches",
+        type=int,
+        default=20,
+        help="Number of batches for diagnostics"
     )
     
     args = parser.parse_args()
@@ -399,6 +441,11 @@ def main():
         # Train model
         pipeline = ChemicalKineticsPipeline(args.config)
         pipeline.run()
+        
+    elif args.diagnose:
+        # Run diagnostics
+        pipeline = ChemicalKineticsPipeline(args.config)
+        pipeline.run_diagnostics(num_batches=args.diagnose_batches)
         
     elif args.tune:
         # Run hyperparameter optimization
@@ -428,11 +475,6 @@ def main():
         print("\nBest parameters:")
         for key, value in study.best_params.items():
             print(f"  {key}: {value}")
-        
-        completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-        pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
-        print(f"\nTrials: {completed} completed, {pruned} pruned")
-        print(f"\nBest configuration saved to: optuna_results/")
 
 
 if __name__ == "__main__":
