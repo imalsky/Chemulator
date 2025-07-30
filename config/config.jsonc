@@ -97,9 +97,9 @@
         "output_scale": 1.0,
         
         // DeepONet-specific parameters
-        "branch_layers": [512, 512, 512, 512, 512],
-        "trunk_layers": [64, 64, 64, 64, 64],
-        "basis_dim": 512,
+        "branch_layers": [512, 512, 512, 512],
+        "trunk_layers": [128, 128, 128, 128],
+        "basis_dim": 64,
         
         // SIREN-specific parameters (when type="siren")
         "hidden_dims": [512, 512, 512, 512],
@@ -113,7 +113,7 @@
         // Hidden layers for FiLM networks
         "hidden_dims": [64, 64, 64, 64, 64],
         // Activation for FiLM networks
-        "activation": "gelu"
+        "activation": "relu"
     },
     
     // ===== PREDICTION SETTINGS =====
@@ -133,7 +133,7 @@
         "use_fraction": 1.0,
         
         // Training duration
-        "epochs": 50,
+        "epochs": 300,
         
         // BATCH SIZE - MAXIMIZED FOR A100 80GB
         "batch_size": 32768,  
@@ -159,7 +159,7 @@
         // Scheduler settings
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 10,  // Restart every 10 epochs
+            "T_0": 30,  // Restart every 10 epochs
             "T_mult": 2,
             "eta_min": 1e-8
         },
@@ -169,7 +169,7 @@
         "huber_delta": 0.5,
         "use_amp": true,
         "amp_dtype": "bfloat16",  // Better for A100 than float16
-        "early_stopping_patience": 10,
+        "early_stopping_patience": 5000,
         "min_delta": 1e-8,
         
         // Reduced logging/memory clearing for performance
@@ -189,7 +189,7 @@
         
         // PyTorch optimizations for A100
         "use_torch_compile": true,
-        "compile_mode": "default",  // Maximum optimization
+        "compile_mode": "max-autotune",  // Maximum optimization
         "use_torch_export": true,
         
         // CUDA optimizations for A100
@@ -206,7 +206,7 @@
         // Hyperband settings
         "algorithm": "hyperband",
         "hyperband_min_resource": 10,
-        "hyperband_max_resource": 40,
+        "hyperband_max_resource": 50,
         "hyperband_reduction_factor": 3,
         
         // Target number of trials

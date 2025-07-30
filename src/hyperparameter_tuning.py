@@ -222,10 +222,10 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     """Suggests a valid model and training configuration for a trial."""
     config = copy.deepcopy(base_config)
 
-    #config["prediction"]["mode"] = "absolute"
+    config["prediction"]["mode"] = "absolute"
     
     # Model architecture choice
-    model_type = trial.suggest_categorical("model_type", ["deeponet"])
+    model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
     config["model"]["type"] = model_type
     
     # Common hyperparameters - EXPANDED SEARCH SPACE
@@ -235,35 +235,21 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     #config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
     config["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.1, step=0.05)
     
-    # Scheduler parameters
-    #config["training"]["scheduler_params"]["T_0"] = trial.suggest_categorical("cosine_T_0", [10])
-    
-    # Gradient accumulation adjustment
-    """
-    if config["training"]["batch_size"] <= 1024:
-        config["training"]["gradient_accumulation_steps"] = 8
-    elif config["training"]["batch_size"] <= 2048:
-        config["training"]["gradient_accumulation_steps"] = 4
-    elif config["training"]["batch_size"] <= 4096:
-        config["training"]["gradient_accumulation_steps"] = 2
-    else:
-        config["training"]["gradient_accumulation_steps"] = 1
-    """
 
     if model_type == "deeponet":
         # More flexible architecture search
-        n_branch = trial.suggest_int("n_branch_layers", 2, 5)
+        n_branch = trial.suggest_int("n_branch_layers", 2, 6)
         branch_layers = []
         for i in range(n_branch):
             if i == 0:
-                width = trial.suggest_categorical(f"branch_layer_{i}", [256, 384, 512])
+                width = trial.suggest_categorical(f"branch_layer_{i}", [256, 384, 512, 1024])
             else:
                 # Allow different widths per layer
-                width = trial.suggest_categorical(f"branch_layer_{i}", [128, 256, 384])
+                width = trial.suggest_categorical(f"branch_layer_{i}", [128, 256, 384, 512, 1024])
             branch_layers.append(width)
         config["model"]["branch_layers"] = branch_layers
         
-        n_trunk = trial.suggest_int("n_trunk_layers", 2, 4)
+        n_trunk = trial.suggest_int("n_trunk_layers", 2, 5)
         trunk_layers = []
         for i in range(n_trunk):
             width = trial.suggest_categorical(f"trunk_layer_{i}", [64, 128, 192])
@@ -279,9 +265,9 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
         hidden_dims = []
         for i in range(n_layers):
             if i == 0:
-                width = trial.suggest_categorical(f"hidden_dim_{i}", [256, 384, 512])
+                width = trial.suggest_categorical(f"hidden_dim_{i}", [256, 384, 512, 1024, 2048])
             else:
-                width = trial.suggest_categorical(f"hidden_dim_{i}", [128, 256, 384])
+                width = trial.suggest_categorical(f"hidden_dim_{i}", [128, 256, 384, 1024, 2048])
             hidden_dims.append(width)
         config["model"]["hidden_dims"] = hidden_dims
         config["model"]["omega_0"] = trial.suggest_float("omega_0", 10.0, 50.0)
@@ -290,7 +276,7 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     use_film = trial.suggest_categorical("use_film", [True, False])
     config["film"]["enabled"] = use_film
     if use_film:
-        film_layers = trial.suggest_int("film_layers", 1, 3)
+        film_layers = trial.suggest_int("film_layers", 1, 5)
         film_widths = []
         for i in range(film_layers):
             width = trial.suggest_categorical(f"film_width_{i}", [32, 64, 128])

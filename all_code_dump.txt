@@ -1,176 +1,596 @@
-===== /Users/imalsky/Desktop/Chemulator/test/benchmark_inference.py =====
-# testing/advanced_benchmark.py
+===== /Users/imalsky/Desktop/Chemulator/test/plot_benchmark.py =====
+#!/usr/bin/env python3
+"""
+Benchmark inference performance for single samples and various batch sizes.
+Highly optimized for measuring real-world inference latency.
+"""
+
 import json
+import sys
 import time
 from pathlib import Path
+import logging
+
+sys.path.append(str(Path(__file__).parent.parent))
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-import os
+from contextlib import contextmanager
 
-# --- Configuration ---
-# Set to True to enable torch.compile (slower on Apple Silicon, faster on server CPUs)
-USE_TORCH_COMPILE = False
-MODEL_DIR = Path(__file__).parent.parent / 'data' / 'models' / "deeponet_20250722_142346"
+# Ensure we can use high-precision timing
+if sys.platform == "win32":
+    from time import perf_counter as timer
+else:
+    from time import perf_counter as timer
 
-# Benchmark settings
-WARMUP_RUNS = 100
-LATENCY_BENCHMARK_RUNS = 1000
-THROUGHPUT_BENCHMARK_RUNS = 500
-BATCH_SIZES_TO_TEST = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
-# ---------------------
+def get_latest_model_dir():
+    """Get the most recent model directory."""
+    models_dir = Path(__file__).parent.parent / 'data' / 'models'
+    model_dirs = [d for d in models_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
+    
+    if not model_dirs:
+        raise ValueError("No model directories found!")
+    
+    return max(model_dirs, key=lambda d: d.stat().st_mtime)
 
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-
-def load_config(model_dir):
-    """Loads the configuration file."""
-    return json.loads((model_dir / 'config.json').read_text())
-
-def load_exported_model(model_dir, use_compile, device):
-    """Loads the exported model and optionally compiles it."""
-    exported_path = model_dir / 'exported_model.pt'
-    if not exported_path.exists():
-        raise FileNotFoundError(f"This script requires 'exported_model.pt'. File not found in {model_dir}")
-
-    print(f"Loading exported model from: {exported_path}")
-    ep = torch.export.load(str(exported_path))
-    model = ep.module().to(device)
-
-    if use_compile:
-        print("Applying torch.compile...")
-        model = torch.compile(model)
+@contextmanager
+def cuda_timer():
+    """Context manager for accurate GPU timing."""
+    if torch.cuda.is_available():
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        start.record()
+        yield
+        end.record()
+        torch.cuda.synchronize()
+        elapsed = start.elapsed_time(end) / 1000.0  # Convert to seconds
+        return elapsed
     else:
-        print("Skipping torch.compile for local eager-mode benchmark.")
-    
-    return model
+        start = timer()
+        yield
+        return timer() - start
 
-def benchmark_latency(model, input_dim, device):
-    """Measures single-core, single-item inference latency."""
-    print("\n--- Part 1: Single-Core Latency Benchmark ---")
-    print("Forcing 1 CPU thread to measure the fastest possible single-request latency.")
+def load_model(model_dir, device):
+    """Load the exported model for inference."""
+    logging.info(f"Loading model from: {model_dir}")
     
-    original_threads = torch.get_num_threads()
-    torch.set_num_threads(1)
+    # Load config
+    config_path = model_dir / 'config.json'
+    with open(config_path, 'r') as f:
+        config = json.load(f)
     
-    dummy_input = torch.randn(1, input_dim, device=device)
-    timings_us = []
+    # Try exported model first (fastest)
+    exported_path = model_dir / 'exported_model.pt'
+    
+    if exported_path.exists():
+        logging.info("Loading exported model for inference...")
+        try:
+            # Try torch.export first
+            import torch.export
+            exported_program = torch.export.load(str(exported_path))
+            model = exported_program.module()
+            logging.info("Loaded via torch.export")
+        except:
+            # Fall back to JIT
+            model = torch.jit.load(str(exported_path), map_location=device)
+            logging.info("Loaded via torch.jit")
+    else:
+        # Fall back to creating model from config
+        logging.warning("No exported model found, creating from config (slower)")
+        from src.models.model import create_model
+        model = create_model(config, device)
+        
+        # Load checkpoint
+        checkpoint_path = model_dir / 'best_model.pt'
+        if checkpoint_path.exists():
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+            model.load_state_dict(state_dict)
+    
+    model.eval()
+    model = model.to(device)
+    
+    # Get dimensions
+    n_species = len(config['data']['species_variables'])
+    n_globals = len(config['data']['global_variables'])
+    input_dim = n_species + n_globals + 1
+    
+    return model, input_dim, config
 
+def benchmark_inference(model, input_dim, device, warmup_runs=100, test_runs=1000):
+    """Benchmark single sample and batched inference."""
+    results = {}
+    
+    # Test batch sizes
+    batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    
+    logging.info("Starting inference benchmark...")
+    
+    # Warmup
+    logging.info(f"Warming up with {warmup_runs} runs...")
+    dummy_input = torch.randn(128, input_dim, device=device)
     with torch.no_grad():
-        for _ in range(LATENCY_BENCHMARK_RUNS):
-            start_time = time.perf_counter()
+        for _ in range(warmup_runs):
             _ = model(dummy_input)
-            end_time = time.perf_counter()
-            timings_us.append((end_time - start_time) * 1_000_000) # Convert to microseconds
     
-    # Restore original thread count
-    torch.set_num_threads(original_threads)
-
-    print(f"\nLatency for a single prediction (Batch Size 1, Single Core):")
-    print(f"  Average: {np.mean(timings_us):.2f} µs")
-    print(f"  Median:  {np.median(timings_us):.2f} µs")
-    print(f"  Min:     {np.min(timings_us):.2f} µs")
-    print(f"  Max:     {np.max(timings_us):.2f} µs")
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
     
-def benchmark_throughput(model, input_dim, device):
-    """Measures multi-core throughput across various batch sizes."""
-    print("\n--- Part 2: Multi-Core Throughput & Latency Benchmark ---")
-    print(f"Using all {torch.get_num_threads()} CPU threads to measure max throughput.")
-
-    results = []
-    print("\n" + "-"*80)
-    print(f"{'Batch Size':<12} | {'Avg Latency/Prediction (µs)':<30} | {'Throughput (predictions/sec)':<30}")
-    print("-" * 80)
-
-    for batch_size in BATCH_SIZES_TO_TEST:
-        dummy_input = torch.randn(batch_size, input_dim, device=device)
-        timings_s = []
-
+    # Benchmark each batch size
+    for batch_size in batch_sizes:
+        logging.info(f"Benchmarking batch size {batch_size}...")
+        
+        # Create input
+        test_input = torch.randn(batch_size, input_dim, device=device)
+        
+        # Time CPU execution
+        cpu_times = []
+        gpu_times = []
+        
         with torch.no_grad():
-            for _ in range(THROUGHPUT_BENCHMARK_RUNS):
-                start_time = time.perf_counter()
-                _ = model(dummy_input)
-                end_time = time.perf_counter()
-                timings_s.append(end_time - start_time)
+            # CPU timing
+            for _ in range(test_runs):
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                
+                start = timer()
+                output = model(test_input)
+                
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                
+                cpu_times.append(timer() - start)
+            
+            # GPU timing (if available)
+            if device.type == 'cuda':
+                for _ in range(test_runs):
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    
+                    start_event.record()
+                    output = model(test_input)
+                    end_event.record()
+                    
+                    torch.cuda.synchronize()
+                    gpu_times.append(start_event.elapsed_time(end_event) / 1000.0)
         
-        total_time_s = sum(timings_s)
-        avg_batch_time_s = total_time_s / THROUGHPUT_BENCHMARK_RUNS
+        # Calculate statistics
+        cpu_times = np.array(cpu_times[10:])  # Skip first few for stability
+        cpu_mean = np.mean(cpu_times)
+        cpu_std = np.std(cpu_times)
+        cpu_median = np.median(cpu_times)
+        cpu_p99 = np.percentile(cpu_times, 99)
         
-        # Latency per prediction in this batched context
-        latency_per_pred_us = (avg_batch_time_s / batch_size) * 1_000_000
+        results[batch_size] = {
+            'cpu_mean': cpu_mean,
+            'cpu_std': cpu_std,
+            'cpu_median': cpu_median,
+            'cpu_p99': cpu_p99,
+            'throughput': batch_size / cpu_mean,
+            'latency_per_sample': cpu_mean / batch_size
+        }
         
-        # Total predictions per second
-        throughput = (batch_size * THROUGHPUT_BENCHMARK_RUNS) / total_time_s
-        
-        results.append(latency_per_pred_us)
-        print(f"{batch_size:<12} | {latency_per_pred_us:<30.2f} | {throughput:,.0f}")
+        if gpu_times:
+            gpu_times = np.array(gpu_times[10:])
+            results[batch_size]['gpu_mean'] = np.mean(gpu_times)
+            results[batch_size]['gpu_median'] = np.median(gpu_times)
+            results[batch_size]['gpu_throughput'] = batch_size / np.mean(gpu_times)
     
-    print("-" * 80)
     return results
 
-def plot_results(batch_sizes, latencies_us, save_path):
-    """Plots latency vs. batch size with results in microseconds."""
-    plt.style.use('seaborn-v0_8-whitegrid')
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    ax.plot(batch_sizes, latencies_us, marker='o', linestyle='-', color='b')
+def plot_benchmark_results(results, model_dir, device):
+    """Create benchmark visualization plots."""
+    batch_sizes = sorted(results.keys())
     
-    ax.set_xscale('log', base=2)
-    ax.set_yscale('log')
-    ax.set_xlabel('Batch Size (log scale)')
-    ax.set_ylabel('Latency per Prediction (µs, log scale)')
-    ax.set_title(f'Model Inference Latency vs. Batch Size (torch.compile: {USE_TORCH_COMPILE})')
+    # Extract metrics
+    latencies = [results[bs]['latency_per_sample'] * 1000 for bs in batch_sizes]  # Convert to ms
+    throughputs = [results[bs]['throughput'] for bs in batch_sizes]
+    total_times = [results[bs]['cpu_mean'] * 1000 for bs in batch_sizes]  # Convert to ms
     
-    from matplotlib.ticker import ScalarFormatter
-    ax.xaxis.set_major_formatter(ScalarFormatter())
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    ax.grid(True, which="both", ls="--")
+    # 1. Latency per sample vs batch size
+    ax1 = axes[0, 0]
+    ax1.plot(batch_sizes, latencies, 'b-o', linewidth=2, markersize=8)
+    ax1.set_xlabel('Batch Size')
+    ax1.set_ylabel('Latency per Sample (ms)')
+    ax1.set_title('Inference Latency per Sample vs Batch Size')
+    ax1.set_xscale('log', base=2)
+    ax1.grid(True, alpha=0.3)
     
-    for i, txt in enumerate(latencies_us):
-        ax.annotate(f'{txt:.1f} µs', (batch_sizes[i], latencies_us[i]), textcoords="offset points", xytext=(5,-15), ha='left', fontsize=8)
-
+    # Add annotations for key points
+    for i, (bs, lat) in enumerate(zip(batch_sizes[:5], latencies[:5])):
+        ax1.annotate(f'{lat:.2f} ms', (bs, lat), textcoords="offset points", 
+                     xytext=(0,10), ha='center', fontsize=9)
+    
+    # 2. Throughput vs batch size
+    ax2 = axes[0, 1]
+    ax2.plot(batch_sizes, throughputs, 'g-s', linewidth=2, markersize=8)
+    ax2.set_xlabel('Batch Size')
+    ax2.set_ylabel('Throughput (samples/second)')
+    ax2.set_title('Inference Throughput vs Batch Size')
+    ax2.set_xscale('log', base=2)
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. Total inference time vs batch size
+    ax3 = axes[1, 0]
+    ax3.plot(batch_sizes, total_times, 'r-^', linewidth=2, markersize=8)
+    ax3.set_xlabel('Batch Size')
+    ax3.set_ylabel('Total Inference Time (ms)')
+    ax3.set_title('Total Batch Inference Time')
+    ax3.set_xscale('log', base=2)
+    ax3.set_yscale('log')
+    ax3.grid(True, alpha=0.3)
+    
+    # 4. Performance summary table
+    ax4 = axes[1, 1]
+    ax4.axis('off')
+    
+    # Create summary statistics
+    single_sample = results[1]
+    optimal_batch = max(results.items(), key=lambda x: x[1]['throughput'])
+    
+    summary_text = f"""Performance Summary
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    Device: {device}
+    
+    Single Sample (Batch=1):
+      Mean Latency: {single_sample['cpu_mean']*1000:.2f} ms
+      P99 Latency: {single_sample['cpu_p99']*1000:.2f} ms
+      Throughput: {single_sample['throughput']:.0f} samples/sec
+    
+    Optimal Batch Size: {optimal_batch[0]}
+      Throughput: {optimal_batch[1]['throughput']:.0f} samples/sec
+      Latency/sample: {optimal_batch[1]['latency_per_sample']*1000:.2f} ms
+      Speedup: {optimal_batch[1]['throughput']/single_sample['throughput']:.1f}x
+    
+    Latency Range:
+      Best: {min(latencies):.2f} ms/sample
+      Worst: {max(latencies):.2f} ms/sample
+    """
+    
+    if 'gpu_mean' in single_sample:
+        summary_text += f"""
+    GPU Timing (Batch=1):
+      Kernel Time: {single_sample['gpu_mean']*1000:.2f} ms
+      CPU Overhead: {(single_sample['cpu_mean']-single_sample['gpu_mean'])*1000:.2f} ms
+    """
+    
+    ax4.text(0.1, 0.9, summary_text, transform=ax4.transAxes,
+             fontsize=11, verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.5))
+    
+    plt.suptitle(f'Inference Performance Benchmark - {model_dir.name}', 
+                 fontsize=16, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(save_path)
-    print(f"\nBenchmark plot saved to: {save_path}")
-    plt.show()
+    
+    # Save plot
+    plots_dir = model_dir / 'plots'
+    plots_dir.mkdir(exist_ok=True)
+    save_path = plots_dir / 'inference_benchmark.png'
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logging.info(f"Benchmark plot saved to: {save_path}")
+    
+    # Create a detailed timing distribution plot
+    fig2, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot timing distributions for key batch sizes
+    key_batch_sizes = [1, 8, 32, 128]
+    positions = np.arange(len(key_batch_sizes))
+    
+    means = [results[bs]['cpu_mean']*1000 for bs in key_batch_sizes]
+    stds = [results[bs]['cpu_std']*1000 for bs in key_batch_sizes]
+    
+    bars = ax.bar(positions, means, yerr=stds, capsize=10, 
+                   color=['blue', 'green', 'orange', 'red'],
+                   alpha=0.7, edgecolor='black', linewidth=2)
+    
+    ax.set_xticks(positions)
+    ax.set_xticklabels([f'Batch {bs}' for bs in key_batch_sizes])
+    ax.set_ylabel('Inference Time (ms)')
+    ax.set_title('Inference Time Distribution for Different Batch Sizes')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bars
+    for bar, mean, std in zip(bars, means, stds):
+        height = bar.get_height()
+        ax.annotate(f'{mean:.1f}±{std:.1f} ms',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha='center', va='bottom')
+    
+    plt.tight_layout()
+    save_path2 = plots_dir / 'inference_timing_distribution.png'
+    plt.savefig(save_path2, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logging.info(f"Timing distribution plot saved to: {save_path2}")
 
 def main():
-    if not MODEL_DIR.exists():
-        raise ValueError(f"Model directory not found: {MODEL_DIR}")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    # --- 1. System and Model Setup ---
-    # Apply low-level optimizations first
-    torch.set_flush_denormal(True)
+    # Get latest model directory
+    model_dir = get_latest_model_dir()
+    logging.info(f"Benchmarking model: {model_dir.name}")
     
-    config = load_config(MODEL_DIR)
-    device = torch.device('cpu')
+    # Device setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logging.info(f"Using device: {device}")
     
-    num_threads = torch.get_num_threads()
-    torch.set_num_threads(num_threads)
-    print(f"Using {num_threads} CPU threads for multi-core tests.")
+    # Set optimization flags
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    
+    # Load model
+    model, input_dim, config = load_model(model_dir, device)
+    
+    # Run benchmark
+    results = benchmark_inference(model, input_dim, device)
+    
+    # Plot results
+    plot_benchmark_results(results, model_dir, device)
+    
+    # Print summary
+    print(f"\nBenchmark Complete!")
+    print(f"Single sample latency: {results[1]['cpu_mean']*1000:.2f} ms")
+    print(f"Peak throughput: {max(r['throughput'] for r in results.values()):.0f} samples/sec")
 
-    model = load_exported_model(MODEL_DIR, USE_TORCH_COMPILE, device)
-    
-    input_dim = len(config['data']['species_variables']) + len(config['data']['global_variables']) + 1
+if __name__ == '__main__':
+    main()
 
-    # --- 2. Comprehensive Warmup ---
-    print(f"\n--- Performing {WARMUP_RUNS} Warmup Runs ---")
-    start_warmup = time.perf_counter()
-    with torch.no_grad():
-        for _ in range(WARMUP_RUNS):
-            dummy_input = torch.randn(BATCH_SIZES_TO_TEST[-1], input_dim, device=device)
-            _ = model(dummy_input)
-    print(f"Warmup complete in {time.perf_counter() - start_warmup:.2f} seconds.")
+===== /Users/imalsky/Desktop/Chemulator/test/plot_training.py =====
+#!/usr/bin/env python3
+"""
+Plot comprehensive training logs and metrics from model training.
+Shows loss curves, learning rates, and training statistics.
+"""
 
-    # --- 3. Run Benchmarks ---
-    benchmark_latency(model, input_dim, device)
-    throughout_results = benchmark_throughput(model, input_dim, device)
+import json
+import sys
+from pathlib import Path
+import logging
+
+sys.path.append(str(Path(__file__).parent.parent))
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from datetime import datetime
+
+# Configure matplotlib
+plt.style.use('seaborn-v0_8-darkgrid')
+plt.rcParams['figure.figsize'] = (16, 12)
+plt.rcParams['font.size'] = 11
+
+def get_latest_model_dir():
+    """Get the most recent model directory."""
+    models_dir = Path(__file__).parent.parent / 'data' / 'models'
+    model_dirs = [d for d in models_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
     
-    # --- 4. Plot Throughput Results ---
-    plots_dir = MODEL_DIR / 'plots'
+    if not model_dirs:
+        raise ValueError("No model directories found!")
+    
+    return max(model_dirs, key=lambda d: d.stat().st_mtime)
+
+def load_training_log(model_dir):
+    """Load training log and config."""
+    log_path = model_dir / 'training_log.json'
+    config_path = model_dir / 'config.json'
+    
+    if not log_path.exists():
+        raise FileNotFoundError(f"No training log found at {log_path}")
+    
+    with open(log_path, 'r') as f:
+        training_log = json.load(f)
+    
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    
+    return training_log, config
+
+def calculate_statistics(values):
+    """Calculate running statistics for a series."""
+    if not values:
+        return []
+    
+    window_size = min(10, len(values) // 4)
+    if window_size < 1:
+        return values
+    
+    # Calculate moving average
+    moving_avg = []
+    for i in range(len(values)):
+        start = max(0, i - window_size + 1)
+        window = values[start:i+1]
+        moving_avg.append(np.mean(window))
+    
+    return moving_avg
+
+def plot_comprehensive_metrics(training_log, config, model_dir):
+    """Create comprehensive training plots."""
+    epochs_data = training_log['epochs']
+    
+    if not epochs_data:
+        logging.warning("No epoch data found in training log!")
+        return
+    
+    # Extract data
+    epochs = [e['epoch'] for e in epochs_data]
+    train_losses = [e['train_loss'] for e in epochs_data]
+    val_losses = [e.get('val_loss', None) for e in epochs_data]
+    learning_rates = [e.get('lr', 0) for e in epochs_data]
+    epoch_times = [e.get('epoch_time', 0) for e in epochs_data]
+    
+    # Filter out None values from validation losses
+    val_epochs = [ep for ep, vl in zip(epochs, val_losses) if vl is not None]
+    val_losses_clean = [vl for vl in val_losses if vl is not None]
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(16, 12))
+    gs = gridspec.GridSpec(3, 2, height_ratios=[2, 1, 1], hspace=0.3, wspace=0.25)
+    
+    # 1. Main loss plot (top, spanning both columns)
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2, alpha=0.8)
+    if val_losses_clean:
+        ax1.plot(val_epochs, val_losses_clean, 'r-', label='Validation Loss', linewidth=2, alpha=0.8)
+        
+        # Add moving averages
+        train_ma = calculate_statistics(train_losses)
+        val_ma = calculate_statistics(val_losses_clean)
+        ax1.plot(epochs, train_ma, 'b--', alpha=0.5, label='Training MA', linewidth=1)
+        if len(val_ma) == len(val_epochs):
+            ax1.plot(val_epochs, val_ma, 'r--', alpha=0.5, label='Validation MA', linewidth=1)
+    
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Loss', fontsize=12)
+    ax1.set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    
+    # Add log scale option if losses span multiple orders of magnitude
+    if max(train_losses) / min(train_losses) > 100:
+        ax1.set_yscale('log')
+    
+    # 2. Learning rate plot
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.plot(epochs, learning_rates, 'g-', linewidth=2)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('Learning Rate', fontsize=12)
+    ax2.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_yscale('log')
+    
+    # 3. Training time per epoch
+    ax3 = fig.add_subplot(gs[1, 1])
+    ax3.plot(epochs, epoch_times, 'orange', linewidth=2)
+    ax3.set_xlabel('Epoch', fontsize=12)
+    ax3.set_ylabel('Time (seconds)', fontsize=12)
+    ax3.set_title('Training Time per Epoch', fontsize=14, fontweight='bold')
+    ax3.grid(True, alpha=0.3)
+    
+    # Add cumulative time on secondary axis
+    ax3_twin = ax3.twinx()
+    cumulative_time = np.cumsum(epoch_times)
+    ax3_twin.plot(epochs, cumulative_time / 3600, 'm--', alpha=0.7, linewidth=1.5)
+    ax3_twin.set_ylabel('Cumulative Time (hours)', fontsize=12, color='m')
+    ax3_twin.tick_params(axis='y', labelcolor='m')
+    
+    # 4. Loss improvement rate
+    ax4 = fig.add_subplot(gs[2, 0])
+    if len(train_losses) > 1:
+        loss_improvement = np.diff(train_losses)
+        ax4.plot(epochs[1:], loss_improvement, 'c-', linewidth=1.5, alpha=0.8)
+        ax4.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        ax4.set_xlabel('Epoch', fontsize=12)
+        ax4.set_ylabel('Loss Change', fontsize=12)
+        ax4.set_title('Training Loss Change per Epoch', fontsize=14, fontweight='bold')
+        ax4.grid(True, alpha=0.3)
+    
+    # 5. Training statistics summary
+    ax5 = fig.add_subplot(gs[2, 1])
+    ax5.axis('off')
+    
+    # Calculate statistics
+    total_time = sum(epoch_times) / 3600  # in hours
+    final_train_loss = train_losses[-1]
+    best_val_loss = min(val_losses_clean) if val_losses_clean else None
+    best_epoch = val_epochs[val_losses_clean.index(best_val_loss)] if best_val_loss else None
+    
+    # Model info
+    model_type = config['model']['type']
+    prediction_mode = config['prediction']['mode']
+    batch_size = config['training']['batch_size']
+    
+    stats_text = f"""Training Summary
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    Model Type: {model_type}
+    Prediction Mode: {prediction_mode}
+    Batch Size: {batch_size:,}
+    Total Epochs: {len(epochs)}
+    Total Training Time: {total_time:.2f} hours
+    Average Time/Epoch: {np.mean(epoch_times):.1f} seconds
+    
+    Final Training Loss: {final_train_loss:.6f}
+    Best Validation Loss: {best_val_loss:.6f if best_val_loss else 'N/A'}
+    Best Epoch: {best_epoch if best_epoch else 'N/A'}
+    
+    Initial Learning Rate: {learning_rates[0]:.2e}
+    Final Learning Rate: {learning_rates[-1]:.2e}
+    
+    Loss Reduction: {(1 - train_losses[-1]/train_losses[0])*100:.1f}%
+    """
+    
+    ax5.text(0.1, 0.9, stats_text, transform=ax5.transAxes, 
+             fontsize=11, verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.5))
+    
+    # Add title with model name and timestamp
+    model_name = model_dir.name
+    fig.suptitle(f'Training Metrics - {model_name}', fontsize=16, fontweight='bold')
+    
+    plt.tight_layout()
+    
+    # Save plot
+    plots_dir = model_dir / 'plots'
     plots_dir.mkdir(exist_ok=True)
-    save_path = plots_dir / f'advanced_benchmark_compile_{USE_TORCH_COMPILE}.png'
-    plot_results(BATCH_SIZES_TO_TEST, throughout_results, save_path)
+    save_path = plots_dir / 'training_logs.png'
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logging.info(f"Training log plot saved to: {save_path}")
+    
+    # Also save a simplified loss-only plot
+    fig2, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2.5)
+    if val_losses_clean:
+        ax.plot(val_epochs, val_losses_clean, 'r-', label='Validation Loss', linewidth=2.5)
+    
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Loss', fontsize=12)
+    ax.set_title('Training Progress', fontsize=14, fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    if max(train_losses) / min(train_losses) > 100:
+        ax.set_yscale('log')
+    
+    plt.tight_layout()
+    save_path2 = plots_dir / 'loss_curves.png'
+    plt.savefig(save_path2, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logging.info(f"Simple loss plot saved to: {save_path2}")
 
+def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Get latest model directory
+    model_dir = get_latest_model_dir()
+    logging.info(f"Analyzing model: {model_dir.name}")
+    
+    # Load training log
+    training_log, config = load_training_log(model_dir)
+    
+    # Create plots
+    plot_comprehensive_metrics(training_log, config, model_dir)
+    
+    # Print summary
+    epochs_data = training_log['epochs']
+    if epochs_data:
+        print(f"\nTraining completed with {len(epochs_data)} epochs")
+        print(f"Final training loss: {epochs_data[-1]['train_loss']:.6f}")
+        if 'val_loss' in epochs_data[-1] and epochs_data[-1]['val_loss'] is not None:
+            print(f"Final validation loss: {epochs_data[-1]['val_loss']:.6f}")
 
 if __name__ == '__main__':
     main()
@@ -178,342 +598,671 @@ if __name__ == '__main__':
 ===== /Users/imalsky/Desktop/Chemulator/test/plot_predictions.py =====
 #!/usr/bin/env python3
 """
-Plots model predictions against ground truth for a RANDOMLY SELECTED,
-VERIFIED test case from the pre-defined test set.
-
-This script robustly identifies a true test sample by:
-1. Loading the test_indices.npy file.
-2. Picking a random sample index from this file.
-3. Using shard_index.json to trace the sample back to its original HDF5 file
-   and profile name (gname) by matching initial conditions.
-4. Loading the full ground truth profile and generating a comparison plot.
+Test model predictions on a randomly selected test profile.
+Plots true vs predicted abundances for all species.
 """
 
 import json
-import re
 import sys
 from pathlib import Path
-import logging
 import random
-import bisect
-import hashlib
+import logging
 
-# Add the project root to the Python path to allow importing from 'src'
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# Add parent directory to path to import from src
+sys.path.append(str(Path(__file__).parent.parent))
 
-import h5py
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-import os
+import h5py
+import re
+import hashlib
 
-# --- -------------------------------------------------- ---
-# ---              USER CONFIGURATION AREA              ---
-# --- -------------------------------------------------- ---
+from src.models.model import create_model
+from src.data.normalizer import NormalizationHelper
 
-# SET THE NAME OF THE TRAINED MODEL FOLDER YOU WANT TO PLOT
-MODEL_FOLDER_NAME = "deeponet"  # <-- CHANGE THIS
+# Configure matplotlib for better plots
+plt.style.use('seaborn-v0_8-darkgrid')
+plt.rcParams['figure.figsize'] = (14, 10)
+plt.rcParams['font.size'] = 12
 
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-
-
-# --- Global Paths ---
-ROOT = Path(__file__).resolve().parent.parent
-MODEL_DIR = ROOT / 'data' / 'models' / MODEL_FOLDER_NAME
-
-# --- Basic Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | %(message)s')
-
-
-def load_model_and_config(model_dir: Path, device: torch.device) -> tuple[torch.nn.Module, dict, 'NormalizationHelper']:
-    """
-    Loads the configuration, model, and normalization helper from a model directory.
-    """
-    from src.models.model import create_model
-    from src.data.normalizer import NormalizationHelper
-
-    # Load Configuration
-    logging.info(f"Loading configuration from {model_dir}")
-    config_path = model_dir / 'config.json'
-    config = json.loads(config_path.read_text())
-
-    # Disable compilation
-    config["system"]["use_torch_compile"] = False
-
-    # Load model from checkpoint
-    logging.info("--> Loading model from standard checkpoint (best_model.pt)...")
-    checkpoint_path = model_dir / 'best_model.pt'
-    model = create_model(config, device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint.get('model_state_dict', checkpoint)
-    # Fix for loading state_dict from compiled model
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)
+def get_latest_model_dir():
+    """Get the most recent model directory."""
+    models_dir = Path(__file__).parent.parent / 'data' / 'models'
     
-    model.eval()
-    logging.info("Model loaded and set to evaluation mode.")
+    # List all model directories
+    model_dirs = [d for d in models_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
+    
+    if not model_dirs:
+        raise ValueError("No model directories found!")
+    
+    # Sort by modification time and return the latest
+    latest = max(model_dirs, key=lambda d: d.stat().st_mtime)
+    return latest
 
-    # Load Normalization Helper
-    prediction_mode = config['prediction']['mode']
-    processed_data_dir = ROOT / config['paths']['processed_data_dir']
-    norm_stats_path = processed_data_dir / 'normalization.json'
-    norm_stats = json.loads(norm_stats_path.read_text())
+def load_model_and_config(model_dir):
+    """Load model, config, and normalization helper."""
+    logging.info(f"Loading model from: {model_dir}")
+    
+    # Load config
+    config_path = model_dir / 'config.json'
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    
+    # Device setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Load normalization stats
+    processed_dir = Path(config['paths']['processed_data_dir']) / f"mode_{config['prediction']['mode']}"
+    norm_stats_path = processed_dir / 'normalization.json'
+    with open(norm_stats_path, 'r') as f:
+        norm_stats = json.load(f)
+    
     norm_helper = NormalizationHelper(
-        stats=norm_stats, device=device,
+        stats=norm_stats,
+        device=device,
         species_vars=config['data']['species_variables'],
         global_vars=config['data']['global_variables'],
-        time_var=config['data']['time_variable'], config=config
+        time_var=config['data']['time_variable'],
+        config=config
     )
-    logging.info("Normalization helper created.")
     
-    return model, config, norm_helper
+    # Try to load exported model first, fall back to checkpoint
+    exported_path = model_dir / 'exported_model.pt'
+    checkpoint_path = model_dir / 'best_model.pt'
+    
+    if exported_path.exists():
+        logging.info("Loading exported model...")
+        try:
+            import torch.export
+            exported_program = torch.export.load(str(exported_path))
+            model = exported_program.module()
+        except:
+            # Fallback to JIT
+            model = torch.jit.load(str(exported_path))
+    elif checkpoint_path.exists():
+        logging.info("Loading from checkpoint...")
+        model = create_model(config, device)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        # Remove _orig_mod prefix if present
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+    else:
+        raise FileNotFoundError("No model file found!")
+    
+    model.eval()
+    model = model.to(device)
+    
+    return model, config, norm_helper, device
 
-
-def find_source_profile_info(sample_index: int, processed_data_dir: Path, norm_helper, config) -> tuple[Path, str]:
-    """
-    Traces a global sample index back to its source HDF5 file and group name (gname).
-    """
-    logging.info(f"Tracing origin of global sample index: {sample_index}...")
+def find_random_test_profile(config):
+    """Find a random test profile from the dataset."""
+    # Get test split info
+    processed_dir = Path(config['paths']['processed_data_dir']) / f"mode_{config['prediction']['mode']}"
+    shard_index_path = processed_dir / 'shard_index.json'
     
-    shard_index_path = processed_data_dir / 'shard_index.json'
-    shard_index = json.loads(shard_index_path.read_text())
-    shards_meta = shard_index['shards']
+    with open(shard_index_path, 'r') as f:
+        shard_index = json.load(f)
     
-    shard_starts = [s['start_idx'] for s in shards_meta]
-    shard_idx = bisect.bisect_right(shard_starts, sample_index) - 1
+    # Get a random test shard
+    test_shards = shard_index['splits']['test']['shards']
+    if not test_shards:
+        raise ValueError("No test shards found!")
     
-    target_shard_meta = shards_meta[shard_idx]
-    shard_filename = target_shard_meta['filename']
-    logging.info(f"Sample found in shard: {shard_filename}")
-
-    match = re.search(r"shard_(run\d+-result)_", shard_filename)
+    random_shard = random.choice(test_shards)
+    shard_path = processed_dir / 'test' / random_shard['filename']
     
-    raw_filename = f"{match.group(1)}.h5"
-    raw_filepath = ROOT / 'data' / 'raw' / raw_filename
-    logging.info(f"Inferred source HDF5 file: {raw_filepath}")
-
-    shard_path = processed_data_dir / shard_filename
+    # Load shard data
     shard_data = np.load(shard_path)
     
-    local_index = sample_index - target_shard_meta['start_idx']
-    sample_row = shard_data[local_index]
+    # Pick a random sample
+    random_idx = random.randint(0, shard_data.shape[0] - 1)
+    sample = shard_data[random_idx]
     
-    n_species = shard_index['n_species']
-    n_globals = shard_index['n_globals']
-    initial_conditions_sample = sample_row[:n_species + n_globals]
-    
-    all_matching_indices = np.where(np.all(np.isclose(shard_data[:, :n_species + n_globals], initial_conditions_sample), axis=1))[0]
-    
-    p_init_norm, t_init_norm = initial_conditions_sample[n_species], initial_conditions_sample[n_species+1]
-
-    # Denormalize p and t
-    def denormalize_var(norm_val, var_name):
-        method = norm_helper.methods[var_name]
-        var_stats = norm_helper.per_key_stats[var_name]
-        if method == 'standard':
-            return norm_val * var_stats['std'] + var_stats['mean']
-        elif method == 'log-standard':
-            log_val = norm_val * var_stats['log_std'] + var_stats['log_mean']
-            return 10 ** log_val
-        elif method == 'min-max':
-            return norm_val * (var_stats['max'] - var_stats['min']) + var_stats['min']
-        elif method == 'log-min-max':
-            log_val = norm_val * (var_stats['max'] - var_stats['min']) + var_stats['min']
-            return 10 ** log_val
-
-    p_init_raw = denormalize_var(p_init_norm, 'P_init')
-    t_init_raw = denormalize_var(t_init_norm, 'T_init')
-
-    with h5py.File(raw_filepath, 'r') as f:
-        for gname in f.keys():
-            match = re.search(r"_P_([0-9.eE+-]+)_T_([0-9.eE+-]+)", gname)
-            if match:
-                p_val_gname, t_val_gname = float(match.group(1)), float(match.group(2))
-                if np.isclose(t_init_raw, t_val_gname, rtol=1e-3, atol=1e-2) and np.isclose(p_init_raw, p_val_gname, rtol=1e-3, atol=1e-2):
-                     logging.info(f"Heuristic match found! gname: {gname}")
-                     return raw_filepath, gname
-
-    # Fallback
-    with h5py.File(raw_filepath, 'r') as f:
-        test_fraction = shard_index.get("test_fraction", 0.15)
-        for gname in f.keys():
-             split_hash = hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()
-             p = int(split_hash[:8], 16) / 0xFFFFFFFF
-             if p < test_fraction:
-                 logging.warning(f"Could not find exact gname match. Falling back to first available test group: {gname}")
-                 return raw_filepath, gname
-
-    raise ValueError(f"Could not find a matching gname in {raw_filepath.name}")
-
-
-def extract_full_profile(raw_filepath: Path, gname: str, config: dict) -> np.ndarray:
-    """Extracts a complete data profile from a specific HDF5 file and group."""
-    with h5py.File(raw_filepath, 'r') as f:
-        h5_group = f[gname]
-        
-        species_vars = config['data']['species_variables']
-        global_vars = config['data']['global_variables']
-        time_var = config['data']['time_variable']
-
-        globals_dict = {}
-        matches = re.findall(r"_([A-Z])_([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", gname)
-        for label, value in matches:
-            key = f"{label}_init"
-            if key in global_vars:
-                globals_dict[key] = float(value)
-
-        var_order = species_vars + global_vars + [time_var]
-        n_t = h5_group[time_var].shape[0]
-        profile = np.zeros((n_t, len(var_order)), dtype=np.float32)
-
-        for i, var in enumerate(var_order):
-            profile[:, i] = h5_group.get(var, globals_dict.get(var))
-            
-    return profile
-
-
-def make_predictions(model: torch.nn.Module, profile: np.ndarray, config: dict, norm_helper: 'NormalizationHelper') -> np.ndarray:
-    """Generates model predictions for an entire profile using efficient batching."""
-    device = next(model.parameters()).device
+    # Extract initial conditions (normalized)
     n_species = len(config['data']['species_variables'])
-    n_t = profile.shape[0]
-
-    profile_t = torch.from_numpy(profile).to(device)
-    norm_prof = norm_helper.normalize_profile(profile_t)
+    n_globals = len(config['data']['global_variables'])
     
-    pred_raw = np.zeros((n_t, n_species), dtype=np.float32)
-    pred_raw[0] = profile[0, :n_species]
-
-    initial_conditions_norm = norm_prof[0, :-1]
-    times_to_predict_norm = norm_prof[1:, -1:]
-    num_predictions = times_to_predict_norm.shape[0]
-
-    predictions = torch.zeros(num_predictions, n_species, device=device)
-    batch_size = 2
-    for start in range(0, num_predictions, batch_size):
-        end = min(start + batch_size, num_predictions)
-        sub_times = times_to_predict_norm[start:end]
-        sub_input = torch.cat([
-            initial_conditions_norm.unsqueeze(0).expand(end - start, -1),
-            sub_times
-        ], dim=1)
-        predictions[start:end] = model(sub_input)
-
-    profile_pred_norm = torch.zeros_like(norm_prof)
-    profile_pred_norm[0, :] = norm_prof[0, :]
-    profile_pred_norm[1:, :n_species] = predictions
-    profile_pred_norm[1:, n_species:] = norm_prof[1:, n_species:]
-    pred_denorm = norm_helper.denormalize_profile(profile_pred_norm)
-    pred_raw = pred_denorm[:, :n_species].detach().cpu().numpy()
-
-    return pred_raw
-
-
-def plot_profile(true_profile: np.ndarray, pred_species_raw: np.ndarray, config: dict, gname: str, save_path: Path):
-    """Generates and saves a log-log plot of species evolution."""
-    species_vars = config['data']['species_variables']
-    times = true_profile[:, -1]
-    true_species_raw = true_profile[:, :len(species_vars)]
+    initial_conditions_norm = sample[:n_species + n_globals]
     
-    fig, ax = plt.subplots(figsize=(14, 9), dpi=120)
-    colors = plt.cm.get_cmap('tab20', len(species_vars))
+    # Now we need to find the corresponding full profile in the raw data
+    # This is tricky, so we'll reconstruct from multiple time samples if available
+    
+    # For now, let's generate predictions at multiple time points
+    time_points = np.logspace(-8, 2, 100)  # 100 time points from 1e-8 to 100
+    
+    return initial_conditions_norm, time_points
 
-    for i, species in enumerate(species_vars):
-        ax.plot(times, true_species_raw[:, i], color=colors(i), linestyle='-', linewidth=2.5, label=f'{species} (True)')
-        ax.plot(times, pred_species_raw[:, i], color=colors(i), linestyle='--', linewidth=2, label=f'{species} (Pred)')
-        ax.plot(times[0], true_species_raw[0, i], 'o', color=colors(i), markersize=8, markeredgecolor='black', zorder=5)
+def make_predictions(model, initial_conditions_norm, time_points_raw, config, norm_helper, device):
+    """Generate predictions for multiple time points."""
+    n_species = len(config['data']['species_variables'])
+    predictions = []
+    
+    # Normalize time points
+    time_tensor = torch.tensor(time_points_raw, dtype=torch.float32).unsqueeze(1)
+    time_profile = torch.zeros(len(time_points_raw), 1)
+    time_profile[:, 0] = time_tensor.squeeze()
+    
+    # Create a dummy profile just for time normalization
+    dummy_profile = torch.zeros(len(time_points_raw), len(config['data']['species_variables']) + len(config['data']['global_variables']) + 1)
+    dummy_profile[:, -1] = time_tensor.squeeze()
+    
+    norm_profile = norm_helper.normalize_profile(dummy_profile)
+    time_points_norm = norm_profile[:, -1]
+    
+    # Batch predictions
+    batch_size = 100
+    initial_conditions_tensor = torch.tensor(initial_conditions_norm, dtype=torch.float32, device=device)
+    
+    for i in range(0, len(time_points_norm), batch_size):
+        end_idx = min(i + batch_size, len(time_points_norm))
+        batch_times = time_points_norm[i:end_idx].to(device)
+        
+        # Prepare input batch
+        batch_size_actual = end_idx - i
+        batch_initials = initial_conditions_tensor.unsqueeze(0).expand(batch_size_actual, -1)
+        batch_input = torch.cat([batch_initials, batch_times.unsqueeze(1)], dim=1)
+        
+        with torch.no_grad():
+            batch_predictions = model(batch_input)
+        
+        predictions.append(batch_predictions.cpu())
+    
+    predictions = torch.cat(predictions, dim=0).numpy()
+    
+    # Denormalize predictions if in absolute mode
+    if config['prediction']['mode'] == 'absolute':
+        # Create full profile for denormalization
+        full_profile_norm = torch.zeros(len(time_points_raw), n_species + len(config['data']['global_variables']) + 1)
+        full_profile_norm[:, :n_species] = torch.tensor(predictions)
+        full_profile_norm[:, n_species:n_species+len(config['data']['global_variables'])] = torch.tensor(initial_conditions_norm[n_species:])
+        full_profile_norm[:, -1] = time_points_norm
+        
+        denorm_profile = norm_helper.denormalize_profile(full_profile_norm)
+        predictions = denorm_profile[:, :n_species].numpy()
+        
+        # Also denormalize initial conditions for plotting
+        initial_profile = torch.zeros(1, n_species + len(config['data']['global_variables']) + 1)
+        initial_profile[0, :n_species + len(config['data']['global_variables'])] = torch.tensor(initial_conditions_norm)
+        initial_denorm = norm_helper.denormalize_profile(initial_profile)
+        initial_species = initial_denorm[0, :n_species].numpy()
+    else:
+        # Ratio mode - need to denormalize differently
+        initial_profile = torch.zeros(1, n_species + len(config['data']['global_variables']) + 1)
+        initial_profile[0, :n_species + len(config['data']['global_variables'])] = torch.tensor(initial_conditions_norm)
+        initial_denorm = norm_helper.denormalize_profile(initial_profile)
+        initial_species = initial_denorm[0, :n_species].numpy()
+        
+        # Convert ratio predictions to absolute
+        predictions = norm_helper.denormalize_ratio_predictions(
+            torch.tensor(predictions),
+            torch.tensor(initial_species)
+        ).numpy()
+    
+    return predictions, initial_species
 
+def plot_predictions(time_points, predictions, initial_species, species_names, model_dir):
+    """Create and save the prediction plot."""
+    fig, ax = plt.subplots(figsize=(14, 10))
+    
+    # Use a colormap with enough distinct colors
+    colors = plt.cm.tab20(np.linspace(0, 1, len(species_names)))
+    
+    # Plot each species
+    for i, (species, color) in enumerate(zip(species_names, colors)):
+        # Plot predictions
+        ax.plot(time_points, predictions[:, i], '-', color=color, linewidth=2.5, 
+                label=f'{species}', alpha=0.8)
+        
+        # Mark initial condition
+        ax.scatter(time_points[0], initial_species[i], color=color, s=100, 
+                   edgecolor='black', linewidth=2, zorder=5)
+    
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlabel('Time (s)', fontsize=14)
     ax.set_ylabel('Abundance', fontsize=14)
-    ax.set_title(f'Prediction vs. Truth for Profile: {gname}', fontsize=16)
-    ax.grid(True, which='both', linestyle=':', linewidth=0.5)
-    ax.legend(bbox_to_anchor=(1.04, 1), loc='upper left')
+    ax.set_title('Model Predictions for Random Test Sample', fontsize=16)
+    ax.grid(True, which='both', alpha=0.3)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., 
+              frameon=True, fancybox=True, shadow=True)
     
-    plt.tight_layout(rect=[0, 0, 0.85, 1])
-    plt.savefig(save_path)
+    # Set reasonable axis limits
+    ax.set_xlim(time_points.min(), time_points.max())
+    y_min = max(predictions.min(), 1e-30)
+    y_max = predictions.max() * 10
+    ax.set_ylim(y_min, y_max)
+    
+    plt.tight_layout()
+    
+    # Save plot
+    plots_dir = model_dir / 'plots'
+    plots_dir.mkdir(exist_ok=True)
+    save_path = plots_dir / 'test_predictions.png'
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    logging.info(f"Plot saved successfully to {save_path}")
-
+    
+    logging.info(f"Plot saved to: {save_path}")
 
 def main():
-    """Main execution function."""
-    device = torch.device('cpu')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    model, config, norm_helper = load_model_and_config(MODEL_DIR, device)
+    # Get latest model directory
+    model_dir = get_latest_model_dir()
+    logging.info(f"Using model: {model_dir.name}")
     
-    prediction_mode = config['prediction']['mode']
-    processed_data_dir = ROOT / config['paths']['processed_data_dir']
-
-    test_indices_path = processed_data_dir / 'test_indices.npy'
-    test_indices = np.load(test_indices_path)
-    random_test_index = random.choice(test_indices)
+    # Load model and config
+    model, config, norm_helper, device = load_model_and_config(model_dir)
     
-    raw_filepath, gname = find_source_profile_info(random_test_index, processed_data_dir, norm_helper, config)
+    # Find a random test profile
+    initial_conditions_norm, time_points = find_random_test_profile(config)
     
-    logging.info(f"Extracting ground truth for '{gname}' from {raw_filepath.name}...")
-    true_profile = extract_full_profile(raw_filepath, gname, config)
-
-    logging.info(f"Generating predictions for profile '{gname}'...")
-    predicted_species = make_predictions(model, true_profile, config, norm_helper)
+    # Make predictions
+    predictions, initial_species = make_predictions(
+        model, initial_conditions_norm, time_points, config, norm_helper, device
+    )
     
-    plots_dir = MODEL_DIR / 'plots'
-    plots_dir.mkdir(exist_ok=True)
-    save_path = plots_dir / f'test_prediction_{gname}.png'
+    # Plot results
+    species_names = config['data']['species_variables']
+    plot_predictions(time_points, predictions, initial_species, species_names, model_dir)
     
-    plot_profile(true_profile, predicted_species, config, gname, save_path)
-
+    # Print some statistics
+    logging.info(f"Initial conditions (P={initial_conditions_norm[-2]:.2e}, T={initial_conditions_norm[-1]:.2e})")
+    logging.info(f"Time range: {time_points.min():.2e} - {time_points.max():.2e} seconds")
+    logging.info(f"Species range: {predictions.min():.2e} - {predictions.max():.2e}")
 
 if __name__ == '__main__':
     main()
 
-===== /Users/imalsky/Desktop/Chemulator/test/plot_losses.py =====
-# testing/plot_losses.py
-import json
-from pathlib import Path
-import matplotlib.pyplot as plt
+===== /Users/imalsky/Desktop/Chemulator/test/plot_errors.py =====
+#!/usr/bin/env python3
+"""
+Analyze and plot model error distributions across test set.
+Shows per-species error statistics and distributions.
+"""
 
-ROOT = Path(__file__).parent.parent
+import json
+import sys
+from pathlib import Path
+import logging
+
+sys.path.append(str(Path(__file__).parent.parent))
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy import stats as scipy_stats
+import seaborn as sns
+
+from src.models.model import create_model
+from src.data.normalizer import NormalizationHelper
+from src.data.dataset import NPYDataset
+
+# Configure matplotlib
+plt.style.use('seaborn-v0_8-darkgrid')
+plt.rcParams['figure.figsize'] = (16, 12)
+plt.rcParams['font.size'] = 10
 
 def get_latest_model_dir():
-    model_path = ROOT / 'data' / 'models'
-    dirs = [d for d in model_path.iterdir() if d.is_dir()]
-    return max(dirs, key=lambda d: d.stat().st_ctime) if dirs else None
+    """Get the most recent model directory."""
+    models_dir = Path(__file__).parent.parent / 'data' / 'models'
+    model_dirs = [d for d in models_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
+    
+    if not model_dirs:
+        raise ValueError("No model directories found!")
+    
+    return max(model_dirs, key=lambda d: d.stat().st_mtime)
 
-MODEL_DIR = get_latest_model_dir()
+def load_model_and_data(model_dir):
+    """Load model, config, and test dataset."""
+    logging.info(f"Loading model from: {model_dir}")
+    
+    # Load config
+    config_path = model_dir / 'config.json'
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    
+    # Device setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Load normalization stats
+    processed_dir = Path(config['paths']['processed_data_dir']) / f"mode_{config['prediction']['mode']}"
+    norm_stats_path = processed_dir / 'normalization.json'
+    with open(norm_stats_path, 'r') as f:
+        norm_stats = json.load(f)
+    
+    norm_helper = NormalizationHelper(
+        stats=norm_stats,
+        device=device,
+        species_vars=config['data']['species_variables'],
+        global_vars=config['data']['global_variables'],
+        time_var=config['data']['time_variable'],
+        config=config
+    )
+    
+    # Load model
+    exported_path = model_dir / 'exported_model.pt'
+    checkpoint_path = model_dir / 'best_model.pt'
+    
+    if exported_path.exists():
+        logging.info("Loading exported model...")
+        try:
+            import torch.export
+            exported_program = torch.export.load(str(exported_path))
+            model = exported_program.module()
+        except:
+            model = torch.jit.load(str(exported_path))
+    elif checkpoint_path.exists():
+        logging.info("Loading from checkpoint...")
+        model = create_model(config, device)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+    else:
+        raise FileNotFoundError("No model file found!")
+    
+    model.eval()
+    model = model.to(device)
+    
+    # Load test dataset
+    test_dataset = NPYDataset(
+        shard_dir=processed_dir,
+        split_name='test',
+        config=config,
+        device=device
+    )
+    
+    return model, config, norm_helper, test_dataset, device
+
+def compute_errors(model, test_dataset, config, norm_helper, device, max_samples=10000):
+    """Compute prediction errors on test set."""
+    n_species = len(config['data']['species_variables'])
+    prediction_mode = config['prediction']['mode']
+    
+    # Limit samples for memory efficiency
+    n_samples = min(len(test_dataset), max_samples)
+    logging.info(f"Computing errors on {n_samples} test samples...")
+    
+    # Storage for errors
+    absolute_errors = []
+    relative_errors = []
+    log_errors = []
+    
+    # Batch processing
+    batch_size = min(1000, n_samples)
+    
+    with torch.no_grad():
+        for i in range(0, n_samples, batch_size):
+            end_idx = min(i + batch_size, n_samples)
+            
+            # Get batch
+            inputs_list = []
+            targets_list = []
+            
+            for j in range(i, end_idx):
+                inp, tgt = test_dataset[j]
+                inputs_list.append(inp)
+                targets_list.append(tgt)
+            
+            inputs = torch.stack(inputs_list)
+            targets = torch.stack(targets_list)
+            
+            if not test_dataset.gpu_cache:
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+            
+            # Predictions
+            predictions = model(inputs)
+            
+            # Denormalize for error calculation
+            if prediction_mode == 'absolute':
+                # Create full profiles for denormalization
+                n_globals = len(config['data']['global_variables'])
+                
+                # Predicted profile
+                pred_profile = torch.zeros(predictions.shape[0], n_species + n_globals + 1, device=device)
+                pred_profile[:, :n_species] = predictions
+                pred_profile[:, n_species:n_species+n_globals] = inputs[:, n_species:n_species+n_globals]
+                pred_profile[:, -1] = inputs[:, -1]
+                
+                # Target profile  
+                target_profile = torch.zeros_like(pred_profile)
+                target_profile[:, :n_species] = targets
+                target_profile[:, n_species:n_species+n_globals] = inputs[:, n_species:n_species+n_globals]
+                target_profile[:, -1] = inputs[:, -1]
+                
+                # Denormalize
+                pred_denorm = norm_helper.denormalize_profile(pred_profile)[:, :n_species]
+                target_denorm = norm_helper.denormalize_profile(target_profile)[:, :n_species]
+                
+            else:  # ratio mode
+                # Get initial species (denormalized)
+                initial_profile = torch.zeros(predictions.shape[0], n_species + len(config['data']['global_variables']) + 1, device=device)
+                initial_profile[:, :n_species + len(config['data']['global_variables'])] = inputs[:, :n_species + len(config['data']['global_variables'])]
+                initial_denorm = norm_helper.denormalize_profile(initial_profile)
+                initial_species = initial_denorm[:, :n_species]
+                
+                # Convert predictions
+                pred_denorm = norm_helper.denormalize_ratio_predictions(predictions, initial_species)
+                target_denorm = norm_helper.denormalize_ratio_predictions(targets, initial_species)
+            
+            # Calculate errors
+            abs_err = torch.abs(pred_denorm - target_denorm).cpu().numpy()
+            absolute_errors.append(abs_err)
+            
+            # Relative error (avoid division by zero)
+            target_cpu = target_denorm.cpu().numpy()
+            rel_err = abs_err / (np.abs(target_cpu) + 1e-30)
+            relative_errors.append(rel_err)
+            
+            # Log error (for positive values)
+            pred_cpu = pred_denorm.cpu().numpy()
+            mask = (pred_cpu > 0) & (target_cpu > 0)
+            log_err = np.full_like(pred_cpu, np.nan)
+            log_err[mask] = np.abs(np.log10(pred_cpu[mask]) - np.log10(target_cpu[mask]))
+            log_errors.append(log_err)
+            
+            if (i + batch_size) % 1000 == 0:
+                logging.info(f"Processed {i + batch_size}/{n_samples} samples")
+    
+    # Concatenate all errors
+    absolute_errors = np.concatenate(absolute_errors, axis=0)
+    relative_errors = np.concatenate(relative_errors, axis=0)
+    log_errors = np.concatenate(log_errors, axis=0)
+    
+    return absolute_errors, relative_errors, log_errors
+
+def plot_error_distributions(absolute_errors, relative_errors, log_errors, species_names, model_dir):
+    """Create comprehensive error distribution plots."""
+    n_species = len(species_names)
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(18, 14))
+    gs = gridspec.GridSpec(4, 3, height_ratios=[1.5, 1, 1, 1], hspace=0.4, wspace=0.3)
+    
+    # 1. Overall error distributions (top row)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax3 = fig.add_subplot(gs[0, 2])
+    
+    # Absolute error distribution
+    all_abs_errors = absolute_errors.flatten()
+    all_abs_errors = all_abs_errors[all_abs_errors < np.percentile(all_abs_errors, 99)]  # Remove outliers
+    ax1.hist(all_abs_errors, bins=50, alpha=0.7, color='blue', edgecolor='black')
+    ax1.set_xlabel('Absolute Error')
+    ax1.set_ylabel('Count')
+    ax1.set_title('Overall Absolute Error Distribution')
+    ax1.set_yscale('log')
+    
+    # Relative error distribution
+    all_rel_errors = relative_errors.flatten()
+    all_rel_errors = all_rel_errors[all_rel_errors < np.percentile(all_rel_errors, 99)]
+    ax2.hist(all_rel_errors, bins=50, alpha=0.7, color='green', edgecolor='black')
+    ax2.set_xlabel('Relative Error')
+    ax2.set_ylabel('Count')
+    ax2.set_title('Overall Relative Error Distribution')
+    ax2.set_yscale('log')
+    
+    # Log error distribution
+    all_log_errors = log_errors.flatten()
+    all_log_errors = all_log_errors[~np.isnan(all_log_errors)]
+    if len(all_log_errors) > 0:
+        ax3.hist(all_log_errors, bins=50, alpha=0.7, color='red', edgecolor='black')
+        ax3.set_xlabel('Log10 Error')
+        ax3.set_ylabel('Count')
+        ax3.set_title('Overall Log10 Error Distribution')
+        ax3.set_yscale('log')
+    
+    # 2. Per-species error statistics (box plots)
+    ax4 = fig.add_subplot(gs[1, :])
+    
+    # Prepare data for box plot
+    rel_error_data = []
+    for i in range(n_species):
+        species_errors = relative_errors[:, i]
+        # Remove extreme outliers for visualization
+        species_errors = species_errors[species_errors < np.percentile(species_errors, 95)]
+        rel_error_data.append(species_errors)
+    
+    bp = ax4.boxplot(rel_error_data, labels=species_names, patch_artist=True)
+    for patch in bp['boxes']:
+        patch.set_facecolor('lightblue')
+    
+    ax4.set_ylabel('Relative Error')
+    ax4.set_title('Per-Species Relative Error Distribution')
+    ax4.set_yscale('log')
+    ax4.grid(True, alpha=0.3)
+    plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    
+    # 3. Error statistics table
+    ax5 = fig.add_subplot(gs[2:, :])
+    ax5.axis('off')
+    
+    # Calculate statistics
+    stats_data = []
+    headers = ['Species', 'Mean Abs Err', 'Median Abs Err', 'Mean Rel Err', 'Median Rel Err', '95% Rel Err']
+    
+    for i, species in enumerate(species_names):
+        abs_err = absolute_errors[:, i]
+        rel_err = relative_errors[:, i]
+        
+        stats_data.append([
+            species,
+            f'{np.mean(abs_err):.2e}',
+            f'{np.median(abs_err):.2e}',
+            f'{np.mean(rel_err):.2%}',
+            f'{np.median(rel_err):.2%}',
+            f'{np.percentile(rel_err, 95):.2%}'
+        ])
+    
+    # Add overall statistics
+    stats_data.append([''] * len(headers))  # Empty row
+    stats_data.append([
+        'OVERALL',
+        f'{np.mean(absolute_errors):.2e}',
+        f'{np.median(absolute_errors):.2e}',
+        f'{np.mean(relative_errors):.2%}',
+        f'{np.median(relative_errors):.2%}',
+        f'{np.percentile(relative_errors, 95):.2%}'
+    ])
+    
+    # Create table
+    table = ax5.table(cellText=stats_data, colLabels=headers, loc='center', cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.5)
+    
+    # Style the table
+    for i in range(len(headers)):
+        table[(0, i)].set_facecolor('#4CAF50')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+    
+    # Highlight overall row
+    for i in range(len(headers)):
+        table[(len(stats_data), i)].set_facecolor('#FFC107')
+        table[(len(stats_data), i)].set_text_props(weight='bold')
+    
+    # Add title
+    fig.suptitle(f'Error Analysis - {model_dir.name}', fontsize=16, fontweight='bold')
+    
+    plt.tight_layout()
+    
+    # Save plot
+    plots_dir = model_dir / 'plots'
+    plots_dir.mkdir(exist_ok=True)
+    save_path = plots_dir / 'error_distributions.png'
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logging.info(f"Error distribution plot saved to: {save_path}")
+    
+    # Create a second plot showing error vs magnitude
+    fig2, axes = plt.subplots(2, 2, figsize=(12, 10))
+    axes = axes.flatten()
+    
+    # Sample 4 species for detailed plots
+    species_indices = np.linspace(0, n_species-1, min(4, n_species), dtype=int)
+    
+    for idx, species_idx in enumerate(species_indices):
+        ax = axes[idx]
+        
+        # Get errors and targets for this species
+        abs_err = absolute_errors[:, species_idx]
+        rel_err = relative_errors[:, species_idx]
+        
+        # Create 2D histogram
+        hist, xedges, yedges = np.histogram2d(
+            np.log10(abs_err + 1e-30), 
+            np.log10(rel_err + 1e-30),
+            bins=50
+        )
+        
+        im = ax.imshow(hist.T, origin='lower', aspect='auto', 
+                       extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                       cmap='viridis')
+        
+        ax.set_xlabel('Log10(Absolute Error)')
+        ax.set_ylabel('Log10(Relative Error)')
+        ax.set_title(f'{species_names[species_idx]}')
+        plt.colorbar(im, ax=ax, label='Count')
+    
+    plt.suptitle('Error Correlation Analysis', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    save_path2 = plots_dir / 'error_correlation.png'
+    plt.savefig(save_path2, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logging.info(f"Error correlation plot saved to: {save_path2}")
 
 def main():
-    if not MODEL_DIR:
-        raise ValueError("No model directory found")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    log_path = MODEL_DIR / 'training_log.json'
-    if not log_path.exists():
-        raise FileNotFoundError(f"Training log not found in {MODEL_DIR}")
+    # Get latest model directory
+    model_dir = get_latest_model_dir()
+    logging.info(f"Analyzing model: {model_dir.name}")
     
-    history = json.loads(log_path.read_text())
-    epochs = history['epochs']
+    # Load model and data
+    model, config, norm_helper, test_dataset, device = load_model_and_data(model_dir)
     
-    epoch_nums = [e['epoch'] for e in epochs]
-    train_losses = [e['train_loss'] for e in epochs]
-    val_losses = [e['val_loss'] for e in epochs if 'val_loss' in e]
+    # Compute errors
+    absolute_errors, relative_errors, log_errors = compute_errors(
+        model, test_dataset, config, norm_helper, device
+    )
     
-    plt.figure(figsize=(10, 6))
-    plt.plot(epoch_nums, train_losses, 'b-', label='Train Loss')
-    if val_losses:
-        plt.plot(epoch_nums[:len(val_losses)], val_losses, 'r-', label='Val Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training vs Validation Loss')
-    plt.legend()
-    plt.grid(True)
+    # Plot distributions
+    species_names = config['data']['species_variables']
+    plot_error_distributions(absolute_errors, relative_errors, log_errors, species_names, model_dir)
     
-    plots_dir = MODEL_DIR / 'plots'
-    plots_dir.mkdir(exist_ok=True)
-    save_path = plots_dir / 'loss_curve.png'
-    plt.savefig(save_path)
-    plt.close()
-    print(f"Plot saved to {save_path}")
+    # Print summary
+    print(f"\nError Analysis Summary:")
+    print(f"Mean absolute error: {np.mean(absolute_errors):.2e}")
+    print(f"Median absolute error: {np.median(absolute_errors):.2e}")
+    print(f"Mean relative error: {np.mean(relative_errors):.2%}")
+    print(f"Median relative error: {np.median(relative_errors):.2%}")
 
 if __name__ == '__main__':
     main()
@@ -532,11 +1281,11 @@ if __name__ == '__main__':
             "data/raw/run9003-result.h5",
             "data/raw/run9004-result.h5",
             "data/raw/run9005-result.h5",
-            //"data/raw/run9006-result.h5",
-            //"data/raw/run9007-result.h5",
-            //"data/raw/run9008-result.h5",
-            //"data/raw/run9009-result.h5",
-            //"data/raw/run9010-result.h5"
+            "data/raw/run9006-result.h5",
+            "data/raw/run9007-result.h5",
+            "data/raw/run9008-result.h5",
+            "data/raw/run9009-result.h5",
+            "data/raw/run9010-result.h5"
         ],
         // Directory for processed NPY shards
         "processed_data_dir": "data/processed",
@@ -618,9 +1367,9 @@ if __name__ == '__main__':
         "output_scale": 1.0,
         
         // DeepONet-specific parameters
-        "branch_layers": [512, 512, 512, 512, 512],
-        "trunk_layers": [64, 64, 64, 64, 64],
-        "basis_dim": 512,
+        "branch_layers": [512, 512, 512, 512],
+        "trunk_layers": [128, 128, 128, 128],
+        "basis_dim": 64,
         
         // SIREN-specific parameters (when type="siren")
         "hidden_dims": [512, 512, 512, 512],
@@ -634,7 +1383,7 @@ if __name__ == '__main__':
         // Hidden layers for FiLM networks
         "hidden_dims": [64, 64, 64, 64, 64],
         // Activation for FiLM networks
-        "activation": "gelu"
+        "activation": "relu"
     },
     
     // ===== PREDICTION SETTINGS =====
@@ -654,10 +1403,10 @@ if __name__ == '__main__':
         "use_fraction": 1.0,
         
         // Training duration
-        "epochs": 50,
+        "epochs": 300,
         
         // BATCH SIZE - MAXIMIZED FOR A100 80GB
-        "batch_size": 131072,  // 8x larger than original
+        "batch_size": 32768,  
         "gradient_accumulation_steps": 1,
         
         // GPU CACHING - CRITICAL FOR PERFORMANCE
@@ -671,7 +1420,7 @@ if __name__ == '__main__':
         "drop_last": true,
         
         // Learning rate - scaled with batch size
-        "learning_rate": 2e-3,  // 4x original due to 8x batch size (sqrt scaling)
+        "learning_rate": 5e-4,  // 4x original due to 8x batch size (sqrt scaling)
         "weight_decay": 1e-5,
         "betas": [0.9, 0.999],
         "eps": 1e-8,
@@ -680,7 +1429,7 @@ if __name__ == '__main__':
         // Scheduler settings
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 10,  // Restart every 10 epochs
+            "T_0": 30,  // Restart every 10 epochs
             "T_mult": 2,
             "eta_min": 1e-8
         },
@@ -690,7 +1439,7 @@ if __name__ == '__main__':
         "huber_delta": 0.5,
         "use_amp": true,
         "amp_dtype": "bfloat16",  // Better for A100 than float16
-        "early_stopping_patience": 10,
+        "early_stopping_patience": 5000,
         "min_delta": 1e-8,
         
         // Reduced logging/memory clearing for performance
@@ -727,7 +1476,7 @@ if __name__ == '__main__':
         // Hyperband settings
         "algorithm": "hyperband",
         "hyperband_min_resource": 10,
-        "hyperband_max_resource": 40,
+        "hyperband_max_resource": 50,
         "hyperband_reduction_factor": 3,
         
         // Target number of trials
@@ -763,14 +1512,56 @@ import torch
 from typing import Dict, Any, Union
 import hashlib
 import json
+import os
 
+# =================================================================
+# 1. CONFIGURE LOGGING FIRST
+# We set this up at the very top so even the prologue can use it.
+# =================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%Y%m%d_%H%M%S",
     stream=sys.stdout
 )
 
+# =================================================================
+# 2. PROLOGUE FOR MAXIMUM PARALLELISM
+# This block now uses the logging system to report its actions.
+# =================================================================
+try:
+    # SLURM_CPUS_PER_TASK is the ground truth for the number of cores allocated
+    n_cores_str = os.environ.get("SLURM_CPUS_PER_TASK")
+    source = "SLURM"
+    
+    if n_cores_str is None:
+        # Fallback for local execution or other schedulers
+        n_cores_str = str(os.cpu_count() or 1)
+        source = "os.cpu_count()"
+
+    n_cores = int(n_cores_str)
+    
+    logging.info(f"CORE PROLOGUE: Detected {n_cores} cores via {source}.")
+    
+    # Set environment variables to force thread counts
+    os.environ["OMP_NUM_THREADS"] = str(n_cores)
+    os.environ["MKL_NUM_THREADS"] = str(n_cores)
+    logging.info(f"CORE PROLOGUE: Set OMP_NUM_THREADS and MKL_NUM_THREADS to {n_cores}.")
+    
+    # Set PyTorch's internal thread counts
+    torch.set_num_threads(n_cores)
+    
+    # Final verification log
+    logging.info(f"CORE PROLOGUE: Verification: torch.get_num_threads() now reports {torch.get_num_threads()} threads.")
+
+except Exception as e:
+    logging.error(f"CORE PROLOGUE: Failed to set thread counts: {e}", exc_info=True)
+
+
+# =================================================================
+# 3. REST OF THE APPLICATION
+# (The rest of the file is unchanged)
+# =================================================================
 # Set multiprocessing sharing strategy
 import torch.multiprocessing
 try:
@@ -1419,10 +2210,10 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     """Suggests a valid model and training configuration for a trial."""
     config = copy.deepcopy(base_config)
 
-    #config["prediction"]["mode"] = "absolute"
+    config["prediction"]["mode"] = "absolute"
     
     # Model architecture choice
-    model_type = trial.suggest_categorical("model_type", ["deeponet"])
+    model_type = trial.suggest_categorical("model_type", ["deeponet", "siren"])
     config["model"]["type"] = model_type
     
     # Common hyperparameters - EXPANDED SEARCH SPACE
@@ -1432,35 +2223,21 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     #config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
     config["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.1, step=0.05)
     
-    # Scheduler parameters
-    #config["training"]["scheduler_params"]["T_0"] = trial.suggest_categorical("cosine_T_0", [10])
-    
-    # Gradient accumulation adjustment
-    """
-    if config["training"]["batch_size"] <= 1024:
-        config["training"]["gradient_accumulation_steps"] = 8
-    elif config["training"]["batch_size"] <= 2048:
-        config["training"]["gradient_accumulation_steps"] = 4
-    elif config["training"]["batch_size"] <= 4096:
-        config["training"]["gradient_accumulation_steps"] = 2
-    else:
-        config["training"]["gradient_accumulation_steps"] = 1
-    """
 
     if model_type == "deeponet":
         # More flexible architecture search
-        n_branch = trial.suggest_int("n_branch_layers", 2, 5)
+        n_branch = trial.suggest_int("n_branch_layers", 2, 6)
         branch_layers = []
         for i in range(n_branch):
             if i == 0:
-                width = trial.suggest_categorical(f"branch_layer_{i}", [256, 384, 512])
+                width = trial.suggest_categorical(f"branch_layer_{i}", [256, 384, 512, 1024])
             else:
                 # Allow different widths per layer
-                width = trial.suggest_categorical(f"branch_layer_{i}", [128, 256, 384])
+                width = trial.suggest_categorical(f"branch_layer_{i}", [128, 256, 384, 512, 1024])
             branch_layers.append(width)
         config["model"]["branch_layers"] = branch_layers
         
-        n_trunk = trial.suggest_int("n_trunk_layers", 2, 4)
+        n_trunk = trial.suggest_int("n_trunk_layers", 2, 5)
         trunk_layers = []
         for i in range(n_trunk):
             width = trial.suggest_categorical(f"trunk_layer_{i}", [64, 128, 192])
@@ -1476,9 +2253,9 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
         hidden_dims = []
         for i in range(n_layers):
             if i == 0:
-                width = trial.suggest_categorical(f"hidden_dim_{i}", [256, 384, 512])
+                width = trial.suggest_categorical(f"hidden_dim_{i}", [256, 384, 512, 1024, 2048])
             else:
-                width = trial.suggest_categorical(f"hidden_dim_{i}", [128, 256, 384])
+                width = trial.suggest_categorical(f"hidden_dim_{i}", [128, 256, 384, 1024, 2048])
             hidden_dims.append(width)
         config["model"]["hidden_dims"] = hidden_dims
         config["model"]["omega_0"] = trial.suggest_float("omega_0", 10.0, 50.0)
@@ -1487,7 +2264,7 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     use_film = trial.suggest_categorical("use_film", [True, False])
     config["film"]["enabled"] = use_film
     if use_film:
-        film_layers = trial.suggest_int("film_layers", 1, 3)
+        film_layers = trial.suggest_int("film_layers", 1, 5)
         film_widths = []
         for i in range(film_layers):
             width = trial.suggest_categorical(f"film_width_{i}", [32, 64, 128])
@@ -1890,7 +2667,13 @@ class Trainer:
         self.logger.info(f"Train batches: {len(self.train_loader)}")
         if self.has_validation:
             self.logger.info(f"Val batches: {len(self.val_loader)}")
-        
+
+
+        if self.system_config.get("use_torch_compile", False):
+            self.logger.info("Compiling model with torch.compile...")
+            self.logger.warning("    This is a one-time process that can take several minutes.")
+
+
         try:
             self._run_training_loop()
             
@@ -2783,7 +3566,7 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
             # A100-optimized compilation
             compile_options = {
                 "mode": compile_mode,
-                "fullgraph": True,
+                "fullgraph": False,
                 "dynamic": False,
             }
             
@@ -3629,7 +4412,6 @@ def shard_worker_split_aware(file_path, config, norm_stats, output_dir):
 #!/usr/bin/env python3
 """
 High-performance dataset implementation for chemical kinetics training.
-OPTIMIZED VERSION for A100 GPU with full GPU caching.
 """
 
 import json
@@ -3637,10 +4419,12 @@ import logging
 import time
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
-
+import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+import math
+from functools import lru_cache
 
 
 class NPYDataset(Dataset):
@@ -3697,85 +4481,74 @@ class NPYDataset(Dataset):
         self._try_gpu_cache()
         
     def _try_gpu_cache(self):
-        """Try to load entire dataset to GPU memory with fallback."""
-        # Check if GPU caching is enabled
+        """Load the entire split to GPU memory; fall back to CPU if needed."""
         gpu_cache_setting = self.config.get("training", {}).get("gpu_cache_dataset", "auto")
-        
-        if gpu_cache_setting == False:
+        if gpu_cache_setting is False:
             self.logger.info(f"GPU caching disabled for {self.split_name}")
             self.cpu_fallback = True
             return
-            
-        # Only attempt on CUDA devices
+
         if self.device.type != "cuda":
             self.logger.info(f"GPU caching not available on {self.device.type}")
             self.cpu_fallback = True
             return
-            
-        # Check available memory
-        free_mem, total_mem = torch.cuda.mem_get_info(self.device.index)
-        needed_gb = self.total_bytes / 1024**3
-        free_gb = free_mem / 1024**3
-        
-        # Need some buffer for operations
-        if needed_gb > free_gb * 0.9:
+
+        free_mem, _ = torch.cuda.mem_get_info(self.device.index)
+        needed_gb = self.total_bytes / 1024 ** 3
+        free_gb   = free_mem       / 1024 ** 3
+        if needed_gb > free_gb * 0.85:     
             self.logger.warning(
                 f"Insufficient GPU memory for {self.split_name}: "
-                f"need {needed_gb:.1f}GB, have {free_gb:.1f}GB free. "
-                f"Falling back to CPU loading."
+                f"need {needed_gb:.1f} GB, have {free_gb:.1f} GB.  Falling back to CPU."
             )
             self.cpu_fallback = True
             return
-            
-        # Try to load to GPU
-        self.logger.info(f"Loading {self.split_name} dataset to GPU ({needed_gb:.1f}GB)...")
-        start_time = time.time()
-        
-        try:
-            # Pre-allocate GPU tensor
-            self.gpu_cache = torch.empty(
-                (self.n_total_samples, self.n_features),
-                dtype=torch.float32,
-                device=self.device
+
+        self.logger.info(f"Loading {self.split_name} dataset to GPU ({needed_gb:.1f} GB)…")
+        start = time.time()
+
+        self.gpu_cache = torch.empty(
+            (self.n_total_samples, self.n_features),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        cur = 0
+        for shard in self.shards:
+            shard_path = self.split_dir / shard["filename"]
+            if self.shard_index.get("compression") == "npz":
+                with np.load(shard_path) as zf:
+                    data = zf["data"].astype(np.float32, copy=False)
+            else:
+                data = np.load(shard_path).astype(np.float32, copy=False)
+
+            n = data.shape[0]
+            self.gpu_cache[cur:cur + n] = torch.from_numpy(data).pin_memory().to(
+                self.device, non_blocking=True
             )
-            
-            # Load each shard
-            current_idx = 0
-            for shard_info in self.shards:
-                shard_path = self.split_dir / shard_info["filename"]
-                
-                # Load shard
-                if self.shard_index.get("compression") == "npz":
-                    with np.load(shard_path) as zf:
-                        data = zf["data"].astype(np.float32, copy=False)
-                else:
-                    data = np.load(shard_path).astype(np.float32, copy=False)
-                
-                # Copy to GPU
-                n_samples = data.shape[0]
-                self.gpu_cache[current_idx:current_idx + n_samples] = torch.from_numpy(data).to(
-                    self.device, non_blocking=True
-                )
-                current_idx += n_samples
-            
-            # Ensure all transfers complete
-            torch.cuda.synchronize()
-            
-            load_time = time.time() - start_time
-            throughput = needed_gb / load_time
-            self.logger.info(
-                f"GPU cache loaded successfully in {load_time:.1f}s ({throughput:.1f} GB/s)"
-            )
-            
-        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-            self.logger.warning(f"GPU caching failed: {e}. Using CPU fallback.")
-            self.gpu_cache = None
-            self.cpu_fallback = True
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
+            cur += n
+            del data                  
+
+        torch.cuda.synchronize()
+        t = time.time() - start
+        self.logger.info(f"GPU cache loaded in {t:.1f}s ({needed_gb/t:.1f} GB/s)")
 
     def _load_shard_cpu(self, shard_idx: int) -> np.ndarray:
         """Load a shard from disk (CPU fallback)."""
+        # ====================================================================
+        # FIXED: Added simple per-worker LRU cache to avoid re-reading files
+        # ====================================================================
+        # Check if the cache exists on this worker process
+        if not hasattr(self, '_shard_cache'):
+            # functools.lru_cache is a simpler way to do this
+            from functools import lru_cache
+            # Cache up to 2 shards per worker, a common scenario
+            self._shard_cache = lru_cache(maxsize=2)(self._load_shard_from_disk)
+        
+        return self._shard_cache(shard_idx)
+
+    def _load_shard_from_disk(self, shard_idx: int) -> np.ndarray:
+        """Helper for the LRU cache that actually hits the disk."""
         shard_info = self.shards[shard_idx]
         shard_path = self.split_dir / shard_info["filename"]
         
@@ -3808,9 +4581,8 @@ class NPYDataset(Dataset):
             shard_data = self._load_shard_cpu(shard_idx)
             row = shard_data[local_idx]
             
-            # FIXED: Return CPU tensors. The batch will be moved to the GPU
-            # all at once by the dataloader / training loop, which is far more efficient.
-            # The DataLoader must be configured with pin_memory=True for this to be fast.
+            # Return CPU tensors. The batch will be moved to the GPU
+            # all at once by the dataloader / training loop.
             input_tensor = torch.from_numpy(row[:self.n_inputs].copy())
             target_tensor = torch.from_numpy(row[self.n_inputs:].copy())
             
@@ -3847,67 +4619,86 @@ def create_dataloader(dataset: Dataset,
                       shuffle: bool = True,
                       device: Optional[torch.device] = None,
                       drop_last: bool = True,
-                      **kwargs) -> DataLoader:
+                      **_) -> DataLoader:
     """
-    Create DataLoader with proper handling of GPU cache and CPU fallback.
-    
-    Args:
-        dataset: The dataset to load from
-        config: Configuration dictionary
-        shuffle: Whether to shuffle the data
-        device: PyTorch device
-        drop_last: Whether to drop the last incomplete batch
-        
-    Returns:
-        Configured DataLoader
+    Build a DataLoader that never loops Python‑side over 32 768 items.
+    If the dataset lives on the GPU, we wrap it in GPUBatchDataset so each
+    __getitem__ delivers a full batch slice in one shot.
     """
     if dataset is None or len(dataset) == 0:
         logging.getLogger(__name__).warning("Cannot create DataLoader for empty dataset")
         return None
 
-    log = logging.getLogger(__name__)
+    log  = logging.getLogger(__name__)
     tcfg = config["training"]
-    bs = tcfg["batch_size"]
-    
-    # Check if using GPU cache
-    is_gpu_cached = hasattr(dataset, 'gpu_cache') and dataset.gpu_cache is not None
-    is_cpu_fallback = hasattr(dataset, 'cpu_fallback') and dataset.cpu_fallback
-    
+    bs   = tcfg["batch_size"]
+
+    is_gpu_cached  = getattr(dataset, "gpu_cache", None) is not None
+    is_cpu_fallback = getattr(dataset, "cpu_fallback", False)
+
+    # ---------- GPU‑cached fast path ----------
     if is_gpu_cached:
-        # GPU mode: no workers needed
-        log.info(f"DataLoader[{dataset.split_name}] GPU mode: bs={bs}")
-        
+        log.info(f"DataLoader[{dataset.split_name}] GPU‑batch mode: bs={bs}")
+
+        class GPUBatchDataset(torch.utils.data.Dataset):
+            def __init__(self, gpu_tensor: torch.Tensor, n_inputs: int,
+                         batch_size: int, shuffle_batches: bool):
+                self.gpu_tensor  = gpu_tensor
+                self.n_inputs    = n_inputs
+                self.batch_size  = batch_size
+                self.shuffle     = shuffle_batches
+                self.total       = gpu_tensor.size(0)
+                self.n_batches   = math.ceil(self.total / batch_size)
+                self.permutation = None
+
+            def __len__(self):
+                return self.n_batches
+
+            def __getitem__(self, batch_idx: int):
+                if self.shuffle:
+                    if self.permutation is None or batch_idx == 0:
+                        self.permutation = torch.randperm(
+                            self.total, device=self.gpu_tensor.device
+                        )
+                    idx = self.permutation
+                else:
+                    idx = None  # straight slice
+
+                start = batch_idx * self.batch_size
+                end   = min(start + self.batch_size, self.total)
+
+                if idx is None:
+                    batch = self.gpu_tensor[start:end]
+                else:
+                    batch = self.gpu_tensor.index_select(0, idx[start:end])
+
+                return batch[:, :self.n_inputs], batch[:, self.n_inputs:]
+
+        gpu_ds = GPUBatchDataset(
+            dataset.gpu_cache, dataset.n_inputs, bs, shuffle
+        )
         return DataLoader(
-            dataset,
-            batch_size=bs,
-            shuffle=shuffle,
-            num_workers=0,  # MUST be 0 for GPU cache
-            pin_memory=False,  # Already on GPU
-            drop_last=drop_last,
+            gpu_ds,
+            batch_size=None,          # dataset already returns a full batch
+            shuffle=False,            # handled inside GPUBatchDataset
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False,
         )
-    elif is_cpu_fallback:
-        # CPU fallback mode
-        log.warning(f"DataLoader[{dataset.split_name}] CPU fallback mode: bs={bs}")
-        
-        # Use some workers for CPU loading but not too many
-        num_workers = min(4, tcfg.get("num_workers", 0))
-        
-        return DataLoader(
-            dataset,
-            batch_size=bs,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=(device and device.type == "cuda"),
-            drop_last=drop_last,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=2 if num_workers > 0 else None,
-        )
-    else:
-        # This shouldn't happen but handle it
-        raise RuntimeError(
-            f"Dataset {dataset.split_name if hasattr(dataset, 'split_name') else 'unknown'} "
-            "is neither GPU-cached nor in CPU fallback mode. Check dataset initialization."
-        )
+
+    # ---------- CPU fallback ----------
+    log.warning(f"DataLoader[{dataset.split_name}] CPU fallback mode: bs={bs}")
+    workers = tcfg.get("num_workers") or min(16, (os.cpu_count() or 1))
+    return DataLoader(
+        dataset,
+        batch_size=bs,
+        shuffle=shuffle,
+        num_workers=workers,
+        pin_memory=(device and device.type == "cuda"),
+        drop_last=drop_last,
+        persistent_workers=(workers > 0),
+        prefetch_factor=2 if workers > 0 else None,
+    )
 
 ===== /Users/imalsky/Desktop/Chemulator/src/data/normalizer.py =====
 #!/usr/bin/env python3
