@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 High-performance dataset implementation for chemical kinetics training.
-OPTIMIZED VERSION for A100 GPU with full GPU caching.
 """
 
 import json
@@ -14,6 +13,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import math
+from functools import lru_cache
+
 
 class NPYDataset(Dataset):
     """
