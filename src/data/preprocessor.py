@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-Chemical kinetics data preprocessor.
-This version uses a highly efficient, parallelized, two-pass process with an
-architecture that minimizes inter-process communication (IPC) and memory overhead.
+Chemical kinetics data preprocessor. This runs before the rest of the training.
 """
 
 import hashlib
@@ -52,10 +50,8 @@ class CorePreprocessor:
         self._create_index_mappings()
         
         if norm_stats:
-            self.norm_helper = NormalizationHelper(
-                norm_stats, torch.device("cpu"), self.species_vars,
-                self.global_vars, self.time_var, config
-            )
+            self.norm_helper = NormalizationHelper(norm_stats, torch.device("cpu"), 
+                                                   self.species_vars,self.global_vars, self.time_var, config)
     
     def _create_index_mappings(self):
         """Create index mappings for robust variable access"""
@@ -66,7 +62,7 @@ class CorePreprocessor:
 
     def _is_profile_valid(self, group: h5py.Group) -> Tuple[bool, str]:
         """
-        Checks if a profile is valid according to strict criteria.
+        Checks if a profile is valid according to criteria in config.
         Returns (is_valid, reason_for_failure_or_success).
         """
         # Validate every variable (species + globals + time)
@@ -90,9 +86,8 @@ class CorePreprocessor:
 
         return True, "valid"
     
-    def process_file_for_stats(
-        self, file_path: Path
-    ) -> Tuple[Dict[str, Dict], Dict[str, Dict], int, Dict]:
+    def process_file_for_stats(self, file_path: Path) -> Tuple[Dict[str, Dict], Dict[str, Dict], int, Dict]:
+        """Get a report of the raw data"""
         accumulators = self.normalizer._initialize_accumulators()
 
         ratio_accumulators: Dict[str, Dict[str, Any]] = {}
@@ -128,6 +123,7 @@ class CorePreprocessor:
                     continue
 
                 # deterministic down‑sampling
+                # check if whole dataset is being used
                 if self.train_cfg["use_fraction"] < 1.0:
                     h = int(hashlib.sha256(gname.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
                     if h >= self.train_cfg["use_fraction"]:
@@ -228,13 +224,9 @@ class CorePreprocessor:
                 
                 # Convert profile to samples
                 if self.prediction_mode == "ratio":
-                    samples = self._profile_to_samples_ratio(
-                        profile, n_t, self.norm_stats.get("ratio_stats", {})
-                    )
+                    samples = self._profile_to_samples_ratio(profile, n_t, self.norm_stats.get("ratio_stats", {}))
                 else:
-                    norm_prof = self.norm_helper.normalize_profile(
-                        torch.from_numpy(profile)
-                    ).numpy()
+                    norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(profile)).numpy()
                     samples = self._profile_to_samples(norm_prof, n_t)
                 
                 if samples is not None:
@@ -302,22 +294,6 @@ class CorePreprocessor:
                 vec = profile[1:, idx] if (var == self.time_var and n_t > 1) else profile[:, idx]
                 if vec.size > 0:
                     self.normalizer._update_single_accumulator(acc, vec, var)
-
-    def _process_single_group(self, grp, gname, ratio_stats) -> Optional[Tuple[np.ndarray, str]]:
-        # The stricter validation is now done before this function is called.
-        n_t = grp[self.time_var].shape[0]
-        if n_t <= 1: return None
-        profile = self._extract_profile(grp, gname, n_t)
-        if profile is None: return None
-        
-        if self.prediction_mode == "ratio": samples = self._profile_to_samples_ratio(profile, n_t, ratio_stats)
-        else: samples = self._profile_to_samples(self.norm_helper.normalize_profile(torch.from_numpy(profile)).numpy(), n_t)
-        if samples is None: return None
-        
-        p = int(hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
-        split_key = "test" if p < self.train_cfg["test_fraction"] else "validation" if p < self.train_cfg["test_fraction"] + self.train_cfg["val_fraction"] else "train"
-        return samples, split_key
-
     
     def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> Optional[np.ndarray]:
         import re
@@ -331,7 +307,7 @@ class CorePreprocessor:
         return profile
 
     def _profile_to_samples(self, norm_prof, n_t):
-        """Get samples"""
+        """Build (n_t‑1) samples for absolute mode."""
         if n_t <= 1:
             return None
         
@@ -412,11 +388,6 @@ class CorePreprocessor:
 def stats_worker(file_path, config):
     return CorePreprocessor(config).process_file_for_stats(Path(file_path))
 
-def shard_worker(file_path, config, norm_stats, output_dir):
-    """Legacy helper kept for completeness; matches shard_worker_split_aware signature."""
-    processor = CorePreprocessor(config, norm_stats)
-    return processor.process_file_for_shards(Path(file_path), Path(output_dir))
-
 class DataPreprocessor:
     """Main parent class to orchestrate parallel data preprocessing."""
     def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
@@ -459,42 +430,6 @@ class DataPreprocessor:
         self._write_summary_log(summary_report, shard_index["total_samples"])
         self.logger.info(f"Core data preprocessing completed in {time.time() - start_time:.1f}s")
         
-    def generate_split_indices(self) -> None:
-        """Generates train/val/test split indices from an existing shard_index.json. This is a very fast operation."""
-        self.logger.info("Generating new train/val/test split indices...")
-        shard_index_path = self.output_dir / "shard_index.json"
-        if not shard_index_path.exists():
-            raise FileNotFoundError(f"Cannot generate splits: shard_index.json not found in {self.output_dir}")
-        
-        shard_index = load_json(shard_index_path)
-        total_samples = shard_index["total_samples"]
-        indices = np.arange(total_samples)
-        
-        seed = self.config.get("system", {}).get("seed", 42)
-        np.random.seed(seed)
-        np.random.shuffle(indices)
-        
-        use_fraction = self.config["training"].get("use_fraction", 1.0)
-        if use_fraction < 1.0:
-            indices = indices[:int(total_samples * use_fraction)]
-        
-        n = len(indices)
-        test_frac = self.config["training"]["test_fraction"]
-        val_frac = self.config["training"]["val_fraction"]
-        
-        test_split_idx = int(n * test_frac)
-        val_split_idx = test_split_idx + int(n * val_frac)
-        
-        split_data = {
-            "test": np.sort(indices[:test_split_idx]).astype(np.int64),
-            "validation": np.sort(indices[test_split_idx:val_split_idx]).astype(np.int64),
-            "train": np.sort(indices[val_split_idx:]).astype(np.int64)
-        }
-        
-        for name, idx_array in split_data.items():
-            path = self.output_dir / shard_index["split_files"][name]
-            np.save(path, idx_array)
-            self.logger.info(f"Saved {name} indices to {path} ({len(idx_array)} samples)")
 
     def _write_normalized_shards(self, norm_stats, file_sample_counts) -> Dict[str, List[Dict]]:
         """Second pass: write split-specific shards to separate directories."""
@@ -561,7 +496,9 @@ class DataPreprocessor:
         self.logger.info("Pass 1: Collecting statistics and sample counts...")
         prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
         final_accs = self.normalizer._initialize_accumulators()
-        final_ratio_accs = {var: {"count": 0,"mean": 0.0,"m2": 0.0,"min": float('inf'),"max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
+        final_ratio_accs = {var: {"count": 0,"mean": 0.0,
+                                  "m2": 0.0,"min": float('inf'),
+                                  "max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
         file_counts = {}
         
         total_report = {
@@ -580,7 +517,7 @@ class DataPreprocessor:
                 if ratio_accs: self.normalizer._merge_accumulators(final_ratio_accs, ratio_accs)
                 file_counts[futures[fut].name] = count
                 
-                # --- NEW: Aggregate the reports ---
+                # Aggregate the reports ---
                 total_report["total_profiles"] += worker_report["total_profiles"]
                 total_report["profiles_kept"] += worker_report["profiles_kept"]
                 for reason, num in worker_report["dropped_reasons"].items():

@@ -15,13 +15,11 @@ import torch
 DEFAULT_EPSILON = 1e-30
 DEFAULT_MIN_STD = 1e-10
 DEFAULT_CLAMP = 50.0
-# Safe epsilon for float32
 SAFE_EPSILON = 1e-38
 MIN_RANGE = 1e-10
 
 class DataNormalizer:
     """Calculates normalization statistics with robust data validation."""
-    
     def __init__(self, config: Dict[str, Any]) -> None:
         self.config = config
         self.data_config = config["data"]
@@ -85,11 +83,9 @@ class DataNormalizer:
             
             # Check for extreme values after log transform
             if vec.min() < -25 or vec.max() > 25:
-                self.logger.warning(
-                    f"Variable '{var_name}' has extreme log values: [{vec.min():.1f}, {vec.max():.1f}]"
-                )
+                self.logger.warning(f"Variable '{var_name}' has extreme log values: [{vec.min():.1f}, {vec.max():.1f}]")
 
-        # 3. Perform Chan's parallel update for mean and variance
+        # 3. Perform parallel update for mean and variance
         n_b = vec.size
         mean_b = float(vec.mean())
         m2_b = float(((vec - mean_b) ** 2).sum()) if n_b > 1 else 0.0
@@ -204,7 +200,6 @@ class DataNormalizer:
 
 class NormalizationHelper:
     """Applies pre-computed normalization statistics to data tensors."""
-    
     def __init__(self, stats: Dict[str, Any], device: torch.device, 
                  species_vars: List[str], global_vars: List[str], 
                  time_var: str, config: Optional[Dict[str, Any]] = None):

@@ -61,7 +61,7 @@ class NPYDataset(Dataset):
         self._shard_ends = np.array([s["end_idx"] for s in self.shards])
         
         # Memory info
-        self.bytes_per_sample = self.n_features * 4  # float32
+        self.bytes_per_sample = self.n_features * 4
         self.total_bytes = self.n_total_samples * self.bytes_per_sample
         
         # Initialize caching
@@ -112,9 +112,7 @@ class NPYDataset(Dataset):
                 data = np.load(shard_path).astype(np.float32, copy=False)
 
             n = data.shape[0]
-            self.gpu_cache[cur:cur + n] = torch.from_numpy(data).pin_memory().to(
-                self.device, non_blocking=True
-            )
+            self.gpu_cache[cur:cur + n] = torch.from_numpy(data).pin_memory().to(self.device, non_blocking=True)
             cur += n
             del data                  
 
@@ -124,9 +122,7 @@ class NPYDataset(Dataset):
 
     def _load_shard_cpu(self, shard_idx: int) -> np.ndarray:
         """Load a shard from disk (CPU fallback)."""
-        # ====================================================================
-        # FIXED: Added simple per-worker LRU cache to avoid re-reading files
-        # ====================================================================
+        
         # Check if the cache exists on this worker process
         if not hasattr(self, '_shard_cache'):
             # functools.lru_cache is a simpler way to do this
@@ -210,9 +206,7 @@ def create_dataloader(dataset: Dataset,
                       drop_last: bool = True,
                       **_) -> DataLoader:
     """
-    Build a DataLoader that never loops Python‑side over 32 768 items.
-    If the dataset lives on the GPU, we wrap it in GPUBatchDataset so each
-    __getitem__ delivers a full batch slice in one shot.
+    Build a DataLoader
     """
     if dataset is None or len(dataset) == 0:
         logging.getLogger(__name__).warning("Cannot create DataLoader for empty dataset")
@@ -222,10 +216,8 @@ def create_dataloader(dataset: Dataset,
     tcfg = config["training"]
     bs   = tcfg["batch_size"]
 
-    is_gpu_cached  = getattr(dataset, "gpu_cache", None) is not None
-    is_cpu_fallback = getattr(dataset, "cpu_fallback", False)
+    is_gpu_cached   = getattr(dataset, "gpu_cache", None) is not None
 
-    # ---------- GPU‑cached fast path ----------
     if is_gpu_cached:
         log.info(f"DataLoader[{dataset.split_name}] GPU‑batch mode: bs={bs}")
 
@@ -251,7 +243,7 @@ def create_dataloader(dataset: Dataset,
                         )
                     idx = self.permutation
                 else:
-                    idx = None  # straight slice
+                    idx = None
 
                 start = batch_idx * self.batch_size
                 end   = min(start + self.batch_size, self.total)
@@ -268,14 +260,14 @@ def create_dataloader(dataset: Dataset,
         )
         return DataLoader(
             gpu_ds,
-            batch_size=None,          # dataset already returns a full batch
-            shuffle=False,            # handled inside GPUBatchDataset
+            batch_size=None,
+            shuffle=False,
             num_workers=0,
             pin_memory=False,
             drop_last=False,
         )
 
-    # ---------- CPU fallback ----------
+    # Cpu fallback
     log.warning(f"DataLoader[{dataset.split_name}] CPU fallback mode: bs={bs}")
     workers = tcfg.get("num_workers") or min(16, (os.cpu_count() or 1))
     return DataLoader(
