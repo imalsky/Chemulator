@@ -6,7 +6,6 @@ Hardware detection and optimization utilities.
 import logging
 import os
 from typing import Dict, Any
-
 import torch
 
 
@@ -51,7 +50,7 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
             torch.backends.cudnn.benchmark = True
             logger.info("cuDNN autotuner enabled")
         
-        # Set memory fraction - safely check if API exists
+        # Set memory fraction
         memory_fraction = config.get("cuda_memory_fraction", 0.9)
         if memory_fraction < 1.0 and hasattr(torch.cuda, "set_per_process_memory_fraction"):
             try:

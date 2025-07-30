@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simplified utility functions for the chemical kinetics pipeline.
+Utility functions for the chemical kinetics pipeline.
 """
 
 import json

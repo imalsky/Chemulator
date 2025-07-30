@@ -9,10 +9,6 @@ import hashlib
 import json
 import os
 
-# =================================================================
-# 1. CONFIGURE LOGGING FIRST
-# We set this up at the very top so even the prologue can use it.
-# =================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
@@ -20,44 +16,6 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
-# =================================================================
-# 2. PROLOGUE FOR MAXIMUM PARALLELISM
-# This block now uses the logging system to report its actions.
-# =================================================================
-try:
-    # SLURM_CPUS_PER_TASK is the ground truth for the number of cores allocated
-    n_cores_str = os.environ.get("SLURM_CPUS_PER_TASK")
-    source = "SLURM"
-    
-    if n_cores_str is None:
-        # Fallback for local execution or other schedulers
-        n_cores_str = str(os.cpu_count() or 1)
-        source = "os.cpu_count()"
-
-    n_cores = int(n_cores_str)
-    
-    logging.info(f"CORE PROLOGUE: Detected {n_cores} cores via {source}.")
-    
-    # Set environment variables to force thread counts
-    os.environ["OMP_NUM_THREADS"] = str(n_cores)
-    os.environ["MKL_NUM_THREADS"] = str(n_cores)
-    logging.info(f"CORE PROLOGUE: Set OMP_NUM_THREADS and MKL_NUM_THREADS to {n_cores}.")
-    
-    # Set PyTorch's internal thread counts
-    torch.set_num_threads(n_cores)
-    
-    # Final verification log
-    logging.info(f"CORE PROLOGUE: Verification: torch.get_num_threads() now reports {torch.get_num_threads()} threads.")
-
-except Exception as e:
-    logging.error(f"CORE PROLOGUE: Failed to set thread counts: {e}", exc_info=True)
-
-
-# =================================================================
-# 3. REST OF THE APPLICATION
-# (The rest of the file is unchanged)
-# =================================================================
-# Set multiprocessing sharing strategy
 import torch.multiprocessing
 try:
     torch.multiprocessing.set_sharing_strategy('file_system')
@@ -65,7 +23,6 @@ try:
 except RuntimeError:
     logging.warning("Could not set multiprocessing sharing strategy.")
 
-import numpy as np
 from utils.hardware import setup_device, optimize_hardware
 from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
 from data.preprocessor import DataPreprocessor
@@ -246,20 +203,14 @@ class ChemicalKineticsPipeline:
             device=self.device
         )
         
-        # **FIXED** Safely log cache status to prevent crash
+        # Log cache status to prevent crash
         cache_info = train_dataset.get_cache_info()
         if cache_info.get("type") == "gpu":
-            self.logger.info(
-                f"✓ GPU caching active for '{train_dataset.split_name}': {cache_info.get('size_gb', 0):.1f}GB loaded."
-            )
+            self.logger.info(f"GPU caching active for '{train_dataset.split_name}': {cache_info.get('size_gb', 0):.1f}GB loaded.")
         elif cache_info.get("type") == "cpu":
-            self.logger.warning(
-                f"CPU fallback active for '{train_dataset.split_name}'. Reason: {cache_info.get('message', 'N/A')}"
-            )
+            self.logger.warning(f"CPU fallback active for '{train_dataset.split_name}'. Reason: {cache_info.get('message', 'N/A')}")
         else:
-            self.logger.error(
-                f"Cache status error for '{train_dataset.split_name}': {cache_info.get('status', 'unknown')}"
-            )
+            self.logger.error(f"Cache status error for '{train_dataset.split_name}': {cache_info.get('status', 'unknown')}")
 
         val_dataset = NPYDataset(
             shard_dir=self.processed_dir,
@@ -448,34 +399,31 @@ def main():
         pipeline.run_diagnostics(num_batches=args.diagnose_batches)
         
     elif args.tune:
-        # Run hyperparameter optimization
-        try:
-            import optuna
-        except ImportError:
-            print("Installing optuna...")
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "optuna"])
-        
-        from hyperparameter_tuning import optimize
-        
-        print(f"Starting hyperparameter optimization with {args.trials} trials...")
-        study = optimize(
-            config_path=args.config,
-            n_trials=args.trials,
-            n_jobs=1,
-            study_name=args.study_name
-        )
-        
-        # Print results
-        print("\n" + "="*60)
-        print("Optimization Complete")
-        print("="*60)
-        print(f"Best validation loss: {study.best_value:.6f}")
-        print(f"Best trial: {study.best_trial.number}")
-        print("\nBest parameters:")
-        for key, value in study.best_params.items():
-            print(f"  {key}: {value}")
-
+            try:
+                import optuna
+            except ImportError:
+                print("Error: The 'optuna' package is not installed",file=sys.stderr)
+                sys.exit(1)
+            
+            from hyperparameter_tuning import optimize
+            
+            print(f"Starting hyperparameter optimization with {args.trials} trials...")
+            study = optimize(
+                config_path=args.config,
+                n_trials=args.trials,
+                n_jobs=1,
+                study_name=args.study_name
+            )
+            
+            # Print results
+            print("\n" + "="*60)
+            print("Optimization Complete")
+            print("="*60)
+            print(f"Best validation loss: {study.best_value:.6f}")
+            print(f"Best trial: {study.best_trial.number}")
+            print("\nBest parameters:")
+            for key, value in study.best_params.items():
+                print(f"  {key}: {value}")
 
 if __name__ == "__main__":
     main()

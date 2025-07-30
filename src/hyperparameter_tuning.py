@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Hyperparameter tuning for chemical kinetics models using Optuna.
-Optimized for ~40 hour runtime with aggressive but smart pruning.
 """
 
 import copy
@@ -21,7 +20,7 @@ from data.dataset import NPYDataset
 from models.model import create_model
 from training.trainer import Trainer
 from data.normalizer import NormalizationHelper
-from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
+from utils.utils import seed_everything, ensure_directories, load_json_config, save_json, load_json
 
 
 class OptunaPruningCallback:

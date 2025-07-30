@@ -11,10 +11,12 @@ from torch.export import Dim
 
 
 class FiLMLayer(nn.Module):
-    """Feature-wise Linear Modulation layer - optimized version."""
-    
-    def __init__(self, condition_dim: int, feature_dim: int, 
-                 hidden_dims: List[int], activation: Union[str, List[str]] = "gelu", 
+    """Feature-wise Linear Modulation layer"""
+    def __init__(self,
+                 condition_dim: int, 
+                 feature_dim: int, 
+                 hidden_dims: List[int], 
+                 activation: Union[str, List[str]] = "gelu", 
                  use_beta: bool = True):
         super().__init__()
         
@@ -53,7 +55,7 @@ class FiLMLayer(nn.Module):
     def _get_activation(self, name: str):
         activations = {
             "gelu": nn.GELU(),
-            "relu": nn.ReLU(inplace=True),  # Inplace for memory efficiency
+            "relu": nn.ReLU(inplace=True),
             "tanh": nn.Tanh(),
             "silu": nn.SiLU(inplace=True),
             "leakyrelu": nn.LeakyReLU(0.2, inplace=True),
@@ -77,7 +79,7 @@ class FiLMLayer(nn.Module):
                 final_layer.bias.data.fill_(1.0)
     
     def forward(self, features: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
-        """Apply FiLM modulation - optimized."""
+        """Apply FiLM modulation"""
         # Generate parameters
         params = self.film_net(condition)
         
@@ -236,7 +238,7 @@ class FiLMDeepONet(nn.Module):
             input_dim=self.num_species + self.num_globals,
             hidden_layers=branch_layers,
             output_dim=self.basis_dim * self.num_species,
-            condition_dim=self.num_species + self.num_globals if self.use_film else None,
+            condition_dim=self.num_globals if self.use_film else None,
             film_config=film_config if self.use_film else None
         )
         
@@ -244,7 +246,7 @@ class FiLMDeepONet(nn.Module):
             input_dim=1,
             hidden_layers=trunk_layers,
             output_dim=self.basis_dim,
-            condition_dim=self.num_species + self.num_globals if self.use_film else None,
+            condition_dim=self.num_globals if self.use_film else None,
             film_config=film_config if self.use_film else None,
             bias=True
         )
@@ -335,7 +337,7 @@ class FiLMDeepONet(nn.Module):
             return nn.Sequential(*layers)
             
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Forward pass - optimized."""
+        """Forward pass"""
         batch_size = inputs.shape[0]
 
         # Split inputs
@@ -344,8 +346,12 @@ class FiLMDeepONet(nn.Module):
 
         # Process through networks
         if self.use_film:
-            branch_out = self.branch_net(branch_input, branch_input)
-            trunk_out = self.trunk_net(trunk_input, branch_input)
+            # Isolate the global parameters for conditioning
+            global_params_for_conditioning = inputs[:, self.num_species : self.num_species + self.num_globals]
+            
+            # Pass only globals as the condition
+            branch_out = self.branch_net(branch_input, global_params_for_conditioning)
+            trunk_out = self.trunk_net(trunk_input, global_params_for_conditioning)
         else:
             branch_out = self.branch_net(branch_input)
             trunk_out = self.trunk_net(trunk_input)
@@ -475,7 +481,7 @@ def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path)
                     logger.info(f"Model exported with torch.export to {save_path}")
                 except Exception as e:
                     logger.warning(f"torch.export failed: {e}. Falling back to torch.jit")
-                    raise  # Re-raise to trigger JIT fallback
+                    raise
             else:
                 # Direct to JIT if torch.export not available
                 raise AttributeError("torch.export not available")

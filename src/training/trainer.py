@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Optimized training pipeline for chemical kinetics models on A100 GPU.
+Training pipeline for chemical kinetics models
 """
 
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
-from contextlib import nullcontext
-import math
+from typing import Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,7 +20,7 @@ from data.normalizer import NormalizationHelper
 
 
 class Trainer:
-    """Optimized trainer for A100 GPU."""
+    """Trainer with several different options"""
     def __init__(self, model: nn.Module, train_dataset, val_dataset, test_dataset,
                 config: Dict[str, Any], save_dir: Path, device: torch.device,
                 norm_helper: NormalizationHelper):
@@ -52,7 +50,7 @@ class Trainer:
         # Check for validation data
         self.has_validation = val_dataset is not None and len(val_dataset) > 0
         if not self.has_validation:
-            self.logger.warning("No validation data – using training loss for checkpointing")
+            self.logger.warning("No validation data. Bad! Using training loss for checkpointing")
         
         # Create data loaders
         self._setup_dataloaders(train_dataset, val_dataset, test_dataset)
@@ -84,26 +82,17 @@ class Trainer:
             "epochs": []
         }
 
-
     def _validate_trainer_config(self):
         """Validate trainer configuration for correctness."""
-        # Fix 2: Validate ratio mode requirements
+        # Validate ratio mode requirements
         if self.prediction_mode == "ratio":
             # Check model compatibility
             model_type = self.config["model"]["type"]
             if model_type != "deeponet":
-                raise ValueError(
-                    f"Training in 'ratio' mode requires 'deeponet' model, "
-                    f"but '{model_type}' was specified. Please use 'deeponet' or switch to 'absolute' mode."
-                )
+                raise ValueError(f"Training in 'ratio' mode, not yet finished")
             
-            # Fix 3: Check for ratio statistics
             if not hasattr(self.norm_helper, 'ratio_stats') or self.norm_helper.ratio_stats is None:
-                raise ValueError(
-                    "Training in 'ratio' mode requires ratio statistics from preprocessing. "
-                    "Ensure data was preprocessed with prediction.mode='ratio' in config. "
-                    "Current normalization data does not contain ratio_stats."
-                )
+                raise ValueError("Training in 'ratio' mode requires ratio statistics from preprocessing. ")
             
             self.logger.info("Ratio mode validation passed: using DeepONet with ratio statistics")
         
@@ -175,6 +164,7 @@ class Trainer:
             try:
                 # Test if fused parameter actually works
                 test_opt = torch.optim.AdamW([torch.zeros(1)], fused=True)
+
                 optimizer_kwargs["fused"] = True
                 self.logger.info("Using fused AdamW optimizer")
             except Exception:
@@ -193,7 +183,7 @@ class Trainer:
 
         steps_per_epoch = len(self.train_loader) // self.gradient_accumulation_steps
         
-        # **FIXED**: Guard against division-by-zero or T_0=0 errors on small datasets.
+        # Guard against division-by-zero or T_0=0 errors on small datasets.
         if steps_per_epoch == 0:
             self.logger.warning(
                 f"Number of batches ({len(self.train_loader)}) is smaller than "
@@ -283,8 +273,6 @@ class Trainer:
         
         return self.criterion(outputs, targets)
 
-
-
     def train(self) -> float:
         """Execute the training loop."""
         if not self.train_loader:
@@ -296,19 +284,13 @@ class Trainer:
         if self.has_validation:
             self.logger.info(f"Val batches: {len(self.val_loader)}")
 
-
         if self.system_config.get("use_torch_compile", False):
             self.logger.info("Compiling model with torch.compile...")
             self.logger.warning("    This is a one-time process that can take several minutes.")
 
-
         try:
             self._run_training_loop()
-            
-            self.logger.info(
-                f"Training completed. Best validation loss: {self.best_val_loss:.6f} "
-                f"at epoch {self.best_epoch}"
-            )
+            self.logger.info(f"Training completed. Best validation loss: {self.best_val_loss:.6f} at epoch {self.best_epoch}")
             
         except KeyboardInterrupt:
             self.logger.info("Training interrupted by user")
@@ -318,7 +300,6 @@ class Trainer:
             raise
             
         finally:
-            # Save training history
             save_path = self.save_dir / "training_log.json"
             with open(save_path, 'w') as f:
                 json.dump(self.training_history, f, indent=2)
@@ -366,6 +347,7 @@ class Trainer:
                     break
             else:
                 # Use training loss if no validation
+                # Probably should just be an error
                 if train_loss < (best_train_loss - self.min_delta):
                     best_train_loss = train_loss
                     self.best_val_loss = train_loss
@@ -444,7 +426,7 @@ class Trainer:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
             
-            # **FIXED**: device_type is now dynamic, based on the detected hardware.
+            # Device_type is now dynamic, based on the detected hardware.
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
                 loss = self._compute_loss(outputs, targets, inputs)
@@ -474,7 +456,7 @@ class Trainer:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
 
-            # **FIXED**: device_type is now dynamic, based on the detected hardware.
+            # Device_type is now dynamic, based on the detected hardware.
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
                 loss = self._compute_loss(outputs, targets, inputs)
