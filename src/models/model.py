@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Optimized model definitions for chemical kinetics neural networks.
-Includes better compilation and A100-specific optimizations.
-"""
 
 import logging
 import math

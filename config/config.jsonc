@@ -65,7 +65,7 @@
     // ===== NORMALIZATION SETTINGS =====
     "normalization": {
         // Default normalization method for all variables
-        "default_method": "log-min-max",
+        "default_method": "log-standard",
         
         // Override methods for specific variables
         "methods": {
