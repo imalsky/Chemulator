@@ -36,10 +36,13 @@ class CorePreprocessor:
         self.proc_cfg = config["preprocessing"]
 
         self.species_vars = self.data_cfg["species_variables"]
+        self.target_species_vars = self.data_cfg.get("target_species_variables", self.species_vars)
+
         self.global_vars = self.data_cfg["global_variables"]
         self.time_var = self.data_cfg["time_variable"]
         self.var_order = self.species_vars + self.global_vars + [self.time_var]
         
+        self.n_target_species = len(self.target_species_vars)
         self.n_species = len(self.species_vars)
         self.n_globals = len(self.global_vars)
         self.n_vars = self.n_species + self.n_globals + 1
@@ -61,6 +64,7 @@ class CorePreprocessor:
         """Create index mappings for robust variable access"""
         self.var_to_idx = {var: i for i, var in enumerate(self.var_order)}
         self.species_indices = [self.var_to_idx[var] for var in self.species_vars]
+        self.target_species_indices = [self.var_to_idx[var] for var in self.target_species_vars]
         self.global_indices = [self.var_to_idx[var] for var in self.global_vars]
         self.time_idx = self.var_to_idx[self.time_var]
 
@@ -351,7 +355,7 @@ class CorePreprocessor:
             return None
         
         n_inputs = self.n_species + self.n_globals + 1
-        samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float64)
+        samples = np.empty((n_t - 1, n_inputs + self.n_target_species), dtype=np.float64)
         
         # Initial species
         samples[:, :self.n_species] = norm_prof[0, self.species_indices] 
@@ -363,7 +367,7 @@ class CorePreprocessor:
         samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]
 
         # Target species
-        samples[:, n_inputs:] = norm_prof[1:, self.species_indices]
+        samples[:, n_inputs:] = norm_prof[1:, self.target_species_indices]
         
         return samples
 
@@ -457,7 +461,8 @@ class DataPreprocessor:
         
         # Save split-aware shard index
         shard_index = {
-            "n_species": len(self.config["data"]["species_variables"]),
+            "n_input_species": len(self.config["data"]["species_variables"]),
+            "n_target_species": len(self.config["data"].get("target_species_variables", self.config["data"]["species_variables"])),
             "n_globals": len(self.config["data"]["global_variables"]),
             "samples_per_shard": self.config["preprocessing"]["shard_size"],
             "compression": self.config["preprocessing"].get("compression"),

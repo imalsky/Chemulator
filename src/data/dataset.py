@@ -44,12 +44,14 @@ class NPYDataset(Dataset):
         self.split_info = full_index["splits"][split_name]
         
         # Extract dimensions
-        self.n_species = self.shard_index["n_species"]
+        self.n_input_species = self.shard_index["n_input_species"]
+        self.n_target_species = self.shard_index["n_target_species"]
+        self.n_species = self.n_input_species 
         self.n_globals = self.shard_index["n_globals"]
         self.samples_per_shard = self.shard_index["samples_per_shard"]
         self.prediction_mode = self.shard_index.get("prediction_mode", "absolute")
-        self.n_features = self.n_species * 2 + self.n_globals + 1
-        self.n_inputs = self.n_species + self.n_globals + 1
+        self.n_features = self.n_input_species + self.n_globals + 1 + self.n_target_species
+        self.n_inputs = self.n_input_species + self.n_globals + 1
         
         # Get shard info for this split
         self.shards = self.split_info["shards"]
