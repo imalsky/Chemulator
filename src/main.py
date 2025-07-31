@@ -28,7 +28,7 @@ from utils.utils import setup_logging, seed_everything, ensure_directories, load
 from data.preprocessor import DataPreprocessor
 from data.dataset import NPYDataset
 from models.model import create_model
-from training.trainer import Trainer, diagnose_performance
+from training.trainer import Trainer
 from data.normalizer import NormalizationHelper
 
 
@@ -297,8 +297,6 @@ class ChemicalKineticsPipeline:
             norm_helper=norm_helper
         )
         
-        # Run diagnostics
-        times = diagnose_performance(trainer, num_batches=num_batches)
         
         # Print summary
         print("\n" + "="*60)
@@ -348,11 +346,6 @@ def main():
         action="store_true",
         help="Run hyperparameter optimization"
     )
-    mode_group.add_argument(
-        "--diagnose",
-        action="store_true",
-        help="Run performance diagnostics"
-    )
     
     # Additional arguments
     parser.add_argument(
@@ -366,12 +359,6 @@ def main():
         type=str,
         default="chemical_kinetics_opt",
         help="Name for Optuna study"
-    )
-    parser.add_argument(
-        "--diagnose-batches",
-        type=int,
-        default=20,
-        help="Number of batches for diagnostics"
     )
     
     args = parser.parse_args()
@@ -393,10 +380,6 @@ def main():
         pipeline = ChemicalKineticsPipeline(args.config)
         pipeline.run()
         
-    elif args.diagnose:
-        # Run diagnostics
-        pipeline = ChemicalKineticsPipeline(args.config)
-        pipeline.run_diagnostics(num_batches=args.diagnose_batches)
         
     elif args.tune:
             try:
