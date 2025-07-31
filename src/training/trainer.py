@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Training pipeline for chemical kinetics models
+Training pipeline for chemical kinetics models with adaptive loss
 """
 
 import json
@@ -8,6 +8,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Dict, Any, Tuple
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -19,8 +20,134 @@ from models.model import export_model
 from data.normalizer import NormalizationHelper
 
 
+class ScaleAwareAdaptiveLoss(nn.Module):
+    """
+    Adaptive loss that accounts for different scales and variations in species.
+    Ensures uniform relative accuracy across all species.
+    """
+    def __init__(self, norm_stats: Dict[str, Any], species_names: list, device: torch.device):
+        super().__init__()
+        self.species_names = species_names
+        
+        # Extract standard deviations for each species
+        stds = []
+        for species in species_names:
+            if species in norm_stats["per_key_stats"]:
+                stats = norm_stats["per_key_stats"][species]
+                if "log_std" in stats:
+                    stds.append(stats["log_std"])
+                else:
+                    # For non-log normalized species
+                    stds.append(stats.get("std", 1.0))
+            else:
+                stds.append(1.0)
+        
+        # Convert to tensor
+        stds = torch.tensor(stds, device=device, dtype=torch.float64)
+        
+        # Create weights inversely proportional to std
+        # Species with larger std (harder to predict) get higher weight
+        self.weights = 1.0 / torch.sqrt(stds)
+        self.weights = self.weights / self.weights.mean()  # Normalize to mean=1
+        
+        # Log the weights
+        logger = logging.getLogger(__name__)
+        logger.info("Species-specific loss weights (based on std):")
+        for species, weight, std in zip(species_names, self.weights.cpu().numpy(), stds.cpu().numpy()):
+            logger.info(f"  {species}: weight={weight:.3f} (std={std:.3f})")
+        
+        # Optional: Manual adjustment for extreme species
+        # You can uncomment and modify this if certain species need extra attention
+        # extreme_species = ["O_evolution", "OH_evolution"]
+        # for i, species in enumerate(species_names):
+        #     if species in extreme_species:
+        #         self.weights[i] *= 2.0  # Double weight for extreme species
+        
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute weighted MSE loss.
+        
+        Args:
+            pred: Predictions in normalized space (batch, n_species)
+            target: Targets in normalized space (batch, n_species)
+        """
+        # Per-species squared error
+        squared_errors = (pred - target) ** 2
+        
+        # Apply species-specific weights
+        weighted_errors = squared_errors * self.weights.unsqueeze(0)
+        
+        # Return mean
+        return weighted_errors.mean()
+
+
+class UniformRelativeErrorLoss(nn.Module):
+    """
+    Alternative loss that directly optimizes for uniform relative error.
+    Works in normalized space but accounts for what the errors mean in real space.
+    """
+    def __init__(self, norm_stats: Dict[str, Any], species_names: list, device: torch.device, 
+                 target_relative_error: float = 0.01):
+        super().__init__()
+        self.species_names = species_names
+        self.target_relative_error = target_relative_error
+        
+        # Extract normalization parameters
+        self.log_stds = []
+        self.is_log = []
+        
+        for species in species_names:
+            if species in norm_stats["per_key_stats"]:
+                stats = norm_stats["per_key_stats"][species]
+                method = norm_stats["normalization_methods"].get(species, "standard")
+                
+                if "log" in method:
+                    self.log_stds.append(stats.get("log_std", 1.0))
+                    self.is_log.append(True)
+                else:
+                    self.log_stds.append(0.0)  # Not used for linear normalized
+                    self.is_log.append(False)
+            else:
+                self.log_stds.append(1.0)
+                self.is_log.append(True)
+        
+        self.log_stds = torch.tensor(self.log_stds, device=device, dtype=torch.float64)
+        self.is_log = torch.tensor(self.is_log, device=device, dtype=torch.bool)
+        
+        # Target error in normalized space for each species
+        # For log-normalized species: target_norm_error = log10(1 + target_relative_error) / log_std
+        log_target = np.log10(1 + target_relative_error)
+        self.target_normalized_errors = torch.where(
+            self.is_log,
+            log_target / self.log_stds,
+            torch.tensor(target_relative_error, device=device, dtype=torch.float64)
+        )
+        
+        logger = logging.getLogger(__name__)
+        logger.info(f"Target relative error: {target_relative_error:.1%}")
+        logger.info("Target normalized RMSE per species:")
+        for species, target_rmse in zip(species_names, self.target_normalized_errors.cpu().numpy()):
+            logger.info(f"  {species}: {target_rmse:.4f}")
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute loss that penalizes deviations from target relative error.
+        """
+        # Compute normalized errors
+        normalized_errors = torch.abs(pred - target)
+        
+        # Compute how far each species is from its target error
+        error_ratios = normalized_errors / self.target_normalized_errors.unsqueeze(0)
+        
+        # Penalize both under and over-achievement
+        # Use squared ratio to penalize large deviations more
+        loss = (error_ratios ** 2).mean()
+        
+        return loss
+
+
 class Trainer:
-    """Trainer with several different options"""
+    """Trainer with adaptive loss functions for multi-scale chemical kinetics"""
     def __init__(self, model: nn.Module, train_dataset, val_dataset, test_dataset,
                 config: Dict[str, Any], save_dir: Path, device: torch.device,
                 norm_helper: NormalizationHelper):
@@ -36,6 +163,7 @@ class Trainer:
         self.train_config = config["training"]
         self.system_config = config["system"]
         self.prediction_config = config.get("prediction", {})
+        self.data_config = config["data"]
         
         # Prediction mode
         self.prediction_mode = self.prediction_config.get("mode", "absolute")
@@ -44,8 +172,9 @@ class Trainer:
         self._validate_trainer_config()
         
         # Dataset info
-        self.n_species = len(config["data"]["species_variables"])
-        self.n_globals = len(config["data"]["global_variables"])
+        self.species_names = self.data_config["species_variables"]
+        self.n_species = len(self.species_names)
+        self.n_globals = len(self.data_config["global_variables"])
         
         # Check for validation data
         self.has_validation = val_dataset is not None and len(val_dataset) > 0
@@ -79,8 +208,12 @@ class Trainer:
         self.training_history = {
             "config": config,
             "prediction_mode": self.prediction_mode,
-            "epochs": []
+            "epochs": [],
+            "per_species_metrics": []
         }
+        
+        # Validation metrics tracking
+        self.track_species_metrics = self.train_config.get("track_species_metrics", True)
 
     def _validate_trainer_config(self):
         """Validate trainer configuration for correctness."""
@@ -89,10 +222,10 @@ class Trainer:
             # Check model compatibility
             model_type = self.config["model"]["type"]
             if model_type != "deeponet":
-                raise ValueError(f"Training in 'ratio' mode, not yet finished")
+                raise ValueError(f"Training in 'ratio' mode requires DeepONet")
             
             if not hasattr(self.norm_helper, 'ratio_stats') or self.norm_helper.ratio_stats is None:
-                raise ValueError("Training in 'ratio' mode requires ratio statistics from preprocessing. ")
+                raise ValueError("Training in 'ratio' mode requires ratio statistics from preprocessing.")
             
             self.logger.info("Ratio mode validation passed: using DeepONet with ratio statistics")
         
@@ -164,7 +297,6 @@ class Trainer:
             try:
                 # Test if fused parameter actually works
                 test_opt = torch.optim.AdamW([torch.zeros(1)], fused=True)
-
                 optimizer_kwargs["fused"] = True
                 self.logger.info("Using fused AdamW optimizer")
             except Exception:
@@ -225,7 +357,7 @@ class Trainer:
             raise ValueError(f"Unknown scheduler '{scheduler_type}'")
     
     def _setup_loss(self):
-        """Setup loss function."""
+        """Setup loss function with adaptive options."""
         loss_type = self.train_config["loss"]
         
         if loss_type == "mse":
@@ -234,11 +366,36 @@ class Trainer:
             self.criterion = nn.L1Loss()
         elif loss_type == "huber":
             self.criterion = nn.HuberLoss(delta=self.train_config.get("huber_delta", 0.5))
+        elif loss_type == "adaptive" or loss_type == "scale_aware":
+            # Use scale-aware adaptive loss
+            self.criterion = ScaleAwareAdaptiveLoss(
+                self.norm_helper.stats,
+                self.species_names,
+                self.device
+            )
+        elif loss_type == "uniform_relative":
+            # Use uniform relative error loss
+            target_error = self.train_config.get("target_relative_error", 0.01)
+            self.criterion = UniformRelativeErrorLoss(
+                self.norm_helper.stats,
+                self.species_names,
+                self.device,
+                target_relative_error=target_error
+            )
         else:
             raise ValueError(f"Unknown loss: {loss_type}")
     
     def _setup_amp(self):
-        """Setup automatic mixed precision for A100."""
+        """Setup automatic mixed precision - disabled for float64."""
+        # Check if using float64
+        model_dtype = next(self.model.parameters()).dtype
+        
+        if model_dtype == torch.float64:
+            self.use_amp = False
+            self.scaler = GradScaler(enabled=False)
+            self.logger.info("AMP disabled for float64 training")
+            return
+        
         self.use_amp = self.train_config.get("use_amp", True)
         
         # Get dtype
@@ -284,6 +441,9 @@ class Trainer:
         if self.has_validation:
             self.logger.info(f"Val batches: {len(self.val_loader)}")
 
+        # Log loss function info
+        self.logger.info(f"Using loss function: {type(self.criterion).__name__}")
+
         if self.system_config.get("use_torch_compile", False):
             self.logger.info("Compiling model with torch.compile...")
             self.logger.warning("    This is a one-time process that can take several minutes.")
@@ -291,6 +451,10 @@ class Trainer:
         try:
             self._run_training_loop()
             self.logger.info(f"Training completed. Best validation loss: {self.best_val_loss:.6f} at epoch {self.best_epoch}")
+            
+            # Run final diagnostics
+            if self.track_species_metrics:
+                self.diagnose_accuracy()
             
         except KeyboardInterrupt:
             self.logger.info("Training interrupted by user")
@@ -347,13 +511,11 @@ class Trainer:
                     break
             else:
                 # Use training loss if no validation
-                # Probably should just be an error
                 if train_loss < (best_train_loss - self.min_delta):
                     best_train_loss = train_loss
                     self.best_val_loss = train_loss
                     self.best_epoch = epoch
                     self._save_best_model()
-
 
     def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
         """Optimized training epoch for GPU."""
@@ -411,13 +573,17 @@ class Trainer:
 
     @torch.inference_mode()
     def _validate(self) -> Tuple[float, Dict[str, float]]:
-        """Optimized validation for GPU."""
+        """Validation with optional per-species metrics."""
         if not self.has_validation or self.val_loader is None:
             return float("inf"), {}
         
         self.model.eval()
         total_loss = 0.0
         total_samples = 0
+        
+        # For per-species tracking
+        if self.track_species_metrics and self.current_epoch % 10 == 0:
+            all_errors = []
         
         is_gpu_cached = hasattr(self.val_loader.dataset, 'gpu_cache') and self.val_loader.dataset.gpu_cache is not None
         
@@ -426,7 +592,6 @@ class Trainer:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
             
-            # Device_type is now dynamic, based on the detected hardware.
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
                 loss = self._compute_loss(outputs, targets, inputs)
@@ -434,8 +599,32 @@ class Trainer:
             batch_size = inputs.size(0)
             total_loss += loss.item() * batch_size
             total_samples += batch_size
+            
+            # Track per-species errors
+            if self.track_species_metrics and self.current_epoch % 10 == 0:
+                errors = ((outputs - targets) ** 2).detach()
+                all_errors.append(errors)
         
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
+        
+        # Log per-species metrics
+        if self.track_species_metrics and self.current_epoch % 10 == 0 and all_errors:
+            all_errors = torch.cat(all_errors, dim=0)
+            mse_per_species = all_errors.mean(dim=0)
+            
+            self.logger.info(f"Per-species validation MSE at epoch {self.current_epoch}:")
+            species_metrics = {}
+            for i, species in enumerate(self.species_names):
+                mse = mse_per_species[i].item()
+                rmse = np.sqrt(mse)
+                self.logger.info(f"  {species}: MSE={mse:.2e}, RMSE={rmse:.3f}")
+                species_metrics[species] = {"mse": mse, "rmse": rmse}
+            
+            self.training_history["per_species_metrics"].append({
+                "epoch": self.current_epoch,
+                "metrics": species_metrics
+            })
+        
         return avg_loss, {}
 
     @torch.inference_mode()
@@ -456,7 +645,6 @@ class Trainer:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
 
-            # Device_type is now dynamic, based on the detected hardware.
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
                 loss = self._compute_loss(outputs, targets, inputs)
@@ -467,6 +655,11 @@ class Trainer:
 
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
         self.logger.info(f"Test loss: {avg_loss:.6f}")
+        
+        # Run detailed diagnostics on test set
+        if self.track_species_metrics:
+            self.diagnose_accuracy(use_test=True)
+        
         return avg_loss
 
     def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
@@ -511,6 +704,120 @@ class Trainer:
                 self.logger.info(f"Exporting model with example input shape: {example_inputs.shape}")
                 export_path = self.save_dir / "exported_model.pt"
                 export_model(self.model, example_inputs, export_path)
+
+    def diagnose_accuracy(self, use_test=False):
+        """
+        Detailed accuracy diagnostics showing real-space performance.
+        """
+        self.model.eval()
+        
+        loader = self.test_loader if use_test else self.val_loader
+        if not loader:
+            self.logger.warning("No data available for diagnostics")
+            return
+        
+        # Collect all predictions
+        all_preds = []
+        all_targets = []
+        all_inputs = []
+        
+        with torch.no_grad():
+            for inputs, targets in loader:
+                outputs = self.model(inputs)
+                all_preds.append(outputs)
+                all_targets.append(targets)
+                all_inputs.append(inputs)
+        
+        all_preds = torch.cat(all_preds)
+        all_targets = torch.cat(all_targets)
+        all_inputs = torch.cat(all_inputs)
+        
+        # Denormalize for real space analysis
+        n_species = all_preds.shape[1]
+        
+        # Create full profiles for denormalization
+        pred_profiles = torch.zeros(all_preds.shape[0], 
+                                   len(self.norm_helper.species_vars) + 
+                                   len(self.norm_helper.global_vars) + 1,
+                                   device=all_preds.device, dtype=torch.float64)
+        
+        pred_profiles[:, :n_species] = all_preds
+        pred_profiles[:, n_species:-1] = all_inputs[:, n_species:-1]
+        pred_profiles[:, -1] = all_inputs[:, -1]
+        
+        target_profiles = pred_profiles.clone()
+        target_profiles[:, :n_species] = all_targets
+        
+        # Denormalize
+        pred_real = self.norm_helper.denormalize_profile(pred_profiles)[:, :n_species]
+        target_real = self.norm_helper.denormalize_profile(target_profiles)[:, :n_species]
+        
+        # Compute metrics per species
+        dataset_name = "Test" if use_test else "Validation"
+        print("\n" + "="*80)
+        print(f"{dataset_name} Set - SPECIES PERFORMANCE ANALYSIS")
+        print("="*80)
+        
+        summary_metrics = {
+            "normalized_space": {},
+            "real_space": {}
+        }
+        
+        for i, species in enumerate(self.species_names):
+            species_pred = pred_real[:, i]
+            species_true = target_real[:, i]
+            
+            # Normalized space MSE
+            norm_mse = ((all_preds[:, i] - all_targets[:, i]) ** 2).mean().item()
+            norm_rmse = np.sqrt(norm_mse)
+            
+            # Real space metrics
+            abs_error = (species_pred - species_true).abs()
+            rel_error = abs_error / (species_true.abs() + 1e-30)
+            
+            # Remove infinities for statistics
+            finite_mask = torch.isfinite(rel_error)
+            rel_error_finite = rel_error[finite_mask]
+            
+            # Store metrics
+            summary_metrics["normalized_space"][species] = {
+                "mse": norm_mse,
+                "rmse": norm_rmse
+            }
+            
+            summary_metrics["real_space"][species] = {
+                "mean_abs_error": abs_error.mean().item(),
+                "mean_rel_error": rel_error_finite.mean().item() if len(rel_error_finite) > 0 else float('inf'),
+                "median_rel_error": rel_error_finite.median().item() if len(rel_error_finite) > 0 else float('inf'),
+                "90th_percentile_rel_error": rel_error_finite.quantile(0.9).item() if len(rel_error_finite) > 0 else float('inf'),
+                "typical_magnitude": species_true.abs().median().item()
+            }
+            
+            print(f"\n{species}:")
+            print(f"  Normalized space: MSE={norm_mse:.2e}, RMSE={norm_rmse:.4f}")
+            print(f"  Real space:")
+            print(f"    Mean absolute error: {abs_error.mean():.2e}")
+            if len(rel_error_finite) > 0:
+                print(f"    Mean relative error: {rel_error_finite.mean():.2%}")
+                print(f"    Median relative error: {rel_error_finite.median():.2%}")
+                print(f"    90th percentile rel error: {rel_error_finite.quantile(0.9):.2%}")
+            else:
+                print(f"    Relative errors: Unable to compute (division by zero)")
+            print(f"    Typical magnitude: {species_true.abs().median():.2e}")
+        
+        # Save detailed metrics
+        metrics_path = self.save_dir / f"{dataset_name.lower()}_diagnostics.json"
+        with open(metrics_path, 'w') as f:
+            # Convert tensors to floats for JSON serialization
+            json_metrics = {
+                "dataset": dataset_name.lower(),
+                "epoch": self.current_epoch,
+                "summary": summary_metrics
+            }
+            json.dump(json_metrics, f, indent=2)
+        
+        print(f"\nDetailed metrics saved to: {metrics_path}")
+        print("="*80)
 
 
 def diagnose_performance(trainer, num_batches=20):

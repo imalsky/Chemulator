@@ -1,6 +1,5 @@
 {
-    // ===== OPTIMIZED CONFIGURATION FOR A100 GPU =====
-    // This configuration maximizes performance on NVIDIA A100 80GB
+    // ===== OPTIMIZED CONFIGURATION FOR 1e-4 MSE TARGET =====
     
     // ===== FILE PATHS =====
     "paths": {
@@ -43,7 +42,7 @@
             "O_evolution"
         ],
         // Global parameters (initial conditions)
-        "global_variables": ["P_init", "T_init"],
+        "global_variables": ["P", "T"],
         // Time variable name in HDF5 files
         "time_variable": "t_time"
     },
@@ -69,8 +68,8 @@
         
         // Override methods for specific variables
         "methods": {
-            "T_init": "standard",
-            "P_init": "log-min-max",
+            "T": "log-standard",
+            "P": "log-standard",
             "t_time": "log-min-max"
         },
         
@@ -82,7 +81,7 @@
         "clamp_value": 50.0
     },
     
-    // ===== MODEL ARCHITECTURE =====
+    // ===== MODEL ARCHITECTURE - DEEPER FOR COMPLEX CHEMISTRY =====
     "model": {
         // Model type: "deeponet" or "siren"
         "type": "deeponet",
@@ -90,30 +89,30 @@
         // Activation function: "gelu", "relu", "silu", "tanh"
         "activation": "gelu",
         
-        // Dropout rate (0.0 = no dropout)
-        "dropout": 0.0,
+        // Dropout rate for regularization
+        "dropout": 0.1,
         
         // Output scaling factor (1.0 = no scaling)
         "output_scale": 1.0,
         
-        // DeepONet-specific parameters
-        "branch_layers": [512, 512, 512, 512],
-        "trunk_layers": [128, 128, 128, 128],
-        "basis_dim": 64,
+        // DeepONet-specific parameters - MUCH DEEPER
+        "branch_layers": [1024, 1024, 768, 768, 512, 512, 384],  // 7 layers, ~3M params
+        "trunk_layers": [256, 256, 192, 192, 128],  // 5 layers
+        "basis_dim": 128,  // Increased basis dimension
         
-        // SIREN-specific parameters (when type="siren")
-        "hidden_dims": [512, 512, 512, 512],
+        // Alternative SIREN configuration (if you want to try)
+        "hidden_dims": [1024, 1024, 768, 768, 512, 512],
         "omega_0": 30.0
     },
     
-    // ===== FiLM CONDITIONING =====
+    // ===== FiLM CONDITIONING - ENHANCED =====
     "film": {
         // Enable Feature-wise Linear Modulation
         "enabled": true,
-        // Hidden layers for FiLM networks
-        "hidden_dims": [64, 64, 64, 64, 64],
+        // Deeper FiLM networks for better conditioning
+        "hidden_dims": [256, 192, 128],
         // Activation for FiLM networks
-        "activation": "relu"
+        "activation": "gelu"
     },
     
     // ===== PREDICTION SETTINGS =====
@@ -121,26 +120,26 @@
         // Prediction mode: "absolute" or "ratio"
         "mode": "absolute",
         
-        // Optional output clamping
+        // Optional output clamping (null = no clamping)
         "output_clamp": null
     },
     
-    // ===== TRAINING PARAMETERS - OPTIMIZED FOR A100 =====
+    // ===== TRAINING PARAMETERS - OPTIMIZED FOR ADAPTIVE LOSS =====
     "training": {
         // Data splitting
         "val_fraction": 0.15,
         "test_fraction": 0.15,
         "use_fraction": 1.0,
         
-        // Training duration
+        // Training duration - more epochs for convergence
         "epochs": 300,
         
-        // BATCH SIZE - MAXIMIZED FOR A100 80GB
-        "batch_size": 32768,  
+        // BATCH SIZE - Reduced for better gradients with adaptive loss
+        "batch_size": 8192,  // Reduced from 32768
         "gradient_accumulation_steps": 1,
         
         // GPU CACHING - CRITICAL FOR PERFORMANCE
-        "gpu_cache_dataset": true,  // Force GPU caching
+        "gpu_cache_dataset": true,
         
         // DATALOADER SETTINGS - OPTIMIZED FOR GPU
         "num_workers": 0,  // MUST be 0 for GPU caching
@@ -149,37 +148,48 @@
         "prefetch_factor": null,
         "drop_last": true,
         
-        // Learning rate - scaled with batch size
-        "learning_rate": 5e-4,  // 4x original due to 8x batch size (sqrt scaling)
+        // Learning rate - adjusted for adaptive loss
+        "learning_rate": 2e-4,  // Slightly lower for stability
         "weight_decay": 1e-5,
         "betas": [0.9, 0.999],
         "eps": 1e-8,
-        "gradient_clip": 5.0,  // Increased for stability with large batches
+        "gradient_clip": 2.0,  // Reduced for stability with adaptive loss
         
-        // Scheduler settings
+        // CRITICAL: Fixed scheduler to prevent restart disruption
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 30,  // Restart every 10 epochs
+            "T_0": 400,  // No restart during training
             "T_mult": 2,
-            "eta_min": 1e-8
+            "eta_min": 1e-9
         },
         
-        // Loss and training settings
-        "loss": "mse",
-        "huber_delta": 0.5,
-        "use_amp": true,
-        "amp_dtype": "bfloat16",  // Better for A100 than float16
-        "early_stopping_patience": 5000,
-        "min_delta": 1e-8,
+        // LOSS FUNCTION - THE KEY CHANGE
+        "loss": "adaptive",  // Options: "adaptive", "uniform_relative", "mse", "huber"
         
-        // Reduced logging/memory clearing for performance
-        "log_interval": 50,  // Less frequent logging
-        "save_interval": 5,
-        "empty_cache_interval": 50000,  // Almost never
+        // For uniform_relative loss (alternative option)
+        "target_relative_error": 0.005,  // 1% relative error target
         
-        // HPO-specific settings
-        "hpo_min_epochs": 10,
-        "hpo_max_epochs": 40
+        // For huber loss (if you want to try)
+        "huber_delta": 0.01,
+        
+        // Mixed precision - disabled for float64
+        "use_amp": false,
+        
+        // Early stopping with reasonable patience
+        "early_stopping_patience": 30,
+        "min_delta": 1e-9,
+        
+        // Logging and monitoring
+        "log_interval": 100,
+        "save_interval": 10,
+        "empty_cache_interval": 50000,
+        
+        // Enable per-species tracking
+        "track_species_metrics": true,
+        
+        // HPO-specific settings (if using hyperparameter optimization)
+        "hpo_min_epochs": 20,
+        "hpo_max_epochs": 60
     },
     
     // ===== SYSTEM/HARDWARE SETTINGS - A100 OPTIMIZED =====
@@ -187,47 +197,60 @@
         // Random seed for reproducibility
         "seed": 42,
         
+        // Float64 precision for accuracy
+        "dtype": "float64",
+        
         // PyTorch optimizations for A100
-        "use_torch_compile": true,
-        "compile_mode": "max-autotune",  // Maximum optimization
+        "use_torch_compile": false,  // Disabled initially for float64
+        "compile_mode": "default",
         "use_torch_export": true,
         
         // CUDA optimizations for A100
         "cudnn_benchmark": true,
-        "tf32": true,  // Use TensorFloat-32 on A100
+        "tf32": false,  // Disabled for float64
         "cuda_memory_fraction": 0.95  // Use most GPU memory
     },
     
     // ===== HYPERPARAMETER OPTIMIZATION =====
     "optuna": {
         // Enable Optuna integration
-        "enabled": true,
+        "enabled": false,  // Set to true if you want to use HPO
         
         // Hyperband settings
         "algorithm": "hyperband",
-        "hyperband_min_resource": 10,
-        "hyperband_max_resource": 50,
+        "hyperband_min_resource": 20,
+        "hyperband_max_resource": 60,
         "hyperband_reduction_factor": 3,
         
         // Target number of trials
-        "n_trials": 100
+        "n_trials": 50
     }
 }
 
-// ===== A100 OPTIMIZATION NOTES =====
+// ===== KEY CHANGES FOR 1e-4 MSE TARGET =====
 // 
-// Key changes from CPU/small GPU config:
-// 1. batch_size: 131072 (8x larger) - A100 can handle this easily
-// 2. gpu_cache_dataset: true - All data loaded to GPU memory
-// 3. num_workers: 0 - No CPU workers needed with GPU cache
-// 4. learning_rate: 2e-3 - Scaled with sqrt(batch_size_ratio)
-// 5. compile_mode: "max-autotune" - Maximum compilation optimization
-// 6. cuda_memory_fraction: 0.95 - Use almost all GPU memory
-// 7. amp_dtype: "bfloat16" - Better numerical stability than float16
+// 1. LOSS FUNCTION: Changed from "mse" to "adaptive"
+//    - This weights species by their difficulty (std)
+//    - Ensures uniform relative accuracy across all species
 // 
-// Expected performance:
-// - GPU utilization: >95%
-// - Training speed: ~1-2 minutes per epoch
-// - Memory usage: ~20-30GB GPU memory
+// 2. LEARNING RATE SCHEDULE: T_0 increased to 400
+//    - Prevents the disruptive restart at epoch 50/100
+//    - Allows smooth convergence
 // 
-// If you run out of memory, reduce batch_size to 65536
+// 3. DEEPER MODEL: 7-layer branch, 5-layer trunk
+//    - ~3-4M parameters total
+//    - Better capacity for complex chemical dynamics
+// 
+// 4. SMALLER BATCH SIZE: 8192 instead of 32768
+//    - Better gradient quality for adaptive loss
+//    - More stable training
+// 
+// 5. MORE EPOCHS: 300 instead of 100
+//    - Adaptive loss may need more time to converge
+//    - Early stopping will prevent overfitting
+// 
+// Expected Results:
+// - Epochs 1-50: MSE might be higher than before (~1e-3)
+// - Epochs 50-150: Steady decrease as model balances species
+// - Epochs 150-300: Convergence to <1e-4 MSE
+// - Final: All species with <10% relative error

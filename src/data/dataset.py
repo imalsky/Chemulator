@@ -61,7 +61,7 @@ class NPYDataset(Dataset):
         self._shard_ends = np.array([s["end_idx"] for s in self.shards])
         
         # Memory info
-        self.bytes_per_sample = self.n_features * 4
+        self.bytes_per_sample = self.n_features * 8
         self.total_bytes = self.n_total_samples * self.bytes_per_sample
         
         # Initialize caching
@@ -98,7 +98,7 @@ class NPYDataset(Dataset):
 
         self.gpu_cache = torch.empty(
             (self.n_total_samples, self.n_features),
-            dtype=torch.float32,
+            dtype=torch.float64,
             device=self.device,
         )
 
@@ -107,9 +107,9 @@ class NPYDataset(Dataset):
             shard_path = self.split_dir / shard["filename"]
             if self.shard_index.get("compression") == "npz":
                 with np.load(shard_path) as zf:
-                    data = zf["data"].astype(np.float32, copy=False)
+                    data = zf["data"].astype(np.float64, copy=False)
             else:
-                data = np.load(shard_path).astype(np.float32, copy=False)
+                data = np.load(shard_path).astype(np.float64, copy=False)
 
             n = data.shape[0]
             self.gpu_cache[cur:cur + n] = torch.from_numpy(data).pin_memory().to(self.device, non_blocking=True)
@@ -139,9 +139,9 @@ class NPYDataset(Dataset):
         
         if self.shard_index.get("compression") == "npz":
             with np.load(shard_path) as zf:
-                return zf["data"].astype(np.float32, copy=False)
+                return zf["data"].astype(np.float64, copy=False)
         else:
-            return np.load(shard_path).astype(np.float32, copy=False)
+            return np.load(shard_path).astype(np.float64, copy=False)
 
     def __len__(self) -> int:
         """Return the total number of samples."""
@@ -168,8 +168,8 @@ class NPYDataset(Dataset):
             
             # Return CPU tensors. The batch will be moved to the GPU
             # all at once by the dataloader / training loop.
-            input_tensor = torch.from_numpy(row[:self.n_inputs].copy())
-            target_tensor = torch.from_numpy(row[self.n_inputs:].copy())
+            input_tensor = torch.from_numpy(row[:self.n_inputs].copy()).double()
+            target_tensor = torch.from_numpy(row[self.n_inputs:].copy()).double()
             
             return input_tensor, target_tensor
 

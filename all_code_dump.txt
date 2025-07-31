@@ -10,10 +10,6 @@ import hashlib
 import json
 import os
 
-# =================================================================
-# 1. CONFIGURE LOGGING FIRST
-# We set this up at the very top so even the prologue can use it.
-# =================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
@@ -21,44 +17,6 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
-# =================================================================
-# 2. PROLOGUE FOR MAXIMUM PARALLELISM
-# This block now uses the logging system to report its actions.
-# =================================================================
-try:
-    # SLURM_CPUS_PER_TASK is the ground truth for the number of cores allocated
-    n_cores_str = os.environ.get("SLURM_CPUS_PER_TASK")
-    source = "SLURM"
-    
-    if n_cores_str is None:
-        # Fallback for local execution or other schedulers
-        n_cores_str = str(os.cpu_count() or 1)
-        source = "os.cpu_count()"
-
-    n_cores = int(n_cores_str)
-    
-    logging.info(f"CORE PROLOGUE: Detected {n_cores} cores via {source}.")
-    
-    # Set environment variables to force thread counts
-    os.environ["OMP_NUM_THREADS"] = str(n_cores)
-    os.environ["MKL_NUM_THREADS"] = str(n_cores)
-    logging.info(f"CORE PROLOGUE: Set OMP_NUM_THREADS and MKL_NUM_THREADS to {n_cores}.")
-    
-    # Set PyTorch's internal thread counts
-    torch.set_num_threads(n_cores)
-    
-    # Final verification log
-    logging.info(f"CORE PROLOGUE: Verification: torch.get_num_threads() now reports {torch.get_num_threads()} threads.")
-
-except Exception as e:
-    logging.error(f"CORE PROLOGUE: Failed to set thread counts: {e}", exc_info=True)
-
-
-# =================================================================
-# 3. REST OF THE APPLICATION
-# (The rest of the file is unchanged)
-# =================================================================
-# Set multiprocessing sharing strategy
 import torch.multiprocessing
 try:
     torch.multiprocessing.set_sharing_strategy('file_system')
@@ -66,7 +24,6 @@ try:
 except RuntimeError:
     logging.warning("Could not set multiprocessing sharing strategy.")
 
-import numpy as np
 from utils.hardware import setup_device, optimize_hardware
 from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
 from data.preprocessor import DataPreprocessor
@@ -247,20 +204,14 @@ class ChemicalKineticsPipeline:
             device=self.device
         )
         
-        # **FIXED** Safely log cache status to prevent crash
+        # Log cache status to prevent crash
         cache_info = train_dataset.get_cache_info()
         if cache_info.get("type") == "gpu":
-            self.logger.info(
-                f"✓ GPU caching active for '{train_dataset.split_name}': {cache_info.get('size_gb', 0):.1f}GB loaded."
-            )
+            self.logger.info(f"GPU caching active for '{train_dataset.split_name}': {cache_info.get('size_gb', 0):.1f}GB loaded.")
         elif cache_info.get("type") == "cpu":
-            self.logger.warning(
-                f"CPU fallback active for '{train_dataset.split_name}'. Reason: {cache_info.get('message', 'N/A')}"
-            )
+            self.logger.warning(f"CPU fallback active for '{train_dataset.split_name}'. Reason: {cache_info.get('message', 'N/A')}")
         else:
-            self.logger.error(
-                f"Cache status error for '{train_dataset.split_name}': {cache_info.get('status', 'unknown')}"
-            )
+            self.logger.error(f"Cache status error for '{train_dataset.split_name}': {cache_info.get('status', 'unknown')}")
 
         val_dataset = NPYDataset(
             shard_dir=self.processed_dir,
@@ -449,34 +400,31 @@ def main():
         pipeline.run_diagnostics(num_batches=args.diagnose_batches)
         
     elif args.tune:
-        # Run hyperparameter optimization
-        try:
-            import optuna
-        except ImportError:
-            print("Installing optuna...")
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "optuna"])
-        
-        from hyperparameter_tuning import optimize
-        
-        print(f"Starting hyperparameter optimization with {args.trials} trials...")
-        study = optimize(
-            config_path=args.config,
-            n_trials=args.trials,
-            n_jobs=1,
-            study_name=args.study_name
-        )
-        
-        # Print results
-        print("\n" + "="*60)
-        print("Optimization Complete")
-        print("="*60)
-        print(f"Best validation loss: {study.best_value:.6f}")
-        print(f"Best trial: {study.best_trial.number}")
-        print("\nBest parameters:")
-        for key, value in study.best_params.items():
-            print(f"  {key}: {value}")
-
+            try:
+                import optuna
+            except ImportError:
+                print("Error: The 'optuna' package is not installed",file=sys.stderr)
+                sys.exit(1)
+            
+            from hyperparameter_tuning import optimize
+            
+            print(f"Starting hyperparameter optimization with {args.trials} trials...")
+            study = optimize(
+                config_path=args.config,
+                n_trials=args.trials,
+                n_jobs=1,
+                study_name=args.study_name
+            )
+            
+            # Print results
+            print("\n" + "="*60)
+            print("Optimization Complete")
+            print("="*60)
+            print(f"Best validation loss: {study.best_value:.6f}")
+            print(f"Best trial: {study.best_trial.number}")
+            print("\nBest parameters:")
+            for key, value in study.best_params.items():
+                print(f"  {key}: {value}")
 
 if __name__ == "__main__":
     main()
@@ -485,7 +433,6 @@ if __name__ == "__main__":
 #!/usr/bin/env python3
 """
 Hyperparameter tuning for chemical kinetics models using Optuna.
-Optimized for ~40 hour runtime with aggressive but smart pruning.
 """
 
 import copy
@@ -505,7 +452,7 @@ from data.dataset import NPYDataset
 from models.model import create_model
 from training.trainer import Trainer
 from data.normalizer import NormalizationHelper
-from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
+from utils.utils import seed_everything, ensure_directories, load_json_config, save_json, load_json
 
 
 class OptunaPruningCallback:
@@ -868,16 +815,14 @@ def optimize(config_path: Path, n_trials: int = 25, n_jobs: int = 1,
 ===== /Users/imalsky/Desktop/Chemulator/src/training/trainer.py =====
 #!/usr/bin/env python3
 """
-Optimized training pipeline for chemical kinetics models on A100 GPU.
+Training pipeline for chemical kinetics models
 """
 
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
-from contextlib import nullcontext
-import math
+from typing import Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -890,7 +835,7 @@ from data.normalizer import NormalizationHelper
 
 
 class Trainer:
-    """Optimized trainer for A100 GPU."""
+    """Trainer with several different options"""
     def __init__(self, model: nn.Module, train_dataset, val_dataset, test_dataset,
                 config: Dict[str, Any], save_dir: Path, device: torch.device,
                 norm_helper: NormalizationHelper):
@@ -920,7 +865,7 @@ class Trainer:
         # Check for validation data
         self.has_validation = val_dataset is not None and len(val_dataset) > 0
         if not self.has_validation:
-            self.logger.warning("No validation data – using training loss for checkpointing")
+            self.logger.warning("No validation data. Bad! Using training loss for checkpointing")
         
         # Create data loaders
         self._setup_dataloaders(train_dataset, val_dataset, test_dataset)
@@ -952,26 +897,17 @@ class Trainer:
             "epochs": []
         }
 
-
     def _validate_trainer_config(self):
         """Validate trainer configuration for correctness."""
-        # Fix 2: Validate ratio mode requirements
+        # Validate ratio mode requirements
         if self.prediction_mode == "ratio":
             # Check model compatibility
             model_type = self.config["model"]["type"]
             if model_type != "deeponet":
-                raise ValueError(
-                    f"Training in 'ratio' mode requires 'deeponet' model, "
-                    f"but '{model_type}' was specified. Please use 'deeponet' or switch to 'absolute' mode."
-                )
+                raise ValueError(f"Training in 'ratio' mode, not yet finished")
             
-            # Fix 3: Check for ratio statistics
             if not hasattr(self.norm_helper, 'ratio_stats') or self.norm_helper.ratio_stats is None:
-                raise ValueError(
-                    "Training in 'ratio' mode requires ratio statistics from preprocessing. "
-                    "Ensure data was preprocessed with prediction.mode='ratio' in config. "
-                    "Current normalization data does not contain ratio_stats."
-                )
+                raise ValueError("Training in 'ratio' mode requires ratio statistics from preprocessing. ")
             
             self.logger.info("Ratio mode validation passed: using DeepONet with ratio statistics")
         
@@ -1043,6 +979,7 @@ class Trainer:
             try:
                 # Test if fused parameter actually works
                 test_opt = torch.optim.AdamW([torch.zeros(1)], fused=True)
+
                 optimizer_kwargs["fused"] = True
                 self.logger.info("Using fused AdamW optimizer")
             except Exception:
@@ -1061,7 +998,7 @@ class Trainer:
 
         steps_per_epoch = len(self.train_loader) // self.gradient_accumulation_steps
         
-        # **FIXED**: Guard against division-by-zero or T_0=0 errors on small datasets.
+        # Guard against division-by-zero or T_0=0 errors on small datasets.
         if steps_per_epoch == 0:
             self.logger.warning(
                 f"Number of batches ({len(self.train_loader)}) is smaller than "
@@ -1151,8 +1088,6 @@ class Trainer:
         
         return self.criterion(outputs, targets)
 
-
-
     def train(self) -> float:
         """Execute the training loop."""
         if not self.train_loader:
@@ -1164,19 +1099,13 @@ class Trainer:
         if self.has_validation:
             self.logger.info(f"Val batches: {len(self.val_loader)}")
 
-
         if self.system_config.get("use_torch_compile", False):
             self.logger.info("Compiling model with torch.compile...")
             self.logger.warning("    This is a one-time process that can take several minutes.")
 
-
         try:
             self._run_training_loop()
-            
-            self.logger.info(
-                f"Training completed. Best validation loss: {self.best_val_loss:.6f} "
-                f"at epoch {self.best_epoch}"
-            )
+            self.logger.info(f"Training completed. Best validation loss: {self.best_val_loss:.6f} at epoch {self.best_epoch}")
             
         except KeyboardInterrupt:
             self.logger.info("Training interrupted by user")
@@ -1186,7 +1115,6 @@ class Trainer:
             raise
             
         finally:
-            # Save training history
             save_path = self.save_dir / "training_log.json"
             with open(save_path, 'w') as f:
                 json.dump(self.training_history, f, indent=2)
@@ -1234,6 +1162,7 @@ class Trainer:
                     break
             else:
                 # Use training loss if no validation
+                # Probably should just be an error
                 if train_loss < (best_train_loss - self.min_delta):
                     best_train_loss = train_loss
                     self.best_val_loss = train_loss
@@ -1312,7 +1241,7 @@ class Trainer:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
             
-            # **FIXED**: device_type is now dynamic, based on the detected hardware.
+            # Device_type is now dynamic, based on the detected hardware.
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
                 loss = self._compute_loss(outputs, targets, inputs)
@@ -1342,7 +1271,7 @@ class Trainer:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
 
-            # **FIXED**: device_type is now dynamic, based on the detected hardware.
+            # Device_type is now dynamic, based on the detected hardware.
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(inputs)
                 loss = self._compute_loss(outputs, targets, inputs)
@@ -1477,7 +1406,7 @@ def diagnose_performance(trainer, num_batches=20):
 ===== /Users/imalsky/Desktop/Chemulator/src/utils/utils.py =====
 #!/usr/bin/env python3
 """
-Simplified utility functions for the chemical kinetics pipeline.
+Utility functions for the chemical kinetics pipeline.
 """
 
 import json
@@ -1599,7 +1528,6 @@ Hardware detection and optimization utilities.
 import logging
 import os
 from typing import Dict, Any
-
 import torch
 
 
@@ -1644,7 +1572,7 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
             torch.backends.cudnn.benchmark = True
             logger.info("cuDNN autotuner enabled")
         
-        # Set memory fraction - safely check if API exists
+        # Set memory fraction
         memory_fraction = config.get("cuda_memory_fraction", 0.9)
         if memory_fraction < 1.0 and hasattr(torch.cuda, "set_per_process_memory_fraction"):
             try:
@@ -1671,10 +1599,12 @@ from torch.export import Dim
 
 
 class FiLMLayer(nn.Module):
-    """Feature-wise Linear Modulation layer - optimized version."""
-    
-    def __init__(self, condition_dim: int, feature_dim: int, 
-                 hidden_dims: List[int], activation: Union[str, List[str]] = "gelu", 
+    """Feature-wise Linear Modulation layer"""
+    def __init__(self,
+                 condition_dim: int, 
+                 feature_dim: int, 
+                 hidden_dims: List[int], 
+                 activation: Union[str, List[str]] = "gelu", 
                  use_beta: bool = True):
         super().__init__()
         
@@ -1713,7 +1643,7 @@ class FiLMLayer(nn.Module):
     def _get_activation(self, name: str):
         activations = {
             "gelu": nn.GELU(),
-            "relu": nn.ReLU(inplace=True),  # Inplace for memory efficiency
+            "relu": nn.ReLU(inplace=True),
             "tanh": nn.Tanh(),
             "silu": nn.SiLU(inplace=True),
             "leakyrelu": nn.LeakyReLU(0.2, inplace=True),
@@ -1737,7 +1667,7 @@ class FiLMLayer(nn.Module):
                 final_layer.bias.data.fill_(1.0)
     
     def forward(self, features: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
-        """Apply FiLM modulation - optimized."""
+        """Apply FiLM modulation"""
         # Generate parameters
         params = self.film_net(condition)
         
@@ -1896,7 +1826,7 @@ class FiLMDeepONet(nn.Module):
             input_dim=self.num_species + self.num_globals,
             hidden_layers=branch_layers,
             output_dim=self.basis_dim * self.num_species,
-            condition_dim=self.num_species + self.num_globals if self.use_film else None,
+            condition_dim=self.num_globals if self.use_film else None,
             film_config=film_config if self.use_film else None
         )
         
@@ -1904,7 +1834,7 @@ class FiLMDeepONet(nn.Module):
             input_dim=1,
             hidden_layers=trunk_layers,
             output_dim=self.basis_dim,
-            condition_dim=self.num_species + self.num_globals if self.use_film else None,
+            condition_dim=self.num_globals if self.use_film else None,
             film_config=film_config if self.use_film else None,
             bias=True
         )
@@ -1995,7 +1925,7 @@ class FiLMDeepONet(nn.Module):
             return nn.Sequential(*layers)
             
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Forward pass - optimized."""
+        """Forward pass"""
         batch_size = inputs.shape[0]
 
         # Split inputs
@@ -2004,8 +1934,12 @@ class FiLMDeepONet(nn.Module):
 
         # Process through networks
         if self.use_film:
-            branch_out = self.branch_net(branch_input, branch_input)
-            trunk_out = self.trunk_net(trunk_input, branch_input)
+            # Isolate the global parameters for conditioning
+            global_params_for_conditioning = inputs[:, self.num_species : self.num_species + self.num_globals]
+            
+            # Pass only globals as the condition
+            branch_out = self.branch_net(branch_input, global_params_for_conditioning)
+            trunk_out = self.trunk_net(trunk_input, global_params_for_conditioning)
         else:
             branch_out = self.branch_net(branch_input)
             trunk_out = self.trunk_net(trunk_input)
@@ -2074,7 +2008,11 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
             
         except Exception as e:
             logger.warning(f"Model compilation failed: {e}. Running in eager mode.")
-    
+
+    if config["system"].get("dtype") == "float64":
+        model = model.double()
+        logger.info("Converted model to float64 precision")
+        
     return model
 
 
@@ -2135,7 +2073,7 @@ def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path)
                     logger.info(f"Model exported with torch.export to {save_path}")
                 except Exception as e:
                     logger.warning(f"torch.export failed: {e}. Falling back to torch.jit")
-                    raise  # Re-raise to trigger JIT fallback
+                    raise
             else:
                 # Direct to JIT if torch.export not available
                 raise AttributeError("torch.export not available")
@@ -2182,6 +2120,8 @@ import h5py
 import numpy as np
 import torch
 import os
+import re
+import sys
 
 from .normalizer import DataNormalizer, NormalizationHelper
 from utils.utils import save_json, load_json
@@ -2192,6 +2132,8 @@ DEFAULT_EPSILON_MAX = 1e38
 class CorePreprocessor:
     """A lightweight helper class containing only the logic needed within a worker."""
     def __init__(self, config: Dict[str, Any], norm_stats: Optional[Dict[str, Any]] = None):
+        self.logger = logging.getLogger(__name__)
+
         self.data_cfg = config["data"]
         self.norm_cfg = config["normalization"]
         self.train_cfg = config["training"]
@@ -2425,9 +2367,6 @@ class CorePreprocessor:
 
     def _update_stats_for_profile(self, profile, n_t, accumulators, ratio_accumulators):
         """Consistent normalization in both modes."""
-        import logging
-        logger = logging.getLogger(__name__)
-        
         if self.prediction_mode == "ratio":
             # Use full profiles for all variables in ratio mode
             for var, acc in accumulators.items():
@@ -2461,40 +2400,63 @@ class CorePreprocessor:
                 vec = profile[1:, idx] if (var == self.time_var and n_t > 1) else profile[:, idx]
                 if vec.size > 0:
                     self.normalizer._update_single_accumulator(acc, vec, var)
-
-    def _process_single_group(self, grp, gname, ratio_stats) -> Optional[Tuple[np.ndarray, str]]:
-        n_t = grp[self.time_var].shape[0]
-        if n_t <= 1: return None
-        profile = self._extract_profile(grp, gname, n_t)
-        if profile is None: return None
-        
-        if self.prediction_mode == "ratio": samples = self._profile_to_samples_ratio(profile, n_t, ratio_stats)
-        else: samples = self._profile_to_samples(self.norm_helper.normalize_profile(torch.from_numpy(profile)).numpy(), n_t)
-        if samples is None: return None
-        
-        p = int(hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
-        split_key = "test" if p < self.train_cfg["test_fraction"] else "validation" if p < self.train_cfg["test_fraction"] + self.train_cfg["val_fraction"] else "train"
-        return samples, split_key
-
     
+
+
     def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> Optional[np.ndarray]:
-        import re
-        globals_dict = {f"{lbl}_init": float(val) for lbl, val in re.findall(r"_([A-Z])_([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", gname) if f"{lbl}_init" in self.global_vars}
-        if len(globals_dict) != len(self.global_vars): return None
-        profile = np.empty((n_t, self.n_vars), dtype=np.float32)
+        """
+        Extracts a full data profile from an HDF5 group with strict validation.
+        """
+
+        config_globals = set(self.global_vars)
+        group_attrs = set(group.attrs.keys())
+        
+        if 'SEED' in group_attrs:
+            group_attrs.remove('SEED')
+
+        globals_missing_from_attrs = config_globals - group_attrs
+        attrs_not_in_globals = group_attrs - config_globals
+        
+        if globals_missing_from_attrs or attrs_not_in_globals:
+            self.logger.critical(f"MISMATCH in HDF5 attributes for group: '{gname}'")
+            if globals_missing_from_attrs:
+                self.logger.critical(f"CONFIG ERROR: The following variables" 
+                                     f"are in your config but MISSING from the HDF5"
+                                     f"attributes: {list(globals_missing_from_attrs)}")
+            if attrs_not_in_globals:
+                self.logger.critical(f"DATA ERROR: The following HDF5 attributes are"
+                                     f"UNUSED in your config's 'global_variables': {list(attrs_not_in_globals)}")
+            self.logger.critical("  > Program will now terminate to enforce data integrity.")
+            sys.exit(1) 
+
+        globals_dict = {key: float(group.attrs[key]) for key in self.global_vars}
+        profile = np.empty((n_t, self.n_vars), dtype=np.float64)
+
         try:
-            for i, var in enumerate(self.var_order):
-                profile[:, i] = group[var][:] if var in group else globals_dict[var]
-        except Exception: return None
+            for i, var_name in enumerate(self.var_order):
+                if var_name in group:
+                    profile[:, i] = group[var_name][:]
+                elif var_name in globals_dict:
+                    profile[:, i] = globals_dict[var_name]
+                else:
+                    self.logger.error(f"FATAL LOGIC ERROR for group '{gname}'"
+                                      f"Variable '{var_name}' was not found."
+                                      f"Please check the preprocessor code.")
+                    sys.exit(1)
+
+        except Exception as e:
+            self.logger.error(f"Failed to read dataset while assembling profile for group '{gname}': {e}")
+            return None
+
         return profile
 
     def _profile_to_samples(self, norm_prof, n_t):
-        """Get samples"""
+        """Build (n_t‑1) samples for absolute mode."""
         if n_t <= 1:
             return None
         
         n_inputs = self.n_species + self.n_globals + 1
-        samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
+        samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float64)
         
         # Initial species
         samples[:, :self.n_species] = norm_prof[0, self.species_indices] 
@@ -2518,14 +2480,13 @@ class CorePreprocessor:
         raw_prof is **unnormalised** profile array  shape = (n_t, n_vars)
         ratio_stats contains mean/std/min/max for log‑ratios (already computed)
         """
-        import logging
         logger = logging.getLogger(__name__)
 
         if n_t <= 1:
             return None
         
         n_inputs  = self.n_species + self.n_globals + 1
-        samples   = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
+        samples   = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float64)
 
         norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(raw_prof)).numpy()
         samples[:, :self.n_species]                   = norm_prof[0, self.species_indices]
@@ -2544,7 +2505,7 @@ class CorePreprocessor:
         clamp_val   = self.norm_cfg.get("clamp_value", 50.0)
         min_std     = self.norm_cfg.get("min_std", 1e-10)
 
-        normd = np.empty_like(log_ratios, dtype=np.float32)
+        normd = np.empty_like(log_ratios, dtype=np.float64)
 
         for i, var in enumerate(self.species_vars):
             method = methods_cfg.get(var, default_m)
@@ -2570,14 +2531,11 @@ class CorePreprocessor:
 def stats_worker(file_path, config):
     return CorePreprocessor(config).process_file_for_stats(Path(file_path))
 
-def shard_worker(file_path, config, norm_stats, output_dir):
-    """Legacy helper kept for completeness; matches shard_worker_split_aware signature."""
-    processor = CorePreprocessor(config, norm_stats)
-    return processor.process_file_for_shards(Path(file_path), Path(output_dir))
-
 class DataPreprocessor:
     """Main parent class to orchestrate parallel data preprocessing."""
     def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
+        self.logger = logging.getLogger(__name__)
+
         self.raw_files = sorted(raw_files)
         self.output_dir = output_dir
 
@@ -2585,7 +2543,7 @@ class DataPreprocessor:
         self.processed_dir.mkdir(parents=True, exist_ok=True)
 
         self.config = config
-        self.logger = logging.getLogger(__name__)
+        
         self.normalizer = DataNormalizer(config)
         self.num_workers = config["preprocessing"].get("num_workers", 1)
         self.parallel = self.num_workers > 1 and len(self.raw_files) > 1
@@ -2617,42 +2575,6 @@ class DataPreprocessor:
         self._write_summary_log(summary_report, shard_index["total_samples"])
         self.logger.info(f"Core data preprocessing completed in {time.time() - start_time:.1f}s")
         
-    def generate_split_indices(self) -> None:
-        """Generates train/val/test split indices from an existing shard_index.json. This is a very fast operation."""
-        self.logger.info("Generating new train/val/test split indices...")
-        shard_index_path = self.output_dir / "shard_index.json"
-        if not shard_index_path.exists():
-            raise FileNotFoundError(f"Cannot generate splits: shard_index.json not found in {self.output_dir}")
-        
-        shard_index = load_json(shard_index_path)
-        total_samples = shard_index["total_samples"]
-        indices = np.arange(total_samples)
-        
-        seed = self.config.get("system", {}).get("seed", 42)
-        np.random.seed(seed)
-        np.random.shuffle(indices)
-        
-        use_fraction = self.config["training"].get("use_fraction", 1.0)
-        if use_fraction < 1.0:
-            indices = indices[:int(total_samples * use_fraction)]
-        
-        n = len(indices)
-        test_frac = self.config["training"]["test_fraction"]
-        val_frac = self.config["training"]["val_fraction"]
-        
-        test_split_idx = int(n * test_frac)
-        val_split_idx = test_split_idx + int(n * val_frac)
-        
-        split_data = {
-            "test": np.sort(indices[:test_split_idx]).astype(np.int64),
-            "validation": np.sort(indices[test_split_idx:val_split_idx]).astype(np.int64),
-            "train": np.sort(indices[val_split_idx:]).astype(np.int64)
-        }
-        
-        for name, idx_array in split_data.items():
-            path = self.output_dir / shard_index["split_files"][name]
-            np.save(path, idx_array)
-            self.logger.info(f"Saved {name} indices to {path} ({len(idx_array)} samples)")
 
     def _write_normalized_shards(self, norm_stats, file_sample_counts) -> Dict[str, List[Dict]]:
         """Second pass: write split-specific shards to separate directories."""
@@ -2719,7 +2641,9 @@ class DataPreprocessor:
         self.logger.info("Pass 1: Collecting statistics and sample counts...")
         prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
         final_accs = self.normalizer._initialize_accumulators()
-        final_ratio_accs = {var: {"count": 0,"mean": 0.0,"m2": 0.0,"min": float('inf'),"max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
+        final_ratio_accs = {var: {"count": 0,"mean": 0.0,
+                                  "m2": 0.0,"min": float('inf'),
+                                  "max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
         file_counts = {}
         
         total_report = {
@@ -2738,7 +2662,7 @@ class DataPreprocessor:
                 if ratio_accs: self.normalizer._merge_accumulators(final_ratio_accs, ratio_accs)
                 file_counts[futures[fut].name] = count
                 
-                # --- NEW: Aggregate the reports ---
+                # Aggregate the reports ---
                 total_report["total_profiles"] += worker_report["total_profiles"]
                 total_report["profiles_kept"] += worker_report["profiles_kept"]
                 for reason, num in worker_report["dropped_reasons"].items():
@@ -2810,8 +2734,8 @@ class ShardWriter:
 
     def add_samples(self, samples: np.ndarray):
         """Simplified add_samples without tracking global indices."""
-        if samples.dtype != np.float32:
-            samples = samples.astype(np.float32)
+        if samples.dtype != np.float64:
+            samples = samples.astype(np.float64)
         
         self.buffer.append(samples)
         self.buffer_size += samples.shape[0]
@@ -2845,7 +2769,7 @@ class ShardWriter:
         self.buffer_size = sum(arr.shape[0] for arr in self.buffer)
 
         # Write shard
-        data = np.concatenate(rows_to_write).astype(np.float32, copy=False)
+        data = np.concatenate(rows_to_write).astype(np.float64, copy=False)
         
         final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
         tmp_path = final_path.with_suffix(".tmp.npy")
@@ -2870,7 +2794,7 @@ class ShardWriter:
         self.buffer = []
         self.buffer_size = 0
 
-        data = np.concatenate(rows_to_write).astype(np.float32, copy=False)
+        data = np.concatenate(rows_to_write).astype(np.float64, copy=False)
         final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
         tmp_path   = final_path.with_suffix(".tmp.npy")
         np.save(tmp_path, data, allow_pickle=False)
@@ -2955,7 +2879,7 @@ class NPYDataset(Dataset):
         self._shard_ends = np.array([s["end_idx"] for s in self.shards])
         
         # Memory info
-        self.bytes_per_sample = self.n_features * 4
+        self.bytes_per_sample = self.n_features * 8
         self.total_bytes = self.n_total_samples * self.bytes_per_sample
         
         # Initialize caching
@@ -2992,7 +2916,7 @@ class NPYDataset(Dataset):
 
         self.gpu_cache = torch.empty(
             (self.n_total_samples, self.n_features),
-            dtype=torch.float32,
+            dtype=torch.float64,
             device=self.device,
         )
 
@@ -3001,9 +2925,9 @@ class NPYDataset(Dataset):
             shard_path = self.split_dir / shard["filename"]
             if self.shard_index.get("compression") == "npz":
                 with np.load(shard_path) as zf:
-                    data = zf["data"].astype(np.float32, copy=False)
+                    data = zf["data"].astype(np.float64, copy=False)
             else:
-                data = np.load(shard_path).astype(np.float32, copy=False)
+                data = np.load(shard_path).astype(np.float64, copy=False)
 
             n = data.shape[0]
             self.gpu_cache[cur:cur + n] = torch.from_numpy(data).pin_memory().to(self.device, non_blocking=True)
@@ -3033,9 +2957,9 @@ class NPYDataset(Dataset):
         
         if self.shard_index.get("compression") == "npz":
             with np.load(shard_path) as zf:
-                return zf["data"].astype(np.float32, copy=False)
+                return zf["data"].astype(np.float64, copy=False)
         else:
-            return np.load(shard_path).astype(np.float32, copy=False)
+            return np.load(shard_path).astype(np.float64, copy=False)
 
     def __len__(self) -> int:
         """Return the total number of samples."""
@@ -3062,8 +2986,8 @@ class NPYDataset(Dataset):
             
             # Return CPU tensors. The batch will be moved to the GPU
             # all at once by the dataloader / training loop.
-            input_tensor = torch.from_numpy(row[:self.n_inputs].copy())
-            target_tensor = torch.from_numpy(row[self.n_inputs:].copy())
+            input_tensor = torch.from_numpy(row[:self.n_inputs].copy()).double()
+            target_tensor = torch.from_numpy(row[self.n_inputs:].copy()).double()
             
             return input_tensor, target_tensor
 
@@ -3416,11 +3340,11 @@ class NormalizationHelper:
 
             if "standard" in method:
                 mean_key, std_key = ("log_mean", "log_std") if "log" in method else ("mean", "std")
-                params["mean"] = torch.tensor(var_stats[mean_key], dtype=torch.float32, device=self.device)
-                params["std"] = torch.tensor(var_stats[std_key], dtype=torch.float32, device=self.device)
+                params["mean"] = torch.tensor(var_stats[mean_key], dtype=torch.float64, device=self.device)
+                params["std"] = torch.tensor(var_stats[std_key], dtype=torch.float64, device=self.device)
             elif "min-max" in method:
-                params["min"] = torch.tensor(var_stats["min"], dtype=torch.float32, device=self.device)
-                params["max"] = torch.tensor(var_stats["max"], dtype=torch.float32, device=self.device)
+                params["min"] = torch.tensor(var_stats["min"], dtype=torch.float64, device=self.device)
+                params["max"] = torch.tensor(var_stats["max"], dtype=torch.float64, device=self.device)
 
             self.norm_params[var] = params
             self.method_groups[method].append(var)
@@ -3484,8 +3408,8 @@ class NormalizationHelper:
         device = standardized_log_ratios.device
         initial_species = initial_species.to(device)
 
-        ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in self.species_vars], device=device, dtype=torch.float32)
-        ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in self.species_vars], device=device, dtype=torch.float32)
+        ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in self.species_vars], device=device, dtype=torch.float64)
+        ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in self.species_vars], device=device, dtype=torch.float64)
         
         log_ratios = (standardized_log_ratios * ratio_stds) + ratio_means
         log_ratios = torch.clamp(log_ratios, min=-38.0, max=38.0)

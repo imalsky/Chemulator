@@ -238,11 +238,11 @@ class NormalizationHelper:
 
             if "standard" in method:
                 mean_key, std_key = ("log_mean", "log_std") if "log" in method else ("mean", "std")
-                params["mean"] = torch.tensor(var_stats[mean_key], dtype=torch.float32, device=self.device)
-                params["std"] = torch.tensor(var_stats[std_key], dtype=torch.float32, device=self.device)
+                params["mean"] = torch.tensor(var_stats[mean_key], dtype=torch.float64, device=self.device)
+                params["std"] = torch.tensor(var_stats[std_key], dtype=torch.float64, device=self.device)
             elif "min-max" in method:
-                params["min"] = torch.tensor(var_stats["min"], dtype=torch.float32, device=self.device)
-                params["max"] = torch.tensor(var_stats["max"], dtype=torch.float32, device=self.device)
+                params["min"] = torch.tensor(var_stats["min"], dtype=torch.float64, device=self.device)
+                params["max"] = torch.tensor(var_stats["max"], dtype=torch.float64, device=self.device)
 
             self.norm_params[var] = params
             self.method_groups[method].append(var)
@@ -306,8 +306,8 @@ class NormalizationHelper:
         device = standardized_log_ratios.device
         initial_species = initial_species.to(device)
 
-        ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in self.species_vars], device=device, dtype=torch.float32)
-        ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in self.species_vars], device=device, dtype=torch.float32)
+        ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in self.species_vars], device=device, dtype=torch.float64)
+        ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in self.species_vars], device=device, dtype=torch.float64)
         
         log_ratios = (standardized_log_ratios * ratio_stds) + ratio_means
         log_ratios = torch.clamp(log_ratios, min=-38.0, max=38.0)
