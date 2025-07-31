@@ -420,7 +420,11 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
             
         except Exception as e:
             logger.warning(f"Model compilation failed: {e}. Running in eager mode.")
-    
+
+    if config["system"].get("dtype") == "float64":
+        model = model.double()
+        logger.info("Converted model to float64 precision")
+        
     return model
 
 

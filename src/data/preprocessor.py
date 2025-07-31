@@ -15,6 +15,8 @@ import h5py
 import numpy as np
 import torch
 import os
+import re
+import sys
 
 from .normalizer import DataNormalizer, NormalizationHelper
 from utils.utils import save_json, load_json
@@ -25,6 +27,8 @@ DEFAULT_EPSILON_MAX = 1e38
 class CorePreprocessor:
     """A lightweight helper class containing only the logic needed within a worker."""
     def __init__(self, config: Dict[str, Any], norm_stats: Optional[Dict[str, Any]] = None):
+        self.logger = logging.getLogger(__name__)
+
         self.data_cfg = config["data"]
         self.norm_cfg = config["normalization"]
         self.train_cfg = config["training"]
@@ -258,9 +262,6 @@ class CorePreprocessor:
 
     def _update_stats_for_profile(self, profile, n_t, accumulators, ratio_accumulators):
         """Consistent normalization in both modes."""
-        import logging
-        logger = logging.getLogger(__name__)
-        
         if self.prediction_mode == "ratio":
             # Use full profiles for all variables in ratio mode
             for var, acc in accumulators.items():
@@ -295,15 +296,53 @@ class CorePreprocessor:
                 if vec.size > 0:
                     self.normalizer._update_single_accumulator(acc, vec, var)
     
+
+
     def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> Optional[np.ndarray]:
-        import re
-        globals_dict = {f"{lbl}_init": float(val) for lbl, val in re.findall(r"_([A-Z])_([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", gname) if f"{lbl}_init" in self.global_vars}
-        if len(globals_dict) != len(self.global_vars): return None
-        profile = np.empty((n_t, self.n_vars), dtype=np.float32)
+        """
+        Extracts a full data profile from an HDF5 group with strict validation.
+        """
+
+        config_globals = set(self.global_vars)
+        group_attrs = set(group.attrs.keys())
+        
+        if 'SEED' in group_attrs:
+            group_attrs.remove('SEED')
+
+        globals_missing_from_attrs = config_globals - group_attrs
+        attrs_not_in_globals = group_attrs - config_globals
+        
+        if globals_missing_from_attrs or attrs_not_in_globals:
+            self.logger.critical(f"MISMATCH in HDF5 attributes for group: '{gname}'")
+            if globals_missing_from_attrs:
+                self.logger.critical(f"CONFIG ERROR: The following variables" 
+                                     f"are in your config but MISSING from the HDF5"
+                                     f"attributes: {list(globals_missing_from_attrs)}")
+            if attrs_not_in_globals:
+                self.logger.critical(f"DATA ERROR: The following HDF5 attributes are"
+                                     f"UNUSED in your config's 'global_variables': {list(attrs_not_in_globals)}")
+            self.logger.critical("  > Program will now terminate to enforce data integrity.")
+            sys.exit(1) 
+
+        globals_dict = {key: float(group.attrs[key]) for key in self.global_vars}
+        profile = np.empty((n_t, self.n_vars), dtype=np.float64)
+
         try:
-            for i, var in enumerate(self.var_order):
-                profile[:, i] = group[var][:] if var in group else globals_dict[var]
-        except Exception: return None
+            for i, var_name in enumerate(self.var_order):
+                if var_name in group:
+                    profile[:, i] = group[var_name][:]
+                elif var_name in globals_dict:
+                    profile[:, i] = globals_dict[var_name]
+                else:
+                    self.logger.error(f"FATAL LOGIC ERROR for group '{gname}'"
+                                      f"Variable '{var_name}' was not found."
+                                      f"Please check the preprocessor code.")
+                    sys.exit(1)
+
+        except Exception as e:
+            self.logger.error(f"Failed to read dataset while assembling profile for group '{gname}': {e}")
+            return None
+
         return profile
 
     def _profile_to_samples(self, norm_prof, n_t):
@@ -312,7 +351,7 @@ class CorePreprocessor:
             return None
         
         n_inputs = self.n_species + self.n_globals + 1
-        samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
+        samples = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float64)
         
         # Initial species
         samples[:, :self.n_species] = norm_prof[0, self.species_indices] 
@@ -336,14 +375,13 @@ class CorePreprocessor:
         raw_prof is **unnormalised** profile array  shape = (n_t, n_vars)
         ratio_stats contains mean/std/min/max for log‑ratios (already computed)
         """
-        import logging
         logger = logging.getLogger(__name__)
 
         if n_t <= 1:
             return None
         
         n_inputs  = self.n_species + self.n_globals + 1
-        samples   = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float32)
+        samples   = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float64)
 
         norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(raw_prof)).numpy()
         samples[:, :self.n_species]                   = norm_prof[0, self.species_indices]
@@ -362,7 +400,7 @@ class CorePreprocessor:
         clamp_val   = self.norm_cfg.get("clamp_value", 50.0)
         min_std     = self.norm_cfg.get("min_std", 1e-10)
 
-        normd = np.empty_like(log_ratios, dtype=np.float32)
+        normd = np.empty_like(log_ratios, dtype=np.float64)
 
         for i, var in enumerate(self.species_vars):
             method = methods_cfg.get(var, default_m)
@@ -391,6 +429,8 @@ def stats_worker(file_path, config):
 class DataPreprocessor:
     """Main parent class to orchestrate parallel data preprocessing."""
     def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
+        self.logger = logging.getLogger(__name__)
+
         self.raw_files = sorted(raw_files)
         self.output_dir = output_dir
 
@@ -398,7 +438,7 @@ class DataPreprocessor:
         self.processed_dir.mkdir(parents=True, exist_ok=True)
 
         self.config = config
-        self.logger = logging.getLogger(__name__)
+        
         self.normalizer = DataNormalizer(config)
         self.num_workers = config["preprocessing"].get("num_workers", 1)
         self.parallel = self.num_workers > 1 and len(self.raw_files) > 1
@@ -589,8 +629,8 @@ class ShardWriter:
 
     def add_samples(self, samples: np.ndarray):
         """Simplified add_samples without tracking global indices."""
-        if samples.dtype != np.float32:
-            samples = samples.astype(np.float32)
+        if samples.dtype != np.float64:
+            samples = samples.astype(np.float64)
         
         self.buffer.append(samples)
         self.buffer_size += samples.shape[0]
@@ -624,7 +664,7 @@ class ShardWriter:
         self.buffer_size = sum(arr.shape[0] for arr in self.buffer)
 
         # Write shard
-        data = np.concatenate(rows_to_write).astype(np.float32, copy=False)
+        data = np.concatenate(rows_to_write).astype(np.float64, copy=False)
         
         final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
         tmp_path = final_path.with_suffix(".tmp.npy")
@@ -649,7 +689,7 @@ class ShardWriter:
         self.buffer = []
         self.buffer_size = 0
 
-        data = np.concatenate(rows_to_write).astype(np.float32, copy=False)
+        data = np.concatenate(rows_to_write).astype(np.float64, copy=False)
         final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
         tmp_path   = final_path.with_suffix(".tmp.npy")
         np.save(tmp_path, data, allow_pickle=False)
