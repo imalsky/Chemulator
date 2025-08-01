@@ -92,27 +92,29 @@
         // Clamp normalized values to [-clamp_value, clamp_value]
         "clamp_value": 999.0
     },
-    
     // ===== MODEL ARCHITECTURE =====
     "model": {
-        "type": "mlp",
-        "hidden_dims": [256, 256, 256],  // Configurable hidden layer sizes
-        "activation": "silu",            // Any standard activation
-        "dropout": 0.05                  // Optional dropout
+        "type": "linear_latent",
+        "latent_dim": 64,                    // Latent space dimension (32-128)
+        "encoder_layers": [256, 256, 128],   // Encoder architecture
+        "decoder_layers": [128, 256, 256],   // Decoder architecture
+        "dynamics_rank": 8,                  // Low-rank component (0 for diagonal only)
+        "lambda_min": -10.0,                 // Min eigenvalue constraint
+        "lambda_max": 0.1,                   // Max eigenvalue constraint
+        "use_time_normalization": false,      // Learn per-sample time scaling
+        "activation": "gelu",
+        "dropout": 0.0,
+        "alpha": 1.0,
 
         //"type": "siren",
-        //"hidden_dims": [256, 256, 256],
-        //"activation": "silu",            // Note: SIREN uses sin(omega*x) internally
-        //"dropout": 0.05,
-        //"omega_0": 30.0                  // SIREN-specific frequency
-        //"type": "deeponet",
-        //"branch_layers": [256, 256, 256, 256],  // Processes initial conditions
-        //"trunk_layers": [256, 256],             // Processes time
-        //"basis_dim": 512,                       // Number of basis functions
-        //"activation": "silu",
-        //"dropout": 0.05,
-        //"output_scale": 1.0
-    },
+        //"hidden_dims": [512, 512, 512, 512],
+        //"omega_0": 30.0,
+        //"use_fourier_features": true,        // Use random Fourier features for time
+        //"fourier_scale": 10.0,
+        //"n_fourier_features": 256,
+        //"activation": "sine",                // SIREN uses sine activation
+        //"dropout": 0.0
+        },
     
     // ===== FiLM CONDITIONING =====
     "film": {
@@ -154,6 +156,7 @@
         "drop_last": true,
         
         // Learning rate - scaled with batch size
+        "spectral_regularization": 0.01,
         "optimizer": "lion",
         "learning_rate": 1e-4,  // 4x original due to 8x batch size (sqrt scaling)
         "weight_decay": 1e-5,

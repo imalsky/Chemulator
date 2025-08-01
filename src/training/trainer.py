@@ -19,6 +19,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlat
 from models.model import export_model
 from data.normalizer import NormalizationHelper
 from lion_pytorch import Lion
+from models.model import add_spectral_regularization_loss
 
 
 class Trainer:
@@ -47,7 +48,7 @@ class Trainer:
         
         # Prediction mode
         self.prediction_mode = self.prediction_config.get("mode", "absolute")
-        self.output_clamp = self.prediction_config.get("output_clamp")
+        #self.output_clamp = self.prediction_config.get("output_clamp")
         
         self._validate_trainer_config()
         
@@ -109,14 +110,8 @@ class Trainer:
                 raise ValueError("Training in 'ratio' mode requires ratio statistics from preprocessing.")
             
             self.logger.info("Ratio mode validation passed: using DeepONet with ratio statistics")
-        
-        # Validate output clamping configuration
-        if self.output_clamp is not None:
-            if isinstance(self.output_clamp, (list, tuple)):
-                if len(self.output_clamp) != 2:
-                    raise ValueError("output_clamp must be None, a single value (min), or a tuple/list of (min, max)")
-            elif not isinstance(self.output_clamp, (int, float)):
-                raise ValueError("output_clamp must be None, a number, or a tuple/list of two numbers")
+
+
 
     def _setup_dataloaders(self, train_dataset, val_dataset, test_dataset):
         """Setup data loaders for GPU-cached data."""
@@ -280,26 +275,33 @@ class Trainer:
                     targets: torch.Tensor,
                     inputs: torch.Tensor) -> torch.Tensor:
         """
-        Compute loss with proper output clamping.
+        Compute loss with optional spectral regularization.
         
-        output_clamp can be:
-        - None: no clamping
-        - Single value: clamp minimum only (backward compatibility)
-        - Tuple/list of (min, max): clamp both sides
+        NO output clamping - that should be handled after denormalization
+        or by training in appropriate space (log-space).
         """
-        if self.output_clamp is not None and self.prediction_mode == "absolute":
-            if isinstance(self.output_clamp, (list, tuple)):
-                # Two-sided clamp
-                outputs = torch.clamp(outputs, min=self.output_clamp[0], max=self.output_clamp[1])
-            else:
-                # Single value - clamp minimum only (backward compatibility)
-                outputs = torch.clamp(outputs, min=self.output_clamp)
-                self.logger.warning(
-                    "Using single-sided output clamping (min only). "
-                    "Consider using (min, max) tuple for two-sided clamping."
-                )
+        # Base MSE loss - no clamping!
+        loss = self.criterion(outputs, targets)
         
-        return self.criterion(outputs, targets)
+        # Add spectral regularization for LinearLatentDynamics
+        if self.config["model"]["type"] == "linear_latent":
+            # Import the helper function
+            from models.model import add_spectral_regularization_loss
+            
+            # Get regularization strength from config
+            lambda_reg = self.train_config.get("spectral_regularization", 0.01)
+            
+            if lambda_reg > 0:
+                spectral_loss = add_spectral_regularization_loss(
+                    self.model, inputs, lambda_reg
+                )
+                loss = loss + spectral_loss
+                
+                # Optionally log spectral loss separately every N batches
+                if hasattr(self, 'global_step') and self.global_step % self.log_interval == 0:
+                    self.logger.debug(f"Spectral regularization loss: {spectral_loss.item():.6f}")
+        
+        return loss
 
     def train(self) -> float:
         """Execute the training loop."""
