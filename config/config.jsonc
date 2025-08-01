@@ -38,7 +38,20 @@
             "OH_evolution",
             "O_evolution"
         ],
-        "target_species_variables": ["NH3_evolution"],
+        "target_species_variables": [
+            "C2H2_evolution",
+            "CH4_evolution",
+            "CO2_evolution",
+            "CO_evolution",
+            "H2O_evolution",
+            "H2_evolution",
+            "HCN_evolution",
+            "H_evolution",
+            "N2_evolution",
+            "NH3_evolution",
+            "OH_evolution",
+            "O_evolution"
+        ],
 
         // Global parameters (initial conditions)
         "global_variables": ["P", "T"],
@@ -51,7 +64,7 @@
         // Number of samples per NPY shard file
         "shard_size": 10000000,
         // Minimum species concentration threshold
-        "min_value_threshold": 1e-20,
+        "min_value_threshold": 1e-25,
         // Compression type: null for raw npy files (faster I/O)
         "compression": null,
         // Number of parallel workers for preprocessing
@@ -82,34 +95,31 @@
     
     // ===== MODEL ARCHITECTURE =====
     "model": {
-        // Model type: "deeponet" or "siren"
-        "type": "deeponet",
-        
-        // Activation function: "gelu", "relu", "silu", "tanh"
-        "activation": "gelu",
-        
-        // Dropout rate (0.0 = no dropout)
-        "dropout": 0.1,
-        
-        // Output scaling factor (1.0 = no scaling)
-        "output_scale": 1.0,
-        
-        // DeepONet-specific parameters
-        "branch_layers": [384, 384, 384, 384],
-        "trunk_layers": [128, 128, 128, 128],
-        "basis_dim": 64,
-        
-        // SIREN-specific parameters (when type="siren")
-        "hidden_dims": [256, 256, 256],
-        "omega_0": 30.0
+        "type": "mlp",
+        "hidden_dims": [256, 256, 256],  // Configurable hidden layer sizes
+        "activation": "silu",            // Any standard activation
+        "dropout": 0.05                  // Optional dropout
+
+        //"type": "siren",
+        //"hidden_dims": [256, 256, 256],
+        //"activation": "silu",            // Note: SIREN uses sin(omega*x) internally
+        //"dropout": 0.05,
+        //"omega_0": 30.0                  // SIREN-specific frequency
+        //"type": "deeponet",
+        //"branch_layers": [256, 256, 256, 256],  // Processes initial conditions
+        //"trunk_layers": [256, 256],             // Processes time
+        //"basis_dim": 512,                       // Number of basis functions
+        //"activation": "silu",
+        //"dropout": 0.05,
+        //"output_scale": 1.0
     },
     
     // ===== FiLM CONDITIONING =====
     "film": {
         // Enable Feature-wise Linear Modulation
-        "enabled": true,
+        "enabled": false,
         // Hidden layers for FiLM networks
-        "hidden_dims": [128, 128],
+        "hidden_dims": [64, 64],
         // Activation for FiLM networks
         "activation": "relu"
     },
@@ -132,9 +142,8 @@
         
         // Training duration
         "epochs": 100,
-        
-        "batch_size": 1024,  
-        "gradient_accumulation_steps": 1,
+        "batch_size": 16384,  
+        "gradient_accumulation_steps":1,
         "gpu_cache_dataset": true,  // Force GPU caching
         
         // DATALOADER SETTINGS - OPTIMIZED FOR GPU
@@ -145,6 +154,7 @@
         "drop_last": true,
         
         // Learning rate - scaled with batch size
+        "optimizer": "lion",
         "learning_rate": 1e-4,  // 4x original due to 8x batch size (sqrt scaling)
         "weight_decay": 1e-5,
         "betas": [0.9, 0.999],
@@ -161,7 +171,7 @@
         
         // Loss and training settings
         "loss": "mse",
-        "use_amp": true,
+        "use_amp": false,
         "amp_dtype": "bfloat16",
         "early_stopping_patience": 5000,
         "min_delta": 1e-8,

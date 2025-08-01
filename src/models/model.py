@@ -103,6 +103,126 @@ class FiLMLayer(nn.Module):
             return features * gamma + beta
 
 
+class FiLMMLP(nn.Module):
+    """Standard MLP with optional FiLM conditioning for baseline comparison."""
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
+        
+        # Extract dimensions
+        self.num_input_species = len(config["data"]["species_variables"])
+        self.num_output_species = len(config["data"].get("target_species_variables", config["data"]["species_variables"]))
+        self.num_globals = len(config["data"]["global_variables"])
+        self.hidden_dims = config["model"]["hidden_dims"]
+        
+        # Get activation
+        self.activation = self._get_activation(config["model"].get("activation", "gelu"))
+        
+        # Dropout
+        dropout_rate = config["model"].get("dropout", 0.0)
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+        
+        # FiLM configuration
+        film_config = config.get("film", {})
+        self.use_film = film_config.get("enabled", True)
+        
+        # Input dimension: species + globals + time
+        input_dim = self.num_input_species + self.num_globals + 1
+        
+        # Build network layers
+        self.layers = nn.ModuleList()
+        self.film_layers = nn.ModuleList() if self.use_film else None
+        
+        prev_dim = input_dim
+        condition_dim = self.num_globals if self.use_film else None
+        
+        # Get FiLM activations
+        film_activations = film_config.get("activations", film_config.get("activation", "gelu"))
+        if isinstance(film_activations, str):
+            film_activations = [film_activations] * len(self.hidden_dims)
+        
+        for i, dim in enumerate(self.hidden_dims):
+            # Main layer
+            self.layers.append(nn.Linear(prev_dim, dim))
+            
+            # FiLM layer
+            if self.use_film:
+                layer_activation = film_activations[i] if isinstance(film_activations, list) else film_activations
+                self.film_layers.append(
+                    FiLMLayer(
+                        condition_dim=condition_dim,
+                        feature_dim=dim,
+                        hidden_dims=film_config.get("hidden_dims", [128, 128]),
+                        activation=layer_activation,
+                        use_beta=True
+                    )
+                )
+            
+            prev_dim = dim
+        
+        # Output layer
+        self.output_layer = nn.Linear(prev_dim, self.num_output_species)
+        
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _get_activation(self, name: str):
+        activations = {
+            "gelu": nn.GELU(),
+            "relu": nn.ReLU(inplace=True),
+            "tanh": nn.Tanh(),
+            "silu": nn.SiLU(inplace=True),
+            "leakyrelu": nn.LeakyReLU(0.2, inplace=True),
+            "elu": nn.ELU(inplace=True)
+        }
+        return activations.get(name.lower(), nn.GELU())
+    
+    def _initialize_weights(self):
+        """Xavier/He initialization for MLP layers."""
+        for layer in self.layers:
+            if isinstance(layer, nn.Linear):
+                # He initialization for ReLU family, Xavier for others
+                if isinstance(self.activation, (nn.ReLU, nn.LeakyReLU, nn.ELU)):
+                    nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
+                else:
+                    nn.init.xavier_normal_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+        
+        # Output layer with smaller initialization
+        nn.init.xavier_uniform_(self.output_layer.weight, gain=0.1)
+        if self.output_layer.bias is not None:
+            nn.init.zeros_(self.output_layer.bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through MLP."""
+        
+        if self.use_film and self.film_layers is not None:
+            # Extract global conditions for FiLM
+            cond_start = self.num_input_species
+            cond_end = self.num_input_species + self.num_globals
+            global_condition = x[:, cond_start:cond_end]
+        
+        # Process through layers
+        h = x
+        for i, layer in enumerate(self.layers):
+            # Linear transformation
+            h = layer(h)
+            
+            # Apply FiLM before activation
+            if self.use_film and self.film_layers is not None:
+                h = self.film_layers[i](h, global_condition)
+            
+            # Activation
+            h = self.activation(h)
+            
+            # Dropout (except last layer)
+            if self.dropout is not None and i < len(self.layers) - 1:
+                h = self.dropout(h)
+        
+        # Output
+        return self.output_layer(h)
+
+
 class FiLMSIREN(nn.Module):
     """SIREN with FiLM conditioning - optimized for A100."""
     def __init__(self, config: Dict[str, Any]):
@@ -200,7 +320,6 @@ class FiLMSIREN(nn.Module):
             
             # Apply FiLM before activation
             if self.use_film and self.film_layers is not None:
-
                 h = self.film_layers[i](h, global_condition)
             
             # SIREN activation
@@ -261,7 +380,6 @@ class FiLMDeepONet(nn.Module):
             if self.use_film
             else self.num_input_species + self.num_globals
         )
-        self.branch_input_dim = branch_input_dim
 
         # ────────────────────────────────────────────────────────────────
         # 5.  Build BRANCH network (coefficients)
@@ -415,15 +533,17 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     prediction_mode = config.get("prediction", {}).get("mode", "absolute")
     
     # Validate model-mode compatibility
-    if prediction_mode == "ratio" and model_type != "deeponet":
+    if prediction_mode == "ratio" and model_type not in ["deeponet", "mlp"]:
         raise ValueError(
-            f"Prediction mode 'ratio' is only compatible with model type 'deeponet', "
+            f"Prediction mode 'ratio' is only compatible with model types 'deeponet' or 'mlp', "
             f"but '{model_type}' was specified. Either:\n"
-            f"  1. Change model.type to 'deeponet' in your config, or\n"
+            f"  1. Change model.type to 'deeponet' or 'mlp' in your config, or\n"
             f"  2. Change prediction.mode to 'absolute'"
         )
     
-    if model_type == "siren":
+    if model_type == "mlp":
+        model = FiLMMLP(config)
+    elif model_type == "siren":
         model = FiLMSIREN(config)
     elif model_type == "deeponet":
         model = FiLMDeepONet(config)

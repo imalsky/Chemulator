@@ -18,6 +18,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlat
 
 from models.model import export_model
 from data.normalizer import NormalizationHelper
+from lion_pytorch import Lion
 
 
 class Trainer:
@@ -144,45 +145,58 @@ class Trainer:
             device=self.device,
             drop_last=False
         ) if test_dataset and len(test_dataset) > 0 else None
-    
+
+
     def _setup_optimizer(self):
-        """Setup AdamW optimizer with safe feature detection."""
-        # Separate parameters for weight decay
-        decay_params = []
-        no_decay_params = []
-        
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
+        """
+        Setup optimizer.
+        Supported:  "adamw" (default)   or   "lion"
+        Select with  training.optimizer  in the config.
+        """
+        opt_name = self.train_config.get("optimizer", "adamw").lower()
+
+        # ── 1. split params by weight-decay ────────────────────────────
+        decay, no_decay = [], []
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
                 continue
-            
-            if param.dim() == 1 or "bias" in name or "norm" in name.lower():
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-        
+            (no_decay if (p.dim() == 1 or "bias" in name or "norm" in name.lower())
+             else decay).append(p)
+
         param_groups = [
-            {"params": decay_params, "weight_decay": self.train_config["weight_decay"]},
-            {"params": no_decay_params, "weight_decay": 0.0}
+            {"params": decay,     "weight_decay": self.train_config["weight_decay"]},
+            {"params": no_decay,  "weight_decay": 0.0},
         ]
-        
-        # Safely check for fused optimizer support
-        optimizer_kwargs = {
-            "lr": self.train_config["learning_rate"],
-            "betas": tuple(self.train_config.get("betas", [0.9, 0.999])),
-            "eps": self.train_config.get("eps", 1e-8),
-        }
-        
-        # Only use fused if available and on CUDA
-        if self.device.type == "cuda" and hasattr(torch.optim.AdamW, "fused"):
-            try:
-                # Test if fused parameter actually works
-                test_opt = torch.optim.AdamW([torch.zeros(1)], fused=True)
-                optimizer_kwargs["fused"] = True
-                self.logger.info("Using fused AdamW optimizer")
-            except Exception:
-                self.logger.info("Fused AdamW not available, using standard implementation")
-        
-        self.optimizer = AdamW(param_groups, **optimizer_kwargs)
+
+        lr     = self.train_config["learning_rate"]
+        betas  = tuple(self.train_config.get("betas", [0.9, 0.999]))
+        eps    = self.train_config.get("eps", 1e-8)
+
+        # ── 2. instantiate the chosen optimiser ───────────────────────
+        if opt_name == "lion":
+            # Lion ignores eps, but we pass weight_decay in defaults
+            self.optimizer = Lion(param_groups, lr=lr, betas=betas,
+                                  weight_decay=self.train_config["weight_decay"])
+            self.logger.info(f"Using Lion optimiser (lr={lr}, betas={betas})")
+
+        elif opt_name == "adamw":
+            opt_kwargs = {"lr": lr, "betas": betas, "eps": eps}
+
+            # fused AdamW (if CUDA & available)
+            if self.device.type == "cuda" and hasattr(torch.optim.AdamW, "fused"):
+                try:
+                    _ = torch.optim.AdamW([torch.zeros(1, device=self.device)], fused=True)
+                    opt_kwargs["fused"] = True
+                    self.logger.info("Using fused AdamW optimiser")
+                except Exception:
+                    self.logger.info("Fused AdamW not available, falling back to standard AdamW")
+
+            self.optimizer = AdamW(param_groups, **opt_kwargs)
+            self.logger.info(f"Using AdamW optimiser (lr={lr}, betas={betas}, eps={eps})")
+
+        else:
+            raise ValueError(f"Unsupported optimizer '{opt_name}'. Choose 'adamw' or 'lion'.")
+
     
     def _setup_scheduler(self):
         """Setup learning rate scheduler."""
@@ -552,5 +566,12 @@ class Trainer:
             if example_loader:
                 example_inputs, _ = next(iter(example_loader))
                 self.logger.info(f"Exporting model with example input shape: {example_inputs.shape}")
+
+
+                self.logger.info(f"Exporting model with example input shape: {example_inputs.shape}")
+                example_inputs = example_inputs.cpu()
+                self.model.cpu()           
+
                 export_path = self.save_dir / "exported_model.pt"
                 export_model(self.model, example_inputs, export_path)
+                self.model.to(self.device)  # restore to original device
