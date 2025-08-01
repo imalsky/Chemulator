@@ -258,57 +258,6 @@ class ChemicalKineticsPipeline:
         
         save_json(results, self.run_save_dir / "results.json")
     
-    def run_diagnostics(self, num_batches=20):
-        """Run performance diagnostics."""
-        self.logger.info("Running performance diagnostics...")
-        
-        # Ensure data is preprocessed
-        self.preprocess_data()
-        
-        # Create model
-        model = create_model(self.config, self.device)
-        
-        # Load norm stats
-        norm_stats = load_json(self.processed_dir / "normalization.json")
-        norm_helper = NormalizationHelper(
-            norm_stats, self.device,
-            self.config["data"]["species_variables"],
-            self.config["data"]["global_variables"],
-            self.config["data"]["time_variable"],
-            self.config
-        )
-        
-        # Create training dataset only
-        train_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            split_name="train",
-            config=self.config,
-            device=self.device
-        )
-        
-        # Create minimal trainer
-        trainer = Trainer(
-            model=model,
-            train_dataset=train_dataset,
-            val_dataset=None,
-            test_dataset=None,
-            config=self.config,
-            save_dir=self.run_save_dir,
-            device=self.device,
-            norm_helper=norm_helper
-        )
-        
-        
-        # Print summary
-        print("\n" + "="*60)
-        print("PERFORMANCE DIAGNOSTICS COMPLETE")
-        print("="*60)
-        print(f"Batch size: {self.config['training']['batch_size']}")
-        print(f"Device: {self.device}")
-        print(f"Model compilation: {self.config['system'].get('use_torch_compile', False)}")
-        print(f"AMP enabled: {self.config['training'].get('use_amp', False)}")
-        print(f"GPU cache: {train_dataset.get_cache_info()['type']}")
-    
     def run(self):
         """Execute the full training pipeline."""
         try:
@@ -644,9 +593,6 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     
     # Common hyperparameters - EXPANDED SEARCH SPACE
     config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu", "tanh"])
-    #config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    #config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [16384])
-    #config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
     config["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.1, step=0.05)
     
 
@@ -698,10 +644,8 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
         config["film"]["hidden_dims"] = film_widths
         config["film"]["activation"] = trial.suggest_categorical("film_activation", ["gelu", "relu"])
 
-    # Loss function
-    config["training"]["loss"] = trial.suggest_categorical("loss", ["mse"])
-    if config["training"]["loss"] == "huber":
-        config["training"]["huber_delta"] = trial.suggest_float("huber_delta", 0.1, 2.0)
+    # Loss function - only MSE
+    config["training"]["loss"] = "mse"
 
     # Gradient clipping
     config["training"]["gradient_clip"] = trial.suggest_categorical("gradient_clip", [1.0])
@@ -712,7 +656,7 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
 def optimize(config_path: Path, n_trials: int = 25, n_jobs: int = 1,
              study_name: str = "chemulator_hpo", pruner: Optional[optuna.pruners.BasePruner] = None):
     """
-    Main function to run Optuna optimization with Hyperband for 40-hoaur runtime.
+    Main function to run Optuna optimization with Hyperband for 40-hour runtime.
     """
     logger = logging.getLogger(__name__)
     base_config = load_json_config(config_path)
@@ -798,7 +742,7 @@ def optimize(config_path: Path, n_trials: int = 25, n_jobs: int = 1,
 ===== /Users/imalsky/Desktop/Chemulator/src/training/trainer.py =====
 #!/usr/bin/env python3
 """
-Training pipeline for chemical kinetics models with adaptive loss
+Training pipeline for chemical kinetics models
 """
 
 import json
@@ -818,134 +762,8 @@ from models.model import export_model
 from data.normalizer import NormalizationHelper
 
 
-class ScaleAwareAdaptiveLoss(nn.Module):
-    """
-    Adaptive loss that accounts for different scales and variations in species.
-    Ensures uniform relative accuracy across all species.
-    """
-    def __init__(self, norm_stats: Dict[str, Any], species_names: list, device: torch.device):
-        super().__init__()
-        self.species_names = species_names
-        
-        # Extract standard deviations for each species
-        stds = []
-        for species in species_names:
-            if species in norm_stats["per_key_stats"]:
-                stats = norm_stats["per_key_stats"][species]
-                if "log_std" in stats:
-                    stds.append(stats["log_std"])
-                else:
-                    # For non-log normalized species
-                    stds.append(stats.get("std", 1.0))
-            else:
-                stds.append(1.0)
-        
-        # Convert to tensor
-        stds = torch.tensor(stds, device=device, dtype=torch.float64)
-        
-        # Create weights inversely proportional to std
-        # Species with larger std (harder to predict) get higher weight
-        self.weights = 1.0 / torch.sqrt(stds)
-        self.weights = self.weights / self.weights.mean()  # Normalize to mean=1
-        
-        # Log the weights
-        logger = logging.getLogger(__name__)
-        logger.info("Species-specific loss weights (based on std):")
-        for species, weight, std in zip(species_names, self.weights.cpu().numpy(), stds.cpu().numpy()):
-            logger.info(f"  {species}: weight={weight:.3f} (std={std:.3f})")
-        
-        # Optional: Manual adjustment for extreme species
-        # You can uncomment and modify this if certain species need extra attention
-        # extreme_species = ["O_evolution", "OH_evolution"]
-        # for i, species in enumerate(species_names):
-        #     if species in extreme_species:
-        #         self.weights[i] *= 2.0  # Double weight for extreme species
-        
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute weighted MSE loss.
-        
-        Args:
-            pred: Predictions in normalized space (batch, n_species)
-            target: Targets in normalized space (batch, n_species)
-        """
-        # Per-species squared error
-        squared_errors = (pred - target) ** 2
-        
-        # Apply species-specific weights
-        weighted_errors = squared_errors * self.weights.unsqueeze(0)
-        
-        # Return mean
-        return weighted_errors.mean()
-
-
-class UniformRelativeErrorLoss(nn.Module):
-    """
-    Alternative loss that directly optimizes for uniform relative error.
-    Works in normalized space but accounts for what the errors mean in real space.
-    """
-    def __init__(self, norm_stats: Dict[str, Any], species_names: list, device: torch.device, 
-                 target_relative_error: float = 0.01):
-        super().__init__()
-        self.species_names = species_names
-        self.target_relative_error = target_relative_error
-        
-        # Extract normalization parameters
-        self.log_stds = []
-        self.is_log = []
-        
-        for species in species_names:
-            if species in norm_stats["per_key_stats"]:
-                stats = norm_stats["per_key_stats"][species]
-                method = norm_stats["normalization_methods"].get(species, "standard")
-                
-                if "log" in method:
-                    self.log_stds.append(stats.get("log_std", 1.0))
-                    self.is_log.append(True)
-                else:
-                    self.log_stds.append(0.0)  # Not used for linear normalized
-                    self.is_log.append(False)
-            else:
-                self.log_stds.append(1.0)
-                self.is_log.append(True)
-        
-        self.log_stds = torch.tensor(self.log_stds, device=device, dtype=torch.float64)
-        self.is_log = torch.tensor(self.is_log, device=device, dtype=torch.bool)
-        
-        # Target error in normalized space for each species
-        # For log-normalized species: target_norm_error = log10(1 + target_relative_error) / log_std
-        log_target = np.log10(1 + target_relative_error)
-        self.target_normalized_errors = torch.where(
-            self.is_log,
-            log_target / self.log_stds,
-            torch.tensor(target_relative_error, device=device, dtype=torch.float64)
-        )
-        
-        logger = logging.getLogger(__name__)
-        logger.info(f"Target relative error: {target_relative_error:.1%}")
-        logger.info("Target normalized RMSE per species:")
-        for species, target_rmse in zip(species_names, self.target_normalized_errors.cpu().numpy()):
-            logger.info(f"  {species}: {target_rmse:.4f}")
-    
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute loss that penalizes deviations from target relative error.
-        """
-        # Compute normalized errors
-        normalized_errors = torch.abs(pred - target)
-        
-        # Compute how far each species is from its target error
-        error_ratios = normalized_errors / self.target_normalized_errors.unsqueeze(0)
-        
-        # Penalize both under and over-achievement
-        # Use squared ratio to penalize large deviations more
-        loss = (error_ratios ** 2).mean()
-        
-        return loss
-
-
 class Trainer:
-    """Trainer with adaptive loss functions for multi-scale chemical kinetics"""
+    """Trainer for chemical kinetics models"""
     def __init__(self, model: nn.Module, train_dataset, val_dataset, test_dataset,
                 config: Dict[str, Any], save_dir: Path, device: torch.device,
                 norm_helper: NormalizationHelper):
@@ -962,6 +780,11 @@ class Trainer:
         self.system_config = config["system"]
         self.prediction_config = config.get("prediction", {})
         self.data_config = config["data"]
+        
+        # Get dtype from config
+        dtype_str = self.system_config.get("dtype", "float32")
+        self.dtype = getattr(torch, dtype_str)
+        self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
         
         # Prediction mode
         self.prediction_mode = self.prediction_config.get("mode", "absolute")
@@ -1156,40 +979,16 @@ class Trainer:
             raise ValueError(f"Unknown scheduler '{scheduler_type}'")
     
     def _setup_loss(self):
-        """Setup loss function with adaptive options."""
-        loss_type = self.train_config["loss"]
-        
-        if loss_type == "mse":
-            self.criterion = nn.MSELoss()
-        elif loss_type == "mae":
-            self.criterion = nn.L1Loss()
-        elif loss_type == "huber":
-            self.criterion = nn.HuberLoss(delta=self.train_config.get("huber_delta", 0.5))
-        elif loss_type == "adaptive" or loss_type == "scale_aware":
-            # Use scale-aware adaptive loss
-            self.criterion = ScaleAwareAdaptiveLoss(
-                self.norm_helper.stats,
-                self.species_names,
-                self.device
-            )
-        elif loss_type == "uniform_relative":
-            # Use uniform relative error loss
-            target_error = self.train_config.get("target_relative_error", 0.01)
-            self.criterion = UniformRelativeErrorLoss(
-                self.norm_helper.stats,
-                self.species_names,
-                self.device,
-                target_relative_error=target_error
-            )
-        else:
-            raise ValueError(f"Unknown loss: {loss_type}")
+        """Setup loss function - MSE only."""
+        loss_type = self.train_config.get("loss", "mse")
+        if loss_type != "mse":
+            self.logger.warning(f"Only MSE loss is supported. Ignoring '{loss_type}' and using MSE.")
+        self.criterion = nn.MSELoss()
     
     def _setup_amp(self):
-        """Setup automatic mixed precision - disabled for float64."""
+        """Setup automatic mixed precision."""
         # Check if using float64
-        model_dtype = next(self.model.parameters()).dtype
-        
-        if model_dtype == torch.float64:
+        if self.dtype == torch.float64:
             self.use_amp = False
             self.scaler = GradScaler(enabled=False)
             self.amp_dtype = None
@@ -1242,7 +1041,7 @@ class Trainer:
             self.logger.info(f"Val batches: {len(self.val_loader)}")
 
         # Log loss function info
-        self.logger.info(f"Using loss function: {type(self.criterion).__name__}")
+        self.logger.info(f"Using loss function: MSE")
 
         if self.system_config.get("use_torch_compile", False):
             self.logger.info("Compiling model with torch.compile...")
@@ -1252,9 +1051,6 @@ class Trainer:
             self._run_training_loop()
             self.logger.info(f"Training completed. Best validation loss: {self.best_val_loss:.6f} at epoch {self.best_epoch}")
             
-            # Run final diagnostics
-            if self.track_species_metrics:
-                self.diagnose_accuracy()
             
         except KeyboardInterrupt:
             self.logger.info("Training interrupted by user")
@@ -1456,10 +1252,6 @@ class Trainer:
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
         self.logger.info(f"Test loss: {avg_loss:.6f}")
         
-        # Run detailed diagnostics on test set
-        if self.track_species_metrics:
-            self.diagnose_accuracy(use_test=True)
-        
         return avg_loss
 
     def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
@@ -1502,8 +1294,14 @@ class Trainer:
             if example_loader:
                 example_inputs, _ = next(iter(example_loader))
                 self.logger.info(f"Exporting model with example input shape: {example_inputs.shape}")
+
+
+                example_inputs = example_inputs.cpu()
+                self.model.cpu()           
+
                 export_path = self.save_dir / "exported_model.pt"
                 export_model(self.model, example_inputs, export_path)
+                self.model.to(self.device)  # restore to original device
 
 ===== /Users/imalsky/Desktop/Chemulator/src/utils/utils.py =====
 #!/usr/bin/env python3
@@ -1823,8 +1621,7 @@ class FiLMSIREN(nn.Module):
         self.film_layers = nn.ModuleList() if self.use_film else None
 
         prev_dim = input_dim
-        # CORRECT: Condition on full initial state (species + globals)
-        condition_dim = self.num_input_species + self.num_globals
+        condition_dim = self.num_globals if self.use_film else None
 
         # Get FiLM activations
         film_activations = film_config.get("activations", film_config.get("activation", "gelu"))
@@ -1877,9 +1674,12 @@ class FiLMSIREN(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass - optimized."""
-        # CORRECT: Extract initial conditions for FiLM (all but time)
-        initial_conditions = x[:, :self.num_input_species + self.num_globals]
-        
+
+        if self.use_film and self.film_layers is not None:
+            cond_start = self.num_input_species
+            cond_end = self.num_input_species + self.num_globals
+            global_condition = x[:, cond_start:cond_end]
+
         # Process through layers
         h = x
         for i, layer in enumerate(self.layers):
@@ -1888,7 +1688,8 @@ class FiLMSIREN(nn.Module):
             
             # Apply FiLM before activation
             if self.use_film and self.film_layers is not None:
-                h = self.film_layers[i](h, initial_conditions)
+
+                h = self.film_layers[i](h, global_condition)
             
             # SIREN activation
             h = torch.sin(self.omega_0 * h)
@@ -1906,46 +1707,72 @@ class FiLMDeepONet(nn.Module):
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         
-        # Extract dimensions
-        self.num_input_species = len(config["data"]["species_variables"])
-        self.num_output_species = len(config["data"].get("target_species_variables", config["data"]["species_variables"]))
-        self.num_globals = len(config["data"]["global_variables"])
+        # ────────────────────────────────────────────────────────────────
+        # 1.  Dimensions
+        # ────────────────────────────────────────────────────────────────
+        self.num_input_species  = len(config["data"]["species_variables"])
+        self.num_output_species = len(
+            config["data"].get("target_species_variables",
+                               config["data"]["species_variables"])
+        )
+        self.num_globals        = len(config["data"]["global_variables"])
 
-        # Architecture parameters
+        # ────────────────────────────────────────────────────────────────
+        # 2.  Architecture hyper-parameters
+        # ────────────────────────────────────────────────────────────────
         branch_layers = config["model"]["branch_layers"]
-        trunk_layers = config["model"]["trunk_layers"]
-        self.basis_dim = config["model"]["basis_dim"]
-        self.activation = self._get_activation(config["model"].get("activation", "gelu"))
+        trunk_layers  = config["model"]["trunk_layers"]
+        self.basis_dim   = config["model"]["basis_dim"]
+        self.activation  = self._get_activation(
+            config["model"].get("activation", "gelu")
+        )
         self.output_scale = config["model"].get("output_scale", 1.0)
-        
-        # Dropout
+
+        # ────────────────────────────────────────────────────────────────
+        # 3.  Regularisation
+        # ────────────────────────────────────────────────────────────────
         dropout_rate = config["model"].get("dropout", 0.0)
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
-        
-        # FiLM configuration
+
+        # ────────────────────────────────────────────────────────────────
+        # 4.  FiLM configuration
+        # ────────────────────────────────────────────────────────────────
         film_config = config.get("film", {})
         self.use_film = film_config.get("enabled", True)
-        
-        # FIXED: Condition on full initial state (species + globals)
-        condition_dim = self.num_input_species + self.num_globals if self.use_film else None
-        
-        # Build networks
+        condition_dim = self.num_globals if self.use_film else None
+
+        # Decide what raw features the BRANCH sees:
+        #   • FiLM ON  -> species only (globals come via FiLM)
+        #   • FiLM OFF -> species + globals as direct inputs
+        branch_input_dim = (
+            self.num_input_species
+            if self.use_film
+            else self.num_input_species + self.num_globals
+        )
+
+        # ────────────────────────────────────────────────────────────────
+        # 5.  Build BRANCH network (coefficients)
+        # ────────────────────────────────────────────────────────────────
         self.branch_net = self._build_mlp_with_film(
-            input_dim=self.num_input_species + self.num_globals,  # Use all input species
-            hidden_layers=branch_layers,
-            output_dim=self.basis_dim * self.num_output_species, # Output is for target species only
-            condition_dim=condition_dim,
-            film_config=film_config if self.use_film else None
+            input_dim   = branch_input_dim,
+            hidden_layers = branch_layers,
+            output_dim  = self.basis_dim * self.num_output_species,
+            condition_dim = condition_dim,
+            film_config   = film_config if self.use_film else None
         )
-        
+
+        # ────────────────────────────────────────────────────────────────
+        # 6.  Build TRUNK network (basis functions) — no FiLM
+        # ────────────────────────────────────────────────────────────────
         self.trunk_net = self._build_mlp_with_film(
-            input_dim=1,
-            hidden_layers=trunk_layers,
-            output_dim=self.basis_dim,
-            condition_dim=None,      # Explicitly disable conditioning for the trunk
-            film_config=None,        # Explicitly disable FiLM for the trunk
-            bias=True
+            input_dim   = 1,                 # time coordinate
+            hidden_layers = trunk_layers,
+            output_dim  = self.basis_dim,
+            condition_dim = None,            # FiLM disabled
+            film_config   = None,
+            bias          = True
         )
+
     
     def _get_activation(self, name: str):
         activations = {
@@ -2034,31 +1861,39 @@ class FiLMDeepONet(nn.Module):
             
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Forward pass"""
-        batch_size = inputs.shape[0]
+        batch_size = inputs.size(0)
 
-        # Split inputs
-        branch_input = inputs[:, :self.num_input_species + self.num_globals]
-        trunk_input = inputs[:, -1:]  # Time
-
-        trunk_out = self.trunk_net(trunk_input)
-
-        # The branch is still conditioned on the initial state if FiLM is enabled.
+        # ───────── branch features … depend on FiLM flag ─────────
         if self.use_film:
-            initial_state_for_conditioning = inputs[:, :self.num_input_species + self.num_globals]
-            branch_out = self.branch_net(branch_input, initial_state_for_conditioning)
+            # species only
+            branch_input = inputs[:, : self.num_input_species]
+            cond_start   = self.num_input_species
+            cond_end     = cond_start + self.num_globals
+            global_condition = inputs[:, cond_start:cond_end]       # (B, Ng)
+        else:
+            # species + globals as raw inputs; no FiLM condition tensor
+            branch_input = inputs[:, : self.num_input_species + self.num_globals]
+            global_condition = None
+
+        # ───────── trunk input (time) ─────────
+        trunk_input = inputs[:, -1:]                                # (B, 1)
+
+        # ───────── networks ─────────
+        trunk_out  = self.trunk_net(trunk_input)                    # (B, D)
+        if self.use_film:
+            branch_out = self.branch_net(branch_input, global_condition)
         else:
             branch_out = self.branch_net(branch_input)
 
-        # Reshape and combine efficiently based on the number of output species
+        # ───────── combine ─────────
         branch_out = branch_out.view(batch_size, self.num_output_species, self.basis_dim)
-        # Efficient matrix multiplication
-        output = torch.bmm(branch_out, trunk_out.unsqueeze(2)).squeeze(2)
+        output     = torch.bmm(branch_out, trunk_out.unsqueeze(2)).squeeze(2)
 
-        # Optional output scaling
+        # optional scaling
         if self.output_scale != 1.0:
             output = output * self.output_scale
-
         return output
+
 
 
 def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
@@ -2113,9 +1948,14 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
         except Exception as e:
             logger.warning(f"Model compilation failed: {e}. Running in eager mode.")
 
-    if config["system"].get("dtype") == "float64":
+    # Convert to specified dtype
+    dtype_str = config["system"].get("dtype", "float32")
+    if dtype_str == "float64":
         model = model.double()
         logger.info("Converted model to float64 precision")
+    elif dtype_str == "float32":
+        model = model.float()
+        logger.info("Using float32 precision")
         
     return model
 
@@ -2228,7 +2068,7 @@ import re
 import sys
 
 from .normalizer import DataNormalizer, NormalizationHelper
-from utils.utils import save_json, load_json
+from utils.utils import save_json
 
 DEFAULT_EPSILON_MIN = 1e-38
 DEFAULT_EPSILON_MAX = 1e38
@@ -2243,6 +2083,11 @@ class CorePreprocessor:
         self.train_cfg = config["training"]
         self.pred_cfg = config.get("prediction", {})
         self.proc_cfg = config["preprocessing"]
+        self.system_cfg = config["system"]
+
+        # Get dtype from config
+        dtype_str = self.system_cfg.get("dtype", "float32")
+        self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
 
         self.species_vars = self.data_cfg["species_variables"]
         self.target_species_vars = self.data_cfg.get("target_species_variables", self.species_vars)
@@ -2282,7 +2127,7 @@ class CorePreprocessor:
         Checks if a profile is valid according to criteria in config.
         Returns (is_valid, reason_for_failure_or_success).
         """
-        # Validate every variable (species + globals + time)
+        # Validate every variable (species + globals + time)
         required_keys = self.species_vars + [self.time_var]
         if not set(required_keys).issubset(group.keys()):
             return False, "missing_keys"
@@ -2326,12 +2171,18 @@ class CorePreprocessor:
             "total_profiles":   0,
             "profiles_kept":    0,
             "dropped_reasons":  defaultdict(int),
+            "found_variables": set(),
+            "found_global_attrs": set(),
         }
 
         with h5py.File(file_path, "r") as f:
             for gname in sorted(f.keys()):
                 report["total_profiles"] += 1
                 grp = f[gname]
+
+                # Track found variables
+                report["found_variables"].update(grp.keys())
+                report["found_global_attrs"].update(grp.attrs.keys())
 
                 # dataset‑level validation
                 is_ok, reason = self._is_profile_valid(grp)
@@ -2381,17 +2232,20 @@ class CorePreprocessor:
             "train": ShardWriter(
                 output_dir / "train", 
                 self.proc_cfg["shard_size"], 
-                file_path.stem
+                file_path.stem,
+                self.np_dtype
             ),
             "validation": ShardWriter(
                 output_dir / "validation",
                 self.proc_cfg["shard_size"],
-                file_path.stem
+                file_path.stem,
+                self.np_dtype
             ),
             "test": ShardWriter(
                 output_dir / "test",
                 self.proc_cfg["shard_size"], 
-                file_path.stem
+                file_path.stem,
+                self.np_dtype
             )
         }
         
@@ -2538,7 +2392,7 @@ class CorePreprocessor:
             sys.exit(1) 
 
         globals_dict = {key: float(group.attrs[key]) for key in self.global_vars}
-        profile = np.empty((n_t, self.n_vars), dtype=np.float64)
+        profile = np.empty((n_t, self.n_vars), dtype=self.np_dtype)
 
         try:
             for i, var_name in enumerate(self.var_order):
@@ -2564,7 +2418,7 @@ class CorePreprocessor:
             return None
         
         n_inputs = self.n_species + self.n_globals + 1
-        samples = np.empty((n_t - 1, n_inputs + self.n_target_species), dtype=np.float64)
+        samples = np.empty((n_t - 1, n_inputs + self.n_target_species), dtype=self.np_dtype)
         
         # Initial species
         samples[:, :self.n_species] = norm_prof[0, self.species_indices] 
@@ -2594,7 +2448,7 @@ class CorePreprocessor:
             return None
         
         n_inputs  = self.n_species + self.n_globals + 1
-        samples   = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float64)
+        samples   = np.empty((n_t - 1, n_inputs + self.n_species), dtype=self.np_dtype)
 
         norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(raw_prof)).numpy()
         samples[:, :self.n_species]                   = norm_prof[0, self.species_indices]
@@ -2613,7 +2467,7 @@ class CorePreprocessor:
         clamp_val   = self.norm_cfg.get("clamp_value", 50.0)
         min_std     = self.norm_cfg.get("min_std", 1e-10)
 
-        normd = np.empty_like(log_ratios, dtype=np.float64)
+        normd = np.empty_like(log_ratios, dtype=self.np_dtype)
 
         for i, var in enumerate(self.species_vars):
             method = methods_cfg.get(var, default_m)
@@ -2758,7 +2612,9 @@ class DataPreprocessor:
         total_report = {
             "total_profiles": 0,
             "profiles_kept": 0,
-            "dropped_reasons": defaultdict(int)
+            "dropped_reasons": defaultdict(int),
+            "all_found_variables": set(),
+            "all_found_global_attrs": set(),
         }
 
         with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
@@ -2774,6 +2630,8 @@ class DataPreprocessor:
                 # Aggregate the reports ---
                 total_report["total_profiles"] += worker_report["total_profiles"]
                 total_report["profiles_kept"] += worker_report["profiles_kept"]
+                total_report["all_found_variables"].update(worker_report["found_variables"])
+                total_report["all_found_global_attrs"].update(worker_report["found_global_attrs"])
                 for reason, num in worker_report["dropped_reasons"].items():
                     total_report["dropped_reasons"][reason] += num
 
@@ -2802,12 +2660,57 @@ class DataPreprocessor:
             "read_error": "Could not read a dataset from the HDF5 group"
         }
 
+        # Get expected variables from config
+        expected_species = set(self.config["data"]["species_variables"])
+        expected_globals = set(self.config["data"]["global_variables"])
+        expected_time = {self.config["data"]["time_variable"]}
+        
+        # Get found variables
+        found_variables = report["all_found_variables"]
+        found_globals = report["all_found_global_attrs"]
+        
+        # Check for mismatches
+        missing_species = expected_species - found_variables
+        missing_time = expected_time - found_variables
+        missing_globals = expected_globals - found_globals
+        
+        extra_variables = found_variables - expected_species - expected_time
+        extra_globals = found_globals - expected_globals - {"SEED"}  # SEED is allowed
+
         with open(summary_path, 'w') as f:
             f.write("="*60 + "\n")
             f.write("      Data Preprocessing Summary\n")
             f.write("="*60 + "\n\n")
             f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Raw Files Processed: {len(self.raw_files)}\n\n")
+            
+            # Variable analysis section
+            f.write("--- Variable Analysis ---\n")
+            f.write("Expected Variables:\n")
+            f.write(f"  Species ({len(expected_species)}): {sorted(expected_species)}\n")
+            f.write(f"  Globals ({len(expected_globals)}): {sorted(expected_globals)}\n")
+            f.write(f"  Time: {list(expected_time)}\n\n")
+            
+            f.write("Found in HDF5 Files:\n")
+            f.write(f"  Dataset Variables ({len(found_variables)}): {sorted(found_variables)}\n")
+            f.write(f"  Global Attributes ({len(found_globals)}): {sorted(found_globals)}\n\n")
+            
+            # Report any issues
+            if missing_species or missing_time or missing_globals or extra_variables or extra_globals:
+                f.write("!!! VARIABLE MISMATCHES DETECTED !!!\n")
+                if missing_species:
+                    f.write(f"  MISSING Species Variables: {sorted(missing_species)}\n")
+                if missing_time:
+                    f.write(f"  MISSING Time Variable: {sorted(missing_time)}\n")
+                if missing_globals:
+                    f.write(f"  MISSING Global Attributes: {sorted(missing_globals)}\n")
+                if extra_variables:
+                    f.write(f"  EXTRA Dataset Variables (not in config): {sorted(extra_variables)}\n")
+                if extra_globals:
+                    f.write(f"  EXTRA Global Attributes (not in config): {sorted(extra_globals)}\n")
+                f.write("\n")
+            else:
+                f.write("✓ All expected variables found correctly\n\n")
 
             f.write("--- Profile Filtering --- \n")
             f.write(f"Total Profiles Found:     {report['total_profiles']:,}\n")
@@ -2829,10 +2732,11 @@ class DataPreprocessor:
 
 class ShardWriter:
     """Writes numpy arrays to shard files, handling buffering and file naming."""
-    def __init__(self, output_dir: Path, shard_size: int, shard_idx_base: str):
+    def __init__(self, output_dir: Path, shard_size: int, shard_idx_base: str, dtype: np.dtype):
         self.output_dir = output_dir
         self.shard_size = shard_size
         self.shard_idx_base = shard_idx_base
+        self.dtype = dtype
         self.buffer: List[np.ndarray] = []
         self.buffer_size = 0
         self.local_shard_id = 0
@@ -2843,8 +2747,8 @@ class ShardWriter:
 
     def add_samples(self, samples: np.ndarray):
         """Simplified add_samples without tracking global indices."""
-        if samples.dtype != np.float64:
-            samples = samples.astype(np.float64)
+        if samples.dtype != self.dtype:
+            samples = samples.astype(self.dtype)
         
         self.buffer.append(samples)
         self.buffer_size += samples.shape[0]
@@ -2878,7 +2782,7 @@ class ShardWriter:
         self.buffer_size = sum(arr.shape[0] for arr in self.buffer)
 
         # Write shard
-        data = np.concatenate(rows_to_write).astype(np.float64, copy=False)
+        data = np.concatenate(rows_to_write).astype(self.dtype, copy=False)
         
         final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
         tmp_path = final_path.with_suffix(".tmp.npy")
@@ -2903,7 +2807,7 @@ class ShardWriter:
         self.buffer = []
         self.buffer_size = 0
 
-        data = np.concatenate(rows_to_write).astype(np.float64, copy=False)
+        data = np.concatenate(rows_to_write).astype(self.dtype, copy=False)
         final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
         tmp_path   = final_path.with_suffix(".tmp.npy")
         np.save(tmp_path, data, allow_pickle=False)
@@ -2922,7 +2826,7 @@ class ShardWriter:
 def shard_worker_split_aware(file_path, config, norm_stats, output_dir):
     """Worker function that creates split-specific shards."""
     processor = CorePreprocessor(config, norm_stats)
-    return processor.process_file_for_shards(Path(file_path), Path(output_dir))   
+    return processor.process_file_for_shards(Path(file_path), Path(output_dir))
 
 ===== /Users/imalsky/Desktop/Chemulator/src/data/dataset.py =====
 #!/usr/bin/env python3
@@ -2934,13 +2838,12 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Dict, Any, Tuple, Optional
 import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import math
-from functools import lru_cache
 
 
 class NPYDataset(Dataset):
@@ -2957,6 +2860,11 @@ class NPYDataset(Dataset):
         self.config = config
         self.device = device
         self.logger = logging.getLogger(__name__)
+
+        # Get dtype from config
+        dtype_str = self.config["system"].get("dtype", "float32")
+        self.dtype = getattr(torch, dtype_str)
+        self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
 
         # Verify split directory exists
         if not self.split_dir.exists():
@@ -2989,8 +2897,9 @@ class NPYDataset(Dataset):
         self._shard_starts = np.array([s["start_idx"] for s in self.shards])
         self._shard_ends = np.array([s["end_idx"] for s in self.shards])
         
-        # Memory info
-        self.bytes_per_sample = self.n_features * 8
+        # Memory info - use configured dtype size
+        bytes_per_element = 4 if dtype_str == "float32" else 8
+        self.bytes_per_sample = self.n_features * bytes_per_element
         self.total_bytes = self.n_total_samples * self.bytes_per_sample
         
         # Initialize caching
@@ -3017,17 +2926,17 @@ class NPYDataset(Dataset):
         if needed_gb > free_gb * 0.85:     
             self.logger.warning(
                 f"Insufficient GPU memory for {self.split_name}: "
-                f"need {needed_gb:.1f} GB, have {free_gb:.1f} GB.  Falling back to CPU."
+                f"need {needed_gb:.1f} GB, have {free_gb:.1f} GB.  Falling back to CPU."
             )
             self.cpu_fallback = True
             return
 
-        self.logger.info(f"Loading {self.split_name} dataset to GPU ({needed_gb:.1f} GB)…")
+        self.logger.info(f"Loading {self.split_name} dataset to GPU ({needed_gb:.1f} GB)…")
         start = time.time()
 
         self.gpu_cache = torch.empty(
             (self.n_total_samples, self.n_features),
-            dtype=torch.float64,
+            dtype=self.dtype,
             device=self.device,
         )
 
@@ -3036,9 +2945,9 @@ class NPYDataset(Dataset):
             shard_path = self.split_dir / shard["filename"]
             if self.shard_index.get("compression") == "npz":
                 with np.load(shard_path) as zf:
-                    data = zf["data"].astype(np.float64, copy=False)
+                    data = zf["data"].astype(self.np_dtype, copy=False)
             else:
-                data = np.load(shard_path).astype(np.float64, copy=False)
+                data = np.load(shard_path).astype(self.np_dtype, copy=False)
 
             n = data.shape[0]
             self.gpu_cache[cur:cur + n] = torch.from_numpy(data).pin_memory().to(self.device, non_blocking=True)
@@ -3047,7 +2956,7 @@ class NPYDataset(Dataset):
 
         torch.cuda.synchronize()
         t = time.time() - start
-        self.logger.info(f"GPU cache loaded in {t:.1f}s ({needed_gb/t:.1f} GB/s)")
+        self.logger.info(f"GPU cache loaded in {t:.1f}s ({needed_gb/t:.1f} GB/s)")
 
     def _load_shard_cpu(self, shard_idx: int) -> np.ndarray:
         """Load a shard from disk (CPU fallback)."""
@@ -3068,9 +2977,9 @@ class NPYDataset(Dataset):
         
         if self.shard_index.get("compression") == "npz":
             with np.load(shard_path) as zf:
-                return zf["data"].astype(np.float64, copy=False)
+                return zf["data"].astype(self.np_dtype, copy=False)
         else:
-            return np.load(shard_path).astype(np.float64, copy=False)
+            return np.load(shard_path).astype(self.np_dtype, copy=False)
 
     def __len__(self) -> int:
         """Return the total number of samples."""
@@ -3095,10 +3004,9 @@ class NPYDataset(Dataset):
             shard_data = self._load_shard_cpu(shard_idx)
             row = shard_data[local_idx]
             
-            # Return CPU tensors. The batch will be moved to the GPU
-            # all at once by the dataloader / training loop.
-            input_tensor = torch.from_numpy(row[:self.n_inputs].copy()).double()
-            target_tensor = torch.from_numpy(row[self.n_inputs:].copy()).double()
+            # Return CPU tensors with configured dtype
+            input_tensor = torch.from_numpy(row[:self.n_inputs].copy()).to(self.dtype)
+            target_tensor = torch.from_numpy(row[self.n_inputs:].copy()).to(self.dtype)
             
             return input_tensor, target_tensor
 
@@ -3416,6 +3324,8 @@ class NormalizationHelper:
     def __init__(self, stats: Dict[str, Any], device: torch.device, 
                  species_vars: List[str], global_vars: List[str], 
                  time_var: str, config: Optional[Dict[str, Any]] = None):
+        dtype_name = (config or {}).get("system", {}).get("dtype", "float32")
+        self.torch_dtype = torch.float64 if dtype_name == "float64" else torch.float32
         self.stats = stats
         self.device = device
         self.species_vars = species_vars
@@ -3427,7 +3337,9 @@ class NormalizationHelper:
         self.methods = stats["normalization_methods"]
         self.per_key_stats = stats["per_key_stats"]
 
-        self.epsilon = stats.get("epsilon", DEFAULT_EPSILON)
+        self.epsilon = torch.tensor(stats.get("epsilon", DEFAULT_EPSILON),
+                                    dtype=self.torch_dtype,
+                                    device=self.device).item()
         self.clamp_value = stats.get("clamp_value", DEFAULT_CLAMP)
         
         self.ratio_stats = stats.get("ratio_stats", None)
@@ -3451,11 +3363,12 @@ class NormalizationHelper:
 
             if "standard" in method:
                 mean_key, std_key = ("log_mean", "log_std") if "log" in method else ("mean", "std")
-                params["mean"] = torch.tensor(var_stats[mean_key], dtype=torch.float64, device=self.device)
-                params["std"] = torch.tensor(var_stats[std_key], dtype=torch.float64, device=self.device)
+                params["mean"] = torch.tensor(var_stats[mean_key], dtype=self.torch_dtype, device=self.device)
+                params["std"]  = torch.tensor(var_stats[std_key],  dtype=self.torch_dtype, device=self.device)
+
             elif "min-max" in method:
-                params["min"] = torch.tensor(var_stats["min"], dtype=torch.float64, device=self.device)
-                params["max"] = torch.tensor(var_stats["max"], dtype=torch.float64, device=self.device)
+                params["min"] = torch.tensor(var_stats["min"], dtype=self.torch_dtype, device=self.device)
+                params["max"] = torch.tensor(var_stats["max"], dtype=self.torch_dtype, device=self.device)
 
             self.norm_params[var] = params
             self.method_groups[method].append(var)
@@ -3519,8 +3432,10 @@ class NormalizationHelper:
         device = standardized_log_ratios.device
         initial_species = initial_species.to(device)
 
-        ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in self.species_vars], device=device, dtype=torch.float64)
-        ratio_stds = torch.tensor([self.ratio_stats[var]["std"] for var in self.species_vars], device=device, dtype=torch.float64)
+        ratio_means = torch.tensor([self.ratio_stats[var]["mean"] for var in self.species_vars],
+                                   device=device, dtype=self.torch_dtype)
+        ratio_stds  = torch.tensor([self.ratio_stats[var]["std"]  for var in self.species_vars],
+                                   device=device, dtype=self.torch_dtype)
         
         log_ratios = (standardized_log_ratios * ratio_stds) + ratio_means
         log_ratios = torch.clamp(log_ratios, min=-38.0, max=38.0)
