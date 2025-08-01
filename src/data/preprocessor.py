@@ -1,48 +1,118 @@
 #!/usr/bin/env python3
 """
-Chemical kinetics data preprocessor. This runs before the rest of the training.
+Chemical kinetics data preprocessor with sequence mode support for LiLaN.
 """
 
 import hashlib
 import logging
-import time
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import h5py
 import numpy as np
 import torch
-import os
-import re
+import json
 import sys
 
 from .normalizer import DataNormalizer, NormalizationHelper
-from utils.utils import save_json
+from utils.utils import save_json, load_json
 
 DEFAULT_EPSILON_MIN = 1e-38
 DEFAULT_EPSILON_MAX = 1e38
 
+
+class SequenceShardWriter:
+    """Writes trajectory sequences to NPZ shards."""
+    def __init__(self, output_dir: Path, shard_size: int, shard_idx_base: str, 
+                 M: int, n_species: int, n_globals: int, dtype: np.dtype):
+        self.output_dir = output_dir
+        self.shard_size = shard_size
+        self.shard_idx_base = shard_idx_base
+        self.M = M
+        self.n_species = n_species
+        self.n_globals = n_globals
+        self.dtype = dtype
+        self.buffer = []
+        self.shard_id = 0
+        self.shard_metadata = []
+        
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+    
+    def add_trajectory(self, x0_log: np.ndarray, globals: np.ndarray, 
+                      t_vec: np.ndarray, y_mat: np.ndarray):
+        """Add a trajectory to buffer."""
+        trajectory = {
+            'x0_log': x0_log.astype(self.dtype),
+            'globals': globals.astype(self.dtype),
+            't_vec': t_vec.astype(self.dtype),
+            'y_mat': y_mat.astype(self.dtype)
+        }
+        self.buffer.append(trajectory)
+        
+        if len(self.buffer) >= self.shard_size:
+            self._write_shard()
+    
+    def _write_shard(self):
+        """Write buffered trajectories to NPZ file."""
+        if not self.buffer:
+            return
+            
+        # Stack all trajectories
+        x0_log = np.stack([t['x0_log'] for t in self.buffer])
+        globals = np.stack([t['globals'] for t in self.buffer])
+        t_vec = np.stack([t['t_vec'] for t in self.buffer])
+        y_mat = np.stack([t['y_mat'] for t in self.buffer])
+        
+        # Write NPZ
+        filename = f"shard_{self.shard_idx_base}_{self.shard_id:04d}.npz"
+        filepath = self.output_dir / filename
+        np.savez_compressed(
+            filepath,
+            x0_log=x0_log,
+            globals=globals,
+            t_vec=t_vec,
+            y_mat=y_mat
+        )
+        
+        self.shard_metadata.append({
+            "filename": filename,
+            "n_samples": len(self.buffer)
+        })
+        
+        self.buffer = []
+        self.shard_id += 1
+    
+    def flush(self):
+        """Write any remaining trajectories."""
+        if self.buffer:
+            self._write_shard()
+
+
 class CorePreprocessor:
-    """A lightweight helper class containing only the logic needed within a worker."""
+    """Core preprocessing logic with sequence mode support."""
     def __init__(self, config: Dict[str, Any], norm_stats: Optional[Dict[str, Any]] = None):
         self.logger = logging.getLogger(__name__)
-
+        self.config = config
+        
         self.data_cfg = config["data"]
         self.norm_cfg = config["normalization"]
         self.train_cfg = config["training"]
         self.pred_cfg = config.get("prediction", {})
         self.proc_cfg = config["preprocessing"]
         self.system_cfg = config["system"]
-
-        # Get dtype from config
+        
+        # Get sequence mode settings
+        self.sequence_mode = self.data_cfg.get("sequence_mode", False)
+        self.M_per_sample = self.data_cfg.get("M_per_sample", 16)
+        self.time_sampling = self.data_cfg.get("time_sampling", {"uniform": 1.0})
+        
+        # Get dtype
         dtype_str = self.system_cfg.get("dtype", "float32")
         self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
-
+        
+        # Variables
         self.species_vars = self.data_cfg["species_variables"]
         self.target_species_vars = self.data_cfg.get("target_species_variables", self.species_vars)
-
         self.global_vars = self.data_cfg["global_variables"]
         self.time_var = self.data_cfg["time_variable"]
         self.var_order = self.species_vars + self.global_vars + [self.time_var]
@@ -53,298 +123,105 @@ class CorePreprocessor:
         self.n_vars = self.n_species + self.n_globals + 1
         
         self.min_value_threshold = self.proc_cfg.get("min_value_threshold", 1e-30)
-        
         self.prediction_mode = self.pred_cfg.get("mode", "absolute")
+        
         self.normalizer = DataNormalizer(config)
         self.norm_stats = norm_stats or {}
         
-        # Create index mappings for robust variable ordering
         self._create_index_mappings()
         
         if norm_stats:
-            self.norm_helper = NormalizationHelper(norm_stats, torch.device("cpu"), 
-                                                   self.species_vars,self.global_vars, self.time_var, config)
+            self.norm_helper = NormalizationHelper(
+                norm_stats, torch.device("cpu"),
+                self.species_vars, self.global_vars, self.time_var, config
+            )
     
     def _create_index_mappings(self):
-        """Create index mappings for robust variable access"""
+        """Create index mappings for robust variable access."""
         self.var_to_idx = {var: i for i, var in enumerate(self.var_order)}
         self.species_indices = [self.var_to_idx[var] for var in self.species_vars]
         self.target_species_indices = [self.var_to_idx[var] for var in self.target_species_vars]
         self.global_indices = [self.var_to_idx[var] for var in self.global_vars]
         self.time_idx = self.var_to_idx[self.time_var]
-
+    
+    def _sample_times(self, t_min: float, t_max: float) -> np.ndarray:
+        """Sample M time points according to time_sampling config."""
+        if isinstance(self.time_sampling, dict):
+            # Mixed sampling
+            uniform_frac = self.time_sampling.get("uniform", 0.5)
+            log_frac = self.time_sampling.get("log_spaced", 0.5)
+            
+            n_uniform = int(self.M_per_sample * uniform_frac)
+            n_log = self.M_per_sample - n_uniform
+            
+            # Uniform samples
+            t_uniform = np.linspace(t_min, t_max, n_uniform)
+            
+            # Log-spaced samples  
+            if n_log > 0:
+                log_min = np.log10(max(t_min, 1e-10))
+                log_max = np.log10(t_max)
+                t_log = np.logspace(log_min, log_max, n_log)
+            else:
+                t_log = np.array([])
+            
+            # Combine and sort
+            times = np.concatenate([t_uniform, t_log])
+            times = np.unique(np.sort(times))
+            
+            # Ensure we have exactly M samples
+            if len(times) > self.M_per_sample:
+                times = times[:self.M_per_sample]
+            elif len(times) < self.M_per_sample:
+                # Pad with linspace
+                extra = self.M_per_sample - len(times)
+                t_extra = np.linspace(t_min, t_max, extra + 2)[1:-1]
+                times = np.sort(np.concatenate([times, t_extra]))
+                
+        else:
+            # Simple uniform sampling
+            times = np.linspace(t_min, t_max, self.M_per_sample)
+            
+        return times
+    
     def _is_profile_valid(self, group: h5py.Group) -> Tuple[bool, str]:
-        """
-        Checks if a profile is valid according to criteria in config.
-        Returns (is_valid, reason_for_failure_or_success).
-        """
-        # Validate every variable (species + globals + time)
+        """Check if a profile is valid."""
         required_keys = self.species_vars + [self.time_var]
         if not set(required_keys).issubset(group.keys()):
             return False, "missing_keys"
-
-        # Check each dataset for NaNs, Infs, and value thresholds
+        
         for var in required_keys:
             try:
                 data = group[var][:]
             except Exception:
                 return False, "read_error"
-
+            
             if not np.all(np.isfinite(data)):
                 return False, "non_finite"
-
-            # Drop profile if any value is less than or equal to threshold
+                
             if np.any(data <= self.min_value_threshold):
                 return False, "below_threshold"
-
+                
         return True, "valid"
     
-    def process_file_for_stats(self, file_path: Path) -> Tuple[Dict[str, Dict], Dict[str, Dict], int, Dict]:
-        """Get a report of the raw data"""
-        accumulators = self.normalizer._initialize_accumulators()
-
-        ratio_accumulators: Dict[str, Dict[str, Any]] = {}
-        if self.prediction_mode == "ratio":
-            for v in self.species_vars:
-                raw_method = self.normalizer._get_method(v)
-                ratio_method = raw_method[4:] if raw_method.startswith("log-") else raw_method
-                ratio_accumulators[v] = {
-                    "method": ratio_method,
-                    "count": 0,
-                    "mean": 0.0,
-                    "m2":   0.0,
-                    "min":  float("inf"),
-                    "max":  float("-inf"),
-                }
-
-        valid_sample_count = 0
-        report = {
-            "total_profiles":   0,
-            "profiles_kept":    0,
-            "dropped_reasons":  defaultdict(int),
-            "found_variables": set(),
-            "found_global_attrs": set(),
-        }
-
-        with h5py.File(file_path, "r") as f:
-            for gname in sorted(f.keys()):
-                report["total_profiles"] += 1
-                grp = f[gname]
-
-                # Track found variables
-                report["found_variables"].update(grp.keys())
-                report["found_global_attrs"].update(grp.attrs.keys())
-
-                # dataset‑level validation
-                is_ok, reason = self._is_profile_valid(grp)
-                if not is_ok:
-                    report["dropped_reasons"][reason] += 1
-                    continue
-
-                # deterministic down‑sampling
-                # check if whole dataset is being used
-                if self.train_cfg["use_fraction"] < 1.0:
-                    h = int(hashlib.sha256(gname.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
-                    if h >= self.train_cfg["use_fraction"]:
-                        continue
-
-                n_t = grp[self.time_var].shape[0]
-                if n_t <= 1:
-                    report["dropped_reasons"]["too_few_timesteps"] += 1
-                    continue
-
-                # assemble full profile (species + globals + time)
-                profile = self._extract_profile(grp, gname, n_t)
-                if profile is None:
-                    report["dropped_reasons"]["extract_profile_failed"] += 1
-                    continue
-
-                # final profile‑level check
-                if (np.any(~np.isfinite(profile)) or
-                    np.any(profile <= self.min_value_threshold)):
-                    report["dropped_reasons"]["below_threshold"] += 1
-                    continue
-
-                # update statistics
-                report["profiles_kept"] += 1
-                valid_sample_count += (n_t - 1)
-                self._update_stats_for_profile(
-                    profile, n_t,
-                    accumulators,
-                    ratio_accumulators,
-                )
-
-        return accumulators, ratio_accumulators, valid_sample_count, report
-
-    def process_file_for_shards(self, file_path: Path, output_dir: Path) -> Dict[str, Any]:
-        """Process file and write to split-specific shard directories."""
-        # Create separate shard writers for each split
-        shard_writers = {
-            "train": ShardWriter(
-                output_dir / "train", 
-                self.proc_cfg["shard_size"], 
-                file_path.stem,
-                self.np_dtype
-            ),
-            "validation": ShardWriter(
-                output_dir / "validation",
-                self.proc_cfg["shard_size"],
-                file_path.stem,
-                self.np_dtype
-            ),
-            "test": ShardWriter(
-                output_dir / "test",
-                self.proc_cfg["shard_size"], 
-                file_path.stem,
-                self.np_dtype
-            )
-        }
-        
-        # Track samples per split
-        split_counts = {"train": 0, "validation": 0, "test": 0}
-        
-        # Process file
-        with h5py.File(file_path, "r") as f:
-            for gname in sorted(f.keys()):
-                # Validation checks
-                is_valid, _ = self._is_profile_valid(f[gname])
-                if not is_valid:
-                    continue
-                
-                # Use fraction check
-                use_fraction = self.train_cfg["use_fraction"]
-                if use_fraction < 1.0:
-                    hash_val = int(hashlib.sha256(gname.encode('utf-8')).hexdigest()[:8], 16) / 0xFFFFFFFF
-                    if hash_val >= use_fraction:
-                        continue
-                
-                # Process profile
-                grp = f[gname]
-                n_t = grp[self.time_var].shape[0]
-                if n_t <= 1:
-                    continue
-                    
-                profile = self._extract_profile(grp, gname, n_t)
-                if profile is None:
-                    continue
-
-                if (np.any(~np.isfinite(profile)) or
-                    np.any(profile <= self.min_value_threshold)):
-                    continue
-
-                # Determine split
-                p = int(hashlib.sha256((gname + "_split").encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
-                test_frac = self.train_cfg["test_fraction"]
-                val_frac = self.train_cfg["val_fraction"]
-                
-                if p < test_frac:
-                    split_key = "test"
-                elif p < test_frac + val_frac:
-                    split_key = "validation"
-                else:
-                    split_key = "train"
-                
-                # Convert profile to samples
-                if self.prediction_mode == "ratio":
-                    samples = self._profile_to_samples_ratio(profile, n_t, self.norm_stats.get("ratio_stats", {}))
-                else:
-                    norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(profile)).numpy()
-                    samples = self._profile_to_samples(norm_prof, n_t)
-                
-                if samples is not None:
-                    # Add to appropriate writer - no need to track indices
-                    shard_writers[split_key].add_samples(samples)
-                    split_counts[split_key] += samples.shape[0]
-        
-        # Flush all writers
-        for writer in shard_writers.values():
-            writer.flush()
-        
-        # Return metadata
-        return {
-            "splits": {
-                "train": {
-                    "shards": shard_writers["train"].get_shard_metadata(),
-                    "samples_written": split_counts["train"]
-                },
-                "validation": {
-                    "shards": shard_writers["validation"].get_shard_metadata(),
-                    "samples_written": split_counts["validation"]
-                },
-                "test": {
-                    "shards": shard_writers["test"].get_shard_metadata(),
-                    "samples_written": split_counts["test"]
-                }
-            }
-        }
-
-    def _update_stats_for_profile(self, profile, n_t, accumulators, ratio_accumulators):
-        """Consistent normalization in both modes."""
-        if self.prediction_mode == "ratio":
-            # Use full profiles for all variables in ratio mode
-            for var, acc in accumulators.items():
-                idx = acc["index"]
-                method = acc["method"]
-                
-                # Use full profile data for all variables (not just initial timestep)
-                if var == self.time_var and n_t > 1:
-                    vec = profile[1:, idx]
-                else:
-                    vec = profile[:, idx]
-                
-                if vec.size > 0:
-                    self.normalizer._update_single_accumulator(acc, vec, var)
-            
-            # Compute ratio statistics correctly with proper indices
-            initial = profile[0, self.species_indices]
-            future = profile[1:, self.species_indices]
-            
-            ratios = future / np.maximum(initial[None, :], self.normalizer.epsilon)
-            ratios = np.clip(ratios, -DEFAULT_EPSILON_MAX, DEFAULT_EPSILON_MAX)
-            log_ratios = np.sign(ratios) * np.log10( np.clip(np.abs(ratios), DEFAULT_EPSILON_MIN, DEFAULT_EPSILON_MAX))
-
-
-            for i, var_name in enumerate(self.species_vars):
-                self.normalizer._update_single_accumulator(ratio_accumulators[var_name], log_ratios[:, i], var_name)
-        else:
-            # Absolute mode
-            for var, acc in accumulators.items():
-                idx = acc["index"]
-                vec = profile[1:, idx] if (var == self.time_var and n_t > 1) else profile[:, idx]
-                if vec.size > 0:
-                    self.normalizer._update_single_accumulator(acc, vec, var)
-    
-
-
     def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> Optional[np.ndarray]:
-        """
-        Extracts a full data profile from an HDF5 group with strict validation.
-        """
-
+        """Extract a full data profile from an HDF5 group."""
         config_globals = set(self.global_vars)
         group_attrs = set(group.attrs.keys())
         
         if 'SEED' in group_attrs:
             group_attrs.remove('SEED')
-
-        globals_missing_from_attrs = config_globals - group_attrs
-        attrs_not_in_globals = group_attrs - config_globals
         
-        if globals_missing_from_attrs or attrs_not_in_globals:
-            self.logger.critical(f"MISMATCH in HDF5 attributes for group: '{gname}'")
-            if globals_missing_from_attrs:
-                self.logger.critical(f"CONFIG ERROR: The following variables" 
-                                     f"are in your config but MISSING from the HDF5"
-                                     f"attributes: {list(globals_missing_from_attrs)}")
-            if attrs_not_in_globals:
-                self.logger.critical(f"DATA ERROR: The following HDF5 attributes are"
-                                     f"UNUSED in your config's 'global_variables': {list(attrs_not_in_globals)}")
-            self.logger.critical("  > Program will now terminate to enforce data integrity.")
-            sys.exit(1) 
-
+        globals_missing = config_globals - group_attrs
+        attrs_extra = group_attrs - config_globals
+        
+        if globals_missing or attrs_extra:
+            self.logger.critical(f"Global variable mismatch in group '{gname}'")
+            sys.exit(1)
+        
         globals_dict = {key: float(group.attrs[key]) for key in self.global_vars}
         profile = np.empty((n_t, self.n_vars), dtype=self.np_dtype)
-
+        
         try:
             for i, var_name in enumerate(self.var_order):
                 if var_name in group:
@@ -352,429 +229,302 @@ class CorePreprocessor:
                 elif var_name in globals_dict:
                     profile[:, i] = globals_dict[var_name]
                 else:
-                    self.logger.error(f"FATAL LOGIC ERROR for group '{gname}'"
-                                      f"Variable '{var_name}' was not found."
-                                      f"Please check the preprocessor code.")
+                    self.logger.error(f"Variable '{var_name}' not found")
                     sys.exit(1)
-
         except Exception as e:
-            self.logger.error(f"Failed to read dataset while assembling profile for group '{gname}': {e}")
+            self.logger.error(f"Failed to read profile: {e}")
             return None
-
+            
         return profile
-
-    def _profile_to_samples(self, norm_prof, n_t):
-        """Build (n_t‑1) samples for absolute mode."""
-        if n_t <= 1:
-            return None
+    
+    def process_file_for_sequence_shards(self, file_path: Path, output_dir: Path) -> Dict[str, Any]:
+        """Process file and write sequence-mode shards."""
+        # Create shard writers for each split
+        writers = {}
+        for split in ["train", "validation", "test"]:
+            writers[split] = SequenceShardWriter(
+                output_dir / split,
+                self.proc_cfg["shard_size"] // self.M_per_sample,  # Adjust for sequences
+                file_path.stem,
+                self.M_per_sample,
+                self.n_species,
+                self.n_globals,
+                self.np_dtype
+            )
         
-        n_inputs = self.n_species + self.n_globals + 1
-        samples = np.empty((n_t - 1, n_inputs + self.n_target_species), dtype=self.np_dtype)
+        split_counts = {"train": 0, "validation": 0, "test": 0}
         
-        # Initial species
-        samples[:, :self.n_species] = norm_prof[0, self.species_indices] 
-
-        # Globals
-        samples[:, self.n_species:self.n_species + self.n_globals] = norm_prof[0, self.global_indices]
-
-        # Time
-        samples[:, n_inputs - 1] = norm_prof[1:, self.time_idx]
-
-        # Target species
-        samples[:, n_inputs:] = norm_prof[1:, self.target_species_indices]
+        with h5py.File(file_path, "r") as f:
+            for gname in sorted(f.keys()):
+                # Validation
+                is_valid, _ = self._is_profile_valid(f[gname])
+                if not is_valid:
+                    continue
+                
+                # Use fraction check
+                if self.train_cfg["use_fraction"] < 1.0:
+                    hash_val = int(hashlib.sha256(gname.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+                    if hash_val >= self.train_cfg["use_fraction"]:
+                        continue
+                
+                # Extract profile
+                grp = f[gname]
+                n_t = grp[self.time_var].shape[0]
+                if n_t <= self.M_per_sample:
+                    continue
+                    
+                profile = self._extract_profile(grp, gname, n_t)
+                if profile is None:
+                    continue
+                
+                # Sample M time points
+                time_data = profile[:, self.time_idx]
+                t_min, t_max = time_data.min(), time_data.max()
+                sampled_times = self._sample_times(t_min, t_max)
+                
+                # Find indices for sampled times
+                time_indices = []
+                for t in sampled_times:
+                    idx = np.argmin(np.abs(time_data - t))
+                    time_indices.append(idx)
+                time_indices = np.array(time_indices)
+                
+                # Extract data at sampled times
+                x0 = profile[0, self.species_indices]
+                globals_vec = profile[0, self.global_indices]
+                
+                # Log transform species
+                x0_log = np.log10(np.maximum(x0, self.norm_cfg.get("epsilon", 1e-30)))
+                
+                # Get targets at sampled times
+                y_mat = profile[time_indices][:, self.target_species_indices]
+                y_mat_log = np.log10(np.maximum(y_mat, self.norm_cfg.get("epsilon", 1e-30)))
+                
+                # Normalize time globally (will be done after collecting stats)
+                t_vec = profile[time_indices, self.time_idx]
+                
+                # Determine split
+                split_hash = int(hashlib.sha256((gname + "_split").encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+                test_frac = self.train_cfg["test_fraction"]
+                val_frac = self.train_cfg["val_fraction"]
+                
+                if split_hash < test_frac:
+                    split = "test"
+                elif split_hash < test_frac + val_frac:
+                    split = "validation"
+                else:
+                    split = "train"
+                
+                # Add to writer
+                writers[split].add_trajectory(x0_log, globals_vec, t_vec, y_mat_log)
+                split_counts[split] += 1
         
-        return samples
-
-    def _profile_to_samples_ratio(
-        self, raw_prof: np.ndarray, n_t: int, ratio_stats: Dict[str, Dict]
-    ) -> Optional[np.ndarray]:
-        """
-        Build (n_t‑1) samples for ratio‑prediction mode.
-        raw_prof is **unnormalised** profile array  shape = (n_t, n_vars)
-        ratio_stats contains mean/std/min/max for log‑ratios (already computed)
-        """
-        logger = logging.getLogger(__name__)
-
-        if n_t <= 1:
-            return None
+        # Flush all writers
+        for writer in writers.values():
+            writer.flush()
         
-        n_inputs  = self.n_species + self.n_globals + 1
-        samples   = np.empty((n_t - 1, n_inputs + self.n_species), dtype=self.np_dtype)
+        # Collect metadata
+        metadata = {
+            "splits": {}
+        }
+        for split in ["train", "validation", "test"]:
+            metadata["splits"][split] = {
+                "shards": writers[split].shard_metadata,
+                "n_trajectories": split_counts[split],
+                "total_samples": split_counts[split]  # In sequence mode, 1 trajectory = 1 sample
+            }
+            
+        return metadata
+    
+    def collect_time_stats(self, file_paths: List[Path]) -> Dict[str, float]:
+        """Collect global time statistics for normalization."""
+        all_times = []
+        
+        for file_path in file_paths:
+            with h5py.File(file_path, "r") as f:
+                for gname in f.keys():
+                    grp = f[gname]
+                    if self.time_var in grp:
+                        times = grp[self.time_var][:]
+                        # Filter out very small times
+                        times = times[times > 1e-10]
+                        if len(times) > 0:
+                            all_times.append(times)
+        
+        if not all_times:
+            raise ValueError("No valid time data found")
+            
+        all_times = np.concatenate(all_times)
+        
+        # Compute tau0 (5th percentile of non-zero times)
+        tau0 = np.percentile(all_times, 5)
+        
+        # Apply log transform
+        tau = np.log(1 + all_times / tau0)
+        
+        return {
+            "tau0": float(tau0),
+            "tmin": float(tau.min()),
+            "tmax": float(tau.max()),
+            "time_transform": "log_min_max"
+        }
 
-        norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(raw_prof)).numpy()
-        samples[:, :self.n_species]                   = norm_prof[0, self.species_indices]
-        samples[:, self.n_species:self.n_species+self.n_globals] = norm_prof[0, self.global_indices]
-        samples[:, n_inputs - 1]                      = norm_prof[1:, self.time_idx]
-
-        initial = raw_prof[0, self.species_indices]
-        future  = raw_prof[1:, self.species_indices]
-
-        ratios = future / np.maximum(initial[None, :], self.norm_cfg["epsilon"])
-        ratios = np.clip(ratios, -DEFAULT_EPSILON_MAX, DEFAULT_EPSILON_MAX)
-        log_ratios = np.sign(ratios) * np.log10(np.clip(np.abs(ratios), DEFAULT_EPSILON_MIN, DEFAULT_EPSILON_MAX))
-
-        methods_cfg = self.norm_cfg.get("methods", {})
-        default_m   = self.norm_cfg.get("default_method", "standard")
-        clamp_val   = self.norm_cfg.get("clamp_value", 50.0)
-        min_std     = self.norm_cfg.get("min_std", 1e-10)
-
-        normd = np.empty_like(log_ratios, dtype=self.np_dtype)
-
-        for i, var in enumerate(self.species_vars):
-            method = methods_cfg.get(var, default_m)
-            if method.startswith("log-"):
-                method = method[4:]
-
-            stats = ratio_stats[var]
-
-            if method == "min-max":
-                rng = max(stats["max"] - stats["min"], self.norm_cfg["epsilon"])
-                normd[:, i] = (log_ratios[:, i] - stats["min"]) / rng
-            else:
-                std = max(stats["std"], min_std)
-                normd[:, i] = (log_ratios[:, i] - stats["mean"]) / std
-
-        if np.any(np.abs(normd) > clamp_val):
-            n_clamped = np.sum(np.abs(normd) > clamp_val)
-            logger.warning(f"Clamping {n_clamped} normalised log‑ratio values to ±{clamp_val}")
-
-        samples[:, n_inputs:] = np.clip(normd, -clamp_val, clamp_val)
-        return samples
-
-def stats_worker(file_path, config):
-    return CorePreprocessor(config).process_file_for_stats(Path(file_path))
 
 class DataPreprocessor:
-    """Main parent class to orchestrate parallel data preprocessing."""
+    """Main preprocessor with sequence mode support."""
     def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
         self.logger = logging.getLogger(__name__)
-
         self.raw_files = sorted(raw_files)
         self.output_dir = output_dir
-
-        self.processed_dir = self.output_dir
-        self.processed_dir.mkdir(parents=True, exist_ok=True)
-
         self.config = config
         
+        self.sequence_mode = config["data"].get("sequence_mode", False)
         self.normalizer = DataNormalizer(config)
         self.num_workers = config["preprocessing"].get("num_workers", 1)
         self.parallel = self.num_workers > 1 and len(self.raw_files) > 1
-
+        
+        self.processed_dir = output_dir
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+    
     def process_to_npy_shards(self) -> None:
-        """Main entry point - creates split-specific shard directories."""
-        start_time = time.time()
-        self.logger.info(f"Starting core data preprocessing with {len(self.raw_files)} files...")
+        """Process data in sequence mode if enabled."""
+        if self.sequence_mode:
+            self._process_sequence_mode()
+        else:
+            # Original row-wise processing
+            self._process_legacy_mode()
+    
+    def _process_sequence_mode(self):
+        """Process data in sequence mode for LiLaN."""
+        self.logger.info("Processing data in SEQUENCE MODE for multi-time supervision")
         
-        # Collect statistics
-        norm_stats, file_sample_counts, summary_report = self._collect_stats_and_counts()
+        # First collect time statistics
+        processor = CorePreprocessor(self.config)
+        time_stats = processor.collect_time_stats(self.raw_files)
+        self.logger.info(f"Time normalization stats: tau0={time_stats['tau0']:.3e}, "
+                        f"tmin={time_stats['tmin']:.3f}, tmax={time_stats['tmax']:.3f}")
+        
+        # Collect normalization statistics (for species and globals)
+        norm_stats = self._collect_normalization_stats()
+        norm_stats["time_normalization"] = time_stats
         save_json(norm_stats, self.output_dir / "normalization.json")
-
-        # Write split-specific shards
-        split_metadata = self._write_normalized_shards(norm_stats, file_sample_counts)
         
-        # Save split-aware shard index
+        # Process files to sequence shards
+        all_metadata = {"splits": {"train": {"shards": [], "n_trajectories": 0},
+                                  "validation": {"shards": [], "n_trajectories": 0},
+                                  "test": {"shards": [], "n_trajectories": 0}}}
+        
+        for file_path in self.raw_files:
+            processor = CorePreprocessor(self.config, norm_stats)
+            metadata = processor.process_file_for_sequence_shards(file_path, self.processed_dir)
+            
+            # Aggregate metadata
+            for split in ["train", "validation", "test"]:
+                all_metadata["splits"][split]["shards"].extend(metadata["splits"][split]["shards"])
+                all_metadata["splits"][split]["n_trajectories"] += metadata["splits"][split]["n_trajectories"]
+        
+        # Save shard index
         shard_index = {
+            "sequence_mode": True,
+            "M_per_sample": self.config["data"]["M_per_sample"],
             "n_input_species": len(self.config["data"]["species_variables"]),
-            "n_target_species": len(self.config["data"].get("target_species_variables", self.config["data"]["species_variables"])),
+            "n_target_species": len(self.config["data"].get("target_species_variables", 
+                                                           self.config["data"]["species_variables"])),
             "n_globals": len(self.config["data"]["global_variables"]),
-            "samples_per_shard": self.config["preprocessing"]["shard_size"],
-            "compression": self.config["preprocessing"].get("compression"),
+            "compression": "npz",
             "prediction_mode": self.config.get("prediction", {}).get("mode", "absolute"),
-            "splits": split_metadata,
-            "total_samples": sum(meta["total_samples"] for meta in split_metadata.values())
+            "splits": all_metadata["splits"],
+            "time_normalization": time_stats
         }
         save_json(shard_index, self.output_dir / "shard_index.json")
-
-        self._write_summary_log(summary_report, shard_index["total_samples"])
-        self.logger.info(f"Core data preprocessing completed in {time.time() - start_time:.1f}s")
         
-
-    def _write_normalized_shards(self, norm_stats, file_sample_counts) -> Dict[str, List[Dict]]:
-        """Second pass: write split-specific shards to separate directories."""
-        self.logger.info("Writing split-specific shards...")
+        self.logger.info(f"Sequence mode preprocessing complete. "
+                        f"Train: {all_metadata['splits']['train']['n_trajectories']} trajectories, "
+                        f"Val: {all_metadata['splits']['validation']['n_trajectories']}, "
+                        f"Test: {all_metadata['splits']['test']['n_trajectories']}")
+    
+    def _collect_normalization_stats(self) -> Dict[str, Any]:
+        """Collect normalization statistics for species and globals."""
+        # Simplified - just collect min/max/mean/std for each variable
+        stats = {"per_key_stats": {}, "normalization_methods": {}}
         
-        # Create split directories
-        split_dirs = {
-            "train": self.processed_dir / "train",
-            "validation": self.processed_dir / "validation", 
-            "test": self.processed_dir / "test"
-        }
-        for split_name, dir_path in split_dirs.items():
-            dir_path.mkdir(exist_ok=True)
-            self.logger.info(f"Created {split_name} directory: {dir_path}")
-        
-        # Initialize split metadata
-        split_metadata = {
-            "train": {"shards": [], "total_samples": 0},
-            "validation": {"shards": [], "total_samples": 0},
-            "test": {"shards": [], "total_samples": 0}
-        }
+        # Initialize accumulators
+        accumulators = {}
+        for var in self.config["data"]["species_variables"] + self.config["data"]["global_variables"]:
+            accumulators[var] = {
+                "count": 0, "mean": 0.0, "m2": 0.0,
+                "min": float("inf"), "max": float("-inf")
+            }
         
         # Process each file
-        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as exe:
-            futures = []
-            
-            for file_path in self.raw_files:
-                future = exe.submit(
-                    shard_worker_split_aware,
-                    file_path,
-                    self.config,
-                    norm_stats,
-                    self.processed_dir
-                )
-                futures.append((future, file_path))
-            
-            # Collect results
-            for future, file_path in futures:
-                result = future.result()
+        for file_path in self.raw_files:
+            with h5py.File(file_path, "r") as f:
+                for gname in f.keys():
+                    grp = f[gname]
+                    
+                    # Species variables (use log transform)
+                    for var in self.config["data"]["species_variables"]:
+                        if var in grp:
+                            data = grp[var][:]
+                            # Apply log transform
+                            log_data = np.log10(np.maximum(data, 1e-30))
+                            self._update_accumulator(accumulators[var], log_data)
+                    
+                    # Global variables
+                    for var in self.config["data"]["global_variables"]:
+                        if var in grp.attrs:
+                            val = float(grp.attrs[var])
+                            self._update_accumulator(accumulators[var], np.array([val]))
+        
+        # Finalize statistics
+        for var, acc in accumulators.items():
+            if acc["count"] > 0:
+                mean = acc["mean"]
+                variance = acc["m2"] / (acc["count"] - 1) if acc["count"] > 1 else 0
+                std = np.sqrt(variance)
                 
-                # Aggregate metadata by split
-                for split_name in ["train", "validation", "test"]:
-                    split_meta = result["splits"][split_name]
-                    split_metadata[split_name]["shards"].extend(split_meta["shards"])
-                    split_metadata[split_name]["total_samples"] += split_meta["samples_written"]
+                if var in self.config["data"]["species_variables"]:
+                    # Species use log-standard normalization
+                    stats["normalization_methods"][var] = "log-standard"
+                    stats["per_key_stats"][var] = {
+                        "method": "log-standard",
+                        "log_mean": mean,
+                        "log_std": max(std, 1e-10),
+                        "min": acc["min"],
+                        "max": acc["max"]
+                    }
+                else:
+                    # Globals use standard normalization
+                    stats["normalization_methods"][var] = "standard"
+                    stats["per_key_stats"][var] = {
+                        "method": "standard", 
+                        "mean": mean,
+                        "std": max(std, 1e-10),
+                        "min": acc["min"],
+                        "max": acc["max"]
+                    }
         
-        # Sort shards within each split and assign global indices
-        for split_name, meta in split_metadata.items():
-            # Sort shards by filename
-            meta["shards"].sort(key=lambda x: x["filename"])
-            
-            # Assign sequential start/end indices
-            current_idx = 0
-            for shard in meta["shards"]:
-                shard["start_idx"] = current_idx
-                shard["end_idx"] = current_idx + shard["n_samples"]
-                current_idx = shard["end_idx"]
-            
-            self.logger.info(f"{split_name}: {len(meta['shards'])} shards, {meta['total_samples']:,} samples")
+        # Time will use special normalization
+        stats["normalization_methods"][self.config["data"]["time_variable"]] = "log_min_max"
         
-        return split_metadata
-     
-    def _collect_stats_and_counts(self) -> Tuple[Dict, Dict, Dict]:
-        self.logger.info("Pass 1: Collecting statistics and sample counts...")
-        prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
-        final_accs = self.normalizer._initialize_accumulators()
-        final_ratio_accs = {var: {"count": 0,"mean": 0.0,
-                                  "m2": 0.0,"min": float('inf'),
-                                  "max": float('-inf')} for var in self.config["data"]["species_variables"]} if prediction_mode == "ratio" else {}
-        file_counts = {}
-        
-        total_report = {
-            "total_profiles": 0,
-            "profiles_kept": 0,
-            "dropped_reasons": defaultdict(int),
-            "all_found_variables": set(),
-            "all_found_global_attrs": set(),
-        }
-
-        with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
-            futures = {executor.submit(stats_worker, fp, self.config): fp for fp in self.raw_files}
-            for fut in as_completed(futures):
-                accs, ratio_accs, count, worker_report = fut.result()
-                
-                # Aggregate results
-                self.normalizer._merge_accumulators(final_accs, accs)
-                if ratio_accs: self.normalizer._merge_accumulators(final_ratio_accs, ratio_accs)
-                file_counts[futures[fut].name] = count
-                
-                # Aggregate the reports ---
-                total_report["total_profiles"] += worker_report["total_profiles"]
-                total_report["profiles_kept"] += worker_report["profiles_kept"]
-                total_report["all_found_variables"].update(worker_report["found_variables"])
-                total_report["all_found_global_attrs"].update(worker_report["found_global_attrs"])
-                for reason, num in worker_report["dropped_reasons"].items():
-                    total_report["dropped_reasons"][reason] += num
-
-        norm_stats = self.normalizer._finalize_statistics(final_accs)
-        if final_ratio_accs:
-            norm_stats["ratio_stats"] = self.normalizer._finalize_statistics(final_ratio_accs, is_ratio=True)
-
-        file_counts = {Path(k).stem: v for k, v in file_counts.items()}
-
-        return norm_stats, file_counts, total_report
-
-    def _write_summary_log(self, report: Dict, total_samples: int):
-        """Writes a human-readable summary of the preprocessing results."""
-        log_dir = Path(self.config["paths"]["log_dir"])
-        log_dir.mkdir(exist_ok=True)
-        summary_path = log_dir / f"preprocessing_summary_{time.strftime('%Y%m%d_%H%M%S')}.txt"
-        
-        dropped_count = report["total_profiles"] - report["profiles_kept"]
-        
-        reason_map = {
-            "missing_keys": "Required dataset keys were missing",
-            "non_finite": "Contained NaN or Infinity values",
-            "below_threshold": f"A species value was below the threshold ({self.config['preprocessing']['min_value_threshold']:.1e})",
-            "too_few_timesteps": "Contained 1 or fewer time steps",
-            "extract_profile_failed": "Failed to extract global variables from name",
-            "read_error": "Could not read a dataset from the HDF5 group"
-        }
-
-        # Get expected variables from config
-        expected_species = set(self.config["data"]["species_variables"])
-        expected_globals = set(self.config["data"]["global_variables"])
-        expected_time = {self.config["data"]["time_variable"]}
-        
-        # Get found variables
-        found_variables = report["all_found_variables"]
-        found_globals = report["all_found_global_attrs"]
-        
-        # Check for mismatches
-        missing_species = expected_species - found_variables
-        missing_time = expected_time - found_variables
-        missing_globals = expected_globals - found_globals
-        
-        extra_variables = found_variables - expected_species - expected_time
-        extra_globals = found_globals - expected_globals - {"SEED"}  # SEED is allowed
-
-        with open(summary_path, 'w') as f:
-            f.write("="*60 + "\n")
-            f.write("      Data Preprocessing Summary\n")
-            f.write("="*60 + "\n\n")
-            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Raw Files Processed: {len(self.raw_files)}\n\n")
-            
-            # Variable analysis section
-            f.write("--- Variable Analysis ---\n")
-            f.write("Expected Variables:\n")
-            f.write(f"  Species ({len(expected_species)}): {sorted(expected_species)}\n")
-            f.write(f"  Globals ({len(expected_globals)}): {sorted(expected_globals)}\n")
-            f.write(f"  Time: {list(expected_time)}\n\n")
-            
-            f.write("Found in HDF5 Files:\n")
-            f.write(f"  Dataset Variables ({len(found_variables)}): {sorted(found_variables)}\n")
-            f.write(f"  Global Attributes ({len(found_globals)}): {sorted(found_globals)}\n\n")
-            
-            # Report any issues
-            if missing_species or missing_time or missing_globals or extra_variables or extra_globals:
-                f.write("!!! VARIABLE MISMATCHES DETECTED !!!\n")
-                if missing_species:
-                    f.write(f"  MISSING Species Variables: {sorted(missing_species)}\n")
-                if missing_time:
-                    f.write(f"  MISSING Time Variable: {sorted(missing_time)}\n")
-                if missing_globals:
-                    f.write(f"  MISSING Global Attributes: {sorted(missing_globals)}\n")
-                if extra_variables:
-                    f.write(f"  EXTRA Dataset Variables (not in config): {sorted(extra_variables)}\n")
-                if extra_globals:
-                    f.write(f"  EXTRA Global Attributes (not in config): {sorted(extra_globals)}\n")
-                f.write("\n")
-            else:
-                f.write("✓ All expected variables found correctly\n\n")
-
-            f.write("--- Profile Filtering --- \n")
-            f.write(f"Total Profiles Found:     {report['total_profiles']:,}\n")
-            f.write(f"Profiles Kept:            {report['profiles_kept']:,}\n")
-            f.write(f"Profiles Dropped:         {dropped_count:,}\n\n")
-            
-            if dropped_count > 0:
-                f.write("--- Reasons for Dropped Profiles ---\n")
-                for reason, count in sorted(report["dropped_reasons"].items()):
-                    f.write(f"  - {count:>10,} : {reason_map.get(reason, reason)}\n")
-                f.write("\n")
-
-            f.write("--- Final Sample Count ---\n")
-            f.write(f"Total Usable Samples:     {total_samples:,}\n")
-            f.write("(Train/Val/Test splits generated separately)\n")
-
-        self.logger.info(f"Preprocessing summary saved to: {summary_path}")
-
-
-class ShardWriter:
-    """Writes numpy arrays to shard files, handling buffering and file naming."""
-    def __init__(self, output_dir: Path, shard_size: int, shard_idx_base: str, dtype: np.dtype):
-        self.output_dir = output_dir
-        self.shard_size = shard_size
-        self.shard_idx_base = shard_idx_base
-        self.dtype = dtype
-        self.buffer: List[np.ndarray] = []
-        self.buffer_size = 0
-        self.local_shard_id = 0
-        self.shard_metadata: List[Dict] = []
-        
-        # Ensure the output directory exists
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def add_samples(self, samples: np.ndarray):
-        """Simplified add_samples without tracking global indices."""
-        if samples.dtype != self.dtype:
-            samples = samples.astype(self.dtype)
-        
-        self.buffer.append(samples)
-        self.buffer_size += samples.shape[0]
-        
-        while self.buffer_size >= self.shard_size:
-            self._write_shard()
-
-    def _write_shard(self) -> None:
-        """Write one shard of exactly shard_size samples (or less if flushing)."""
-        if not self.buffer:
-            return
-
-        rows_to_write = []
-        size_so_far = 0
-
-        # Collect arrays until we have enough for a shard
-        while self.buffer and size_so_far < self.shard_size:
-            arr = self.buffer.pop(0)
-            needed = self.shard_size - size_so_far
-            
-            if arr.shape[0] <= needed:
-                rows_to_write.append(arr)
-                size_so_far += arr.shape[0]
-            else:
-                # Split the array
-                rows_to_write.append(arr[:needed])
-                self.buffer.insert(0, arr[needed:])
-                size_so_far += needed
-        
-        # Update buffer size
-        self.buffer_size = sum(arr.shape[0] for arr in self.buffer)
-
-        # Write shard
-        data = np.concatenate(rows_to_write).astype(self.dtype, copy=False)
-        
-        final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
-        tmp_path = final_path.with_suffix(".tmp.npy")
-
-        np.save(tmp_path, data, allow_pickle=False)
-        os.replace(tmp_path, final_path)
-
-        self.shard_metadata.append({
-            "filename": final_path.name,
-            "n_samples": data.shape[0],
-        })
-        
-        self.local_shard_id += 1
-
-    def flush(self) -> None:
-        """Write out any rows left in the buffer (< shard_size)."""
-        if self.buffer_size == 0:
-            return
-        
-        # write whatever is left as a final shard
-        rows_to_write = self.buffer
-        self.buffer = []
-        self.buffer_size = 0
-
-        data = np.concatenate(rows_to_write).astype(self.dtype, copy=False)
-        final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
-        tmp_path   = final_path.with_suffix(".tmp.npy")
-        np.save(tmp_path, data, allow_pickle=False)
-        os.replace(tmp_path, final_path)
-
-        self.shard_metadata.append({
-            "filename": final_path.name,
-            "n_samples": data.shape[0],
-        })
-        self.local_shard_id += 1
-
-    def get_shard_metadata(self) -> List[Dict]:
-        """Return metadata collected for all shards."""
-        return list(self.shard_metadata)
+        return stats
     
-def shard_worker_split_aware(file_path, config, norm_stats, output_dir):
-    """Worker function that creates split-specific shards."""
-    processor = CorePreprocessor(config, norm_stats)
-    return processor.process_file_for_shards(Path(file_path), Path(output_dir))
+    def _update_accumulator(self, acc: Dict, data: np.ndarray):
+        """Update accumulator with Welford's algorithm."""
+        for val in data.flatten():
+            if np.isfinite(val):
+                n = acc["count"]
+                acc["count"] += 1
+                delta = val - acc["mean"]
+                acc["mean"] += delta / acc["count"]
+                delta2 = val - acc["mean"]
+                acc["m2"] += delta * delta2
+                acc["min"] = min(acc["min"], val)
+                acc["max"] = max(acc["max"], val)
+    
+    def _process_legacy_mode(self):
+        """Original row-wise processing (fallback)."""
+        # Import original implementation
+        from .preprocessor import DataPreprocessor as LegacyPreprocessor
+        legacy = LegacyPreprocessor(self.raw_files, self.output_dir, self.config)
+        legacy.process_to_npy_shards()

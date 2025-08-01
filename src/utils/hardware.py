@@ -34,17 +34,25 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
     """Apply hardware-specific optimizations with safe feature detection."""
     logger = logging.getLogger(__name__)
     
+    try:
+        # 'high' is often best on A100; adjust if you see numeric issues
+        torch.set_float32_matmul_precision("high")
+        logger.info("float32 matmul precision set to 'high'")
+    except Exception:
+        pass
+
+
     # CUDA optimizations
     if device.type == "cuda":
         # Enable TensorFloat-32 for faster matmul
-        if config.get("tf32", True):
+        if config.get("tf32", True) and torch.get_default_dtype() == torch.float32:
             if hasattr(torch.backends.cuda, "matmul"):
                 torch.backends.cuda.matmul.allow_tf32 = True
                 logger.info("TensorFloat-32 enabled for matmul")
             if hasattr(torch.backends.cudnn, "allow_tf32"):
                 torch.backends.cudnn.allow_tf32 = True
                 logger.info("TensorFloat-32 enabled for cuDNN")
-        
+                
         # Enable cuDNN autotuner
         if config.get("cudnn_benchmark", True) and hasattr(torch.backends.cudnn, "benchmark"):
             torch.backends.cudnn.benchmark = True
@@ -54,11 +62,14 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
         memory_fraction = config.get("cuda_memory_fraction", 0.9)
         if memory_fraction < 1.0 and hasattr(torch.cuda, "set_per_process_memory_fraction"):
             try:
-                torch.cuda.set_per_process_memory_fraction(memory_fraction)
+                torch.cuda.set_per_process_memory_fraction(memory_fraction, device=device)
                 logger.info(f"CUDA memory fraction set to {memory_fraction}")
             except Exception as e:
                 logger.warning(f"Could not set CUDA memory fraction: {e}")
     
     # Set number of threads for CPU operations
-    torch.set_num_threads(min(32, os.cpu_count() or 1))
-    logger.info(f"Using {torch.get_num_threads()} CPU threads")
+    if "OMP_NUM_THREADS" not in os.environ:
+        torch.set_num_threads(min(32, os.cpu_count() or 1))
+        logger.info(f"Using {torch.get_num_threads()} CPU threads (auto-set)")
+    else:
+        logger.info(f"Using {os.environ['OMP_NUM_THREADS']} CPU threads (OMP_NUM_THREADS)")

@@ -7,7 +7,7 @@ import torch
 from typing import Dict, Any, Union
 import hashlib
 import json
-import os
+import psutil
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,8 +25,9 @@ except RuntimeError:
 
 from utils.hardware import setup_device, optimize_hardware
 from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
-from data.preprocessor import DataPreprocessor
-from data.dataset import NPYDataset
+
+from data.preprocessor import DataPreprocessor         
+from data.dataset import NPYDataset, SequenceDataset   
 from models.model import create_model
 from training.trainer import Trainer
 from data.normalizer import NormalizationHelper
@@ -34,29 +35,32 @@ from data.normalizer import NormalizationHelper
 
 class ChemicalKineticsPipeline:
     """Optimized training pipeline for A100 GPU."""
-    def __init__(self, config_or_path: Union[Path, Dict[str, Any]]):
+    def __init__(self, config_or_path: Union[Path, Dict]):
         """Initialize the pipeline."""
         if isinstance(config_or_path, (Path, str)):
             self.config = load_json_config(Path(config_or_path))
         elif isinstance(config_or_path, dict):
             self.config = config_or_path
         else:
-            raise TypeError(f"config_or_path must be a Path, str, or dict")
+            raise TypeError("config_or_path must be a Path, str, or dict")
         
-        # Get prediction mode
+        # Get prediction mode as early as possible
         self.prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
-        
-        # Setup paths
+
+        # Bootstrap console logging so early failures are visible
+        setup_logging()
+
+        # Create directory tree
         self.setup_paths()
-        
-        # Setup logging
+
+        # Now attach a file handler
         log_file = self.log_dir / f"pipeline_{self.prediction_mode}_{time.strftime('%Y%m%d_%H%M%S')}.log"
         setup_logging(log_file=log_file)
         
         self.logger = logging.getLogger(__name__)
         self.logger.info(f"Chemical Kinetics Pipeline initialized - Mode: {self.prediction_mode}")
         
-        seed_everything(self.config["system"]["seed"])
+        seed_everything(self.config.get("system", {}).get("seed", 42))
         
         # Setup hardware
         self.device = setup_device()
@@ -69,14 +73,18 @@ class ChemicalKineticsPipeline:
         # Create run directory
         model_type = self.config["model"]["type"]
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{self.prediction_mode}_{timestamp}"
-        
+        mix = self.config["model"].get("mixture", {}).get("K", 1)
+        warp = self.config["model"].get("time_warp", {}).get("enabled", False)
+        seq_tag = "seq" if self.config["data"].get("sequence_mode", False) else "row"
+        extra = f"K{mix}_{'warp' if warp else 'nowarp'}_{seq_tag}"
+        self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{self.prediction_mode}_{extra}_{timestamp}"
+
         # Convert paths
         self.raw_data_files = [Path(f) for f in paths["raw_data_files"]]
         
         # Mode-specific processed directory
         base_processed_dir = Path(paths["processed_data_dir"])
-        self.processed_dir = base_processed_dir / f"mode_{self.prediction_mode}"
+        self.processed_dir = base_processed_dir / f"mode_{self.prediction_mode}_{seq_tag}"  
         
         self.log_dir = Path(paths["log_dir"])
         
@@ -97,6 +105,11 @@ class ChemicalKineticsPipeline:
             "prediction_mode": self.prediction_mode,
             "normalization_methods": self.config["normalization"].get("methods", {}),
             "default_norm_method": self.config["normalization"]["default_method"],
+            # sequence-mode drivers
+            "sequence_mode": self.config["data"].get("sequence_mode", False),
+            "M_per_sample": self.config["data"].get("M_per_sample", 16),
+            "time_sampling": self.config["data"].get("time_sampling", {"uniform": 1.0}),
+            "shard_size": self.config["preprocessing"].get("shard_size"),
         }
         
         hash_str = json.dumps(data_params, sort_keys=True)
@@ -149,7 +162,7 @@ class ChemicalKineticsPipeline:
 
     def _log_memory_status(self):
         """Log current memory status."""
-        import psutil
+            
         
         # CPU memory
         mem = psutil.virtual_memory()
@@ -158,7 +171,8 @@ class ChemicalKineticsPipeline:
         
         # GPU memory
         if self.device.type == "cuda":
-            free_mem, total_mem = torch.cuda.mem_get_info(self.device.index)
+            idx = 0 if self.device.index is None else self.device.index
+            free_mem, total_mem = torch.cuda.mem_get_info(idx)
             used_mem = total_mem - free_mem
             self.logger.info(f"GPU memory: {total_mem/1024**3:.1f}GB total, "
                              f"{free_mem/1024**3:.1f}GB free, "
@@ -166,7 +180,8 @@ class ChemicalKineticsPipeline:
 
     def train_model(self):
         """Train the neural network model."""
-        self.logger.info("Starting model training...")
+        mode_str = "sequence" if self.config["data"].get("sequence_mode", False) else "row-wise"
+        self.logger.info(f"Starting model training in {mode_str} mode...")
 
         # Ensure data is preprocessed
         self.preprocess_data()
@@ -182,7 +197,11 @@ class ChemicalKineticsPipeline:
         self.logger.info(f"Model: {self.config['model']['type']} - Parameters: {total_params:,}")
 
         # Load normalization stats
-        norm_stats = load_json(self.processed_dir / "normalization.json")
+        norm_file = self.processed_dir / "normalization.json"
+        if not norm_file.exists():
+            raise FileNotFoundError(f"Normalization file missing: {norm_file}.")
+        norm_stats = load_json(norm_file)
+
         norm_helper = NormalizationHelper(
             norm_stats,
             self.device,
@@ -195,36 +214,60 @@ class ChemicalKineticsPipeline:
         # Log memory status before creating datasets
         self._log_memory_status()
 
-        # Create datasets
-        train_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            split_name="train",
-            config=self.config,
-            device=self.device
-        )
-        
-        # Log cache status to prevent crash
-        cache_info = train_dataset.get_cache_info()
-        if cache_info.get("type") == "gpu":
-            self.logger.info(f"GPU caching active for '{train_dataset.split_name}': {cache_info.get('size_gb', 0):.1f}GB loaded.")
-        elif cache_info.get("type") == "cpu":
-            self.logger.warning(f"CPU fallback active for '{train_dataset.split_name}'. Reason: {cache_info.get('message', 'N/A')}")
-        else:
-            self.logger.error(f"Cache status error for '{train_dataset.split_name}': {cache_info.get('status', 'unknown')}")
+        # Choose dataset type by shard_index.json
+        index_path = self.processed_dir / "shard_index.json"
+        with open(index_path) as f:
+            shard_index = json.load(f)
+        is_sequence = bool(shard_index.get("sequence_mode", False))
 
-        val_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            split_name="validation",
-            config=self.config,
-            device=self.device
-        ) if self.config["training"]["val_fraction"] > 0 else None
-        
-        test_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            split_name="test",
-            config=self.config,
-            device=self.device
-        ) if self.config["training"]["test_fraction"] > 0 else None
+        if is_sequence:
+            self.logger.info("Detected sequence-mode shards; using SequenceDataset.")
+            train_dataset = SequenceDataset(
+                shard_dir=self.processed_dir,
+                split_name="train",
+                config=self.config,
+                device=self.device
+            )
+            val_dataset = SequenceDataset(
+                shard_dir=self.processed_dir,
+                split_name="validation",
+                config=self.config,
+                device=self.device
+            ) if self.config["training"]["val_fraction"] > 0 else None
+            test_dataset = SequenceDataset(
+                shard_dir=self.processed_dir,
+                split_name="test",
+                config=self.config,
+                device=self.device
+            ) if self.config["training"]["test_fraction"] > 0 else None
+            self.logger.info(f"Sequence train samples: {len(train_dataset)}")
+        else:
+            self.logger.info("Detected row-wise shards; using NPYDataset.")
+            train_dataset = NPYDataset(
+                shard_dir=self.processed_dir,
+                split_name="train",
+                config=self.config,
+                device=self.device
+            )
+            cache_info = train_dataset.get_cache_info()
+            if cache_info.get("type") == "gpu":
+                self.logger.info(f"GPU caching active for '{train_dataset.split_name}': {cache_info.get('size_gb', 0):.1f}GB loaded.")
+            elif cache_info.get("type") == "cpu":
+                self.logger.warning(f"CPU fallback active for '{train_dataset.split_name}'. Reason: {cache_info.get('message', 'N/A')}")
+            else:
+                self.logger.error(f"Cache status error for '{train_dataset.split_name}': {cache_info.get('status', 'unknown')}")
+            val_dataset = NPYDataset(
+                shard_dir=self.processed_dir,
+                split_name="validation",
+                config=self.config,
+                device=self.device
+            ) if self.config["training"]["val_fraction"] > 0 else None
+            test_dataset = NPYDataset(
+                shard_dir=self.processed_dir,
+                split_name="test",
+                config=self.config,
+                device=self.device
+            ) if self.config["training"]["test_fraction"] > 0 else None
         
         # Initialize trainer
         trainer = Trainer(
@@ -319,43 +362,39 @@ def main():
     
     # Execute based on mode
     if args.normalize:
-        # Just normalize data
         pipeline = ChemicalKineticsPipeline(args.config)
         pipeline.normalize_only()
         print("\nData normalization complete!")
         
     elif args.train:
-        # Train model
         pipeline = ChemicalKineticsPipeline(args.config)
         pipeline.run()
         
-        
     elif args.tune:
-            try:
-                import optuna
-            except ImportError:
-                print("Error: The 'optuna' package is not installed",file=sys.stderr)
-                sys.exit(1)
-            
-            from hyperparameter_tuning import optimize
-            
-            print(f"Starting hyperparameter optimization with {args.trials} trials...")
-            study = optimize(
-                config_path=args.config,
-                n_trials=args.trials,
-                n_jobs=1,
-                study_name=args.study_name
-            )
-            
-            # Print results
-            print("\n" + "="*60)
-            print("Optimization Complete")
-            print("="*60)
-            print(f"Best validation loss: {study.best_value:.6f}")
-            print(f"Best trial: {study.best_trial.number}")
-            print("\nBest parameters:")
-            for key, value in study.best_params.items():
-                print(f"  {key}: {value}")
+        try:
+            import optuna
+        except ImportError:
+            print("Error: The 'optuna' package is not installed", file=sys.stderr)
+            sys.exit(1)
+        
+        from hyperparameter_tuning import optimize
+        
+        print(f"Starting hyperparameter optimization with {args.trials} trials...")
+        study = optimize(
+            config_path=args.config,
+            n_trials=args.trials,
+            n_jobs=1,
+            study_name=args.study_name
+        )
+        
+        print("\n" + "="*60)
+        print("Optimization Complete")
+        print("="*60)
+        print(f"Best validation loss: {study.best_value:.6f}")
+        print(f"Best trial: {study.best_trial.number}")
+        print("\nBest parameters:")
+        for key, value in study.best_params.items():
+            print(f"  {key}: {value}")
 
 if __name__ == "__main__":
     main()

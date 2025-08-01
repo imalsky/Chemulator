@@ -1,223 +1,157 @@
 {
-    "paths": {
-        // Raw HDF5 data files to process
-        "raw_data_files": [
-            "data/raw/run9001-result.h5",
-            "data/raw/run9002-result.h5",
-            "data/raw/run9003-result.h5",
-            "data/raw/run9004-result.h5",
-            "data/raw/run9005-result.h5",
-            "data/raw/run9006-result.h5",
-            "data/raw/run9007-result.h5",
-            "data/raw/run9008-result.h5",
-            "data/raw/run9009-result.h5",
-            "data/raw/run9010-result.h5"
-        ],
-        // Directory for processed NPY shards
-        "processed_data_dir": "data/processed",
-        // Directory for saved models
-        "model_save_dir": "data/models",
-        // Directory for logs
-        "log_dir": "logs"
-    },
-    
-    // ===== DATA CONFIGURATION =====
-    "data": {
-        // Chemical species to predict
-        "species_variables": [
-            "C2H2_evolution",
-            "CH4_evolution",
-            "CO2_evolution",
-            "CO_evolution",
-            "H2O_evolution",
-            "H2_evolution",
-            "HCN_evolution",
-            "H_evolution",
-            "N2_evolution",
-            "NH3_evolution",
-            "OH_evolution",
-            "O_evolution"
-        ],
-        "target_species_variables": [
-            "C2H2_evolution",
-            "CH4_evolution",
-            "CO2_evolution",
-            "CO_evolution",
-            "H2O_evolution",
-            "H2_evolution",
-            "HCN_evolution",
-            "H_evolution",
-            "N2_evolution",
-            "NH3_evolution",
-            "OH_evolution",
-            "O_evolution"
-        ],
+  "paths": {
+    "raw_data_files": [
+      "data/raw/run9001-result.h5",
+      "data/raw/run9002-result.h5",
+      "data/raw/run9003-result.h5",
+      "data/raw/run9004-result.h5",
+      "data/raw/run9005-result.h5",
+      "data/raw/run9006-result.h5",
+      "data/raw/run9007-result.h5",
+      "data/raw/run9008-result.h5",
+      "data/raw/run9009-result.h5",
+      "data/raw/run9010-result.h5"
+    ],
+    "processed_data_dir": "data/processed",
+    "model_save_dir": "data/models",
+    "log_dir": "logs"
+  },
 
-        // Global parameters (initial conditions)
-        "global_variables": ["P", "T"],
-        // Time variable name in HDF5 files
-        "time_variable": "t_time"
-    },
-    
-    // ===== PREPROCESSING SETTINGS =====
-    "preprocessing": {
-        // Number of samples per NPY shard file
-        "shard_size": 10000000,
-        // Minimum species concentration threshold
-        "min_value_threshold": 1e-25,
-        // Compression type: null for raw npy files (faster I/O)
-        "compression": null,
-        // Number of parallel workers for preprocessing
-        "num_workers": 8,
-        // Enable parallel preprocessing
-        "parallel_enabled": true
-    },
-    
-    // ===== NORMALIZATION SETTINGS =====
-    "normalization": {
-        // Default normalization method for all variables
-        "default_method": "log-standard",
-        
-        // Override methods for specific variables
-        "methods": {
-            "T": "standard",
-            "P": "log-min-max",
-            "t_time": "log-min-max"
-        },
-        
-        // Epsilon for numerical stability
-        "epsilon": 1e-30,
-        // Minimum standard deviation to prevent division by tiny values
-        "min_std": 1e-10,
-        // Clamp normalized values to [-clamp_value, clamp_value]
-        "clamp_value": 999.0
-    },
-    // ===== MODEL ARCHITECTURE =====
-    "model": {
-        "type": "linear_latent",
-        "latent_dim": 64,                    // Latent space dimension (32-128)
-        "encoder_layers": [256, 256, 128],   // Encoder architecture
-        "decoder_layers": [128, 256, 256],   // Decoder architecture
-        "dynamics_rank": 8,                  // Low-rank component (0 for diagonal only)
-        "lambda_min": -10.0,                 // Min eigenvalue constraint
-        "lambda_max": 0.1,                   // Max eigenvalue constraint
-        "use_time_normalization": false,      // Learn per-sample time scaling
-        "activation": "gelu",
-        "dropout": 0.0,
-        "alpha": 1.0,
+  "data": {
+    "species_variables": [
+      "C2H2_evolution","CH4_evolution","CO2_evolution","CO_evolution",
+      "H2O_evolution","H2_evolution","HCN_evolution","H_evolution",
+      "N2_evolution","NH3_evolution","OH_evolution","O_evolution"
+    ],
+    "target_species_variables": [
+      "C2H2_evolution","CH4_evolution","CO2_evolution","CO_evolution",
+      "H2O_evolution","H2_evolution","HCN_evolution","H_evolution",
+      "N2_evolution","NH3_evolution","OH_evolution","O_evolution"
+    ],
+    "global_variables": ["P","T"],
+    "time_variable": "t_time",
 
-        //"type": "siren",
-        //"hidden_dims": [512, 512, 512, 512],
-        //"omega_0": 30.0,
-        //"use_fourier_features": true,        // Use random Fourier features for time
-        //"fourier_scale": 10.0,
-        //"n_fourier_features": 256,
-        //"activation": "sine",                // SIREN uses sine activation
-        //"dropout": 0.0
-        },
-    
-    // ===== FiLM CONDITIONING =====
-    "film": {
-        // Enable Feature-wise Linear Modulation
-        "enabled": false,
-        // Hidden layers for FiLM networks
-        "hidden_dims": [64, 64],
-        // Activation for FiLM networks
-        "activation": "relu"
+    // NEW for sequence-mode
+    "sequence_mode": true,
+    "M_per_sample": 16,
+    "time_sampling": { "uniform": 0.5, "log_spaced": 0.5 }
+  },
+
+  "preprocessing": {
+    // IMPORTANT: this is trajectories-per-shard in sequence mode
+    "shard_size": 1000000,              // was 10,000,000 — don't do that
+    "min_value_threshold": 1e-25,
+    "compression": null,              // ignored by sequence NPZ (uses compressed)
+    "num_workers": 8,
+    "parallel_enabled": true
+  },
+
+  "normalization": {
+    "default_method": "log-standard",
+    "methods": {
+      "T": "standard",
+      "P": "standard",                // changed from log-min-max
+      "t_time": "log-min-max"         // time is still log-min-max (global)
     },
-    
-    // ===== PREDICTION SETTINGS =====
-    "prediction": {
-        // Prediction mode: "absolute" or "ratio"
-        "mode": "absolute",
-        
-        // Optional output clamping
-        "output_clamp": null
-    },
-    
-    // ===== TRAINING PARAMETERS - OPTIMIZED FOR A100 =====
-    "training": {
-        // Data splitting
-        "val_fraction": 0.15,
-        "test_fraction": 0.15,
-        "use_fraction": 1.0,
-        
-        // Training duration
-        "epochs": 100,
-        "batch_size": 16384,  
-        "gradient_accumulation_steps":1,
-        "gpu_cache_dataset": true,  // Force GPU caching
-        
-        // DATALOADER SETTINGS - OPTIMIZED FOR GPU
-        "num_workers": 0,  // MUST be 0 for GPU caching
-        "pin_memory": false,  // Not needed with GPU cache
-        "persistent_workers": false,
-        "prefetch_factor": null,
-        "drop_last": true,
-        
-        // Learning rate - scaled with batch size
-        "spectral_regularization": 0.01,
-        "optimizer": "lion",
-        "learning_rate": 1e-4,  // 4x original due to 8x batch size (sqrt scaling)
-        "weight_decay": 1e-5,
-        "betas": [0.9, 0.999],
-        "eps": 1e-8,
-        "gradient_clip": 5.0,  // Increased for stability with large batches
-        
-        // Scheduler settings
-        "scheduler": "cosine",
-        "scheduler_params": {
-            "T_0": 100,  
-            "T_mult": 2,
-            "eta_min": 1e-8
-        },
-        
-        // Loss and training settings
-        "loss": "mse",
-        "use_amp": false,
-        "amp_dtype": "bfloat16",
-        "early_stopping_patience": 5000,
-        "min_delta": 1e-8,
-        
-        // Reduced logging/memory clearing for performance
-        "log_interval": 1000,  // Less frequent logging
-        "save_interval": 5,
-        "empty_cache_interval": 50000,  // Almost never
-        
-        // HPO-specific settings
-        "hpo_min_epochs": 10,
-        "hpo_max_epochs": 40
-    },
-    
-    // ===== SYSTEM/HARDWARE SETTINGS - A100 OPTIMIZED =====
-    "system": {
-        // Random seed for reproducibility
-        "seed": 42,
-        
-        // PyTorch optimizations for A100
-        "use_torch_compile": true,
-        "compile_mode": "default",  // Maximum optimization
-        "use_torch_export": true,
-        
-        // CUDA optimizations for A100
-        "cudnn_benchmark": true,
-        "tf32": true,  // Use TensorFloat-32 on A100
-        "dtype": "float32",
-        "cuda_memory_fraction": 0.95  // Use most GPU memory
-    },
-    
-    // ===== HYPERPARAMETER OPTIMIZATION =====
-    "optuna": {
-        // Enable Optuna integration
-        "enabled": true,
-        
-        // Hyperband settings
-        "algorithm": "hyperband",
-        "hyperband_min_resource": 10,
-        "hyperband_max_resource": 50,
-        "hyperband_reduction_factor": 3,
-        
-        // Target number of trials
-        "n_trials": 100
+    "epsilon": 1e-30,
+    "min_std": 1e-10,
+    "clamp_value": 999.0
+  },
+
+  "model": {
+    "type": "linear_latent_mixture",  // NEW: use hybrid variant
+    "latent_dim": 64,
+    "encoder_layers": [256,256,128],
+    "decoder_layers": [128,256,256],
+
+    // Generator settings (matches code: model['generator']['rank'])
+    "generator": { "rank": 8 },
+
+    // Mixture and time-warp blocks (the code reads these)
+    "mixture": { "K": 3 }, 
+    "time_warp": { "enabled": true,
+                   "J_terms": 3 },
+
+    "activation": "gelu",
+    "dropout": 0.0
+  },
+
+  "film": {
+    "enabled": false,
+    "hidden_dims": [64,64],
+    "activation": "relu"
+  },
+
+  "prediction": {
+    "mode": "absolute",
+    "output_clamp": null
+  },
+
+  "training": {
+    "val_fraction": 0.15,
+    "test_fraction": 0.15,
+    "use_fraction": 1.0,
+
+    "epochs": 100,
+    "batch_size": 16384,
+    "gradient_accumulation_steps": 1,
+
+    // SequenceDataset will try to GPU-cache entire split; 'auto' is safer
+    "gpu_cache_dataset": "auto",      // was true; keep if you know it fits
+
+    "num_workers": 0,
+    "pin_memory": false,
+    "persistent_workers": false,
+    "prefetch_factor": null,
+    "drop_last": true,
+
+    // OPTIMIZER
+    "optimizer": "lion",
+    "learning_rate": 1e-4,
+    "weight_decay": 1e-5,
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "gradient_clip": 5.0,
+
+    // SCHEDULER
+    "scheduler": "cosine",
+    "scheduler_params": { "T_0": 100, "T_mult": 2, "eta_min": 1e-8 },
+
+    // AMP
+    "use_amp": false,
+    "amp_dtype": "bfloat16",
+
+    "early_stopping_patience": 5000,
+    "min_delta": 1e-8,
+
+    "log_interval": 1000,
+    "save_interval": 5,
+    "empty_cache_interval": 50000,
+
+    // NEW: regularization weights consumed by Trainer for the mixture
+    "regularization": {
+      "lambda_entropy": 0.01,
+      "lambda_diversity": 0.01
     }
+  },
+
+  "system": {
+    "seed": 42,
+    "use_torch_compile": true,
+    "compile_mode": "default",
+    "use_torch_export": true,
+    "cudnn_benchmark": true,
+    "tf32": true,
+    "dtype": "float32",
+    "cuda_memory_fraction": 0.95
+  },
+
+  "optuna": {
+    "enabled": true,
+    "algorithm": "hyperband",
+    "hyperband_min_resource": 10,
+    "hyperband_max_resource": 50,
+    "hyperband_reduction_factor": 3,
+    "n_trials": 100
+  }
 }

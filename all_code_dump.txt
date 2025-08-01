@@ -1,0 +1,3343 @@
+===== /Users/imalsky/Desktop/Chemulator/src/main.py =====
+#!/usr/bin/env python3
+import logging
+import sys
+import time
+from pathlib import Path
+import torch
+from typing import Dict, Any, Union
+import hashlib
+import json
+import os
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s - %(message)s",
+    datefmt="%Y%m%d_%H%M%S",
+    stream=sys.stdout
+)
+
+import torch.multiprocessing
+try:
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    logging.info("SUCCESS: Set multiprocessing sharing strategy to 'file_system'.")
+except RuntimeError:
+    logging.warning("Could not set multiprocessing sharing strategy.")
+
+from utils.hardware import setup_device, optimize_hardware
+from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
+
+from data.preprocessor import DataPreprocessor         
+from data.dataset import NPYDataset, SequenceDataset   
+from models.model import create_model
+from training.trainer import Trainer
+from data.normalizer import NormalizationHelper
+
+
+class ChemicalKineticsPipeline:
+    """Optimized training pipeline for A100 GPU."""
+    def __init__(self, config_or_path: Union[Path, Dict, Any]):
+        """Initialize the pipeline."""
+        if isinstance(config_or_path, (Path, str)):
+            self.config = load_json_config(Path(config_or_path))
+        elif isinstance(config_or_path, dict):
+            self.config = config_or_path
+        else:
+            raise TypeError("config_or_path must be a Path, str, or dict")
+        
+        # Get prediction mode
+        self.prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
+        
+        # Setup paths
+        self.setup_paths()
+        
+        # Setup logging
+        log_file = self.log_dir / f"pipeline_{self.prediction_mode}_{time.strftime('%Y%m%d_%H%M%S')}.log"
+        setup_logging(log_file=log_file)
+        
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Chemical Kinetics Pipeline initialized - Mode: {self.prediction_mode}")
+        
+        seed_everything(self.config["system"]["seed"])
+        
+        # Setup hardware
+        self.device = setup_device()
+        optimize_hardware(self.config["system"], self.device)
+        
+    def setup_paths(self):
+        """Create directory structure."""
+        paths = self.config["paths"]
+        
+        # Create run directory
+        model_type = self.config["model"]["type"]
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        mix = self.config["model"].get("mixture", {}).get("K", 1)
+        warp = self.config["model"].get("time_warp", {}).get("enabled", False)
+        seq_tag = "seq" if self.config["data"].get("sequence_mode", False) else "row"
+        extra = f"K{mix}_{'warp' if warp else 'nowarp'}_{seq_tag}"
+        self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{self.prediction_mode}_{extra}_{timestamp}"
+
+        # Convert paths
+        self.raw_data_files = [Path(f) for f in paths["raw_data_files"]]
+        
+        # Mode-specific processed directory
+        base_processed_dir = Path(paths["processed_data_dir"])
+        self.processed_dir = base_processed_dir / f"mode_{self.prediction_mode}_{seq_tag}"  
+        
+        self.log_dir = Path(paths["log_dir"])
+        
+        # Create directories
+        ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
+
+    def _compute_data_hash(self) -> str:
+        """
+        Compute a hash of data-critical parameters.
+        """
+        data_params = {
+            "raw_files": sorted([str(f) for f in self.raw_data_files]),
+            "species_variables": self.config["data"]["species_variables"],
+            "global_variables": self.config["data"]["global_variables"],
+            "time_variable": self.config["data"]["time_variable"],
+            "min_value_threshold": self.config["preprocessing"]["min_value_threshold"],
+            "use_fraction": self.config["training"]["use_fraction"],
+            "prediction_mode": self.prediction_mode,
+            "normalization_methods": self.config["normalization"].get("methods", {}),
+            "default_norm_method": self.config["normalization"]["default_method"],
+            # sequence-mode drivers
+            "sequence_mode": self.config["data"].get("sequence_mode", False),
+            "M_per_sample": self.config["data"].get("M_per_sample", 16),
+            "time_sampling": self.config["data"].get("time_sampling", {"uniform": 1.0}),
+            "shard_size": self.config["preprocessing"].get("shard_size"),
+        }
+        
+        hash_str = json.dumps(data_params, sort_keys=True)
+        return hashlib.sha256(hash_str.encode()).hexdigest()[:16]
+
+    def normalize_only(self):
+        """Run only the data preprocessing and normalization step."""
+        self.logger.info("Running data normalization only...")
+        
+        # Check if data already exists
+        current_hash = self._compute_data_hash()
+        hash_file = self.processed_dir / "data_hash.json"
+        
+        regenerate = True
+        if hash_file.exists():
+            saved_hash_data = load_json(hash_file)
+            if saved_hash_data.get("hash") == current_hash:
+                self.logger.info("Data already preprocessed with matching hash. Skipping regeneration.")
+                regenerate = False
+            else:
+                self.logger.info("Data hash mismatch. Regenerating data...")
+        
+        if regenerate:
+            preprocessor = DataPreprocessor(
+                raw_files=self.raw_data_files,
+                output_dir=self.processed_dir,
+                config=self.config
+            )
+            
+            missing = [p for p in self.raw_data_files if not p.exists()]
+            if missing:
+                raise FileNotFoundError(f"Missing raw data files: {missing}")
+            
+            # Process to shards and compute normalization
+            preprocessor.process_to_npy_shards()
+            
+            # Save the hash
+            save_json({
+                "hash": current_hash,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": self.prediction_mode
+            }, hash_file)
+            
+            self.logger.info(f"Data normalization complete. Files saved to: {self.processed_dir}")
+
+    def preprocess_data(self):
+        """Preprocess data if needed."""
+        self.logger.info(f"Preprocessing data for {self.prediction_mode} mode...")
+        self.normalize_only()
+
+    def _log_memory_status(self):
+        """Log current memory status."""
+        import psutil
+        
+        # CPU memory
+        mem = psutil.virtual_memory()
+        self.logger.info(f"System memory: {mem.total/1024**3:.1f}GB total, "
+                         f"{mem.available/1024**3:.1f}GB available ({mem.percent:.1f}% used)")
+        
+        # GPU memory
+        if self.device.type == "cuda":
+            free_mem, total_mem = torch.cuda.mem_get_info(self.device.index)
+            used_mem = total_mem - free_mem
+            self.logger.info(f"GPU memory: {total_mem/1024**3:.1f}GB total, "
+                             f"{free_mem/1024**3:.1f}GB free, "
+                             f"{used_mem/1024**3:.1f}GB used")
+
+    def train_model(self):
+        """Train the neural network model."""
+        mode_str = "sequence" if self.config["data"].get("sequence_mode", False) else "row-wise"
+        self.logger.info(f"Starting model training in {mode_str} mode...")
+
+        # Ensure data is preprocessed
+        self.preprocess_data()
+
+        # Save config for this run
+        save_json(self.config, self.run_save_dir / "config.json")
+
+        # Create model
+        model = create_model(self.config, self.device)
+
+        # Log model info
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        self.logger.info(f"Model: {self.config['model']['type']} - Parameters: {total_params:,}")
+
+        # Load normalization stats
+        norm_stats = load_json(self.processed_dir / "normalization.json")
+        norm_helper = NormalizationHelper(
+            norm_stats,
+            self.device,
+            self.config["data"]["species_variables"],
+            self.config["data"]["global_variables"],
+            self.config["data"]["time_variable"],
+            self.config
+        )
+        
+        # Log memory status before creating datasets
+        self._log_memory_status()
+
+        # Choose dataset type by shard_index.json
+        index_path = self.processed_dir / "shard_index.json"
+        with open(index_path) as f:
+            shard_index = json.load(f)
+        is_sequence = bool(shard_index.get("sequence_mode", False))
+
+        if is_sequence:
+            self.logger.info("Detected sequence-mode shards; using SequenceDataset.")
+            train_dataset = SequenceDataset(
+                shard_dir=self.processed_dir,
+                split_name="train",
+                config=self.config,
+                device=self.device
+            )
+            val_dataset = SequenceDataset(
+                shard_dir=self.processed_dir,
+                split_name="validation",
+                config=self.config,
+                device=self.device
+            ) if self.config["training"]["val_fraction"] > 0 else None
+            test_dataset = SequenceDataset(
+                shard_dir=self.processed_dir,
+                split_name="test",
+                config=self.config,
+                device=self.device
+            ) if self.config["training"]["test_fraction"] > 0 else None
+            self.logger.info(f"Sequence train samples: {len(train_dataset)}")
+        else:
+            self.logger.info("Detected row-wise shards; using NPYDataset.")
+            train_dataset = NPYDataset(
+                shard_dir=self.processed_dir,
+                split_name="train",
+                config=self.config,
+                device=self.device
+            )
+            cache_info = train_dataset.get_cache_info()
+            if cache_info.get("type") == "gpu":
+                self.logger.info(f"GPU caching active for '{train_dataset.split_name}': {cache_info.get('size_gb', 0):.1f}GB loaded.")
+            elif cache_info.get("type") == "cpu":
+                self.logger.warning(f"CPU fallback active for '{train_dataset.split_name}'. Reason: {cache_info.get('message', 'N/A')}")
+            else:
+                self.logger.error(f"Cache status error for '{train_dataset.split_name}': {cache_info.get('status', 'unknown')}")
+            val_dataset = NPYDataset(
+                shard_dir=self.processed_dir,
+                split_name="validation",
+                config=self.config,
+                device=self.device
+            ) if self.config["training"]["val_fraction"] > 0 else None
+            test_dataset = NPYDataset(
+                shard_dir=self.processed_dir,
+                split_name="test",
+                config=self.config,
+                device=self.device
+            ) if self.config["training"]["test_fraction"] > 0 else None
+        
+        # Initialize trainer
+        trainer = Trainer(
+            model=model,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            test_dataset=test_dataset,
+            config=self.config,
+            save_dir=self.run_save_dir,
+            device=self.device,
+            norm_helper=norm_helper
+        )
+
+        # Train model
+        best_val_loss = trainer.train()
+        
+        # Evaluate on test set
+        test_loss = trainer.evaluate_test()
+        
+        self.logger.info(f"Training complete! Best validation loss: {best_val_loss:.6f}")
+        self.logger.info(f"Test loss: {test_loss:.6f}")
+        
+        # Save results
+        results = {
+            "best_val_loss": best_val_loss,
+            "test_loss": test_loss,
+            "model_path": str(self.run_save_dir / "best_model.pt"),
+            "training_time": trainer.total_training_time,
+        }
+        
+        save_json(results, self.run_save_dir / "results.json")
+    
+    def run(self):
+        """Execute the full training pipeline."""
+        try:
+            self.train_model()
+            self.logger.info("Pipeline completed successfully!")
+            self.logger.info(f"Results saved in: {self.run_save_dir}")
+        except Exception as e:
+            self.logger.error(f"Pipeline failed: {e}", exc_info=True)
+            sys.exit(1)
+
+def main():
+    """Main entry point."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Chemical Kinetics Neural Network Training")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/config.jsonc"),
+        help="Path to configuration file"
+    )
+    
+    # Operation mode arguments
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Only preprocess and normalize the data"
+    )
+    mode_group.add_argument(
+        "--train",
+        action="store_true",
+        help="Train a model using the configuration"
+    )
+    mode_group.add_argument(
+        "--tune",
+        action="store_true",
+        help="Run hyperparameter optimization"
+    )
+    
+    # Additional arguments
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=100,
+        help="Number of Optuna trials for hyperparameter optimization"
+    )
+    parser.add_argument(
+        "--study-name",
+        type=str,
+        default="chemical_kinetics_opt",
+        help="Name for Optuna study"
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate config path
+    if not args.config.exists():
+        print(f"Error: Configuration file not found: {args.config}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Execute based on mode
+    if args.normalize:
+        pipeline = ChemicalKineticsPipeline(args.config)
+        pipeline.normalize_only()
+        print("\nData normalization complete!")
+        
+    elif args.train:
+        pipeline = ChemicalKineticsPipeline(args.config)
+        pipeline.run()
+        
+    elif args.tune:
+        try:
+            import optuna
+        except ImportError:
+            print("Error: The 'optuna' package is not installed", file=sys.stderr)
+            sys.exit(1)
+        
+        from hyperparameter_tuning import optimize
+        
+        print(f"Starting hyperparameter optimization with {args.trials} trials...")
+        study = optimize(
+            config_path=args.config,
+            n_trials=args.trials,
+            n_jobs=1,
+            study_name=args.study_name
+        )
+        
+        print("\n" + "="*60)
+        print("Optimization Complete")
+        print("="*60)
+        print(f"Best validation loss: {study.best_value:.6f}")
+        print(f"Best trial: {study.best_trial.number}")
+        print("\nBest parameters:")
+        for key, value in study.best_params.items():
+            print(f"  {key}: {value}")
+
+if __name__ == "__main__":
+    main()
+
+
+===== /Users/imalsky/Desktop/Chemulator/src/hyperparameter_tuning.py =====
+#!/usr/bin/env python3
+"""
+Hyperparameter tuning for chemical kinetics models using Optuna.
+Simplified to target the LiLaN family (linear_latent / linear_latent_mixture)
+and sequence-mode datasets. No DeepONet/SIREN here — this is the fast, stable path.
+"""
+
+import copy
+import logging
+import time
+from pathlib import Path
+from typing import Dict, Any, Optional, Callable
+
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import HyperbandPruner
+import torch
+import json
+
+from main import ChemicalKineticsPipeline
+from utils.hardware import setup_device, optimize_hardware
+from data.dataset import SequenceDataset, NPYDataset
+from models.model import create_model
+from training.trainer import Trainer
+from data.normalizer import NormalizationHelper
+from utils.utils import (seed_everything, ensure_directories, 
+                        load_json_config, save_json, load_json)
+
+
+class OptunaPruningCallback:
+    """Report intermediate values to Optuna and allow pruning after a warmup."""
+    def __init__(self, trial: optuna.Trial, min_epochs: int = 10):
+        self.trial = trial
+        self.min_epochs = min_epochs
+        
+    def __call__(self, epoch: int, val_loss: float) -> bool:
+        self.trial.report(val_loss, epoch)
+        if epoch < self.min_epochs:
+            return False
+        return self.trial.should_prune()
+
+
+class OptunaTrialRunner:
+    """Prepares data once and executes trials with modified configs."""
+    def __init__(self, base_config_path: Path):
+        self.base_config_path = base_config_path
+        self.base_config = load_json_config(base_config_path)
+        self.device = setup_device()
+        self.logger = logging.getLogger(__name__)
+        self._pipelines = {}
+        self._prepare_current_mode()
+
+    def _prepare_current_mode(self):
+        """Preprocess data for the current prediction mode in the base config."""
+        mode = self.base_config["prediction"]["mode"]
+        self.logger.info(f"Preparing data for '{mode}' mode...")
+        pipeline = ChemicalKineticsPipeline(self.base_config)
+        pipeline.normalize_only()
+        self._pipelines[mode] = OptunaPipeline(self.base_config, pipeline.processed_dir)
+
+    def run_trial(self, trial: optuna.Trial) -> float:
+        """Configure and run a single trial."""
+        config = suggest_lilan_config(trial, self.base_config)
+        prediction_mode = config["prediction"]["mode"]
+        pipeline = self._pipelines[prediction_mode]
+        return pipeline.execute_trial(config, trial)
+
+
+class OptunaPipeline:
+    """Loads datasets and runs training for a specific processed_dir."""
+    def __init__(self, config: Dict[str, Any], processed_dir: Path):
+        self.config = config
+        self.device = setup_device()
+        self.logger = logging.getLogger(f"OptunaPipeline_{config['prediction']['mode']}")
+        self.processed_dir = processed_dir
+        self.model_save_root = Path(self.config["paths"]["model_save_dir"])
+
+        # Normalization stats
+        norm_stats_path = self.processed_dir / "normalization.json"
+        if not norm_stats_path.exists():
+            raise FileNotFoundError(f"Normalization stats not found in {norm_stats_path}")
+        norm_stats = load_json(norm_stats_path)
+        self.norm_helper = NormalizationHelper(
+            stats=norm_stats,
+            device=self.device,
+            species_vars=self.config["data"]["species_variables"],
+            global_vars=self.config["data"]["global_variables"],
+            time_var=self.config["data"]["time_variable"],
+            config=self.config
+        )
+
+        self._load_datasets()
+
+    def _load_datasets(self):
+        """Choose SequenceDataset when sequence-mode shards are present."""
+        index_path = self.processed_dir / "shard_index.json"
+        with open(index_path) as f:
+            shard_index = json.load(f)
+        is_sequence = bool(shard_index.get("sequence_mode", False))
+
+        self.logger.info(f"Loading datasets from: {self.processed_dir} (sequence_mode={is_sequence})")
+
+        if is_sequence:
+            self.train_dataset = SequenceDataset(self.processed_dir, "train", self.config, self.device)
+            self.val_dataset   = SequenceDataset(self.processed_dir, "validation", self.config, self.device)
+        else:
+            # Fallback to legacy row-wise dataset if needed
+            self.train_dataset = NPYDataset(self.processed_dir, "train", self.config, self.device)
+            self.val_dataset   = NPYDataset(self.processed_dir, "validation", self.config, self.device)
+
+        self.logger.info(f"Datasets loaded: train={len(self.train_dataset)}, val={len(self.val_dataset)}")
+
+    def execute_trial(self, config: Dict[str, Any], trial: optuna.Trial) -> float:
+        """Run training for a trial with pruning and return best val loss."""
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        trial_id = f"trial_{trial.number:04d}_{config['prediction']['mode']}"
+        save_dir = self.model_save_root / "optuna" / f"{timestamp}_{trial_id}"
+        ensure_directories(save_dir)
+
+        try:
+            seed_everything(config["system"]["seed"])
+            optimize_hardware(config["system"], self.device)
+            model = create_model(config, self.device)
+
+            # Hyperband sets epochs via user_attrs; default to hpo_max_epochs
+            n_epochs = trial.user_attrs.get("n_epochs", config["training"]["hpo_max_epochs"])
+            config["training"]["epochs"] = n_epochs
+
+            min_epochs = config["training"]["hpo_min_epochs"]
+            pruning_callback = OptunaPruningCallback(trial, min_epochs)
+
+            # Log this trial
+            self.logger.info(f"Trial {trial.number}: epochs={n_epochs} lr={config['training']['learning_rate']:.2e} "
+                             f"type={config['model']['type']} latent={config['model']['latent_dim']} "
+                             f"K={config['model'].get('mixture',{}).get('K','-')} "
+                             f"rank={config['model'].get('generator',{}).get('rank','-')} "
+                             f"warp={config['model'].get('time_warp',{}).get('enabled', False)}")
+
+            trainer = PrunableTrainer(
+                model=model,
+                train_dataset=self.train_dataset,
+                val_dataset=self.val_dataset,
+                test_dataset=None,
+                config=config,
+                save_dir=save_dir,
+                device=self.device,
+                norm_helper=self.norm_helper,
+                epoch_callback=pruning_callback
+            )
+
+            best_val_loss = trainer.train()
+
+            trial.set_user_attr("full_config", config)
+            trial.set_user_attr("final_lr", trainer.optimizer.param_groups[0]['lr'])
+            save_json(config, save_dir / "config.json")
+
+            self.logger.info(f"Trial {trial.number} done. Best loss={best_val_loss:.6f} "
+                             f"Final LR={trainer.optimizer.param_groups[0]['lr']:.2e}")
+            return best_val_loss
+
+        except optuna.TrialPruned:
+            self.logger.info(f"Trial {trial.number} pruned.")
+            raise
+        except Exception as e:
+            self.logger.error(f"Trial {trial.number} failed: {e}", exc_info=True)
+            return float("inf")
+        finally:
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+
+class PrunableTrainer(Trainer):
+    """Trainer with an epoch callback hook for Optuna pruning."""
+    def __init__(self, *args, epoch_callback: Optional[Callable[[int, float], bool]] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.epoch_callback = epoch_callback
+        
+    def _run_training_loop(self):
+        best_train_loss = float("inf")
+        for epoch in range(1, self.train_config["epochs"] + 1):
+            self.current_epoch = epoch
+            epoch_start = time.time()
+
+            train_loss, train_metrics = self._train_epoch()
+            val_loss, val_metrics = self._validate()
+
+            if self.scheduler and not self.scheduler_step_on_batch:
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau) and self.has_validation:
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+
+            epoch_time = time.time() - epoch_start
+            self.total_training_time += epoch_time
+            self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
+
+            if self.epoch_callback:
+                loss_for_pruning = val_loss if self.has_validation and val_loss != float("inf") else train_loss
+                if self.epoch_callback(epoch, loss_for_pruning):
+                    self.logger.info(f"Trial pruned at epoch {epoch} with loss {loss_for_pruning:.6f}")
+                    raise optuna.TrialPruned()
+
+            if self.has_validation:
+                if val_loss < (self.best_val_loss - self.min_delta):
+                    self.best_val_loss = val_loss
+                    self.best_epoch = epoch
+                    self.patience_counter = 0
+                    self._save_best_model()
+                else:
+                    self.patience_counter += 1
+
+                if self.patience_counter >= self.early_stopping_patience:
+                    self.logger.info(f"Early stopping at epoch {epoch}")
+                    break
+            else:
+                if train_loss < (best_train_loss - self.min_delta):
+                    best_train_loss = train_loss
+                    self.best_val_loss = train_loss
+                    self.best_epoch = epoch
+                    self._save_best_model()
+
+
+def suggest_lilan_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Produce a LiLaN (Linear Latent) config for this trial.
+    We keep the search space tight and relevant:
+      - type: linear_latent or linear_latent_mixture
+      - latent_dim
+      - generator.rank
+      - mixture.K (if mixture)
+      - time_warp.enabled + J_terms
+      - encoder/decoder depth/width
+      - learning rate and weight decay
+      - regularization weights for mixture (entropy/diversity)
+    """
+    cfg = copy.deepcopy(base_config)
+
+    # Always absolute mode for this benchmark
+    cfg["prediction"]["mode"] = "absolute"
+
+    # Ensure sequence mode stays on — HPO shouldn’t flip preprocessing mode
+    cfg["data"]["sequence_mode"] = True
+
+    # Model family choice: single generator vs mixture
+    model_type = trial.suggest_categorical("model_type", ["linear_latent", "linear_latent_mixture"])
+    cfg["model"]["type"] = model_type
+
+    # Core sizes
+    cfg["model"]["latent_dim"] = trial.suggest_categorical("latent_dim", [48, 64, 96])
+
+    # Encoder/decoder depths (compact)
+    enc_depth = trial.suggest_int("enc_depth", 2, 3)
+    dec_depth = trial.suggest_int("dec_depth", 2, 3)
+
+    def sample_width(tag: str) -> int:
+        return trial.suggest_categorical(tag, [128, 192, 256, 320])
+
+    cfg["model"]["encoder_layers"] = [sample_width(f"enc_w{i}") for i in range(enc_depth)]
+    cfg["model"]["decoder_layers"] = [sample_width(f"dec_w{i}") for i in range(dec_depth)]
+
+    # Generator rank
+    cfg["model"]["generator"] = {"rank": trial.suggest_categorical("generator_rank", [4, 8, 12, 16])}
+
+    # Mixture settings
+    if model_type == "linear_latent_mixture":
+        cfg["model"]["mixture"] = {"K": trial.suggest_categorical("mixture_K", [2, 3, 4])}
+    else:
+        cfg["model"].pop("mixture", None)
+
+    # Time warp
+    use_warp = trial.suggest_categorical("time_warp", [True, False])
+    if use_warp:
+        cfg["model"]["time_warp"] = {"enabled": True, "J_terms": trial.suggest_categorical("warp_J", [2, 3, 4])}
+    else:
+        cfg["model"]["time_warp"] = {"enabled": False}
+
+    # Activations / dropout
+    cfg["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu"])
+    cfg["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.10, step=0.05)
+
+    # Training hyperparams
+    cfg["training"]["learning_rate"] = trial.suggest_float("lr", 3e-5, 3e-4, log=True)
+    cfg["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-4, log=True)
+
+    # Mixture regularization weights (used by Trainer hooks)
+    cfg["training"]["regularization"] = {
+        "lambda_entropy": trial.suggest_float("lambda_entropy", 0.0, 0.05),
+        "lambda_diversity": trial.suggest_float("lambda_diversity", 0.0, 0.05),
+    }
+
+    # Keep batch size and sequence sampling fixed to avoid data reprocessing mid-HPO
+    # You can tune batch size if VRAM allows, but be consistent across trials.
+    return cfg
+
+
+def optimize(config_path: Path,
+             n_trials: int = 25,
+             n_jobs: int = 1,
+             study_name: str = "chemulator_hpo",
+             pruner: Optional[optuna.pruners.BasePruner] = None):
+    """Run Optuna with Hyperband on the LiLaN search space."""
+    logger = logging.getLogger(__name__)
+    base_config = load_json_config(config_path)
+
+    # Prepare data once
+    trial_runner = OptunaTrialRunner(config_path)
+    objective = trial_runner.run_trial
+
+    # Hyperband for budget allocation across epochs
+    if pruner is None:
+        min_resource = base_config["training"]["hpo_min_epochs"]
+        max_resource = base_config["training"]["hpo_max_epochs"]
+        pruner = HyperbandPruner(min_resource=min_resource, max_resource=max_resource, reduction_factor=3)
+        logger.info(f"Using Hyperband pruner: min={min_resource} max={max_resource} r=3")
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=TPESampler(seed=42, n_startup_trials=5),
+        pruner=pruner,
+        study_name=study_name,
+        storage=f"sqlite:///{study_name}.db",
+        load_if_exists=True
+    )
+
+    logger.info(f"Starting optimization: n_trials={n_trials}, n_jobs={n_jobs}")
+    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
+
+    # Save results
+    results_dir = Path("optuna_results")
+    ensure_directories(results_dir)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    best_config = study.best_trial.user_attrs.get("full_config", {})
+    if not best_config:
+        logger.warning("Could not retrieve full config from user_attrs.")
+
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    pruned    = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+
+    epoch_distribution = {}
+    for t in completed + pruned:
+        n_epochs = t.user_attrs.get("n_epochs", "unknown")
+        epoch_distribution[n_epochs] = epoch_distribution.get(n_epochs, 0) + 1
+
+    best_results = {
+        "best_value": study.best_value,
+        "best_params": study.best_trial.params,
+        "best_config": best_config,
+        "n_trials_completed": len(completed),
+        "n_trials_pruned": len(pruned),
+        "epoch_distribution": epoch_distribution,
+        "best_trial_final_lr": study.best_trial.user_attrs.get("final_lr", "unknown"),
+        "study_db": f"{study_name}.db"
+    }
+
+    save_json(best_results, results_dir / f"best_config_{study_name}_{timestamp}.json")
+
+    print("\n" + "="*60)
+    print("OPTIMIZATION COMPLETE")
+    print("="*60)
+    print(f"Best validation loss: {best_results['best_value']:.6f}")
+    print(f"Best trial final LR: {best_results['best_trial_final_lr']}")
+    print(f"Trials: {best_results['n_trials_completed']} completed, {best_results['n_trials_pruned']} pruned")
+    print("\nEpoch distribution:")
+    for epochs, count in sorted(epoch_distribution.items(), key=lambda x: (str(x[0]), x[1])):
+        print(f"  {epochs} epochs: {count} trials")
+    print("\nBest parameters:")
+    for key, value in best_results['best_params'].items():
+        print(f"  {key}: {value}")
+
+    return study
+
+
+===== /Users/imalsky/Desktop/Chemulator/src/training/trainer.py =====
+#!/usr/bin/env python3
+"""
+Unified training module for all model training logic.
+"""
+
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional, Callable
+import numpy as np
+
+import torch
+import torch.nn as nn
+from torch.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
+
+from data.normalizer import NormalizationHelper
+from lion_pytorch import Lion
+
+
+class Trainer:
+    """Unified trainer for chemical kinetics models."""
+    def __init__(self, model: nn.Module, train_dataset, val_dataset, test_dataset,
+                 config: Dict[str, Any], save_dir: Path, device: torch.device,
+                 norm_helper: Optional[NormalizationHelper] = None):
+        self.logger = logging.getLogger(__name__)
+        
+        self.model = model
+        self.config = config
+        self.save_dir = save_dir
+        self.device = device
+        self.norm_helper = norm_helper
+        
+        # Extract config sections
+        self.train_config = config["training"]
+        self.system_config = config["system"]
+        self.data_config = config["data"]
+        
+        # Check sequence mode
+        self.sequence_mode = self.data_config.get("sequence_mode", False)
+        
+        # Get dtype
+        dtype_str = self.system_config.get("dtype", "float32")
+        self.dtype = getattr(torch, dtype_str)
+        
+        # Dataset info
+        self.has_validation = val_dataset is not None and len(val_dataset) > 0
+        
+        # Create data loaders
+        self._setup_dataloaders(train_dataset, val_dataset, test_dataset)
+        
+        # Training state
+        self.current_epoch = 0
+        self.global_step = 0
+        self.best_val_loss = float("inf")
+        self.best_epoch = -1
+        self.total_training_time = 0
+        self.patience_counter = 0
+        
+        # Training parameters
+        self.early_stopping_patience = self.train_config["early_stopping_patience"]
+        self.min_delta = self.train_config["min_delta"]
+        self.gradient_accumulation_steps = self.train_config["gradient_accumulation_steps"]
+        
+        # Setup components
+        self._setup_optimizer()
+        self._setup_scheduler()
+        self._setup_loss()
+        self._setup_amp()
+        
+        # History
+        self.training_history = {
+            "config": config,
+            "epochs": []
+        }
+    
+    def _setup_dataloaders(self, train_dataset, val_dataset, test_dataset):
+        """Setup data loaders."""
+        from data.dataset import create_dataloader
+        
+        self.train_loader = create_dataloader(
+            train_dataset, self.config, shuffle=True, 
+            device=self.device, drop_last=True
+        ) if train_dataset else None
+        
+        self.val_loader = create_dataloader(
+            val_dataset, self.config, shuffle=False,
+            device=self.device, drop_last=False
+        ) if val_dataset and len(val_dataset) > 0 else None
+        
+        self.test_loader = create_dataloader(
+            test_dataset, self.config, shuffle=False,
+            device=self.device, drop_last=False
+        ) if test_dataset and len(test_dataset) > 0 else None
+    
+    def _setup_optimizer(self):
+        """Setup optimizer with weight decay handling."""
+        opt_name = self.train_config.get("optimizer", "adamw").lower()
+        
+        # Split parameters by weight decay
+        decay, no_decay = [], []
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.dim() == 1 or "bias" in name or "norm" in name.lower():
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        
+        param_groups = [
+            {"params": decay, "weight_decay": self.train_config["weight_decay"]},
+            {"params": no_decay, "weight_decay": 0.0}
+        ]
+        
+        lr = self.train_config["learning_rate"]
+        betas = tuple(self.train_config.get("betas", [0.9, 0.999]))
+        eps = self.train_config.get("eps", 1e-8)
+        
+        if opt_name == "lion":
+            self.optimizer = Lion(param_groups, lr=lr, betas=betas,
+                                weight_decay=self.train_config["weight_decay"])
+            self.logger.info(f"Using Lion optimizer (lr={lr}, betas={betas})")
+        elif opt_name == "adamw":
+            opt_kwargs = {"lr": lr, "betas": betas, "eps": eps}
+            
+            # Try fused AdamW
+            if self.device.type == "cuda" and hasattr(torch.optim.AdamW, "fused"):
+                try:
+                    _ = torch.optim.AdamW([torch.zeros(1, device=self.device)], fused=True)
+                    opt_kwargs["fused"] = True
+                    self.logger.info("Using fused AdamW")
+                except:
+                    pass
+            
+            self.optimizer = AdamW(param_groups, **opt_kwargs)
+            self.logger.info(f"Using AdamW optimizer (lr={lr}, betas={betas}, eps={eps})")
+        else:
+            raise ValueError(f"Unknown optimizer: {opt_name}")
+    
+    def _setup_scheduler(self):
+        """Setup learning rate scheduler."""
+        scheduler_type = self.train_config.get("scheduler", "none").lower()
+        
+        if scheduler_type == "none" or not self.train_loader:
+            self.scheduler = None
+            self.scheduler_step_on_batch = False
+            return
+        
+        steps_per_epoch = len(self.train_loader) // self.gradient_accumulation_steps
+        if steps_per_epoch == 0:
+            steps_per_epoch = 1
+        
+        params = self.train_config.get("scheduler_params", {})
+        
+        if scheduler_type == "cosine":
+            T_0_epochs = params.get("T_0", 10)
+            T_0_steps = T_0_epochs * steps_per_epoch
+            
+            self.scheduler = CosineAnnealingWarmRestarts(
+                self.optimizer,
+                T_0=T_0_steps,
+                T_mult=params.get("T_mult", 2),
+                eta_min=params.get("eta_min", 1e-8)
+            )
+            self.scheduler_step_on_batch = True
+            
+        elif scheduler_type == "plateau":
+            if not self.has_validation:
+                self.logger.warning("Plateau scheduler requires validation data")
+                self.scheduler = None
+                self.scheduler_step_on_batch = False
+                return
+            
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=params.get("factor", 0.5),
+                patience=params.get("patience", 10),
+                min_lr=params.get("min_lr", 1e-7)
+            )
+            self.scheduler_step_on_batch = False
+        else:
+            raise ValueError(f"Unknown scheduler: {scheduler_type}")
+    
+    def _setup_loss(self):
+        """Setup loss function."""
+        self.criterion = nn.MSELoss()
+    
+    def _setup_amp(self):
+        """Setup automatic mixed precision."""
+        if self.dtype == torch.float64:
+            self.use_amp = False
+            self.scaler = GradScaler(enabled=False)
+            self.amp_dtype = None
+            return
+        
+        self.use_amp = self.train_config.get("use_amp", True)
+        dtype_str = str(self.train_config.get("amp_dtype", "bfloat16")).lower()
+        self.amp_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float16
+        
+        # GradScaler only for float16
+        self.scaler = GradScaler(enabled=(self.amp_dtype == torch.float16))
+    
+    def _compute_loss(self, outputs: torch.Tensor, targets: torch.Tensor, 
+                     inputs: torch.Tensor) -> torch.Tensor:
+        """Compute loss with regularization."""
+        # MSE loss
+        loss = self.criterion(outputs, targets)
+        
+        # Add regularization losses if available
+        if hasattr(self.model, 'get_regularization_losses'):
+            reg_losses = self.model.get_regularization_losses(inputs)
+            
+            # Gate entropy
+            if 'gate_entropy' in reg_losses:
+                lambda_entropy = self.train_config.get("regularization", {}).get("lambda_entropy", 0.01)
+                if lambda_entropy > 0:
+                    loss = loss + lambda_entropy * reg_losses['gate_entropy']
+            
+            # Generator diversity
+            if 'generator_diversity' in reg_losses:
+                lambda_diversity = self.train_config.get("regularization", {}).get("lambda_diversity", 0.01)
+                if lambda_diversity > 0:
+                    loss = loss + lambda_diversity * reg_losses['generator_diversity']
+        
+        return loss
+    
+    def train(self) -> float:
+        """Execute training loop."""
+        if not self.train_loader:
+            self.logger.error("No training data available")
+            return float("inf")
+        
+        self.logger.info(f"Starting training in {'sequence' if self.sequence_mode else 'row-wise'} mode")
+        self.logger.info(f"Train batches: {len(self.train_loader)}")
+        if self.has_validation:
+            self.logger.info(f"Val batches: {len(self.val_loader)}")
+        
+        try:
+            self._run_training_loop()
+            self.logger.info(f"Training completed. Best validation loss: {self.best_val_loss:.6f} "
+                           f"at epoch {self.best_epoch}")
+        except KeyboardInterrupt:
+            self.logger.info("Training interrupted by user")
+        except Exception as e:
+            self.logger.error(f"Training failed: {e}", exc_info=True)
+            raise
+        finally:
+            # Save training history
+            save_path = self.save_dir / "training_log.json"
+            with open(save_path, 'w') as f:
+                json.dump(self.training_history, f, indent=2)
+        
+        return self.best_val_loss
+    
+    def _run_training_loop(self):
+        """Main training loop."""
+        best_train_loss = float("inf")
+        
+        for epoch in range(1, self.train_config["epochs"] + 1):
+            self.current_epoch = epoch
+            epoch_start = time.time()
+            
+            # Train
+            train_loss, train_metrics = self._train_epoch()
+            
+            # Validate
+            val_loss, val_metrics = self._validate()
+            
+            # Update scheduler
+            if self.scheduler and not self.scheduler_step_on_batch:
+                if isinstance(self.scheduler, ReduceLROnPlateau) and self.has_validation:
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+            
+            # Log epoch
+            epoch_time = time.time() - epoch_start
+            self.total_training_time += epoch_time
+            self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
+            
+            # Save best model
+            if self.has_validation:
+                if val_loss < (self.best_val_loss - self.min_delta):
+                    self.best_val_loss = val_loss
+                    self.best_epoch = epoch
+                    self.patience_counter = 0
+                    self._save_best_model()
+                else:
+                    self.patience_counter += 1
+                
+                if self.patience_counter >= self.early_stopping_patience:
+                    self.logger.info(f"Early stopping at epoch {epoch}")
+                    break
+            else:
+                if train_loss < (best_train_loss - self.min_delta):
+                    best_train_loss = train_loss
+                    self.best_val_loss = train_loss
+                    self.best_epoch = epoch
+                    self._save_best_model()
+    
+    def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0.0
+        total_samples = 0
+        
+        for batch_idx, (inputs, targets) in enumerate(self.train_loader):
+            # Ensure on device
+            if inputs.device != self.device:
+                inputs = inputs.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+            
+            with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                outputs = self.model(inputs)
+                loss = self._compute_loss(outputs, targets, inputs)
+                loss = loss / self.gradient_accumulation_steps
+            
+            if self.scaler.is_enabled():
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or \
+               (batch_idx + 1) == len(self.train_loader):
+                # Gradient clipping
+                if self.train_config["gradient_clip"] > 0:
+                    if self.scaler.is_enabled():
+                        self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.train_config["gradient_clip"]
+                    )
+                
+                # Optimizer step
+                if self.scaler.is_enabled():
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                
+                self.optimizer.zero_grad(set_to_none=True)
+                
+                # Scheduler step
+                if self.scheduler and self.scheduler_step_on_batch:
+                    self.scheduler.step()
+                
+                self.global_step += 1
+            
+            batch_size = inputs.size(0)
+            total_loss += loss.item() * self.gradient_accumulation_steps * batch_size
+            total_samples += batch_size
+        
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+        return avg_loss, {}
+    
+    @torch.inference_mode()
+    def _validate(self) -> Tuple[float, Dict[str, float]]:
+        """Validation epoch."""
+        if not self.has_validation or self.val_loader is None:
+            return float("inf"), {}
+        
+        self.model.eval()
+        total_loss = 0.0
+        total_samples = 0
+        
+        for inputs, targets in self.val_loader:
+            if inputs.device != self.device:
+                inputs = inputs.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+            
+            with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                outputs = self.model(inputs)
+                loss = self._compute_loss(outputs, targets, inputs)
+            
+            batch_size = inputs.size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+        
+        avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
+        return avg_loss, {}
+    
+    @torch.inference_mode()
+    def evaluate_test(self) -> float:
+        """Evaluate on test set."""
+        if not self.test_loader:
+            self.logger.warning("No test data available")
+            return float("inf")
+        
+        self.model.eval()
+        total_loss = 0.0
+        total_samples = 0
+        
+        for inputs, targets in self.test_loader:
+            if inputs.device != self.device:
+                inputs = inputs.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+            
+            with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                outputs = self.model(inputs)
+                loss = self._compute_loss(outputs, targets, inputs)
+            
+            batch_size = inputs.size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+        
+        avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
+        self.logger.info(f"Test loss: {avg_loss:.6f}")
+        return avg_loss
+    
+    def _log_epoch(self, train_loss, val_loss, train_metrics, val_metrics, epoch_time):
+        """Log epoch results."""
+        lr = self.optimizer.param_groups[0]['lr']
+        log_entry = {
+            "epoch": self.current_epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "epoch_time": epoch_time,
+            "lr": lr
+        }
+        self.training_history["epochs"].append(log_entry)
+        
+        val_str = f"Val: {val_loss:.3e}" if self.has_validation else "Val: N/A"
+        self.logger.info(
+            f"Epoch {self.current_epoch}/{self.train_config['epochs']} | "
+            f"Train: {train_loss:.3e} | {val_str} | "
+            f"Time: {epoch_time:.1f}s | LR: {lr:.2e}"
+        )
+    
+    def _save_best_model(self):
+        """Save best model checkpoint."""
+        checkpoint = {
+            "epoch": self.current_epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
+            "best_val_loss": self.best_val_loss,
+            "config": self.config
+        }
+        
+        checkpoint_path = self.save_dir / "best_model.pt"
+        torch.save(checkpoint, checkpoint_path)
+        self.logger.info(f"Saved best model to {checkpoint_path}")
+        
+        # Export model if enabled
+        if self.system_config.get("use_torch_export", False):
+            self._export_model()
+    
+    def _export_model(self):
+        """Export model for deployment."""
+        example_loader = self.val_loader or self.train_loader
+        if example_loader:
+            example_inputs, _ = next(iter(example_loader))
+            if example_inputs.device != torch.device("cpu"):
+                example_inputs = example_inputs.cpu()
+                self.model.cpu()
+            
+            from models.model import export_model
+            export_path = self.save_dir / "exported_model.pt"
+            export_model(self.model, example_inputs, export_path)
+            
+            # Restore to original device
+            self.model.to(self.device)
+
+
+# For Optuna integration
+class PrunableTrainer(Trainer):
+    """Trainer with Optuna pruning support."""
+    def __init__(self, *args, epoch_callback: Optional[Callable[[int, float], bool]] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.epoch_callback = epoch_callback
+    
+    def _run_training_loop(self):
+        """Training loop with pruning callbacks."""
+        best_train_loss = float("inf")
+        
+        for epoch in range(1, self.train_config["epochs"] + 1):
+            self.current_epoch = epoch
+            epoch_start = time.time()
+            
+            train_loss, train_metrics = self._train_epoch()
+            val_loss, val_metrics = self._validate()
+            
+            if self.scheduler and not self.scheduler_step_on_batch:
+                if isinstance(self.scheduler, ReduceLROnPlateau) and self.has_validation:
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+            
+            epoch_time = time.time() - epoch_start
+            self.total_training_time += epoch_time
+            self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
+            
+            # Optuna callback
+            if self.epoch_callback:
+                loss_for_pruning = val_loss if self.has_validation and val_loss != float("inf") else train_loss
+                
+                if self.epoch_callback(epoch, loss_for_pruning):
+                    self.logger.info(f"Trial pruned at epoch {epoch} with loss {loss_for_pruning:.6f}")
+                    import optuna
+                    raise optuna.TrialPruned()
+            
+            # Early stopping logic
+            if self.has_validation:
+                if val_loss < (self.best_val_loss - self.min_delta):
+                    self.best_val_loss = val_loss
+                    self.best_epoch = epoch
+                    self.patience_counter = 0
+                    self._save_best_model()
+                else:
+                    self.patience_counter += 1
+                
+                if self.patience_counter >= self.early_stopping_patience:
+                    self.logger.info(f"Early stopping at epoch {epoch}")
+                    break
+            else:
+                if train_loss < (best_train_loss - self.min_delta):
+                    best_train_loss = train_loss
+                    self.best_val_loss = train_loss
+                    self.best_epoch = epoch
+                    self._save_best_model()
+
+===== /Users/imalsky/Desktop/Chemulator/src/utils/utils.py =====
+#!/usr/bin/env python3
+"""
+Utility functions for the chemical kinetics pipeline.
+"""
+
+import json
+import logging
+import os
+import random
+import sys
+from pathlib import Path
+from typing import Any, Dict, Union
+
+import numpy as np
+import torch
+
+
+def setup_logging(level: int = logging.INFO, log_file: Path = None) -> None:
+    """Configure logging for the application."""
+    format_string = "%(asctime)s | %(levelname)-8s | %(name)s - %(message)s"
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    
+    # Clear existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Create formatter
+    formatter = logging.Formatter(format_string, datefmt="%Y-%m-%d %H:%M:%S")
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+
+
+def seed_everything(seed: int) -> None:
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Random seed set to {seed}")
+
+
+def load_json_config(path: Union[str, Path]) -> Dict[str, Any]:
+    """Load JSON configuration file."""
+    path = Path(path)
+    
+    if not path.exists():
+        raise FileNotFoundError(f"Configuration file not found: {path}")
+    
+    # Try json5 first for comment support
+    try:
+        import json5
+        with open(path, 'r', encoding='utf-8') as f:
+            config = json5.load(f)
+    except ImportError:
+        # Fallback to standard json
+        with open(path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    
+    return config
+
+
+def save_json(data: Dict[str, Any], path: Union[str, Path], indent: int = 2) -> None:
+    """Save dictionary to JSON file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Custom encoder for numpy/torch types
+    class NumpyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, torch.Tensor):
+                return obj.cpu().numpy().tolist()
+            elif isinstance(obj, Path):
+                return str(obj)
+            return super().default(obj)
+    
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=indent, cls=NumpyEncoder)
+
+
+def load_json(path: Union[str, Path]) -> Dict[str, Any]:
+    """Load JSON file."""
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def ensure_directories(*paths: Union[str, Path]) -> None:
+    """Create directories if they don't exist."""
+    for path in paths:
+        Path(path).mkdir(parents=True, exist_ok=True)
+
+===== /Users/imalsky/Desktop/Chemulator/src/utils/hardware.py =====
+#!/usr/bin/env python3
+"""
+Hardware detection and optimization utilities.
+"""
+
+import logging
+import os
+from typing import Dict, Any
+import torch
+
+
+def setup_device() -> torch.device:
+    """Detect and configure the best available compute device."""
+    logger = logging.getLogger(__name__)
+    
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info(f"Using CUDA device: {gpu_name} ({gpu_memory:.1f} GB)")
+        
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        logger.info("Using Apple Silicon MPS device")
+        
+    else:
+        device = torch.device("cpu")
+        logger.info(f"Using CPU device ({os.cpu_count()} cores)")
+    
+    return device
+
+
+def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
+    """Apply hardware-specific optimizations with safe feature detection."""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # 'high' is often best on A100; adjust if you see numeric issues
+        torch.set_float32_matmul_precision("high")
+        logger.info("float32 matmul precision set to 'high'")
+    except Exception:
+        pass
+
+
+    # CUDA optimizations
+    if device.type == "cuda":
+        # Enable TensorFloat-32 for faster matmul
+        if config.get("tf32", True) and torch.get_default_dtype() == torch.float32:
+            if hasattr(torch.backends.cuda, "matmul"):
+                torch.backends.cuda.matmul.allow_tf32 = True
+                logger.info("TensorFloat-32 enabled for matmul")
+            if hasattr(torch.backends.cudnn, "allow_tf32"):
+                torch.backends.cudnn.allow_tf32 = True
+                logger.info("TensorFloat-32 enabled for cuDNN")
+                
+        # Enable cuDNN autotuner
+        if config.get("cudnn_benchmark", True) and hasattr(torch.backends.cudnn, "benchmark"):
+            torch.backends.cudnn.benchmark = True
+            logger.info("cuDNN autotuner enabled")
+        
+        # Set memory fraction
+        memory_fraction = config.get("cuda_memory_fraction", 0.9)
+        if memory_fraction < 1.0 and hasattr(torch.cuda, "set_per_process_memory_fraction"):
+            try:
+                torch.cuda.set_per_process_memory_fraction(memory_fraction)
+                logger.info(f"CUDA memory fraction set to {memory_fraction}")
+            except Exception as e:
+                logger.warning(f"Could not set CUDA memory fraction: {e}")
+    
+    # Set number of threads for CPU operations
+    torch.set_num_threads(min(32, os.cpu_count() or 1))
+    logger.info(f"Using {torch.get_num_threads()} CPU threads")
+
+===== /Users/imalsky/Desktop/Chemulator/src/models/model.py =====
+#!/usr/bin/env python3
+"""
+Linear Latent Network models with mixture of generators and time warping.
+"""
+
+import logging
+import math
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class TimeWarp(nn.Module):
+    """Monotone time warping module."""
+    def __init__(self, n_species: int, n_globals: int, J_terms: int = 3):
+        super().__init__()
+        self.J_terms = J_terms
+        
+        # Network to predict warp parameters
+        input_dim = n_species + n_globals
+        self.param_net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 32),
+            nn.GELU(),
+            nn.Linear(32, 1 + 2 * J_terms)  # s, {a_j, b_j}
+        )
+        
+        # Initialize near identity
+        with torch.no_grad():
+            # Last layer bias: [s=1, a_j=small, b_j=1]
+            bias = self.param_net[-1].bias
+            bias[0] = 1.0  # s around 1
+            bias[1:1+J_terms] = 0.01  # a_j small
+            bias[1+J_terms:] = 1.0  # b_j around 1
+    
+    def forward(self, t_norm: torch.Tensor, x0_log: torch.Tensor, globals: torch.Tensor) -> torch.Tensor:
+        """
+        Apply monotone time warp.
+        
+        Args:
+            t_norm: Normalized time in [0, 1], shape [B] or [B, M]
+            x0_log: Initial log-species, shape [B, n_species]
+            globals: Global parameters, shape [B, n_globals]
+            
+        Returns:
+            Warped time tau(t), same shape as t_norm
+        """
+        # Get warp parameters
+        features = torch.cat([x0_log, globals], dim=1)
+        params = self.param_net(features)
+        
+        # Extract parameters with softplus for positivity
+        s = F.softplus(params[:, 0:1])  # [B, 1]
+        a = F.softplus(params[:, 1:1+self.J_terms])  # [B, J]
+        b = F.softplus(params[:, 1+self.J_terms:])  # [B, J]
+        
+        # Handle different time shapes
+        if t_norm.dim() == 1:
+            t_norm = t_norm.unsqueeze(1)  # [B, 1]
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
+        # Compute warp: tau(t) = s*t + sum_j a_j(1 - exp(-b_j*t))
+        tau = s * t_norm  # [B, M]
+        
+        for j in range(self.J_terms):
+            tau = tau + a[:, j:j+1] * (1 - torch.exp(-b[:, j:j+1] * t_norm))
+        
+        if squeeze_output:
+            tau = tau.squeeze(1)
+            
+        return tau
+
+
+class LinearLatentMixture(nn.Module):
+    """
+    Linear Latent Network with mixture of K generators and optional time warping.
+    
+    For sequence mode with multi-time supervision.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
+        self.logger = logging.getLogger(__name__)
+        
+        # Dimensions
+        self.num_species = len(config["data"]["species_variables"])
+        self.num_globals = len(config["data"]["global_variables"])
+        self.num_targets = len(config["data"].get("target_species_variables", 
+                                                  config["data"]["species_variables"]))
+        
+        # Model config
+        model_config = config["model"]
+        self.latent_dim = model_config.get("latent_dim", 64)
+        self.K = model_config.get("mixture", {}).get("K", 1)
+        self.use_time_warp = model_config.get("time_warp", {}).get("enabled", False)
+        
+        # Architecture parameters
+        self.encoder_layers = model_config.get("encoder_layers", [256, 256, 128])
+        self.decoder_layers = model_config.get("decoder_layers", [128, 256, 256])
+        self.generator_rank = model_config.get("generator", {}).get("rank", 8)
+        
+        # Activation and dropout
+        self.activation = self._get_activation(model_config.get("activation", "gelu"))
+        dropout_rate = model_config.get("dropout", 0.0)
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+        
+        # Build encoder: (x0_log, globals) -> z0
+        encoder_input_dim = self.num_species + self.num_globals
+        self.encoder = self._build_mlp(
+            encoder_input_dim,
+            self.encoder_layers,
+            self.latent_dim,
+            use_layernorm=True
+        )
+        
+        # Mixture components
+        if self.K > 1:
+            # Gate network: (x0_log, globals) -> p_k
+            self.gate_net = nn.Sequential(
+                nn.Linear(encoder_input_dim, 64),
+                self.activation,
+                nn.Linear(64, 32),
+                self.activation,
+                nn.Linear(32, self.K)
+            )
+            
+            # K generator networks
+            self.generator_nets = nn.ModuleList([
+                self._build_generator_net() for _ in range(self.K)
+            ])
+        else:
+            # Single generator
+            self.generator_nets = nn.ModuleList([self._build_generator_net()])
+        
+        # Optional time warp
+        if self.use_time_warp:
+            J_terms = model_config.get("time_warp", {}).get("J_terms", 3)
+            self.time_warp = TimeWarp(self.num_species, self.num_globals, J_terms)
+        
+        # Decoder: (z(t), globals) -> log-species
+        decoder_input_dim = self.latent_dim + self.num_globals
+        self.decoder = self._build_mlp(
+            decoder_input_dim,
+            self.decoder_layers,
+            self.num_targets,
+            use_layernorm=True,
+            final_activation=False
+        )
+        
+        self._initialize_weights()
+    
+    def _get_activation(self, name: str):
+        """Get activation function by name."""
+        activations = {
+            "gelu": nn.GELU(),
+            "relu": nn.ReLU(inplace=True),
+            "tanh": nn.Tanh(),
+            "silu": nn.SiLU(inplace=True),
+            "elu": nn.ELU(inplace=True)
+        }
+        return activations.get(name.lower(), nn.GELU())
+    
+    def _build_mlp(self, input_dim: int, hidden_layers: List[int], 
+                   output_dim: int, use_layernorm: bool = True,
+                   final_activation: bool = True) -> nn.Sequential:
+        """Build a multi-layer perceptron."""
+        layers = []
+        prev_dim = input_dim
+        
+        for i, dim in enumerate(hidden_layers):
+            if i > 0 and use_layernorm:
+                layers.append(nn.LayerNorm(prev_dim))
+            
+            layers.append(nn.Linear(prev_dim, dim))
+            layers.append(self.activation)
+            
+            if self.dropout is not None:
+                layers.append(self.dropout)
+            
+            prev_dim = dim
+        
+        # Output layer
+        if use_layernorm:
+            layers.append(nn.LayerNorm(prev_dim))
+        layers.append(nn.Linear(prev_dim, output_dim))
+        
+        if final_activation:
+            layers.append(self.activation)
+        
+        return nn.Sequential(*layers)
+    
+    def _build_generator_net(self) -> nn.Module:
+        """Build a stable generator network A(globals)."""
+        class StableGenerator(nn.Module):
+            def __init__(self, n_globals, latent_dim, rank, activation):
+                super().__init__()
+                self.latent_dim = latent_dim
+                self.rank = rank
+                
+                # Network for symmetric negative definite part
+                self.sym_net = nn.Sequential(
+                    nn.Linear(n_globals, 64),
+                    activation,
+                    nn.Linear(64, latent_dim * rank)
+                )
+                
+                # Networks for skew-symmetric part
+                if rank > 0:
+                    self.skew_u_net = nn.Sequential(
+                        nn.Linear(n_globals, 64),
+                        activation,
+                        nn.Linear(64, latent_dim * rank)
+                    )
+                    self.skew_v_net = nn.Sequential(
+                        nn.Linear(n_globals, 64),
+                        activation,
+                        nn.Linear(64, latent_dim * rank)
+                    )
+                
+                # Stability margin
+                self.alpha = 1.0
+            
+            def forward(self, globals: torch.Tensor) -> torch.Tensor:
+                """Compute stable A matrix."""
+                B = globals.size(0)
+                d, r = self.latent_dim, self.rank
+                
+                # Symmetric negative definite: -C*C^T - alpha*I
+                C = self.sym_net(globals).view(B, d, r)
+                sym_part = -torch.bmm(C, C.transpose(1, 2))
+                I = torch.eye(d, device=globals.device, dtype=globals.dtype).unsqueeze(0)
+                sym_part = sym_part - self.alpha * I
+                
+                # Skew-symmetric part
+                if r > 0 and hasattr(self, 'skew_u_net'):
+                    U = self.skew_u_net(globals).view(B, d, r)
+                    V = self.skew_v_net(globals).view(B, d, r)
+                    skew = torch.bmm(U, V.transpose(1, 2)) - torch.bmm(V, U.transpose(1, 2))
+                else:
+                    skew = torch.zeros_like(sym_part)
+                
+                return sym_part + skew
+        
+        return StableGenerator(self.num_globals, self.latent_dim, 
+                               self.generator_rank, self.activation)
+    
+    def _initialize_weights(self):
+        """Initialize weights for stability."""
+        for module in [self.encoder, self.decoder]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.5)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        
+        # Initialize generators with small values
+        for gen in self.generator_nets:
+            for m in gen.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.uniform_(m.weight, -0.01, 0.01)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+    
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for sequence mode.
+        
+        Args:
+            inputs: [B, n_species + n_globals + M] where last M dims are normalized times
+            
+        Returns:
+            outputs: [B, M, n_targets] log-abundances at M time points
+        """
+        B = inputs.size(0)
+        
+        # Parse inputs
+        x0_log = inputs[:, :self.num_species]
+        globals = inputs[:, self.num_species:self.num_species + self.num_globals]
+        t_norm = inputs[:, self.num_species + self.num_globals:]  # [B, M]
+        M = t_norm.size(1)
+        
+        # Apply time warp if enabled
+        if self.use_time_warp:
+            t_eff = self.time_warp(t_norm, x0_log, globals)
+        else:
+            t_eff = t_norm
+        
+        # Encode initial condition
+        encoder_input = torch.cat([x0_log, globals], dim=1)
+        z0 = self.encoder(encoder_input)  # [B, latent_dim]
+        
+        if self.K > 1:
+            # Mixture of generators
+            # Get gate probabilities
+            logits = self.gate_net(encoder_input)  # [B, K]
+            p = F.softmax(logits / 0.1, dim=-1)  # Temperature scaling
+            
+            # Compute weighted evolution
+            z_t_all = []
+            for k in range(self.K):
+                A_k = self.generator_nets[k](globals)  # [B, d, d]
+                
+                # Evolve for all times
+                z_t_k = []
+                for m in range(M):
+                    At = A_k * t_eff[:, m:m+1].unsqueeze(-1)  # [B, d, d]
+                    exp_At = torch.linalg.matrix_exp(At)  # [B, d, d]
+                    z_m = torch.bmm(exp_At, z0.unsqueeze(-1)).squeeze(-1)  # [B, d]
+                    z_t_k.append(z_m)
+                
+                z_t_k = torch.stack(z_t_k, dim=1)  # [B, M, d]
+                z_t_all.append(z_t_k)
+            
+            # Weighted sum
+            z_t_all = torch.stack(z_t_all, dim=1)  # [B, K, M, d]
+            p_expanded = p.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
+            z_t = (z_t_all * p_expanded).sum(dim=1)  # [B, M, d]
+            
+        else:
+            # Single generator
+            A = self.generator_nets[0](globals)  # [B, d, d]
+            
+            # Evolve for all times
+            z_t_list = []
+            for m in range(M):
+                At = A * t_eff[:, m:m+1].unsqueeze(-1)  # [B, d, d]
+                exp_At = torch.linalg.matrix_exp(At)  # [B, d, d]
+                z_m = torch.bmm(exp_At, z0.unsqueeze(-1)).squeeze(-1)  # [B, d]
+                z_t_list.append(z_m)
+            
+            z_t = torch.stack(z_t_list, dim=1)  # [B, M, d]
+        
+        # Decode all time points
+        globals_expanded = globals.unsqueeze(1).expand(B, M, self.num_globals)
+        decoder_input = torch.cat([z_t, globals_expanded], dim=-1)  # [B, M, d+g]
+        
+        # Reshape for decoder
+        decoder_input_flat = decoder_input.view(B * M, -1)
+        output_flat = self.decoder(decoder_input_flat)  # [B*M, n_targets]
+        outputs = output_flat.view(B, M, self.num_targets)  # [B, M, n_targets]
+        
+        return outputs
+    
+    def get_regularization_losses(self, inputs: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute regularization losses."""
+        losses = {}
+        
+        if self.K > 1:
+            # Gate entropy regularization
+            x0_log = inputs[:, :self.num_species]
+            globals = inputs[:, self.num_species:self.num_species + self.num_globals]
+            encoder_input = torch.cat([x0_log, globals], dim=1)
+            
+            logits = self.gate_net(encoder_input)
+            p = F.softmax(logits / 0.1, dim=-1)
+            entropy = -(p * (p + 1e-8).log()).sum(dim=-1).mean()
+            losses['gate_entropy'] = -entropy  # Maximize entropy
+            
+            # Generator diversity (pairwise distance)
+            if self.K > 1:
+                diversity = 0.0
+                count = 0
+                for i in range(self.K):
+                    for j in range(i+1, self.K):
+                        A_i = self.generator_nets[i](globals)
+                        A_j = self.generator_nets[j](globals)
+                        diversity += torch.norm(A_i - A_j, p='fro', dim=(1,2)).mean()
+                        count += 1
+                if count > 0:
+                    losses['generator_diversity'] = -diversity / count  # Maximize diversity
+        
+        return losses
+
+
+# Keep LinearLatentDynamics for backward compatibility
+class LinearLatentDynamics(LinearLatentMixture):
+    """Alias for backward compatibility."""
+    def __init__(self, config: Dict[str, Any]):
+        # Force K=1 and no time warp for compatibility
+        config = config.copy()
+        config["model"]["mixture"] = {"K": 1}
+        config["model"]["time_warp"] = {"enabled": False}
+        super().__init__(config)
+
+
+def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
+    """Create and compile model."""
+    model_type = config["model"]["type"].lower()
+    
+    # Map model types
+    if model_type == "linear_latent":
+        model = LinearLatentDynamics(config)
+    elif model_type == "linear_latent_mixture":
+        model = LinearLatentMixture(config)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+    
+    model = model.to(device)
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Created {model_type} model")
+    
+    # Log model details
+    if hasattr(model, 'K'):
+        logger.info(f"  Mixture components K: {model.K}")
+    if hasattr(model, 'use_time_warp'):
+        logger.info(f"  Time warping: {model.use_time_warp}")
+    logger.info(f"  Latent dimension: {model.latent_dim}")
+    
+    # Compile model if requested
+    if config["system"].get("use_torch_compile", False) and hasattr(torch, 'compile'):
+        compile_mode = config["system"].get("compile_mode", "default")
+        logger.info(f"Compiling model with mode='{compile_mode}'...")
+        
+        try:
+            model = torch.compile(model, mode=compile_mode, fullgraph=False, dynamic=False)
+            logger.info("Model compilation successful")
+        except Exception as e:
+            logger.warning(f"Model compilation failed: {e}. Running in eager mode.")
+    
+    # Set dtype
+    dtype_str = config["system"].get("dtype", "float32")
+    if dtype_str == "float64":
+        model = model.double()
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total trainable parameters: {total_params:,}")
+    
+    return model
+
+
+def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path):
+    """Export model with torch.export."""
+    logger = logging.getLogger(__name__)
+    
+    model.eval()
+    
+    # Unwrap compiled models
+    if hasattr(model, '_orig_mod'):
+        model = model._orig_mod
+    
+    with torch.no_grad():
+        try:
+            if hasattr(torch, 'export'):
+                # Use torch.export for dynamic shapes
+                from torch.export import export, save
+                from torch.export import Dim
+                
+                # Dynamic batch and time dimensions
+                batch_dim = Dim("batch", min=1, max=131072)
+                time_dim = Dim("time", min=1, max=4096)
+                
+                # Adjust example for multi-time
+                if example_input.dim() == 2:
+                    # Add time dimension if needed
+                    n_species = model.num_species
+                    n_globals = model.num_globals
+                    # Assume last dims are time
+                    n_times = example_input.size(1) - n_species - n_globals
+                    if n_times == 1:
+                        # Expand to multiple times for export
+                        base = example_input[:, :n_species + n_globals]
+                        times = example_input[:, -1:].repeat(1, 3)
+                        example_input = torch.cat([base, times], dim=1)
+                
+                exported = export(
+                    model, 
+                    (example_input,),
+                    dynamic_shapes={"inputs": {0: batch_dim, -1: time_dim}}
+                )
+                save(exported, str(save_path))
+                logger.info(f"Model exported with torch.export to {save_path}")
+                
+        except Exception as e:
+            # Fallback to JIT
+            logger.warning(f"torch.export failed: {e}. Using torch.jit")
+            traced = torch.jit.trace(model, example_input)
+            torch.jit.save(traced, str(save_path))
+            logger.info(f"Model exported with torch.jit to {save_path}")
+
+===== /Users/imalsky/Desktop/Chemulator/src/data/preprocessor.py =====
+#!/usr/bin/env python3
+"""
+Chemical kinetics data preprocessor with sequence mode support for LiLaN.
+"""
+
+import hashlib
+import logging
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+
+import h5py
+import numpy as np
+import torch
+import json
+import sys
+
+from .normalizer import DataNormalizer, NormalizationHelper
+from utils.utils import save_json, load_json
+
+DEFAULT_EPSILON_MIN = 1e-38
+DEFAULT_EPSILON_MAX = 1e38
+
+
+class SequenceShardWriter:
+    """Writes trajectory sequences to NPZ shards."""
+    def __init__(self, output_dir: Path, shard_size: int, shard_idx_base: str, 
+                 M: int, n_species: int, n_globals: int, dtype: np.dtype):
+        self.output_dir = output_dir
+        self.shard_size = shard_size
+        self.shard_idx_base = shard_idx_base
+        self.M = M
+        self.n_species = n_species
+        self.n_globals = n_globals
+        self.dtype = dtype
+        self.buffer = []
+        self.shard_id = 0
+        self.shard_metadata = []
+        
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+    
+    def add_trajectory(self, x0_log: np.ndarray, globals: np.ndarray, 
+                      t_vec: np.ndarray, y_mat: np.ndarray):
+        """Add a trajectory to buffer."""
+        trajectory = {
+            'x0_log': x0_log.astype(self.dtype),
+            'globals': globals.astype(self.dtype),
+            't_vec': t_vec.astype(self.dtype),
+            'y_mat': y_mat.astype(self.dtype)
+        }
+        self.buffer.append(trajectory)
+        
+        if len(self.buffer) >= self.shard_size:
+            self._write_shard()
+    
+    def _write_shard(self):
+        """Write buffered trajectories to NPZ file."""
+        if not self.buffer:
+            return
+            
+        # Stack all trajectories
+        x0_log = np.stack([t['x0_log'] for t in self.buffer])
+        globals = np.stack([t['globals'] for t in self.buffer])
+        t_vec = np.stack([t['t_vec'] for t in self.buffer])
+        y_mat = np.stack([t['y_mat'] for t in self.buffer])
+        
+        # Write NPZ
+        filename = f"shard_{self.shard_idx_base}_{self.shard_id:04d}.npz"
+        filepath = self.output_dir / filename
+        np.savez_compressed(
+            filepath,
+            x0_log=x0_log,
+            globals=globals,
+            t_vec=t_vec,
+            y_mat=y_mat
+        )
+        
+        self.shard_metadata.append({
+            "filename": filename,
+            "n_samples": len(self.buffer)
+        })
+        
+        self.buffer = []
+        self.shard_id += 1
+    
+    def flush(self):
+        """Write any remaining trajectories."""
+        if self.buffer:
+            self._write_shard()
+
+
+class CorePreprocessor:
+    """Core preprocessing logic with sequence mode support."""
+    def __init__(self, config: Dict[str, Any], norm_stats: Optional[Dict[str, Any]] = None):
+        self.logger = logging.getLogger(__name__)
+        self.config = config
+        
+        self.data_cfg = config["data"]
+        self.norm_cfg = config["normalization"]
+        self.train_cfg = config["training"]
+        self.pred_cfg = config.get("prediction", {})
+        self.proc_cfg = config["preprocessing"]
+        self.system_cfg = config["system"]
+        
+        # Get sequence mode settings
+        self.sequence_mode = self.data_cfg.get("sequence_mode", False)
+        self.M_per_sample = self.data_cfg.get("M_per_sample", 16)
+        self.time_sampling = self.data_cfg.get("time_sampling", {"uniform": 1.0})
+        
+        # Get dtype
+        dtype_str = self.system_cfg.get("dtype", "float32")
+        self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
+        
+        # Variables
+        self.species_vars = self.data_cfg["species_variables"]
+        self.target_species_vars = self.data_cfg.get("target_species_variables", self.species_vars)
+        self.global_vars = self.data_cfg["global_variables"]
+        self.time_var = self.data_cfg["time_variable"]
+        self.var_order = self.species_vars + self.global_vars + [self.time_var]
+        
+        self.n_target_species = len(self.target_species_vars)
+        self.n_species = len(self.species_vars)
+        self.n_globals = len(self.global_vars)
+        self.n_vars = self.n_species + self.n_globals + 1
+        
+        self.min_value_threshold = self.proc_cfg.get("min_value_threshold", 1e-30)
+        self.prediction_mode = self.pred_cfg.get("mode", "absolute")
+        
+        self.normalizer = DataNormalizer(config)
+        self.norm_stats = norm_stats or {}
+        
+        self._create_index_mappings()
+        
+        if norm_stats:
+            self.norm_helper = NormalizationHelper(
+                norm_stats, torch.device("cpu"),
+                self.species_vars, self.global_vars, self.time_var, config
+            )
+    
+    def _create_index_mappings(self):
+        """Create index mappings for robust variable access."""
+        self.var_to_idx = {var: i for i, var in enumerate(self.var_order)}
+        self.species_indices = [self.var_to_idx[var] for var in self.species_vars]
+        self.target_species_indices = [self.var_to_idx[var] for var in self.target_species_vars]
+        self.global_indices = [self.var_to_idx[var] for var in self.global_vars]
+        self.time_idx = self.var_to_idx[self.time_var]
+    
+    def _sample_times(self, t_min: float, t_max: float) -> np.ndarray:
+        """Sample M time points according to time_sampling config."""
+        if isinstance(self.time_sampling, dict):
+            # Mixed sampling
+            uniform_frac = self.time_sampling.get("uniform", 0.5)
+            log_frac = self.time_sampling.get("log_spaced", 0.5)
+            
+            n_uniform = int(self.M_per_sample * uniform_frac)
+            n_log = self.M_per_sample - n_uniform
+            
+            # Uniform samples
+            t_uniform = np.linspace(t_min, t_max, n_uniform)
+            
+            # Log-spaced samples  
+            if n_log > 0:
+                log_min = np.log10(max(t_min, 1e-10))
+                log_max = np.log10(t_max)
+                t_log = np.logspace(log_min, log_max, n_log)
+            else:
+                t_log = np.array([])
+            
+            # Combine and sort
+            times = np.concatenate([t_uniform, t_log])
+            times = np.unique(np.sort(times))
+            
+            # Ensure we have exactly M samples
+            if len(times) > self.M_per_sample:
+                times = times[:self.M_per_sample]
+            elif len(times) < self.M_per_sample:
+                # Pad with linspace
+                extra = self.M_per_sample - len(times)
+                t_extra = np.linspace(t_min, t_max, extra + 2)[1:-1]
+                times = np.sort(np.concatenate([times, t_extra]))
+                
+        else:
+            # Simple uniform sampling
+            times = np.linspace(t_min, t_max, self.M_per_sample)
+            
+        return times
+    
+    def _is_profile_valid(self, group: h5py.Group) -> Tuple[bool, str]:
+        """Check if a profile is valid."""
+        required_keys = self.species_vars + [self.time_var]
+        if not set(required_keys).issubset(group.keys()):
+            return False, "missing_keys"
+        
+        for var in required_keys:
+            try:
+                data = group[var][:]
+            except Exception:
+                return False, "read_error"
+            
+            if not np.all(np.isfinite(data)):
+                return False, "non_finite"
+                
+            if np.any(data <= self.min_value_threshold):
+                return False, "below_threshold"
+                
+        return True, "valid"
+    
+    def _extract_profile(self, group: h5py.Group, gname: str, n_t: int) -> Optional[np.ndarray]:
+        """Extract a full data profile from an HDF5 group."""
+        config_globals = set(self.global_vars)
+        group_attrs = set(group.attrs.keys())
+        
+        if 'SEED' in group_attrs:
+            group_attrs.remove('SEED')
+        
+        globals_missing = config_globals - group_attrs
+        attrs_extra = group_attrs - config_globals
+        
+        if globals_missing or attrs_extra:
+            self.logger.critical(f"Global variable mismatch in group '{gname}'")
+            sys.exit(1)
+        
+        globals_dict = {key: float(group.attrs[key]) for key in self.global_vars}
+        profile = np.empty((n_t, self.n_vars), dtype=self.np_dtype)
+        
+        try:
+            for i, var_name in enumerate(self.var_order):
+                if var_name in group:
+                    profile[:, i] = group[var_name][:]
+                elif var_name in globals_dict:
+                    profile[:, i] = globals_dict[var_name]
+                else:
+                    self.logger.error(f"Variable '{var_name}' not found")
+                    sys.exit(1)
+        except Exception as e:
+            self.logger.error(f"Failed to read profile: {e}")
+            return None
+            
+        return profile
+    
+    def process_file_for_sequence_shards(self, file_path: Path, output_dir: Path) -> Dict[str, Any]:
+        """Process file and write sequence-mode shards."""
+        # Create shard writers for each split
+        writers = {}
+        for split in ["train", "validation", "test"]:
+            writers[split] = SequenceShardWriter(
+                output_dir / split,
+                self.proc_cfg["shard_size"] // self.M_per_sample,  # Adjust for sequences
+                file_path.stem,
+                self.M_per_sample,
+                self.n_species,
+                self.n_globals,
+                self.np_dtype
+            )
+        
+        split_counts = {"train": 0, "validation": 0, "test": 0}
+        
+        with h5py.File(file_path, "r") as f:
+            for gname in sorted(f.keys()):
+                # Validation
+                is_valid, _ = self._is_profile_valid(f[gname])
+                if not is_valid:
+                    continue
+                
+                # Use fraction check
+                if self.train_cfg["use_fraction"] < 1.0:
+                    hash_val = int(hashlib.sha256(gname.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+                    if hash_val >= self.train_cfg["use_fraction"]:
+                        continue
+                
+                # Extract profile
+                grp = f[gname]
+                n_t = grp[self.time_var].shape[0]
+                if n_t <= self.M_per_sample:
+                    continue
+                    
+                profile = self._extract_profile(grp, gname, n_t)
+                if profile is None:
+                    continue
+                
+                # Sample M time points
+                time_data = profile[:, self.time_idx]
+                t_min, t_max = time_data.min(), time_data.max()
+                sampled_times = self._sample_times(t_min, t_max)
+                
+                # Find indices for sampled times
+                time_indices = []
+                for t in sampled_times:
+                    idx = np.argmin(np.abs(time_data - t))
+                    time_indices.append(idx)
+                time_indices = np.array(time_indices)
+                
+                # Extract data at sampled times
+                x0 = profile[0, self.species_indices]
+                globals_vec = profile[0, self.global_indices]
+                
+                # Log transform species
+                x0_log = np.log10(np.maximum(x0, self.norm_cfg.get("epsilon", 1e-30)))
+                
+                # Get targets at sampled times
+                y_mat = profile[time_indices][:, self.target_species_indices]
+                y_mat_log = np.log10(np.maximum(y_mat, self.norm_cfg.get("epsilon", 1e-30)))
+                
+                # Normalize time globally (will be done after collecting stats)
+                t_vec = profile[time_indices, self.time_idx]
+                
+                # Determine split
+                split_hash = int(hashlib.sha256((gname + "_split").encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+                test_frac = self.train_cfg["test_fraction"]
+                val_frac = self.train_cfg["val_fraction"]
+                
+                if split_hash < test_frac:
+                    split = "test"
+                elif split_hash < test_frac + val_frac:
+                    split = "validation"
+                else:
+                    split = "train"
+                
+                # Add to writer
+                writers[split].add_trajectory(x0_log, globals_vec, t_vec, y_mat_log)
+                split_counts[split] += 1
+        
+        # Flush all writers
+        for writer in writers.values():
+            writer.flush()
+        
+        # Collect metadata
+        metadata = {
+            "splits": {}
+        }
+        for split in ["train", "validation", "test"]:
+            metadata["splits"][split] = {
+                "shards": writers[split].shard_metadata,
+                "n_trajectories": split_counts[split],
+                "total_samples": split_counts[split]  # In sequence mode, 1 trajectory = 1 sample
+            }
+            
+        return metadata
+    
+    def collect_time_stats(self, file_paths: List[Path]) -> Dict[str, float]:
+        """Collect global time statistics for normalization."""
+        all_times = []
+        
+        for file_path in file_paths:
+            with h5py.File(file_path, "r") as f:
+                for gname in f.keys():
+                    grp = f[gname]
+                    if self.time_var in grp:
+                        times = grp[self.time_var][:]
+                        # Filter out very small times
+                        times = times[times > 1e-10]
+                        if len(times) > 0:
+                            all_times.append(times)
+        
+        if not all_times:
+            raise ValueError("No valid time data found")
+            
+        all_times = np.concatenate(all_times)
+        
+        # Compute tau0 (5th percentile of non-zero times)
+        tau0 = np.percentile(all_times, 5)
+        
+        # Apply log transform
+        tau = np.log(1 + all_times / tau0)
+        
+        return {
+            "tau0": float(tau0),
+            "tmin": float(tau.min()),
+            "tmax": float(tau.max()),
+            "time_transform": "log_min_max"
+        }
+
+
+class DataPreprocessor:
+    """Main preprocessor with sequence mode support."""
+    def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
+        self.logger = logging.getLogger(__name__)
+        self.raw_files = sorted(raw_files)
+        self.output_dir = output_dir
+        self.config = config
+        
+        self.sequence_mode = config["data"].get("sequence_mode", False)
+        self.normalizer = DataNormalizer(config)
+        self.num_workers = config["preprocessing"].get("num_workers", 1)
+        self.parallel = self.num_workers > 1 and len(self.raw_files) > 1
+        
+        self.processed_dir = output_dir
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+    
+    def process_to_npy_shards(self) -> None:
+        """Process data in sequence mode if enabled."""
+        if self.sequence_mode:
+            self._process_sequence_mode()
+        else:
+            # Original row-wise processing
+            self._process_legacy_mode()
+    
+    def _process_sequence_mode(self):
+        """Process data in sequence mode for LiLaN."""
+        self.logger.info("Processing data in SEQUENCE MODE for multi-time supervision")
+        
+        # First collect time statistics
+        processor = CorePreprocessor(self.config)
+        time_stats = processor.collect_time_stats(self.raw_files)
+        self.logger.info(f"Time normalization stats: tau0={time_stats['tau0']:.3e}, "
+                        f"tmin={time_stats['tmin']:.3f}, tmax={time_stats['tmax']:.3f}")
+        
+        # Collect normalization statistics (for species and globals)
+        norm_stats = self._collect_normalization_stats()
+        norm_stats["time_normalization"] = time_stats
+        save_json(norm_stats, self.output_dir / "normalization.json")
+        
+        # Process files to sequence shards
+        all_metadata = {"splits": {"train": {"shards": [], "n_trajectories": 0},
+                                  "validation": {"shards": [], "n_trajectories": 0},
+                                  "test": {"shards": [], "n_trajectories": 0}}}
+        
+        for file_path in self.raw_files:
+            processor = CorePreprocessor(self.config, norm_stats)
+            metadata = processor.process_file_for_sequence_shards(file_path, self.processed_dir)
+            
+            # Aggregate metadata
+            for split in ["train", "validation", "test"]:
+                all_metadata["splits"][split]["shards"].extend(metadata["splits"][split]["shards"])
+                all_metadata["splits"][split]["n_trajectories"] += metadata["splits"][split]["n_trajectories"]
+        
+        # Save shard index
+        shard_index = {
+            "sequence_mode": True,
+            "M_per_sample": self.config["data"]["M_per_sample"],
+            "n_input_species": len(self.config["data"]["species_variables"]),
+            "n_target_species": len(self.config["data"].get("target_species_variables", 
+                                                           self.config["data"]["species_variables"])),
+            "n_globals": len(self.config["data"]["global_variables"]),
+            "compression": "npz",
+            "prediction_mode": self.config.get("prediction", {}).get("mode", "absolute"),
+            "splits": all_metadata["splits"],
+            "time_normalization": time_stats
+        }
+        save_json(shard_index, self.output_dir / "shard_index.json")
+        
+        self.logger.info(f"Sequence mode preprocessing complete. "
+                        f"Train: {all_metadata['splits']['train']['n_trajectories']} trajectories, "
+                        f"Val: {all_metadata['splits']['validation']['n_trajectories']}, "
+                        f"Test: {all_metadata['splits']['test']['n_trajectories']}")
+    
+    def _collect_normalization_stats(self) -> Dict[str, Any]:
+        """Collect normalization statistics for species and globals."""
+        # Simplified - just collect min/max/mean/std for each variable
+        stats = {"per_key_stats": {}, "normalization_methods": {}}
+        
+        # Initialize accumulators
+        accumulators = {}
+        for var in self.config["data"]["species_variables"] + self.config["data"]["global_variables"]:
+            accumulators[var] = {
+                "count": 0, "mean": 0.0, "m2": 0.0,
+                "min": float("inf"), "max": float("-inf")
+            }
+        
+        # Process each file
+        for file_path in self.raw_files:
+            with h5py.File(file_path, "r") as f:
+                for gname in f.keys():
+                    grp = f[gname]
+                    
+                    # Species variables (use log transform)
+                    for var in self.config["data"]["species_variables"]:
+                        if var in grp:
+                            data = grp[var][:]
+                            # Apply log transform
+                            log_data = np.log10(np.maximum(data, 1e-30))
+                            self._update_accumulator(accumulators[var], log_data)
+                    
+                    # Global variables
+                    for var in self.config["data"]["global_variables"]:
+                        if var in grp.attrs:
+                            val = float(grp.attrs[var])
+                            self._update_accumulator(accumulators[var], np.array([val]))
+        
+        # Finalize statistics
+        for var, acc in accumulators.items():
+            if acc["count"] > 0:
+                mean = acc["mean"]
+                variance = acc["m2"] / (acc["count"] - 1) if acc["count"] > 1 else 0
+                std = np.sqrt(variance)
+                
+                if var in self.config["data"]["species_variables"]:
+                    # Species use log-standard normalization
+                    stats["normalization_methods"][var] = "log-standard"
+                    stats["per_key_stats"][var] = {
+                        "method": "log-standard",
+                        "log_mean": mean,
+                        "log_std": max(std, 1e-10),
+                        "min": acc["min"],
+                        "max": acc["max"]
+                    }
+                else:
+                    # Globals use standard normalization
+                    stats["normalization_methods"][var] = "standard"
+                    stats["per_key_stats"][var] = {
+                        "method": "standard", 
+                        "mean": mean,
+                        "std": max(std, 1e-10),
+                        "min": acc["min"],
+                        "max": acc["max"]
+                    }
+        
+        # Time will use special normalization
+        stats["normalization_methods"][self.config["data"]["time_variable"]] = "log_min_max"
+        
+        return stats
+    
+    def _update_accumulator(self, acc: Dict, data: np.ndarray):
+        """Update accumulator with Welford's algorithm."""
+        for val in data.flatten():
+            if np.isfinite(val):
+                n = acc["count"]
+                acc["count"] += 1
+                delta = val - acc["mean"]
+                acc["mean"] += delta / acc["count"]
+                delta2 = val - acc["mean"]
+                acc["m2"] += delta * delta2
+                acc["min"] = min(acc["min"], val)
+                acc["max"] = max(acc["max"], val)
+    
+    def _process_legacy_mode(self):
+        """Original row-wise processing (fallback)."""
+        # Import original implementation
+        from .preprocessor import DataPreprocessor as LegacyPreprocessor
+        legacy = LegacyPreprocessor(self.raw_files, self.output_dir, self.config)
+        legacy.process_to_npy_shards()
+
+===== /Users/imalsky/Desktop/Chemulator/src/data/dataset.py =====
+#!/usr/bin/env python3
+"""
+High-performance dataset implementation with sequence mode support.
+"""
+
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+import math
+
+
+class SequenceDataset(Dataset):
+    """Dataset for sequence mode (trajectory-based) data."""
+    def __init__(self, shard_dir: Path, split_name: str, config: Dict[str, Any], 
+                 device: torch.device):
+        super().__init__()
+        self.shard_dir = Path(shard_dir)
+        self.split_dir = self.shard_dir / split_name
+        self.split_name = split_name
+        self.config = config
+        self.device = device
+        self.logger = logging.getLogger(__name__)
+        
+        # Get dtype
+        dtype_str = self.config["system"].get("dtype", "float32")
+        self.dtype = getattr(torch, dtype_str)
+        self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
+        
+        # Load metadata
+        shard_index_path = self.shard_dir / "shard_index.json"
+        with open(shard_index_path) as f:
+            self.shard_index = json.load(f)
+        
+        self.split_info = self.shard_index["splits"][split_name]
+        self.M = self.shard_index["M_per_sample"]
+        self.n_species = self.shard_index["n_input_species"]
+        self.n_target_species = self.shard_index["n_target_species"]
+        self.n_globals = self.shard_index["n_globals"]
+        
+        # Time normalization parameters
+        self.time_norm = self.shard_index["time_normalization"]
+        self.tau0 = self.time_norm["tau0"]
+        self.tmin = self.time_norm["tmin"]
+        self.tmax = self.time_norm["tmax"]
+        
+        # Build shard info
+        self.shards = self.split_info["shards"]
+        self.n_shards = len(self.shards)
+        self.n_total_samples = self.split_info["n_trajectories"]
+        
+        # Build lookup for shard boundaries
+        self._build_shard_lookup()
+        
+        # Caching
+        self.gpu_cache = None
+        self.cpu_fallback = False
+        self._try_gpu_cache()
+    
+    def _build_shard_lookup(self):
+        """Build lookup arrays for shard access."""
+        self.shard_starts = [0]
+        cumsum = 0
+        for shard in self.shards:
+            cumsum += shard["n_samples"]
+            self.shard_starts.append(cumsum)
+        self.shard_starts = np.array(self.shard_starts[:-1])
+    
+    def _normalize_time(self, t: np.ndarray) -> np.ndarray:
+        """Apply global log-min-max time normalization."""
+        tau = np.log(1 + t / self.tau0)
+        return (tau - self.tmin) / (self.tmax - self.tmin)
+    
+    def _try_gpu_cache(self):
+        """Try to cache all data on GPU."""
+        gpu_cache_setting = self.config.get("training", {}).get("gpu_cache_dataset", "auto")
+        if gpu_cache_setting is False or self.device.type != "cuda":
+            self.cpu_fallback = True
+            return
+        
+        # Calculate memory needed
+        bytes_per_float = 4 if self.dtype == torch.float32 else 8
+        bytes_needed = self.n_total_samples * (
+            self.n_species +  # x0_log
+            self.n_globals +  # globals
+            self.M +  # t_vec
+            self.M * self.n_target_species  # y_mat
+        ) * bytes_per_float
+        
+        free_mem, _ = torch.cuda.mem_get_info(self.device.index)
+        if bytes_needed > free_mem * 0.85:
+            self.logger.warning(f"Insufficient GPU memory for sequence caching. Using CPU fallback.")
+            self.cpu_fallback = True
+            return
+        
+        # Load all data
+        self.logger.info(f"Loading {self.split_name} sequence data to GPU ({bytes_needed/1e9:.1f} GB)...")
+        
+        all_x0_log = []
+        all_globals = []
+        all_t_vec = []
+        all_y_mat = []
+        
+        for shard in self.shards:
+            shard_path = self.split_dir / shard["filename"]
+            data = np.load(shard_path)
+            
+            # Normalize time
+            t_vec_norm = self._normalize_time(data['t_vec'])
+            
+            all_x0_log.append(torch.from_numpy(data['x0_log']).to(self.dtype))
+            all_globals.append(torch.from_numpy(data['globals']).to(self.dtype))
+            all_t_vec.append(torch.from_numpy(t_vec_norm).to(self.dtype))
+            all_y_mat.append(torch.from_numpy(data['y_mat']).to(self.dtype))
+        
+        # Concatenate and move to GPU
+        self.gpu_cache = {
+            'x0_log': torch.cat(all_x0_log).to(self.device),
+            'globals': torch.cat(all_globals).to(self.device),
+            't_vec': torch.cat(all_t_vec).to(self.device),
+            'y_mat': torch.cat(all_y_mat).to(self.device)
+        }
+        
+        self.logger.info(f"GPU sequence cache loaded successfully")
+    
+    def _load_from_disk(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Load a single trajectory from disk."""
+        # Find which shard
+        shard_idx = np.searchsorted(self.shard_starts, idx, side='right') - 1
+        local_idx = idx - self.shard_starts[shard_idx]
+        
+        # Load shard
+        shard_path = self.split_dir / self.shards[shard_idx]["filename"]
+        data = np.load(shard_path)
+        
+        # Extract trajectory
+        x0_log = data['x0_log'][local_idx]
+        globals_vec = data['globals'][local_idx]
+        t_vec = self._normalize_time(data['t_vec'][local_idx])
+        y_mat = data['y_mat'][local_idx]
+        
+        # Combine inputs
+        inputs = np.concatenate([x0_log, globals_vec, t_vec])
+        
+        # Convert to tensors
+        inputs_tensor = torch.from_numpy(inputs).to(self.dtype)
+        targets_tensor = torch.from_numpy(y_mat).to(self.dtype)
+        
+        return inputs_tensor, targets_tensor
+    
+    def __len__(self) -> int:
+        return self.n_total_samples
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get a trajectory sample."""
+        if self.gpu_cache is not None:
+            # Fast GPU path
+            x0_log = self.gpu_cache['x0_log'][idx]
+            globals_vec = self.gpu_cache['globals'][idx]
+            t_vec = self.gpu_cache['t_vec'][idx]
+            y_mat = self.gpu_cache['y_mat'][idx]
+            
+            # Combine inputs
+            inputs = torch.cat([x0_log, globals_vec, t_vec])
+            
+            return inputs, y_mat
+        else:
+            # CPU fallback
+            return self._load_from_disk(idx)
+
+
+class NPYDataset(Dataset):
+    """Original row-wise dataset for backward compatibility."""
+    # Keep original implementation for non-sequence mode
+    def __init__(self, shard_dir: Path, split_name: str, config: Dict[str, Any], 
+                 device: torch.device):
+        # Check if sequence mode
+        shard_index_path = shard_dir / "shard_index.json"
+        if shard_index_path.exists():
+            with open(shard_index_path) as f:
+                index = json.load(f)
+                if index.get("sequence_mode", False):
+                    raise ValueError("This is sequence mode data. Use SequenceDataset instead.")
+        
+        # Original implementation continues...
+        super().__init__()
+        self.shard_dir = Path(shard_dir)
+        self.split_dir = self.shard_dir / split_name
+        self.split_name = split_name
+        self.config = config
+        self.device = device
+        self.logger = logging.getLogger(__name__)
+
+        # Get dtype from config
+        dtype_str = self.config["system"].get("dtype", "float32")
+        self.dtype = getattr(torch, dtype_str)
+        self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
+
+        # Verify split directory exists
+        if not self.split_dir.exists():
+            raise FileNotFoundError(f"Split directory not found: {self.split_dir}")
+
+        # Load shard index metadata
+        shard_index_path = self.shard_dir / "shard_index.json"
+        with open(shard_index_path) as f:
+            full_index = json.load(f)
+        
+        self.shard_index = full_index
+        self.split_info = full_index["splits"][split_name]
+        
+        # Extract dimensions
+        self.n_input_species = self.shard_index["n_input_species"]
+        self.n_target_species = self.shard_index["n_target_species"]
+        self.n_species = self.n_input_species 
+        self.n_globals = self.shard_index["n_globals"]
+        self.samples_per_shard = self.shard_index["samples_per_shard"]
+        self.prediction_mode = self.shard_index.get("prediction_mode", "absolute")
+        self.n_features = self.n_input_species + self.n_globals + 1 + self.n_target_species
+        self.n_inputs = self.n_input_species + self.n_globals + 1
+        
+        # Get shard info for this split
+        self.shards = self.split_info["shards"]
+        self.n_shards = len(self.shards)
+        self.n_total_samples = self.split_info["total_samples"]
+        
+        # Build lookup arrays
+        self._shard_starts = np.array([s["start_idx"] for s in self.shards])
+        self._shard_ends = np.array([s["end_idx"] for s in self.shards])
+        
+        # Memory info - use configured dtype size
+        bytes_per_element = 4 if dtype_str == "float32" else 8
+        self.bytes_per_sample = self.n_features * bytes_per_element
+        self.total_bytes = self.n_total_samples * self.bytes_per_sample
+        
+        # Initialize caching
+        self.gpu_cache = None
+        self.cpu_fallback = False
+        self._try_gpu_cache()
+        
+    def _try_gpu_cache(self):
+        """Load the entire split to GPU memory; fall back to CPU if needed."""
+        gpu_cache_setting = self.config.get("training", {}).get("gpu_cache_dataset", "auto")
+        if gpu_cache_setting is False:
+            self.logger.info(f"GPU caching disabled for {self.split_name}")
+            self.cpu_fallback = True
+            return
+
+        if self.device.type != "cuda":
+            self.logger.info(f"GPU caching not available on {self.device.type}")
+            self.cpu_fallback = True
+            return
+
+        free_mem, _ = torch.cuda.mem_get_info(self.device.index)
+        needed_gb = self.total_bytes / 1024 ** 3
+        free_gb   = free_mem       / 1024 ** 3
+        if needed_gb > free_gb * 0.85:     
+            self.logger.warning(
+                f"Insufficient GPU memory for {self.split_name}: "
+                f"need {needed_gb:.1f} GB, have {free_gb:.1f} GB.  Falling back to CPU."
+            )
+            self.cpu_fallback = True
+            return
+
+        self.logger.info(f"Loading {self.split_name} dataset to GPU ({needed_gb:.1f} GB)…")
+        start = time.time()
+
+        self.gpu_cache = torch.empty(
+            (self.n_total_samples, self.n_features),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        cur = 0
+        for shard in self.shards:
+            shard_path = self.split_dir / shard["filename"]
+            if self.shard_index.get("compression") == "npz":
+                with np.load(shard_path) as zf:
+                    data = zf["data"].astype(self.np_dtype, copy=False)
+            else:
+                data = np.load(shard_path).astype(self.np_dtype, copy=False)
+
+            n = data.shape[0]
+            self.gpu_cache[cur:cur + n] = torch.from_numpy(data).pin_memory().to(self.device, non_blocking=True)
+            cur += n
+            del data                  
+
+        torch.cuda.synchronize()
+        t = time.time() - start
+        self.logger.info(f"GPU cache loaded in {t:.1f}s ({needed_gb/t:.1f} GB/s)")
+
+    def _load_shard_cpu(self, shard_idx: int) -> np.ndarray:
+        """Load a shard from disk (CPU fallback)."""
+        
+        # Check if the cache exists on this worker process
+        if not hasattr(self, '_shard_cache'):
+            # functools.lru_cache is a simpler way to do this
+            from functools import lru_cache
+            # Cache up to 2 shards per worker, a common scenario
+            self._shard_cache = lru_cache(maxsize=2)(self._load_shard_from_disk)
+        
+        return self._shard_cache(shard_idx)
+
+    def _load_shard_from_disk(self, shard_idx: int) -> np.ndarray:
+        """Helper for the LRU cache that actually hits the disk."""
+        shard_info = self.shards[shard_idx]
+        shard_path = self.split_dir / shard_info["filename"]
+        
+        if self.shard_index.get("compression") == "npz":
+            with np.load(shard_path) as zf:
+                return zf["data"].astype(self.np_dtype, copy=False)
+        else:
+            return np.load(shard_path).astype(self.np_dtype, copy=False)
+
+    def __len__(self) -> int:
+        """Return the total number of samples."""
+        return self.n_total_samples
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get a single sample by index."""
+        if self.gpu_cache is not None:
+            # Fast path: Direct GPU slicing, no change needed here.
+            row = self.gpu_cache[idx]
+            return row[:self.n_inputs], row[self.n_inputs:]
+        else:
+            # CPU fallback path
+            if not self.cpu_fallback:
+                raise RuntimeError("Dataset not properly initialized")
+            
+            # Find which shard contains this index
+            shard_idx = np.searchsorted(self._shard_starts, idx, side='right') - 1
+            local_idx = idx - self._shard_starts[shard_idx]
+            
+            # Load shard and get sample
+            shard_data = self._load_shard_cpu(shard_idx)
+            row = shard_data[local_idx]
+            
+            # Return CPU tensors with configured dtype
+            input_tensor = torch.from_numpy(row[:self.n_inputs].copy()).to(self.dtype)
+            target_tensor = torch.from_numpy(row[self.n_inputs:].copy()).to(self.dtype)
+            
+            return input_tensor, target_tensor
+
+    def get_cache_info(self) -> Dict[str, Any]:
+        """Get cache statistics with consistent structure."""
+        if self.gpu_cache is not None:
+            return {
+                "type": "gpu",
+                "size_gb": self.total_bytes / 1024**3,
+                "device": str(self.device),
+                "status": "active"
+            }
+        elif self.cpu_fallback:
+            return {
+                "type": "cpu",
+                "size_gb": 0,
+                "device": str(self.device),
+                "status": "fallback",
+                "message": "Using CPU loading due to insufficient GPU memory"
+            }
+        else:
+            return {
+                "type": "none",
+                "size_gb": 0,
+                "device": str(self.device),
+                "status": "error",
+                "message": "Dataset caching failed"
+            }
+
+
+def create_dataloader(dataset: Dataset,
+                      config: Dict[str, Any],
+                      shuffle: bool = True,
+                      device: Optional[torch.device] = None,
+                      drop_last: bool = True,
+                      **_) -> DataLoader:
+    """Create appropriate dataloader based on dataset type."""
+    if dataset is None or len(dataset) == 0:
+        logging.getLogger(__name__).warning("Cannot create DataLoader for empty dataset")
+        return None
+    
+    log = logging.getLogger(__name__)
+    tcfg = config["training"]
+    bs = tcfg["batch_size"]
+    
+    # Check if sequence mode
+    is_sequence = isinstance(dataset, SequenceDataset)
+    
+    if is_sequence:
+        # Sequence mode - simple batching
+        log.info(f"DataLoader[{dataset.split_name}] sequence mode: bs={bs}")
+        return DataLoader(
+            dataset,
+            batch_size=bs,
+            shuffle=shuffle,
+            num_workers=0,  # Already on GPU
+            pin_memory=False,
+            drop_last=drop_last
+        )
+    else:
+        # Original implementation for row-wise data
+        is_gpu_cached = getattr(dataset, "gpu_cache", None) is not None
+
+        if is_gpu_cached:
+            log.info(f"DataLoader[{dataset.split_name}] GPU‑batch mode: bs={bs}")
+
+            class GPUBatchDataset(torch.utils.data.Dataset):
+                def __init__(self, gpu_tensor: torch.Tensor, n_inputs: int,
+                             batch_size: int, shuffle_batches: bool):
+                    self.gpu_tensor  = gpu_tensor
+                    self.n_inputs    = n_inputs
+                    self.batch_size  = batch_size
+                    self.shuffle     = shuffle_batches
+                    self.total       = gpu_tensor.size(0)
+                    self.n_batches   = math.ceil(self.total / batch_size)
+                    self.permutation = None
+
+                def __len__(self):
+                    return self.n_batches
+
+                def __getitem__(self, batch_idx: int):
+                    if self.shuffle:
+                        if self.permutation is None or batch_idx == 0:
+                            self.permutation = torch.randperm(
+                                self.total, device=self.gpu_tensor.device
+                            )
+                        idx = self.permutation
+                    else:
+                        idx = None
+
+                    start = batch_idx * self.batch_size
+                    end   = min(start + self.batch_size, self.total)
+
+                    if idx is None:
+                        batch = self.gpu_tensor[start:end]
+                    else:
+                        batch = self.gpu_tensor.index_select(0, idx[start:end])
+
+                    return batch[:, :self.n_inputs], batch[:, self.n_inputs:]
+
+            gpu_ds = GPUBatchDataset(
+                dataset.gpu_cache, dataset.n_inputs, bs, shuffle
+            )
+            return DataLoader(
+                gpu_ds,
+                batch_size=None,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+                drop_last=False,
+            )
+
+        # Cpu fallback
+        log.warning(f"DataLoader[{dataset.split_name}] CPU fallback mode: bs={bs}")
+        workers = tcfg.get("num_workers") or min(16, (os.cpu_count() or 1))
+        return DataLoader(
+            dataset,
+            batch_size=bs,
+            shuffle=shuffle,
+            num_workers=workers,
+            pin_memory=(device and device.type == "cuda"),
+            drop_last=drop_last,
+            persistent_workers=(workers > 0),
+            prefetch_factor=2 if workers > 0 else None,
+        )
+
+===== /Users/imalsky/Desktop/Chemulator/src/data/normalizer.py =====
+#!/usr/bin/env python3
+"""
+Data normalization module for chemical kinetics datasets.
+
+• Compatible with both *row-wise* and *sequence-mode* pipelines.
+• Guards against double-normalizing time when the SequenceDataset has
+  already mapped t → [0, 1].
+• Casts tensors to the configured dtype / device on entry, avoiding
+  mixed-precision surprises.
+• All original validation, logging and ratio helpers are preserved.
+"""
+
+import logging
+import math
+from typing import Dict, List, Any, Optional
+
+import numpy as np
+import torch
+
+# ----------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------
+DEFAULT_EPSILON = 1e-30
+DEFAULT_MIN_STD = 1e-10
+DEFAULT_CLAMP   = 50.0
+SAFE_EPSILON    = 1e-38      # for log-transform safety
+MIN_RANGE       = 1e-10
+
+
+# ----------------------------------------------------------------------
+# Data-wide statistics collector
+# ----------------------------------------------------------------------
+class DataNormalizer:
+    """Calculates normalization statistics with robust data validation."""
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self.config       = config
+        self.data_config  = config["data"]
+        self.norm_config  = config["normalization"]
+
+        self.species_vars = self.data_config["species_variables"]
+        self.global_vars  = self.data_config["global_variables"]
+        self.time_var     = self.data_config["time_variable"]
+        self.all_vars     = self.species_vars + self.global_vars + [self.time_var]
+
+        self.epsilon  = self.norm_config.get("epsilon", DEFAULT_EPSILON)
+        self.min_std  = self.norm_config.get("min_std", DEFAULT_MIN_STD)
+        self.logger   = logging.getLogger(__name__)
+
+    # ----- accumulator helpers ------------------------------------------------
+    def _initialize_accumulators(self) -> Dict[str, Dict[str, Any]]:
+        """Return per-variable accumulator dicts."""
+        accs: Dict[str, Dict[str, Any]] = {}
+        for i, var in enumerate(self.all_vars):
+            method = self._get_method(var)
+            if method == "none":
+                continue
+            accs[var] = {
+                "method": method,
+                "index":  i,
+                "count":  0,
+                "mean":   0.0,
+                "m2":     0.0,
+                "min":    float("inf"),
+                "max":    float("-inf"),
+            }
+        return accs
+
+    def _get_method(self, var: str) -> str:
+        return self.norm_config.get("methods", {}).get(var,
+                                                      self.norm_config["default_method"])
+
+    def _update_single_accumulator(self, acc: Dict[str, Any],
+                                   vec: np.ndarray,
+                                   var_name: str) -> None:
+        """Fast (vectorised) accumulator update with safety checks."""
+        if vec.size == 0:
+            return
+
+        # filter non-finite
+        finite_mask = np.isfinite(vec)
+        if not np.all(finite_mask):
+            bad = (~finite_mask).sum()
+            if bad / vec.size > 0.01:
+                self.logger.warning(f"{var_name}: {bad}/{vec.size} non-finite")
+            vec = vec[finite_mask]
+            if vec.size == 0:
+                self.logger.warning(f"{var_name}: nothing left after filtering")
+                return
+
+        # log-transform safeguards
+        if acc["method"].startswith("log-"):
+            below = vec < SAFE_EPSILON
+            if np.any(below):
+                self.logger.warning(f"{var_name}: {below.sum()} values < {SAFE_EPSILON:.1e}")
+            vec = np.log10(np.maximum(vec, SAFE_EPSILON))
+
+            if vec.min() < -25 or vec.max() > 25:
+                self.logger.warning(f"{var_name}: extreme log range [{vec.min():.1f}, {vec.max():.1f}]")
+
+        # Welford merge
+        n_b  = vec.size
+        mean = float(vec.mean())
+        m2   = float(((vec - mean) ** 2).sum()) if n_b > 1 else 0.0
+
+        n_a  = acc["count"]
+        delta = mean - acc["mean"]
+        n_ab = n_a + n_b
+        if n_ab > 0:
+            acc["mean"] = (n_a * acc["mean"] + n_b * mean) / n_ab
+            acc["m2"]  += m2 + delta ** 2 * n_a * n_b / n_ab
+
+        acc["count"] = n_ab
+        acc["min"]   = min(acc["min"], float(vec.min()))
+        acc["max"]   = max(acc["max"], float(vec.max()))
+
+    # merge, finalise identical to original version ---------------------------
+    def _merge_accumulators(self,
+                            main_accs: Dict[str, Dict[str, Any]],
+                            other_accs: Dict[str, Dict[str, Any]]) -> None:
+        for var, ob in other_accs.items():
+            if not ob:
+                continue
+            if var not in main_accs:
+                main_accs[var] = ob
+                continue
+            oa = main_accs[var]
+            n_a, mean_a, m2_a = oa["count"], oa["mean"], oa["m2"]
+            n_b, mean_b, m2_b = ob["count"], ob["mean"], ob["m2"]
+            n_ab = n_a + n_b
+            if n_ab == 0:
+                continue
+            delta    = mean_b - mean_a
+            oa["mean"] = (n_a * mean_a + n_b * mean_b) / n_ab
+            oa["m2"]   = m2_a + m2_b + delta ** 2 * n_a * n_b / n_ab
+            oa["count"] = n_ab
+            oa["min"]   = min(oa["min"], ob["min"])
+            oa["max"]   = max(oa["max"], ob["max"])
+
+    def _finalize_statistics(self,
+                             accs: Dict[str, Dict[str, Any]],
+                             is_ratio: bool = False) -> Dict[str, Any]:
+        stats: Dict[str, Any] = {"per_key_stats": {}}
+        if not is_ratio:
+            stats["normalization_methods"] = {}
+
+        for var, acc in accs.items():
+            method = acc.get("method", "standard")
+            if not is_ratio:
+                stats["normalization_methods"][var] = method
+            if method == "none":
+                continue
+            if acc["count"] == 0:
+                self.logger.warning(f"{var}: no valid samples, set to 'none'")
+                if not is_ratio:
+                    stats["normalization_methods"][var] = "none"
+                continue
+
+            var_stats: Dict[str, Any] = {"method": method}
+            if acc["count"] > 1:
+                variance = acc["m2"] / (acc["count"] - 1)
+                std      = max(math.sqrt(variance), self.min_std)
+            else:
+                std = 1.0
+
+            if "standard" in method:
+                k_mean, k_std = ("log_mean", "log_std") if "log" in method else ("mean", "std")
+                var_stats[k_mean] = acc["mean"]
+                var_stats[k_std]  = std
+                if std < MIN_RANGE:
+                    self.logger.warning(f"{var}: very small std {std:.1e}")
+
+            elif "min-max" in method:
+                var_stats["min"] = acc["min"]
+                var_stats["max"] = acc["max"]
+                rng = acc["max"] - acc["min"]
+                if rng < MIN_RANGE:
+                    self.logger.warning(f"{var}: tiny range {rng:.1e}, expanding")
+                    c = (acc["max"] + acc["min"]) / 2
+                    var_stats["min"] = c - MIN_RANGE / 2
+                    var_stats["max"] = c + MIN_RANGE / 2
+
+            if is_ratio:
+                stats[var] = {**var_stats,
+                              "min": acc["min"],
+                              "max": acc["max"],
+                              "count": acc["count"]}
+            else:
+                stats["per_key_stats"][var] = var_stats
+
+        if not is_ratio:
+            for var in self.all_vars:
+                stats["normalization_methods"].setdefault(var, "none")
+            stats["epsilon"]      = SAFE_EPSILON
+            stats["clamp_value"]  = self.norm_config.get("clamp_value", DEFAULT_CLAMP)
+        return stats
+
+
+# ----------------------------------------------------------------------
+# Runtime helper (vectorised normalise / denormalise)
+# ----------------------------------------------------------------------
+class NormalizationHelper:
+    """Apply pre-computed statistics to torch tensors."""
+    def __init__(self,
+                 stats: Dict[str, Any],
+                 device: torch.device,
+                 species_vars: List[str],
+                 global_vars: List[str],
+                 time_var: str,
+                 config: Optional[Dict[str, Any]] = None):
+
+        dtype_name   = (config or {}).get("system", {}).get("dtype", "float32")
+        self.torch_dtype = torch.float64 if dtype_name == "float64" else torch.float32
+
+        self.stats        = stats
+        self.device       = device
+        self.species_vars = species_vars
+        self.global_vars  = global_vars
+        self.time_var     = time_var
+
+        self.n_species    = len(species_vars)
+        self.n_globals    = len(global_vars)
+
+        self.methods      = stats["normalization_methods"]
+        self.per_key_stats= stats["per_key_stats"]
+
+        # detect sequence mode (time already pre-scaled to [0,1])
+        self.is_sequence_mode = bool(stats.get("time_normalization")) or \
+                                bool((config or {}).get("data", {}).get("sequence_mode", False))
+
+        self.epsilon     = torch.tensor(stats.get("epsilon", DEFAULT_EPSILON),
+                                        dtype=self.torch_dtype,
+                                        device=self.device)
+        self.clamp_value = stats.get("clamp_value", DEFAULT_CLAMP)
+        self.ratio_stats = stats.get("ratio_stats", None)
+
+        self.logger = logging.getLogger(__name__)
+        self._precompute_parameters()
+
+    # ---------- internal precompute ------------------------------------------
+    def _precompute_parameters(self) -> None:
+        """Cache per-variable tensors on the right device/dtype."""
+        self.norm_params: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.method_groups = {
+            "standard": [], "log-standard": [],
+            "min-max": [], "log-min-max": [], "none": []
+        }
+
+        var_to_col = {v: i for i, v in enumerate(self.species_vars +
+                                                 self.global_vars + [self.time_var])}
+
+        for var, method in self.methods.items():
+            # In sequence mode the time column is already normalised -> skip
+            if self.is_sequence_mode and var == self.time_var:
+                self.method_groups["none"].append(var)
+                continue
+
+            if method == "none" or var not in self.per_key_stats:
+                self.method_groups["none"].append(var)
+                continue
+
+            vs   = self.per_key_stats[var]
+            pars = {"method": method}
+
+            if "standard" in method:
+                k_mean, k_std = ("log_mean", "log_std") if "log" in method else ("mean", "std")
+                pars["mean"] = torch.tensor(vs[k_mean], dtype=self.torch_dtype, device=self.device)
+                pars["std"]  = torch.tensor(vs[k_std],  dtype=self.torch_dtype, device=self.device)
+            elif "min-max" in method:
+                pars["min"] = torch.tensor(vs["min"], dtype=self.torch_dtype, device=self.device)
+                pars["max"] = torch.tensor(vs["max"], dtype=self.torch_dtype, device=self.device)
+
+            self.norm_params[var] = pars
+            self.method_groups[method].append(var)
+
+        # column indices grouped by method
+        self.col_indices: Dict[str, List[int]] = {
+            m: [var_to_col[v] for v in lst] for m, lst in self.method_groups.items() if lst
+        }
+
+    # ---------- normalise / denormalise --------------------------------------
+    def normalize_profile(self, profile: torch.Tensor) -> torch.Tensor:
+        """Return a new tensor with variables normalised."""
+        if profile.device != self.device or profile.dtype != self.torch_dtype:
+            profile = profile.to(device=self.device, dtype=self.torch_dtype)
+
+        norm = profile.clone()
+
+        for method, cols in self.col_indices.items():
+            if not cols or method == "none":
+                continue
+            slice_ = norm[:, cols]
+            if "standard" in method:
+                means = torch.stack([self.norm_params[v]["mean"]
+                                     for v in self.method_groups[method]])
+                stds  = torch.stack([self.norm_params[v]["std"]
+                                     for v in self.method_groups[method]])
+                data  = torch.log10(torch.clamp(slice_, min=self.epsilon)) if "log" in method else slice_
+                norm[:, cols] = torch.clamp((data - means) / stds,
+                                            -self.clamp_value, self.clamp_value)
+
+            elif "min-max" in method:
+                mins   = torch.stack([self.norm_params[v]["min"]
+                                      for v in self.method_groups[method]])
+                maxs   = torch.stack([self.norm_params[v]["max"]
+                                      for v in self.method_groups[method]])
+                ranges = torch.clamp(maxs - mins, min=self.epsilon)
+                data   = torch.log10(torch.clamp(slice_, min=self.epsilon)) if "log" in method else slice_
+                norm[:, cols] = torch.clamp((data - mins) / ranges, 0.0, 1.0)
+        return norm
+
+    def denormalize_profile(self, profile: torch.Tensor) -> torch.Tensor:
+        """Invert normalisation."""
+        if profile.device != self.device or profile.dtype != self.torch_dtype:
+            profile = profile.to(device=self.device, dtype=self.torch_dtype)
+
+        denorm = profile.clone()
+
+        for method, cols in self.col_indices.items():
+            if not cols or method == "none":
+                continue
+            slice_ = denorm[:, cols]
+            if "standard" in method:
+                means = torch.stack([self.norm_params[v]["mean"]
+                                     for v in self.method_groups[method]])
+                stds  = torch.stack([self.norm_params[v]["std"]
+                                     for v in self.method_groups[method]])
+                raw   = slice_ * stds + means
+                if "log" in method:
+                    raw = torch.pow(torch.tensor(10.0, dtype=self.torch_dtype, device=self.device),
+                                    torch.clamp(raw, min=-38.0, max=38.0))
+                denorm[:, cols] = torch.clamp(raw, min=-3.4e38, max=3.4e38)
+
+            elif "min-max" in method:
+                mins   = torch.stack([self.norm_params[v]["min"]
+                                      for v in self.method_groups[method]])
+                maxs   = torch.stack([self.norm_params[v]["max"]
+                                      for v in self.method_groups[method]])
+                ranges = torch.clamp(maxs - mins, min=self.epsilon)
+                raw    = slice_ * ranges + mins
+                if "log" in method:
+                    raw = torch.pow(torch.tensor(10.0, dtype=self.torch_dtype, device=self.device),
+                                    torch.clamp(raw, min=-38.0, max=38.0))
+                denorm[:, cols] = raw
+        return denorm
+
+    # ---------- ratio helper (unchanged) -------------------------------------
+    def denormalize_ratio_predictions(self,
+                                      standardized_log_ratios: torch.Tensor,
+                                      initial_species: torch.Tensor) -> torch.Tensor:
+        """Convert std-log-ratio predictions back to absolute values."""
+        if self.ratio_stats is None:
+            raise ValueError("Ratio statistics not available.")
+
+        device  = standardized_log_ratios.device
+        initial = initial_species.to(device=device, dtype=self.torch_dtype)
+
+        ratio_means = torch.tensor([self.ratio_stats[v]["mean"] for v in self.species_vars],
+                                   device=device, dtype=self.torch_dtype)
+        ratio_stds  = torch.tensor([self.ratio_stats[v]["std"]  for v in self.species_vars],
+                                   device=device, dtype=self.torch_dtype)
+
+        log_ratios = standardized_log_ratios * ratio_stds + ratio_means
+        log_ratios = torch.clamp(log_ratios, min=-38.0, max=38.0)
+        ratios     = torch.pow(torch.tensor(10.0, dtype=self.torch_dtype, device=device), log_ratios)
+
+        return initial * ratios
+
+
