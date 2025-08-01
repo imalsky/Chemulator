@@ -19,7 +19,7 @@ import re
 import sys
 
 from .normalizer import DataNormalizer, NormalizationHelper
-from utils.utils import save_json, load_json
+from utils.utils import save_json
 
 DEFAULT_EPSILON_MIN = 1e-38
 DEFAULT_EPSILON_MAX = 1e38
@@ -34,6 +34,11 @@ class CorePreprocessor:
         self.train_cfg = config["training"]
         self.pred_cfg = config.get("prediction", {})
         self.proc_cfg = config["preprocessing"]
+        self.system_cfg = config["system"]
+
+        # Get dtype from config
+        dtype_str = self.system_cfg.get("dtype", "float32")
+        self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
 
         self.species_vars = self.data_cfg["species_variables"]
         self.target_species_vars = self.data_cfg.get("target_species_variables", self.species_vars)
@@ -73,7 +78,7 @@ class CorePreprocessor:
         Checks if a profile is valid according to criteria in config.
         Returns (is_valid, reason_for_failure_or_success).
         """
-        # Validate every variable (species + globals + time)
+        # Validate every variable (species + globals + time)
         required_keys = self.species_vars + [self.time_var]
         if not set(required_keys).issubset(group.keys()):
             return False, "missing_keys"
@@ -117,12 +122,18 @@ class CorePreprocessor:
             "total_profiles":   0,
             "profiles_kept":    0,
             "dropped_reasons":  defaultdict(int),
+            "found_variables": set(),
+            "found_global_attrs": set(),
         }
 
         with h5py.File(file_path, "r") as f:
             for gname in sorted(f.keys()):
                 report["total_profiles"] += 1
                 grp = f[gname]
+
+                # Track found variables
+                report["found_variables"].update(grp.keys())
+                report["found_global_attrs"].update(grp.attrs.keys())
 
                 # dataset‑level validation
                 is_ok, reason = self._is_profile_valid(grp)
@@ -172,17 +183,20 @@ class CorePreprocessor:
             "train": ShardWriter(
                 output_dir / "train", 
                 self.proc_cfg["shard_size"], 
-                file_path.stem
+                file_path.stem,
+                self.np_dtype
             ),
             "validation": ShardWriter(
                 output_dir / "validation",
                 self.proc_cfg["shard_size"],
-                file_path.stem
+                file_path.stem,
+                self.np_dtype
             ),
             "test": ShardWriter(
                 output_dir / "test",
                 self.proc_cfg["shard_size"], 
-                file_path.stem
+                file_path.stem,
+                self.np_dtype
             )
         }
         
@@ -329,7 +343,7 @@ class CorePreprocessor:
             sys.exit(1) 
 
         globals_dict = {key: float(group.attrs[key]) for key in self.global_vars}
-        profile = np.empty((n_t, self.n_vars), dtype=np.float64)
+        profile = np.empty((n_t, self.n_vars), dtype=self.np_dtype)
 
         try:
             for i, var_name in enumerate(self.var_order):
@@ -355,7 +369,7 @@ class CorePreprocessor:
             return None
         
         n_inputs = self.n_species + self.n_globals + 1
-        samples = np.empty((n_t - 1, n_inputs + self.n_target_species), dtype=np.float64)
+        samples = np.empty((n_t - 1, n_inputs + self.n_target_species), dtype=self.np_dtype)
         
         # Initial species
         samples[:, :self.n_species] = norm_prof[0, self.species_indices] 
@@ -385,7 +399,7 @@ class CorePreprocessor:
             return None
         
         n_inputs  = self.n_species + self.n_globals + 1
-        samples   = np.empty((n_t - 1, n_inputs + self.n_species), dtype=np.float64)
+        samples   = np.empty((n_t - 1, n_inputs + self.n_species), dtype=self.np_dtype)
 
         norm_prof = self.norm_helper.normalize_profile(torch.from_numpy(raw_prof)).numpy()
         samples[:, :self.n_species]                   = norm_prof[0, self.species_indices]
@@ -404,7 +418,7 @@ class CorePreprocessor:
         clamp_val   = self.norm_cfg.get("clamp_value", 50.0)
         min_std     = self.norm_cfg.get("min_std", 1e-10)
 
-        normd = np.empty_like(log_ratios, dtype=np.float64)
+        normd = np.empty_like(log_ratios, dtype=self.np_dtype)
 
         for i, var in enumerate(self.species_vars):
             method = methods_cfg.get(var, default_m)
@@ -549,7 +563,9 @@ class DataPreprocessor:
         total_report = {
             "total_profiles": 0,
             "profiles_kept": 0,
-            "dropped_reasons": defaultdict(int)
+            "dropped_reasons": defaultdict(int),
+            "all_found_variables": set(),
+            "all_found_global_attrs": set(),
         }
 
         with ProcessPoolExecutor(max_workers=self.num_workers if self.parallel else 1) as executor:
@@ -565,6 +581,8 @@ class DataPreprocessor:
                 # Aggregate the reports ---
                 total_report["total_profiles"] += worker_report["total_profiles"]
                 total_report["profiles_kept"] += worker_report["profiles_kept"]
+                total_report["all_found_variables"].update(worker_report["found_variables"])
+                total_report["all_found_global_attrs"].update(worker_report["found_global_attrs"])
                 for reason, num in worker_report["dropped_reasons"].items():
                     total_report["dropped_reasons"][reason] += num
 
@@ -593,12 +611,57 @@ class DataPreprocessor:
             "read_error": "Could not read a dataset from the HDF5 group"
         }
 
+        # Get expected variables from config
+        expected_species = set(self.config["data"]["species_variables"])
+        expected_globals = set(self.config["data"]["global_variables"])
+        expected_time = {self.config["data"]["time_variable"]}
+        
+        # Get found variables
+        found_variables = report["all_found_variables"]
+        found_globals = report["all_found_global_attrs"]
+        
+        # Check for mismatches
+        missing_species = expected_species - found_variables
+        missing_time = expected_time - found_variables
+        missing_globals = expected_globals - found_globals
+        
+        extra_variables = found_variables - expected_species - expected_time
+        extra_globals = found_globals - expected_globals - {"SEED"}  # SEED is allowed
+
         with open(summary_path, 'w') as f:
             f.write("="*60 + "\n")
             f.write("      Data Preprocessing Summary\n")
             f.write("="*60 + "\n\n")
             f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Raw Files Processed: {len(self.raw_files)}\n\n")
+            
+            # Variable analysis section
+            f.write("--- Variable Analysis ---\n")
+            f.write("Expected Variables:\n")
+            f.write(f"  Species ({len(expected_species)}): {sorted(expected_species)}\n")
+            f.write(f"  Globals ({len(expected_globals)}): {sorted(expected_globals)}\n")
+            f.write(f"  Time: {list(expected_time)}\n\n")
+            
+            f.write("Found in HDF5 Files:\n")
+            f.write(f"  Dataset Variables ({len(found_variables)}): {sorted(found_variables)}\n")
+            f.write(f"  Global Attributes ({len(found_globals)}): {sorted(found_globals)}\n\n")
+            
+            # Report any issues
+            if missing_species or missing_time or missing_globals or extra_variables or extra_globals:
+                f.write("!!! VARIABLE MISMATCHES DETECTED !!!\n")
+                if missing_species:
+                    f.write(f"  MISSING Species Variables: {sorted(missing_species)}\n")
+                if missing_time:
+                    f.write(f"  MISSING Time Variable: {sorted(missing_time)}\n")
+                if missing_globals:
+                    f.write(f"  MISSING Global Attributes: {sorted(missing_globals)}\n")
+                if extra_variables:
+                    f.write(f"  EXTRA Dataset Variables (not in config): {sorted(extra_variables)}\n")
+                if extra_globals:
+                    f.write(f"  EXTRA Global Attributes (not in config): {sorted(extra_globals)}\n")
+                f.write("\n")
+            else:
+                f.write("✓ All expected variables found correctly\n\n")
 
             f.write("--- Profile Filtering --- \n")
             f.write(f"Total Profiles Found:     {report['total_profiles']:,}\n")
@@ -620,10 +683,11 @@ class DataPreprocessor:
 
 class ShardWriter:
     """Writes numpy arrays to shard files, handling buffering and file naming."""
-    def __init__(self, output_dir: Path, shard_size: int, shard_idx_base: str):
+    def __init__(self, output_dir: Path, shard_size: int, shard_idx_base: str, dtype: np.dtype):
         self.output_dir = output_dir
         self.shard_size = shard_size
         self.shard_idx_base = shard_idx_base
+        self.dtype = dtype
         self.buffer: List[np.ndarray] = []
         self.buffer_size = 0
         self.local_shard_id = 0
@@ -634,8 +698,8 @@ class ShardWriter:
 
     def add_samples(self, samples: np.ndarray):
         """Simplified add_samples without tracking global indices."""
-        if samples.dtype != np.float64:
-            samples = samples.astype(np.float64)
+        if samples.dtype != self.dtype:
+            samples = samples.astype(self.dtype)
         
         self.buffer.append(samples)
         self.buffer_size += samples.shape[0]
@@ -669,7 +733,7 @@ class ShardWriter:
         self.buffer_size = sum(arr.shape[0] for arr in self.buffer)
 
         # Write shard
-        data = np.concatenate(rows_to_write).astype(np.float64, copy=False)
+        data = np.concatenate(rows_to_write).astype(self.dtype, copy=False)
         
         final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
         tmp_path = final_path.with_suffix(".tmp.npy")
@@ -694,7 +758,7 @@ class ShardWriter:
         self.buffer = []
         self.buffer_size = 0
 
-        data = np.concatenate(rows_to_write).astype(np.float64, copy=False)
+        data = np.concatenate(rows_to_write).astype(self.dtype, copy=False)
         final_path = self.output_dir / f"shard_{self.shard_idx_base}_{self.local_shard_id:04d}.npy"
         tmp_path   = final_path.with_suffix(".tmp.npy")
         np.save(tmp_path, data, allow_pickle=False)
@@ -713,4 +777,4 @@ class ShardWriter:
 def shard_worker_split_aware(file_path, config, norm_stats, output_dir):
     """Worker function that creates split-specific shards."""
     processor = CorePreprocessor(config, norm_stats)
-    return processor.process_file_for_shards(Path(file_path), Path(output_dir))   
+    return processor.process_file_for_shards(Path(file_path), Path(output_dir))

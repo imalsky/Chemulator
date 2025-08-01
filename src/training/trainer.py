@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Training pipeline for chemical kinetics models with adaptive loss
+Training pipeline for chemical kinetics models
 """
 
 import json
@@ -20,134 +20,8 @@ from models.model import export_model
 from data.normalizer import NormalizationHelper
 
 
-class ScaleAwareAdaptiveLoss(nn.Module):
-    """
-    Adaptive loss that accounts for different scales and variations in species.
-    Ensures uniform relative accuracy across all species.
-    """
-    def __init__(self, norm_stats: Dict[str, Any], species_names: list, device: torch.device):
-        super().__init__()
-        self.species_names = species_names
-        
-        # Extract standard deviations for each species
-        stds = []
-        for species in species_names:
-            if species in norm_stats["per_key_stats"]:
-                stats = norm_stats["per_key_stats"][species]
-                if "log_std" in stats:
-                    stds.append(stats["log_std"])
-                else:
-                    # For non-log normalized species
-                    stds.append(stats.get("std", 1.0))
-            else:
-                stds.append(1.0)
-        
-        # Convert to tensor
-        stds = torch.tensor(stds, device=device, dtype=torch.float64)
-        
-        # Create weights inversely proportional to std
-        # Species with larger std (harder to predict) get higher weight
-        self.weights = 1.0 / torch.sqrt(stds)
-        self.weights = self.weights / self.weights.mean()  # Normalize to mean=1
-        
-        # Log the weights
-        logger = logging.getLogger(__name__)
-        logger.info("Species-specific loss weights (based on std):")
-        for species, weight, std in zip(species_names, self.weights.cpu().numpy(), stds.cpu().numpy()):
-            logger.info(f"  {species}: weight={weight:.3f} (std={std:.3f})")
-        
-        # Optional: Manual adjustment for extreme species
-        # You can uncomment and modify this if certain species need extra attention
-        # extreme_species = ["O_evolution", "OH_evolution"]
-        # for i, species in enumerate(species_names):
-        #     if species in extreme_species:
-        #         self.weights[i] *= 2.0  # Double weight for extreme species
-        
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute weighted MSE loss.
-        
-        Args:
-            pred: Predictions in normalized space (batch, n_species)
-            target: Targets in normalized space (batch, n_species)
-        """
-        # Per-species squared error
-        squared_errors = (pred - target) ** 2
-        
-        # Apply species-specific weights
-        weighted_errors = squared_errors * self.weights.unsqueeze(0)
-        
-        # Return mean
-        return weighted_errors.mean()
-
-
-class UniformRelativeErrorLoss(nn.Module):
-    """
-    Alternative loss that directly optimizes for uniform relative error.
-    Works in normalized space but accounts for what the errors mean in real space.
-    """
-    def __init__(self, norm_stats: Dict[str, Any], species_names: list, device: torch.device, 
-                 target_relative_error: float = 0.01):
-        super().__init__()
-        self.species_names = species_names
-        self.target_relative_error = target_relative_error
-        
-        # Extract normalization parameters
-        self.log_stds = []
-        self.is_log = []
-        
-        for species in species_names:
-            if species in norm_stats["per_key_stats"]:
-                stats = norm_stats["per_key_stats"][species]
-                method = norm_stats["normalization_methods"].get(species, "standard")
-                
-                if "log" in method:
-                    self.log_stds.append(stats.get("log_std", 1.0))
-                    self.is_log.append(True)
-                else:
-                    self.log_stds.append(0.0)  # Not used for linear normalized
-                    self.is_log.append(False)
-            else:
-                self.log_stds.append(1.0)
-                self.is_log.append(True)
-        
-        self.log_stds = torch.tensor(self.log_stds, device=device, dtype=torch.float64)
-        self.is_log = torch.tensor(self.is_log, device=device, dtype=torch.bool)
-        
-        # Target error in normalized space for each species
-        # For log-normalized species: target_norm_error = log10(1 + target_relative_error) / log_std
-        log_target = np.log10(1 + target_relative_error)
-        self.target_normalized_errors = torch.where(
-            self.is_log,
-            log_target / self.log_stds,
-            torch.tensor(target_relative_error, device=device, dtype=torch.float64)
-        )
-        
-        logger = logging.getLogger(__name__)
-        logger.info(f"Target relative error: {target_relative_error:.1%}")
-        logger.info("Target normalized RMSE per species:")
-        for species, target_rmse in zip(species_names, self.target_normalized_errors.cpu().numpy()):
-            logger.info(f"  {species}: {target_rmse:.4f}")
-    
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute loss that penalizes deviations from target relative error.
-        """
-        # Compute normalized errors
-        normalized_errors = torch.abs(pred - target)
-        
-        # Compute how far each species is from its target error
-        error_ratios = normalized_errors / self.target_normalized_errors.unsqueeze(0)
-        
-        # Penalize both under and over-achievement
-        # Use squared ratio to penalize large deviations more
-        loss = (error_ratios ** 2).mean()
-        
-        return loss
-
-
 class Trainer:
-    """Trainer with adaptive loss functions for multi-scale chemical kinetics"""
+    """Trainer for chemical kinetics models"""
     def __init__(self, model: nn.Module, train_dataset, val_dataset, test_dataset,
                 config: Dict[str, Any], save_dir: Path, device: torch.device,
                 norm_helper: NormalizationHelper):
@@ -164,6 +38,11 @@ class Trainer:
         self.system_config = config["system"]
         self.prediction_config = config.get("prediction", {})
         self.data_config = config["data"]
+        
+        # Get dtype from config
+        dtype_str = self.system_config.get("dtype", "float32")
+        self.dtype = getattr(torch, dtype_str)
+        self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
         
         # Prediction mode
         self.prediction_mode = self.prediction_config.get("mode", "absolute")
@@ -358,40 +237,16 @@ class Trainer:
             raise ValueError(f"Unknown scheduler '{scheduler_type}'")
     
     def _setup_loss(self):
-        """Setup loss function with adaptive options."""
-        loss_type = self.train_config["loss"]
-        
-        if loss_type == "mse":
-            self.criterion = nn.MSELoss()
-        elif loss_type == "mae":
-            self.criterion = nn.L1Loss()
-        elif loss_type == "huber":
-            self.criterion = nn.HuberLoss(delta=self.train_config.get("huber_delta", 0.5))
-        elif loss_type == "adaptive" or loss_type == "scale_aware":
-            # Use scale-aware adaptive loss
-            self.criterion = ScaleAwareAdaptiveLoss(
-                self.norm_helper.stats,
-                self.species_names,
-                self.device
-            )
-        elif loss_type == "uniform_relative":
-            # Use uniform relative error loss
-            target_error = self.train_config.get("target_relative_error", 0.01)
-            self.criterion = UniformRelativeErrorLoss(
-                self.norm_helper.stats,
-                self.species_names,
-                self.device,
-                target_relative_error=target_error
-            )
-        else:
-            raise ValueError(f"Unknown loss: {loss_type}")
+        """Setup loss function - MSE only."""
+        loss_type = self.train_config.get("loss", "mse")
+        if loss_type != "mse":
+            self.logger.warning(f"Only MSE loss is supported. Ignoring '{loss_type}' and using MSE.")
+        self.criterion = nn.MSELoss()
     
     def _setup_amp(self):
-        """Setup automatic mixed precision - disabled for float64."""
+        """Setup automatic mixed precision."""
         # Check if using float64
-        model_dtype = next(self.model.parameters()).dtype
-        
-        if model_dtype == torch.float64:
+        if self.dtype == torch.float64:
             self.use_amp = False
             self.scaler = GradScaler(enabled=False)
             self.amp_dtype = None
@@ -444,7 +299,7 @@ class Trainer:
             self.logger.info(f"Val batches: {len(self.val_loader)}")
 
         # Log loss function info
-        self.logger.info(f"Using loss function: {type(self.criterion).__name__}")
+        self.logger.info(f"Using loss function: MSE")
 
         if self.system_config.get("use_torch_compile", False):
             self.logger.info("Compiling model with torch.compile...")
@@ -454,9 +309,6 @@ class Trainer:
             self._run_training_loop()
             self.logger.info(f"Training completed. Best validation loss: {self.best_val_loss:.6f} at epoch {self.best_epoch}")
             
-            # Run final diagnostics
-            if self.track_species_metrics:
-                self.diagnose_accuracy()
             
         except KeyboardInterrupt:
             self.logger.info("Training interrupted by user")
@@ -657,10 +509,6 @@ class Trainer:
 
         avg_loss = total_loss / total_samples if total_samples > 0 else float("inf")
         self.logger.info(f"Test loss: {avg_loss:.6f}")
-        
-        # Run detailed diagnostics on test set
-        if self.track_species_metrics:
-            self.diagnose_accuracy(use_test=True)
         
         return avg_loss
 
