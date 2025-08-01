@@ -252,8 +252,8 @@ class FiLMDeepONet(nn.Module):
             input_dim=1,
             hidden_layers=trunk_layers,
             output_dim=self.basis_dim,
-            condition_dim=condition_dim,
-            film_config=film_config if self.use_film else None,
+            condition_dim=None,      # Explicitly disable conditioning for the trunk
+            film_config=None,        # Explicitly disable FiLM for the trunk
             bias=True
         )
     
@@ -350,15 +350,14 @@ class FiLMDeepONet(nn.Module):
         branch_input = inputs[:, :self.num_input_species + self.num_globals]
         trunk_input = inputs[:, -1:]  # Time
 
-        # Process through networks
+        trunk_out = self.trunk_net(trunk_input)
+
+        # The branch is still conditioned on the initial state if FiLM is enabled.
         if self.use_film:
             initial_state_for_conditioning = inputs[:, :self.num_input_species + self.num_globals]
-            
             branch_out = self.branch_net(branch_input, initial_state_for_conditioning)
-            trunk_out = self.trunk_net(trunk_input, initial_state_for_conditioning)
         else:
             branch_out = self.branch_net(branch_input)
-            trunk_out = self.trunk_net(trunk_input)
 
         # Reshape and combine efficiently based on the number of output species
         branch_out = branch_out.view(batch_size, self.num_output_species, self.basis_dim)
