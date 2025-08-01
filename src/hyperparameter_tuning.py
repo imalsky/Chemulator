@@ -229,9 +229,6 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
     
     # Common hyperparameters - EXPANDED SEARCH SPACE
     config["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu", "relu", "tanh"])
-    #config["training"]["learning_rate"] = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    #config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [16384])
-    #config["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
     config["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.1, step=0.05)
     
 
@@ -283,10 +280,8 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
         config["film"]["hidden_dims"] = film_widths
         config["film"]["activation"] = trial.suggest_categorical("film_activation", ["gelu", "relu"])
 
-    # Loss function
-    config["training"]["loss"] = trial.suggest_categorical("loss", ["mse"])
-    if config["training"]["loss"] == "huber":
-        config["training"]["huber_delta"] = trial.suggest_float("huber_delta", 0.1, 2.0)
+    # Loss function - only MSE
+    config["training"]["loss"] = "mse"
 
     # Gradient clipping
     config["training"]["gradient_clip"] = trial.suggest_categorical("gradient_clip", [1.0])
@@ -297,7 +292,7 @@ def suggest_model_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Di
 def optimize(config_path: Path, n_trials: int = 25, n_jobs: int = 1,
              study_name: str = "chemulator_hpo", pruner: Optional[optuna.pruners.BasePruner] = None):
     """
-    Main function to run Optuna optimization with Hyperband for 40-hoaur runtime.
+    Main function to run Optuna optimization with Hyperband for 40-hour runtime.
     """
     logger = logging.getLogger(__name__)
     base_config = load_json_config(config_path)

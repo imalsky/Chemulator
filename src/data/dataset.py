@@ -7,13 +7,12 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Dict, Any, Tuple, Optional
 import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import math
-from functools import lru_cache
 
 
 class NPYDataset(Dataset):
@@ -30,6 +29,11 @@ class NPYDataset(Dataset):
         self.config = config
         self.device = device
         self.logger = logging.getLogger(__name__)
+
+        # Get dtype from config
+        dtype_str = self.config["system"].get("dtype", "float32")
+        self.dtype = getattr(torch, dtype_str)
+        self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
 
         # Verify split directory exists
         if not self.split_dir.exists():
@@ -62,8 +66,9 @@ class NPYDataset(Dataset):
         self._shard_starts = np.array([s["start_idx"] for s in self.shards])
         self._shard_ends = np.array([s["end_idx"] for s in self.shards])
         
-        # Memory info
-        self.bytes_per_sample = self.n_features * 8
+        # Memory info - use configured dtype size
+        bytes_per_element = 4 if dtype_str == "float32" else 8
+        self.bytes_per_sample = self.n_features * bytes_per_element
         self.total_bytes = self.n_total_samples * self.bytes_per_sample
         
         # Initialize caching
@@ -90,17 +95,17 @@ class NPYDataset(Dataset):
         if needed_gb > free_gb * 0.85:     
             self.logger.warning(
                 f"Insufficient GPU memory for {self.split_name}: "
-                f"need {needed_gb:.1f} GB, have {free_gb:.1f} GB.  Falling back to CPU."
+                f"need {needed_gb:.1f} GB, have {free_gb:.1f} GB.  Falling back to CPU."
             )
             self.cpu_fallback = True
             return
 
-        self.logger.info(f"Loading {self.split_name} dataset to GPU ({needed_gb:.1f} GB)…")
+        self.logger.info(f"Loading {self.split_name} dataset to GPU ({needed_gb:.1f} GB)…")
         start = time.time()
 
         self.gpu_cache = torch.empty(
             (self.n_total_samples, self.n_features),
-            dtype=torch.float64,
+            dtype=self.dtype,
             device=self.device,
         )
 
@@ -109,9 +114,9 @@ class NPYDataset(Dataset):
             shard_path = self.split_dir / shard["filename"]
             if self.shard_index.get("compression") == "npz":
                 with np.load(shard_path) as zf:
-                    data = zf["data"].astype(np.float64, copy=False)
+                    data = zf["data"].astype(self.np_dtype, copy=False)
             else:
-                data = np.load(shard_path).astype(np.float64, copy=False)
+                data = np.load(shard_path).astype(self.np_dtype, copy=False)
 
             n = data.shape[0]
             self.gpu_cache[cur:cur + n] = torch.from_numpy(data).pin_memory().to(self.device, non_blocking=True)
@@ -120,7 +125,7 @@ class NPYDataset(Dataset):
 
         torch.cuda.synchronize()
         t = time.time() - start
-        self.logger.info(f"GPU cache loaded in {t:.1f}s ({needed_gb/t:.1f} GB/s)")
+        self.logger.info(f"GPU cache loaded in {t:.1f}s ({needed_gb/t:.1f} GB/s)")
 
     def _load_shard_cpu(self, shard_idx: int) -> np.ndarray:
         """Load a shard from disk (CPU fallback)."""
@@ -141,9 +146,9 @@ class NPYDataset(Dataset):
         
         if self.shard_index.get("compression") == "npz":
             with np.load(shard_path) as zf:
-                return zf["data"].astype(np.float64, copy=False)
+                return zf["data"].astype(self.np_dtype, copy=False)
         else:
-            return np.load(shard_path).astype(np.float64, copy=False)
+            return np.load(shard_path).astype(self.np_dtype, copy=False)
 
     def __len__(self) -> int:
         """Return the total number of samples."""
@@ -168,10 +173,9 @@ class NPYDataset(Dataset):
             shard_data = self._load_shard_cpu(shard_idx)
             row = shard_data[local_idx]
             
-            # Return CPU tensors. The batch will be moved to the GPU
-            # all at once by the dataloader / training loop.
-            input_tensor = torch.from_numpy(row[:self.n_inputs].copy()).double()
-            target_tensor = torch.from_numpy(row[self.n_inputs:].copy()).double()
+            # Return CPU tensors with configured dtype
+            input_tensor = torch.from_numpy(row[:self.n_inputs].copy()).to(self.dtype)
+            target_tensor = torch.from_numpy(row[self.n_inputs:].copy()).to(self.dtype)
             
             return input_tensor, target_tensor
 

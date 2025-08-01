@@ -133,8 +133,7 @@ class FiLMSIREN(nn.Module):
         self.film_layers = nn.ModuleList() if self.use_film else None
 
         prev_dim = input_dim
-        # CORRECT: Condition on full initial state (species + globals)
-        condition_dim = self.num_input_species + self.num_globals
+        condition_dim = self.num_globals if self.use_film else None
 
         # Get FiLM activations
         film_activations = film_config.get("activations", film_config.get("activation", "gelu"))
@@ -187,9 +186,12 @@ class FiLMSIREN(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass - optimized."""
-        # CORRECT: Extract initial conditions for FiLM (all but time)
-        initial_conditions = x[:, :self.num_input_species + self.num_globals]
-        
+
+        if self.use_film and self.film_layers is not None:
+            cond_start = self.num_input_species
+            cond_end = self.num_input_species + self.num_globals
+            global_condition = x[:, cond_start:cond_end]
+
         # Process through layers
         h = x
         for i, layer in enumerate(self.layers):
@@ -198,7 +200,8 @@ class FiLMSIREN(nn.Module):
             
             # Apply FiLM before activation
             if self.use_film and self.film_layers is not None:
-                h = self.film_layers[i](h, initial_conditions)
+
+                h = self.film_layers[i](h, global_condition)
             
             # SIREN activation
             h = torch.sin(self.omega_0 * h)
@@ -216,46 +219,73 @@ class FiLMDeepONet(nn.Module):
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         
-        # Extract dimensions
-        self.num_input_species = len(config["data"]["species_variables"])
-        self.num_output_species = len(config["data"].get("target_species_variables", config["data"]["species_variables"]))
-        self.num_globals = len(config["data"]["global_variables"])
+        # ────────────────────────────────────────────────────────────────
+        # 1.  Dimensions
+        # ────────────────────────────────────────────────────────────────
+        self.num_input_species  = len(config["data"]["species_variables"])
+        self.num_output_species = len(
+            config["data"].get("target_species_variables",
+                               config["data"]["species_variables"])
+        )
+        self.num_globals        = len(config["data"]["global_variables"])
 
-        # Architecture parameters
+        # ────────────────────────────────────────────────────────────────
+        # 2.  Architecture hyper-parameters
+        # ────────────────────────────────────────────────────────────────
         branch_layers = config["model"]["branch_layers"]
-        trunk_layers = config["model"]["trunk_layers"]
-        self.basis_dim = config["model"]["basis_dim"]
-        self.activation = self._get_activation(config["model"].get("activation", "gelu"))
+        trunk_layers  = config["model"]["trunk_layers"]
+        self.basis_dim   = config["model"]["basis_dim"]
+        self.activation  = self._get_activation(
+            config["model"].get("activation", "gelu")
+        )
         self.output_scale = config["model"].get("output_scale", 1.0)
-        
-        # Dropout
+
+        # ────────────────────────────────────────────────────────────────
+        # 3.  Regularisation
+        # ────────────────────────────────────────────────────────────────
         dropout_rate = config["model"].get("dropout", 0.0)
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
-        
-        # FiLM configuration
+
+        # ────────────────────────────────────────────────────────────────
+        # 4.  FiLM configuration
+        # ────────────────────────────────────────────────────────────────
         film_config = config.get("film", {})
         self.use_film = film_config.get("enabled", True)
-        
-        # FIXED: Condition on full initial state (species + globals)
-        condition_dim = self.num_input_species + self.num_globals if self.use_film else None
-        
-        # Build networks
+        condition_dim = self.num_globals if self.use_film else None
+
+        # Decide what raw features the BRANCH sees:
+        #   • FiLM ON  -> species only (globals come via FiLM)
+        #   • FiLM OFF -> species + globals as direct inputs
+        branch_input_dim = (
+            self.num_input_species
+            if self.use_film
+            else self.num_input_species + self.num_globals
+        )
+        self.branch_input_dim = branch_input_dim
+
+        # ────────────────────────────────────────────────────────────────
+        # 5.  Build BRANCH network (coefficients)
+        # ────────────────────────────────────────────────────────────────
         self.branch_net = self._build_mlp_with_film(
-            input_dim=self.num_input_species + self.num_globals,  # Use all input species
-            hidden_layers=branch_layers,
-            output_dim=self.basis_dim * self.num_output_species, # Output is for target species only
-            condition_dim=condition_dim,
-            film_config=film_config if self.use_film else None
+            input_dim   = branch_input_dim,
+            hidden_layers = branch_layers,
+            output_dim  = self.basis_dim * self.num_output_species,
+            condition_dim = condition_dim,
+            film_config   = film_config if self.use_film else None
         )
-        
+
+        # ────────────────────────────────────────────────────────────────
+        # 6.  Build TRUNK network (basis functions) — no FiLM
+        # ────────────────────────────────────────────────────────────────
         self.trunk_net = self._build_mlp_with_film(
-            input_dim=1,
-            hidden_layers=trunk_layers,
-            output_dim=self.basis_dim,
-            condition_dim=None,      # Explicitly disable conditioning for the trunk
-            film_config=None,        # Explicitly disable FiLM for the trunk
-            bias=True
+            input_dim   = 1,                 # time coordinate
+            hidden_layers = trunk_layers,
+            output_dim  = self.basis_dim,
+            condition_dim = None,            # FiLM disabled
+            film_config   = None,
+            bias          = True
         )
+
     
     def _get_activation(self, name: str):
         activations = {
@@ -344,31 +374,39 @@ class FiLMDeepONet(nn.Module):
             
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Forward pass"""
-        batch_size = inputs.shape[0]
+        batch_size = inputs.size(0)
 
-        # Split inputs
-        branch_input = inputs[:, :self.num_input_species + self.num_globals]
-        trunk_input = inputs[:, -1:]  # Time
-
-        trunk_out = self.trunk_net(trunk_input)
-
-        # The branch is still conditioned on the initial state if FiLM is enabled.
+        # ───────── branch features … depend on FiLM flag ─────────
         if self.use_film:
-            initial_state_for_conditioning = inputs[:, :self.num_input_species + self.num_globals]
-            branch_out = self.branch_net(branch_input, initial_state_for_conditioning)
+            # species only
+            branch_input = inputs[:, : self.num_input_species]
+            cond_start   = self.num_input_species
+            cond_end     = cond_start + self.num_globals
+            global_condition = inputs[:, cond_start:cond_end]       # (B, Ng)
+        else:
+            # species + globals as raw inputs; no FiLM condition tensor
+            branch_input = inputs[:, : self.num_input_species + self.num_globals]
+            global_condition = None
+
+        # ───────── trunk input (time) ─────────
+        trunk_input = inputs[:, -1:]                                # (B, 1)
+
+        # ───────── networks ─────────
+        trunk_out  = self.trunk_net(trunk_input)                    # (B, D)
+        if self.use_film:
+            branch_out = self.branch_net(branch_input, global_condition)
         else:
             branch_out = self.branch_net(branch_input)
 
-        # Reshape and combine efficiently based on the number of output species
+        # ───────── combine ─────────
         branch_out = branch_out.view(batch_size, self.num_output_species, self.basis_dim)
-        # Efficient matrix multiplication
-        output = torch.bmm(branch_out, trunk_out.unsqueeze(2)).squeeze(2)
+        output     = torch.bmm(branch_out, trunk_out.unsqueeze(2)).squeeze(2)
 
-        # Optional output scaling
+        # optional scaling
         if self.output_scale != 1.0:
             output = output * self.output_scale
-
         return output
+
 
 
 def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
@@ -423,9 +461,14 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
         except Exception as e:
             logger.warning(f"Model compilation failed: {e}. Running in eager mode.")
 
-    if config["system"].get("dtype") == "float64":
+    # Convert to specified dtype
+    dtype_str = config["system"].get("dtype", "float32")
+    if dtype_str == "float64":
         model = model.double()
         logger.info("Converted model to float64 precision")
+    elif dtype_str == "float32":
+        model = model.float()
+        logger.info("Using float32 precision")
         
     return model
 

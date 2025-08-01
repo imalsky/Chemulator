@@ -1,8 +1,4 @@
 {
-    // ===== OPTIMIZED CONFIGURATION FOR A100 GPU =====
-    // This configuration maximizes performance on NVIDIA A100 80GB
-    
-    // ===== FILE PATHS =====
     "paths": {
         // Raw HDF5 data files to process
         "raw_data_files": [
@@ -27,7 +23,7 @@
     
     // ===== DATA CONFIGURATION =====
     "data": {
-        // Chemical species to predict (order matters!)
+        // Chemical species to predict
         "species_variables": [
             "C2H2_evolution",
             "CH4_evolution",
@@ -55,7 +51,7 @@
         // Number of samples per NPY shard file
         "shard_size": 10000000,
         // Minimum species concentration threshold
-        "min_value_threshold": 1e-25,
+        "min_value_threshold": 1e-20,
         // Compression type: null for raw npy files (faster I/O)
         "compression": null,
         // Number of parallel workers for preprocessing
@@ -71,17 +67,17 @@
         
         // Override methods for specific variables
         "methods": {
-            "T_init": "standard",
-            "P_init": "log-min-max",
+            "T": "standard",
+            "P": "log-min-max",
             "t_time": "log-min-max"
         },
         
         // Epsilon for numerical stability
-        "epsilon": 1e-38,
+        "epsilon": 1e-30,
         // Minimum standard deviation to prevent division by tiny values
         "min_std": 1e-10,
         // Clamp normalized values to [-clamp_value, clamp_value]
-        "clamp_value": 50.0
+        "clamp_value": 999.0
     },
     
     // ===== MODEL ARCHITECTURE =====
@@ -135,13 +131,10 @@
         "use_fraction": 1.0,
         
         // Training duration
-        "epochs": 50,
+        "epochs": 100,
         
-        // BATCH SIZE - MAXIMIZED FOR A100 80GB
-        "batch_size": 32768,  
+        "batch_size": 1024,  
         "gradient_accumulation_steps": 1,
-        
-        // GPU CACHING - CRITICAL FOR PERFORMANCE
         "gpu_cache_dataset": true,  // Force GPU caching
         
         // DATALOADER SETTINGS - OPTIMIZED FOR GPU
@@ -161,19 +154,15 @@
         // Scheduler settings
         "scheduler": "cosine",
         "scheduler_params": {
-            "T_0": 50,  // Restart every 10 epochs
+            "T_0": 100,  
             "T_mult": 2,
             "eta_min": 1e-8
         },
         
         // Loss and training settings
         "loss": "mse",
-        //"target_relative_error": 0.005, 
-        //"track_species_metrics": true, 
-        //"loss": "huber",
-        //"huber_delta": 0.1,
-        "use_amp": false,
-        "amp_dtype": "float64",  // Better for A100 than float16
+        "use_amp": true,
+        "amp_dtype": "bfloat16",
         "early_stopping_patience": 5000,
         "min_delta": 1e-8,
         
@@ -199,8 +188,8 @@
         
         // CUDA optimizations for A100
         "cudnn_benchmark": true,
-        "tf32": false,  // Use TensorFloat-32 on A100
-        "dtype": "float64",
+        "tf32": true,  // Use TensorFloat-32 on A100
+        "dtype": "float32",
         "cuda_memory_fraction": 0.95  // Use most GPU memory
     },
     
@@ -219,21 +208,3 @@
         "n_trials": 100
     }
 }
-
-// ===== A100 OPTIMIZATION NOTES =====
-// 
-// Key changes from CPU/small GPU config:
-// 1. batch_size: 131072 (8x larger) - A100 can handle this easily
-// 2. gpu_cache_dataset: true - All data loaded to GPU memory
-// 3. num_workers: 0 - No CPU workers needed with GPU cache
-// 4. learning_rate: 2e-3 - Scaled with sqrt(batch_size_ratio)
-// 5. compile_mode: "max-autotune" - Maximum compilation optimization
-// 6. cuda_memory_fraction: 0.95 - Use almost all GPU memory
-// 7. amp_dtype: "bfloat16" - Better numerical stability than float16
-// 
-// Expected performance:
-// - GPU utilization: >95%
-// - Training speed: ~1-2 minutes per epoch
-// - Memory usage: ~20-30GB GPU memory
-// 
-// If you run out of memory, reduce batch_size to 65536

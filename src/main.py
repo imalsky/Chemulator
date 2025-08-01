@@ -257,57 +257,6 @@ class ChemicalKineticsPipeline:
         
         save_json(results, self.run_save_dir / "results.json")
     
-    def run_diagnostics(self, num_batches=20):
-        """Run performance diagnostics."""
-        self.logger.info("Running performance diagnostics...")
-        
-        # Ensure data is preprocessed
-        self.preprocess_data()
-        
-        # Create model
-        model = create_model(self.config, self.device)
-        
-        # Load norm stats
-        norm_stats = load_json(self.processed_dir / "normalization.json")
-        norm_helper = NormalizationHelper(
-            norm_stats, self.device,
-            self.config["data"]["species_variables"],
-            self.config["data"]["global_variables"],
-            self.config["data"]["time_variable"],
-            self.config
-        )
-        
-        # Create training dataset only
-        train_dataset = NPYDataset(
-            shard_dir=self.processed_dir,
-            split_name="train",
-            config=self.config,
-            device=self.device
-        )
-        
-        # Create minimal trainer
-        trainer = Trainer(
-            model=model,
-            train_dataset=train_dataset,
-            val_dataset=None,
-            test_dataset=None,
-            config=self.config,
-            save_dir=self.run_save_dir,
-            device=self.device,
-            norm_helper=norm_helper
-        )
-        
-        
-        # Print summary
-        print("\n" + "="*60)
-        print("PERFORMANCE DIAGNOSTICS COMPLETE")
-        print("="*60)
-        print(f"Batch size: {self.config['training']['batch_size']}")
-        print(f"Device: {self.device}")
-        print(f"Model compilation: {self.config['system'].get('use_torch_compile', False)}")
-        print(f"AMP enabled: {self.config['training'].get('use_amp', False)}")
-        print(f"GPU cache: {train_dataset.get_cache_info()['type']}")
-    
     def run(self):
         """Execute the full training pipeline."""
         try:
