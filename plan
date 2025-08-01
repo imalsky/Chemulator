@@ -1,0 +1,165 @@
+Here’s the no-nonsense review you asked for—what to change, why it helps, and a concrete rollout plan—to move from your current “one-time-per-row” pipeline to true multi-time training per sample while keeping your existing model.
+
+What to change (by component)
+1) Preprocessor (CorePreprocessor + shard format)
+Today: _profile_to_samples(...) emits (n_t-1) independent rows, each with
+[x0, g, t_k] → x(t_k) (i.e., n_inputs = N_spec + N_glob + 1).
+
+Change: add a fixed-M multi-time mode that packs M time points per sample for the same (x0, g):
+
+Inputs per row: [x0, g, t_1, …, t_M] → length N_spec + N_glob + M.
+
+Targets per row: [x(t_1), …, x(t_M)] reshaped logically as [M, N_out] (you can store flattened as M*N_out but the loader should reshape to [M, N_out]).
+
+Config you’ll need:
+
+preprocessing.multi_time.enabled: true
+
+preprocessing.multi_time.M: <int> (start with 8–16, not 100)
+
+preprocessing.multi_time.sampling: "uniform" | "log-heavy-early" | "stratified"
+(pick one; at minimum include anchors near 0 and near t_end)
+
+Shard index additions (shard_index.json):
+
+num_times_per_sample: M
+
+input_layout: "x0,g,t[1..M]"
+
+target_layout: "x(t1..tM) flattened"
+
+(Optional) time_sampling_strategy: <string>
+
+Optional (long trajectories):
+
+preprocessing.multi_time.pack_mode: "single" | "sliding" | "random-subset"
+
+single: pick one set of M times per profile
+
+sliding: emit multiple samples per profile (e.g., windows)
+
+random-subset: different M per epoch not applicable here (that belongs in a non-sharded, online sampler)
+
+2) Dataset / DataLoader (NPYDataset, create_dataloader)
+Today: hard-codes n_inputs = N_spec + N_glob + 1, n_features = n_inputs + N_out.
+
+Change (fixed-M path):
+
+Read M from shard_index.
+
+Set n_inputs = N_spec + N_glob + M.
+
+Set n_features = n_inputs + (M * N_out).
+
+In __getitem__:
+
+return inputs unchanged,
+
+reshape targets from [M * N_out] → [M, N_out].
+
+GPU cache still works (fixed row width). The GPUBatchDataset wrapper does not need structural changes beyond using the new n_inputs.
+
+If you ever want variable-M: ditch GPU cache for that split, add a custom collate that pads to M_max and emits a boolean mask, and teach the Trainer to use a masked MSE. (Not recommended unless you truly need variable lengths.)
+
+3) Trainer (loss, metrics, logging)
+Today: Works for [B, N_in] → [B, N_out] and averages errors over batch only.
+
+Change for multi-time (fixed-M):
+
+Loss: keep MSE—it will naturally handle [B, M, N_out] as long as targets is [B, M, N_out] and outputs matches. No code gymnastics needed.
+
+Per-species metrics: you currently do
+mse_per_species = errors.mean(dim=0); with multi-time this yields [M, N_out].
+Fix: reduce over batch and time, i.e., mean over axes (0, 1), then report [N_out].
+(If you later add a mask, use weighted means.)
+
+Scheduler step count: swap floor for ceil in steps_per_epoch = ceil(len(loader)/grad_accum) so cosine restarts align with actual optimizer steps.
+
+Spectral regularizer cadence: compute every k steps (e.g., 10) or on a subsample (e.g., first 64 items) to cut the eigencost.
+
+4) Model / Export
+Model: Your LinearLatentDynamics already supports [B, M] times and vectorizes the matrix_exp. No change required.
+
+Export caveat: Your exporter currently sets the last feature axis as dynamically sized via {param_name: {0: batch_dim, -1: time_dim}}. That only makes sense if the feature vector itself has a variable length—which is not true in a fixed-M format (the last axis length is fixed: N_spec + N_glob + M).
+
+If you use fixed-M: keep a fixed last dimension; export with a representative M (the one you trained with) and remove the -1: time_dim symbolic dim.
+
+If you truly need variable time count at export: refactor the model signature to accept time as a separate tensor (inputs_static, times); then you can mark the time axis dynamic cleanly. Otherwise leave it fixed.
+
+Why this helps (benefits)
+Accuracy at arbitrary 
+𝑡
+t: joint supervision over a curve for the same (x0,g) lowers gradient variance and tightens identification of 
+𝐴
+(
+𝑔
+)
+A(g) and the decoder; this is especially valuable for stiff kinetics and long horizons.
+
+Sample efficiency: one encode of (x0,g) and one build of 
+𝐴
+(
+𝑔
+)
+A(g) serve many time points; the network “sees” temporal structure instead of disconnected endpoints.
+
+Throughput: a single batched matrix_exp across times is measurably faster than 100 independent forwards. (Still cap M—cost scales with B·M·d^3.)
+
+Numerical stability: multi-time supervision discourages degenerate solutions that only match one time slice and miss the curve shape.
+
+Rollout plan (do this order)
+Decide M and sampling.
+Start with M=8 or 12. Include endpoints (near 0 and near t_end) plus interior times; bias early times if your dynamics are stiff.
+
+Preprocessor: add a multi-time path.
+
+Implement _profile_to_samples_multi_time(profile, n_t, M, sampling_strategy) that:
+
+picks t_1..t_M indices,
+
+builds one row per profile with inputs [x0,g,t_1..t_M] and targets concatenated [x(t_1)..x(t_M)].
+
+Gate it via preprocessing.multi_time.enabled.
+
+Write M and layouts to shard_index.json.
+
+NPYDataset: teach it M.
+
+Read num_times_per_sample from shard_index.json.
+
+Compute n_inputs and n_features accordingly.
+
+Reshape targets to [M, N_out] in __getitem__.
+
+Keep the GPU cache fast path unchanged otherwise.
+
+Trainer: fix reductions and minor nits.
+
+In validation metrics: reduce MSE over batch and time before per-species reporting.
+
+Change cosine steps to ceil.
+
+Throttle spectral regularization (every k steps or subsample).
+
+Export: lock the last dim (fixed-M) or refactor signature.
+
+If fixed-M: remove the -1: time_dim dynamic mapping; export with an example that has your chosen M.
+
+If you refactor to (static, times): then keep the dynamic time axis.
+
+Smoke tests before long runs.
+
+One batch through the multi-time path yields outputs.shape == [B, M, N_out], loss is scalar.
+
+t=0 sanity: decoder(encoder(x0,g),g) matches prediction at near-zero time.
+
+Spectrum check: max Re(eigs(A(g))) ≤ −α across random g.
+
+Don’t overdo it
+Do not feed all 100 times each step; use M=8–16 and randomize times across epochs if you want broader coverage.
+
+Keep inference simple: you’ll still query a single 
+𝑡
+t; the multi-time training makes that single query more accurate across the interval.
+
+That’s it. Make these changes and you’ll get the advantages of multi-time training without touching your model internals or losing your GPU-cache performance.

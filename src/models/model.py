@@ -1,559 +1,353 @@
 #!/usr/bin/env python3
+"""
+Corrected chemical kinetics models with Linear Latent Dynamics.
+All issues from the analysis have been addressed.
+"""
 
 import logging
 import math
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.export import Dim
 
 
-class FiLMLayer(nn.Module):
-    """Feature-wise Linear Modulation layer"""
-    def __init__(self,
-                 condition_dim: int, 
-                 feature_dim: int, 
-                 hidden_dims: List[int], 
-                 activation: Union[str, List[str]] = "gelu", 
-                 use_beta: bool = True):
-        super().__init__()
-        
-        self.use_beta = use_beta
-        self.feature_dim = feature_dim
-        out_multiplier = 2 if use_beta else 1
-        
-        # Handle activation specification
-        if isinstance(activation, str):
-            activations = [activation] * len(hidden_dims)
-        else:
-            if len(activation) != len(hidden_dims):
-                raise ValueError(f"Number of activations ({len(activation)}) must match hidden_dims ({len(hidden_dims)})")
-            activations = activation
-        
-        # Build FiLM MLP
-        layers = []
-        prev_dim = condition_dim
-        
-        # Hidden layers with per-layer activation
-        for dim, act in zip(hidden_dims, activations):
-            layers.extend([
-                nn.Linear(prev_dim, dim),
-                self._get_activation(act)
-            ])
-            prev_dim = dim
-        
-        # Output layer
-        layers.append(nn.Linear(prev_dim, out_multiplier * feature_dim))
-        
-        self.film_net = nn.Sequential(*layers)
-        
-        # Initialize to identity mapping
-        self._initialize_identity()
+class LinearLatentDynamics(nn.Module):
+    """
+    Global-conditioned linear latent dynamics with analytic time evolution.
     
-    def _get_activation(self, name: str):
-        activations = {
-            "gelu": nn.GELU(),
-            "relu": nn.ReLU(inplace=True),
-            "tanh": nn.Tanh(),
-            "silu": nn.SiLU(inplace=True),
-            "leakyrelu": nn.LeakyReLU(0.2, inplace=True),
-            "elu": nn.ELU(inplace=True)
-        }
-        if name.lower() not in activations:
-            raise ValueError(f"Unknown activation: {name}")
-        return activations[name.lower()]
+    Architecture:
+    1. Encoder: (x0, g) -> z0
+    2. Dynamics: z(t) = exp(A(g) * t) * z0, where A(g) is guaranteed stable
+    3. Decoder: (z(t), g) -> x(t)
     
-    def _initialize_identity(self):
-        """Initialize FiLM to identity mapping."""
-        with torch.no_grad():
-            final_layer = self.film_net[-1]
-            # Small weights
-            final_layer.weight.data.normal_(0, 0.02)
-            # Set bias for gamma=1, beta=0
-            if self.use_beta:
-                final_layer.bias.data[:self.feature_dim] = 1.0
-                final_layer.bias.data[self.feature_dim:] = 0.0
-            else:
-                final_layer.bias.data.fill_(1.0)
-    
-    def forward(self, features: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
-        """Apply FiLM modulation"""
-        # Generate parameters
-        params = self.film_net(condition)
-        
-        if self.use_beta:
-            gamma = params[:, :self.feature_dim]
-            beta = params[:, self.feature_dim:]
-        else:
-            gamma = params
-            beta = 0
-        
-        # Handle different feature dimensions efficiently
-        if features.dim() == 2:
-            # Simple 2D case
-            return features * gamma + beta
-        else:
-            # Reshape for broadcasting
-            shape = [gamma.size(0)] + [1] * (features.dim() - 2) + [self.feature_dim]
-            gamma = gamma.view(*shape)
-            if self.use_beta:
-                beta = beta.view(*shape)
-            return features * gamma + beta
-
-
-class FiLMMLP(nn.Module):
-    """Standard MLP with optional FiLM conditioning for baseline comparison."""
+    Key fixes:
+    - No output clamping in forward pass
+    - Guaranteed stable A(g) using symmetric negative definite + skew symmetric decomposition
+    - Support for multi-time queries per sample
+    - Proper dtype handling for all operations
+    - Deterministic time normalization behavior
+    """
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
+        self.logger = logging.getLogger(__name__)
         
-        # Extract dimensions
+        # Dimensions
         self.num_input_species = len(config["data"]["species_variables"])
-        self.num_output_species = len(config["data"].get("target_species_variables", config["data"]["species_variables"]))
+        self.num_output_species = len(config["data"].get("target_species_variables", 
+                                                         config["data"]["species_variables"]))
         self.num_globals = len(config["data"]["global_variables"])
-        self.hidden_dims = config["model"]["hidden_dims"]
         
-        # Get activation
-        self.activation = self._get_activation(config["model"].get("activation", "gelu"))
+        # Model hyperparameters
+        model_config = config["model"]
+        self.latent_dim = model_config.get("latent_dim", 64)
+        self.encoder_layers = model_config.get("encoder_layers", [256, 256, 128])
+        self.decoder_layers = model_config.get("decoder_layers", [128, 256, 256])
+        self.dynamics_rank = model_config.get("dynamics_rank", 8)
+        self.use_time_normalization = model_config.get("use_time_normalization", True)
         
-        # Dropout
-        dropout_rate = config["model"].get("dropout", 0.0)
+        # Stability margin (eigenvalues will be <= -alpha)
+        self.alpha = model_config.get("alpha", 1.0)
+        
+        # Check if time is already normalized in preprocessing
+        norm_config = config.get("normalization", {})
+        time_norm_method = norm_config.get("methods", {}).get(config["data"]["time_variable"], "none")
+        self.time_is_prenormalized = time_norm_method != "none"
+        
+        # Deterministic handling: disable time normalization if already normalized
+        if self.time_is_prenormalized and self.use_time_normalization:
+            self.logger.warning("Time is already normalized in preprocessing. Disabling use_time_normalization.")
+            self.use_time_normalization = False
+        
+        # Activation and regularization
+        self.activation = self._get_activation(model_config.get("activation", "gelu"))
+        dropout_rate = model_config.get("dropout", 0.0)
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
         
-        # FiLM configuration
-        film_config = config.get("film", {})
-        self.use_film = film_config.get("enabled", True)
+        # Build encoder: (x0, g) -> z0
+        encoder_input_dim = self.num_input_species + self.num_globals
+        self.encoder = self._build_mlp(
+            encoder_input_dim, 
+            self.encoder_layers, 
+            self.latent_dim,
+            use_layernorm=True
+        )
         
-        # Input dimension: species + globals + time
-        input_dim = self.num_input_species + self.num_globals + 1
+        # Optional learned time normalization
+        if self.use_time_normalization:
+            self.time_scale_net = nn.Sequential(
+                nn.Linear(self.num_input_species + self.num_globals, 64),
+                self.activation,
+                nn.Linear(64, 32),
+                self.activation,
+                nn.Linear(32, 1),
+                nn.Softplus()  # Ensure positive time scale
+            )
         
-        # Build network layers
-        self.layers = nn.ModuleList()
-        self.film_layers = nn.ModuleList() if self.use_film else None
+        # Dynamics: A(g) = -C(g)C(g)^T - αI + (U(g)V(g)^T - V(g)U(g)^T)
+        # Symmetric negative definite part
+        self.dynamics_sym_c_net = nn.Sequential(
+            nn.Linear(self.num_globals, 64),
+            self.activation,
+            nn.Linear(64, self.latent_dim * self.dynamics_rank)
+        )
         
-        prev_dim = input_dim
-        condition_dim = self.num_globals if self.use_film else None
-        
-        # Get FiLM activations
-        film_activations = film_config.get("activations", film_config.get("activation", "gelu"))
-        if isinstance(film_activations, str):
-            film_activations = [film_activations] * len(self.hidden_dims)
-        
-        for i, dim in enumerate(self.hidden_dims):
-            # Main layer
-            self.layers.append(nn.Linear(prev_dim, dim))
+        # Skew-symmetric part (only adds imaginary eigenvalues)
+        if self.dynamics_rank > 0:
+            self.dynamics_skew_u_net = nn.Sequential(
+                nn.Linear(self.num_globals, 64),
+                self.activation,
+                nn.Linear(64, self.latent_dim * self.dynamics_rank)
+            )
             
-            # FiLM layer
-            if self.use_film:
-                layer_activation = film_activations[i] if isinstance(film_activations, list) else film_activations
-                self.film_layers.append(
-                    FiLMLayer(
-                        condition_dim=condition_dim,
-                        feature_dim=dim,
-                        hidden_dims=film_config.get("hidden_dims", [128, 128]),
-                        activation=layer_activation,
-                        use_beta=True
-                    )
-                )
-            
-            prev_dim = dim
+            self.dynamics_skew_v_net = nn.Sequential(
+                nn.Linear(self.num_globals, 64),
+                self.activation,
+                nn.Linear(64, self.latent_dim * self.dynamics_rank)
+            )
         
-        # Output layer
-        self.output_layer = nn.Linear(prev_dim, self.num_output_species)
+        # Build decoder: (z(t), g) -> x(t)
+        decoder_input_dim = self.latent_dim + self.num_globals
+        self.decoder = self._build_mlp(
+            decoder_input_dim,
+            self.decoder_layers,
+            self.num_output_species,
+            use_layernorm=True,
+            final_activation=False
+        )
         
-        # Initialize weights
+        # Initialize weights carefully
         self._initialize_weights()
-    
+        
     def _get_activation(self, name: str):
         activations = {
             "gelu": nn.GELU(),
             "relu": nn.ReLU(inplace=True),
             "tanh": nn.Tanh(),
             "silu": nn.SiLU(inplace=True),
-            "leakyrelu": nn.LeakyReLU(0.2, inplace=True),
             "elu": nn.ELU(inplace=True)
         }
         return activations.get(name.lower(), nn.GELU())
+    
+    def _build_mlp(self, input_dim: int, hidden_layers: List[int], 
+                   output_dim: int, use_layernorm: bool = True,
+                   final_activation: bool = True) -> nn.Sequential:
+        """Build a multi-layer perceptron."""
+        layers = []
+        prev_dim = input_dim
+        
+        for i, dim in enumerate(hidden_layers):
+            if i > 0 and use_layernorm:
+                layers.append(nn.LayerNorm(prev_dim))
+            
+            layers.append(nn.Linear(prev_dim, dim))
+            layers.append(self.activation)
+            
+            if self.dropout is not None:
+                layers.append(self.dropout)
+            
+            prev_dim = dim
+        
+        # Output layer
+        if use_layernorm:
+            layers.append(nn.LayerNorm(prev_dim))
+        layers.append(nn.Linear(prev_dim, output_dim))
+        
+        if final_activation:
+            layers.append(self.activation)
+        
+        return nn.Sequential(*layers)
     
     def _initialize_weights(self):
-        """Xavier/He initialization for MLP layers."""
-        for layer in self.layers:
-            if isinstance(layer, nn.Linear):
-                # He initialization for ReLU family, Xavier for others
-                if isinstance(self.activation, (nn.ReLU, nn.LeakyReLU, nn.ELU)):
-                    nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
-                else:
-                    nn.init.xavier_normal_(layer.weight)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
+        """Initialize weights for stable dynamics."""
+        # Initialize encoder/decoder with Xavier
+        for module in [self.encoder, self.decoder]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.5)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
         
-        # Output layer with smaller initialization
-        nn.init.xavier_uniform_(self.output_layer.weight, gain=0.1)
-        if self.output_layer.bias is not None:
-            nn.init.zeros_(self.output_layer.bias)
+        # Initialize dynamics networks with small values
+        for net in [self.dynamics_sym_c_net, 
+                   getattr(self, 'dynamics_skew_u_net', None),
+                   getattr(self, 'dynamics_skew_v_net', None)]:
+            if net is not None:
+                for m in net.modules():
+                    if isinstance(m, nn.Linear):
+                        nn.init.uniform_(m.weight, -0.01, 0.01)
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through MLP."""
+    def compute_dynamics_matrix(self, global_vars: torch.Tensor) -> torch.Tensor:
+        """
+        Compute A(g) = -C(g)C(g)^T - αI + skew_symmetric_part
         
-        if self.use_film and self.film_layers is not None:
-            # Extract global conditions for FiLM
-            cond_start = self.num_input_species
-            cond_end = self.num_input_species + self.num_globals
-            global_condition = x[:, cond_start:cond_end]
+        This guarantees all eigenvalues have real part <= -α
         
-        # Process through layers
-        h = x
-        for i, layer in enumerate(self.layers):
-            # Linear transformation
-            h = layer(h)
+        Args:
+            global_vars: [batch_size, num_globals]
             
-            # Apply FiLM before activation
-            if self.use_film and self.film_layers is not None:
-                h = self.film_layers[i](h, global_condition)
-            
-            # Activation
-            h = self.activation(h)
-            
-            # Dropout (except last layer)
-            if self.dropout is not None and i < len(self.layers) - 1:
-                h = self.dropout(h)
+        Returns:
+            A: [batch_size, latent_dim, latent_dim]
+        """
+        B, d, r = global_vars.size(0), self.latent_dim, self.dynamics_rank
+        device, dtype = global_vars.device, global_vars.dtype
         
-        # Output
-        return self.output_layer(h)
-
-
-class FiLMSIREN(nn.Module):
-    """SIREN with FiLM conditioning - optimized for A100."""
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__()
-
-        # Extract dimensions
-        self.num_input_species = len(config["data"]["species_variables"])
-        self.num_output_species = len(config["data"].get("target_species_variables", config["data"]["species_variables"]))
-        self.num_globals = len(config["data"]["global_variables"])
-        self.hidden_dims = config["model"]["hidden_dims"]
-
-        # SIREN parameters
-        self.omega_0 = config["model"].get("omega_0", 30.0)
+        # Symmetric negative definite part: -C*C^T - αI
+        C = self.dynamics_sym_c_net(global_vars).view(B, d, r)
+        symmetric_part = -torch.bmm(C, C.transpose(1, 2))  # [B, d, d]
         
-        # Dropout
-        dropout_rate = config["model"].get("dropout", 0.0)
-        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
-
-        # FiLM configuration
-        film_config = config.get("film", {})
-        self.use_film = film_config.get("enabled", True)
-
-        # Input dimension
-        input_dim = self.num_input_species + self.num_globals + 1
-
-        # Build network layers
-        self.layers = nn.ModuleList()
-        self.film_layers = nn.ModuleList() if self.use_film else None
-
-        prev_dim = input_dim
-        condition_dim = self.num_globals if self.use_film else None
-
-        # Get FiLM activations
-        film_activations = film_config.get("activations", film_config.get("activation", "gelu"))
-        if isinstance(film_activations, str):
-            film_activations = [film_activations] * len(self.hidden_dims)
-
-        for i, dim in enumerate(self.hidden_dims):
-            # Main layer
-            self.layers.append(nn.Linear(prev_dim, dim))
-
-            # FiLM layer
-            if self.use_film:
-                layer_activation = film_activations[i] if isinstance(film_activations, list) else film_activations
-                self.film_layers.append(
-                    FiLMLayer(
-                        condition_dim=condition_dim,
-                        feature_dim=dim,
-                        hidden_dims=film_config.get("hidden_dims", [128, 128]),
-                        activation=layer_activation,
-                        use_beta=True
-                    )
-                )
-
-            prev_dim = dim
-
-        # Output layer
-        self.output_layer = nn.Linear(prev_dim, self.num_output_species)
-
-        # Initialize SIREN weights
-        self._initialize_siren_weights()
-    
-    def _initialize_siren_weights(self):
-        """Initialize weights following SIREN paper."""
-        with torch.no_grad():
-            # First layer
-            if len(self.layers) > 0:
-                fan_in = self.layers[0].in_features
-                self.layers[0].weight.uniform_(-1.0 / fan_in, 1.0 / fan_in)
-            
-            # Hidden layers
-            for layer in self.layers[1:]:
-                fan_in = layer.in_features
-                bound = math.sqrt(6.0 / fan_in) / self.omega_0
-                layer.weight.uniform_(-bound, bound)
-            
-            # Output layer
-            fan_in = self.output_layer.in_features
-            bound = math.sqrt(6.0 / fan_in) / self.omega_0
-            self.output_layer.weight.uniform_(-bound, bound)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass - optimized."""
-
-        if self.use_film and self.film_layers is not None:
-            cond_start = self.num_input_species
-            cond_end = self.num_input_species + self.num_globals
-            global_condition = x[:, cond_start:cond_end]
-
-        # Process through layers
-        h = x
-        for i, layer in enumerate(self.layers):
-            # Linear transformation
-            h = layer(h)
-            
-            # Apply FiLM before activation
-            if self.use_film and self.film_layers is not None:
-                h = self.film_layers[i](h, global_condition)
-            
-            # SIREN activation
-            h = torch.sin(self.omega_0 * h)
-            
-            # Dropout (except last layer)
-            if self.dropout is not None and i < len(self.layers) - 1:
-                h = self.dropout(h)
+        # Create identity with correct dtype
+        I = torch.eye(d, device=device, dtype=dtype).unsqueeze(0)
+        symmetric_part = symmetric_part - self.alpha * I
         
-        # Output
-        return self.output_layer(h)
-
-
-class FiLMDeepONet(nn.Module):
-    """Deep Operator Network with FiLM conditioning - optimized."""
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__()
-        
-        # ────────────────────────────────────────────────────────────────
-        # 1.  Dimensions
-        # ────────────────────────────────────────────────────────────────
-        self.num_input_species  = len(config["data"]["species_variables"])
-        self.num_output_species = len(
-            config["data"].get("target_species_variables",
-                               config["data"]["species_variables"])
-        )
-        self.num_globals        = len(config["data"]["global_variables"])
-
-        # ────────────────────────────────────────────────────────────────
-        # 2.  Architecture hyper-parameters
-        # ────────────────────────────────────────────────────────────────
-        branch_layers = config["model"]["branch_layers"]
-        trunk_layers  = config["model"]["trunk_layers"]
-        self.basis_dim   = config["model"]["basis_dim"]
-        self.activation  = self._get_activation(
-            config["model"].get("activation", "gelu")
-        )
-        self.output_scale = config["model"].get("output_scale", 1.0)
-
-        # ────────────────────────────────────────────────────────────────
-        # 3.  Regularisation
-        # ────────────────────────────────────────────────────────────────
-        dropout_rate = config["model"].get("dropout", 0.0)
-        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
-
-        # ────────────────────────────────────────────────────────────────
-        # 4.  FiLM configuration
-        # ────────────────────────────────────────────────────────────────
-        film_config = config.get("film", {})
-        self.use_film = film_config.get("enabled", True)
-        condition_dim = self.num_globals if self.use_film else None
-
-        # Decide what raw features the BRANCH sees:
-        #   • FiLM ON  -> species only (globals come via FiLM)
-        #   • FiLM OFF -> species + globals as direct inputs
-        branch_input_dim = (
-            self.num_input_species
-            if self.use_film
-            else self.num_input_species + self.num_globals
-        )
-
-        # ────────────────────────────────────────────────────────────────
-        # 5.  Build BRANCH network (coefficients)
-        # ────────────────────────────────────────────────────────────────
-        self.branch_net = self._build_mlp_with_film(
-            input_dim   = branch_input_dim,
-            hidden_layers = branch_layers,
-            output_dim  = self.basis_dim * self.num_output_species,
-            condition_dim = condition_dim,
-            film_config   = film_config if self.use_film else None
-        )
-
-        # ────────────────────────────────────────────────────────────────
-        # 6.  Build TRUNK network (basis functions) — no FiLM
-        # ────────────────────────────────────────────────────────────────
-        self.trunk_net = self._build_mlp_with_film(
-            input_dim   = 1,                 # time coordinate
-            hidden_layers = trunk_layers,
-            output_dim  = self.basis_dim,
-            condition_dim = None,            # FiLM disabled
-            film_config   = None,
-            bias          = True
-        )
-
-    
-    def _get_activation(self, name: str):
-        activations = {
-            "gelu": nn.GELU(),
-            "relu": nn.ReLU(inplace=True),
-            "tanh": nn.Tanh(),
-            "silu": nn.SiLU(inplace=True),
-            "leakyrelu": nn.LeakyReLU(0.2, inplace=True),
-            "elu": nn.ELU(inplace=True)
-        }
-        return activations.get(name.lower(), nn.GELU())
-    
-    def _build_mlp_with_film(self, input_dim: int, hidden_layers: List[int],
-                            output_dim: int, condition_dim: Optional[int] = None,
-                            film_config: Optional[Dict] = None, bias: bool = True) -> nn.Module:
-        """Build MLP with optional FiLM - optimized."""
-        if self.use_film and condition_dim is not None and film_config is not None:
-            # Build with FiLM
-            layers = nn.ModuleList()
-            film_layers = nn.ModuleList()
-
-            # Get FiLM activations
-            film_activations = film_config.get("activations", film_config.get("activation", "gelu"))
-            if isinstance(film_activations, str):
-                film_activations = [film_activations] * len(hidden_layers)
-
-            prev_dim = input_dim
-            for i, dim in enumerate(hidden_layers):
-                layers.append(nn.Linear(prev_dim, dim, bias=bias))
-
-                layer_activation = film_activations[i] if isinstance(film_activations, list) else film_activations
-                film_layers.append(
-                    FiLMLayer(
-                        condition_dim=condition_dim,
-                        feature_dim=dim,
-                        hidden_dims=film_config.get("hidden_dims", [128, 128]),
-                        activation=layer_activation,
-                        use_beta=True
-                    )
-                )
-                prev_dim = dim
-
-            output_layer = nn.Linear(prev_dim, output_dim, bias=bias)
-
-            class MLPWithFiLM(nn.Module):
-                def __init__(self, layers, film_layers, output_layer, activation, dropout):
-                    super().__init__()
-                    self.layers = layers
-                    self.film_layers = film_layers
-                    self.output_layer = output_layer
-                    self.activation = activation
-                    self.dropout = dropout
-
-                def forward(self, x, condition):
-                    h = x
-                    for i, (layer, film_layer) in enumerate(zip(self.layers, self.film_layers)):
-                        h = layer(h)
-                        h = film_layer(h, condition)
-                        h = self.activation(h)
-                        
-                        # Dropout (except last layer)
-                        if self.dropout is not None and i < len(self.layers) - 1:
-                            h = self.dropout(h)
-                            
-                    return self.output_layer(h)
-
-            return MLPWithFiLM(layers, film_layers, output_layer, self.activation, self.dropout)
-
+        # Skew-symmetric part (only affects imaginary eigenvalues)
+        if r > 0:
+            U = self.dynamics_skew_u_net(global_vars).view(B, d, r)
+            V = self.dynamics_skew_v_net(global_vars).view(B, d, r)
+            
+            UV_T = torch.bmm(U, V.transpose(1, 2))
+            VU_T = torch.bmm(V, U.transpose(1, 2))
+            skew = UV_T - VU_T  # Guaranteed skew-symmetric
         else:
-            # Build standard MLP
-            layers = []
-            prev_dim = input_dim
-
-            for i, dim in enumerate(hidden_layers):
-                layers.append(nn.Linear(prev_dim, dim, bias=bias))
-                layers.append(self.activation)
-                
-                # Dropout (except last layer)
-                if self.dropout is not None and i < len(hidden_layers) - 1:
-                    layers.append(self.dropout)
-                    
-                prev_dim = dim
-
-            layers.append(nn.Linear(prev_dim, output_dim, bias=bias))
-            return nn.Sequential(*layers)
-            
+            # Use zero tensor with correct shape and dtype
+            skew = torch.zeros_like(symmetric_part)
+        
+        return symmetric_part + skew
+    
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Forward pass"""
+        """
+        Forward pass with matrix exponential dynamics.
+        
+        Supports multi-time queries:
+        - If time has shape [B, 1], returns [B, num_output_species]
+        - If time has shape [B, M], returns [B, M, num_output_species]
+        
+        Args:
+            inputs: [batch_size, num_input_species + num_globals + time_dims]
+                   where time_dims is either 1 or M (multiple time points)
+        """
         batch_size = inputs.size(0)
-
-        # ───────── branch features … depend on FiLM flag ─────────
-        if self.use_film:
-            # species only
-            branch_input = inputs[:, : self.num_input_species]
-            cond_start   = self.num_input_species
-            cond_end     = cond_start + self.num_globals
-            global_condition = inputs[:, cond_start:cond_end]       # (B, Ng)
+        
+        # Extract inputs
+        initial_species = inputs[:, :self.num_input_species]
+        global_vars = inputs[:, self.num_input_species:self.num_input_species + self.num_globals]
+        
+        # Handle single or multiple time queries
+        time_data = inputs[:, self.num_input_species + self.num_globals:]
+        if time_data.dim() == 2 and time_data.size(1) == 1:
+            # Single time per sample
+            time = time_data  # [B, 1]
+            multi_time = False
         else:
-            # species + globals as raw inputs; no FiLM condition tensor
-            branch_input = inputs[:, : self.num_input_species + self.num_globals]
-            global_condition = None
-
-        # ───────── trunk input (time) ─────────
-        trunk_input = inputs[:, -1:]                                # (B, 1)
-
-        # ───────── networks ─────────
-        trunk_out  = self.trunk_net(trunk_input)                    # (B, D)
-        if self.use_film:
-            branch_out = self.branch_net(branch_input, global_condition)
+            # Multiple times per sample
+            time = time_data  # [B, M]
+            multi_time = True
+            num_times = time.size(1)
+        
+        # Time normalization (deterministic based on preprocessing)
+        if self.use_time_normalization and not self.time_is_prenormalized:
+            encoder_input = torch.cat([initial_species, global_vars], dim=1)
+            time_scale = self.time_scale_net(encoder_input).clamp_min(1e-3)  # [B, 1]
+            
+            # Optional: detach to prevent trivial solutions
+            # time_scale = time_scale.detach()
+            
+            if multi_time:
+                normalized_time = time / time_scale  # [B, M]
+            else:
+                normalized_time = time / time_scale  # [B, 1]
         else:
-            branch_out = self.branch_net(branch_input)
-
-        # ───────── combine ─────────
-        branch_out = branch_out.view(batch_size, self.num_output_species, self.basis_dim)
-        output     = torch.bmm(branch_out, trunk_out.unsqueeze(2)).squeeze(2)
-
-        # optional scaling
-        if self.output_scale != 1.0:
-            output = output * self.output_scale
+            normalized_time = time
+        
+        # Encode to latent space
+        encoder_input = torch.cat([initial_species, global_vars], dim=1)
+        z0 = self.encoder(encoder_input)  # [B, latent_dim]
+        
+        # Compute dynamics matrix A(g)
+        A = self.compute_dynamics_matrix(global_vars)  # [B, latent_dim, latent_dim]
+        
+        if multi_time:
+            # Multiple time queries
+            # Reshape for batch matrix operations
+            At = A.unsqueeze(1) * normalized_time.unsqueeze(-1).unsqueeze(-1)  # [B, M, d, d]
+            At_flat = At.view(-1, self.latent_dim, self.latent_dim)  # [B*M, d, d]
+            
+            # Compute matrix exponential for all time points
+            exp_At_flat = torch.linalg.matrix_exp(At_flat)  # [B*M, d, d]
+            exp_At = exp_At_flat.view(batch_size, num_times, self.latent_dim, self.latent_dim)  # [B, M, d, d]
+            
+            # Apply to initial latent state
+            z0_expanded = z0.unsqueeze(1).unsqueeze(-1)  # [B, 1, d, 1]
+            z_t = torch.matmul(exp_At, z0_expanded).squeeze(-1)  # [B, M, d]
+            
+            # Decode with global conditioning
+            global_vars_expanded = global_vars.unsqueeze(1).expand(batch_size, num_times, self.num_globals)
+            decoder_input = torch.cat([z_t, global_vars_expanded], dim=-1)  # [B, M, d+g]
+            decoder_input_flat = decoder_input.view(-1, self.latent_dim + self.num_globals)
+            
+            output_flat = self.decoder(decoder_input_flat)  # [B*M, num_output_species]
+            output = output_flat.view(batch_size, num_times, self.num_output_species)  # [B, M, num_output_species]
+            
+        else:
+            # Single time query
+            At = A * normalized_time.unsqueeze(-1)  # [B, d, d]
+            exp_At = torch.linalg.matrix_exp(At)  # [B, d, d]
+            
+            # Apply to initial latent state
+            z_t = torch.bmm(exp_At, z0.unsqueeze(-1)).squeeze(-1)  # [B, d]
+            
+            # Decode with global conditioning
+            decoder_input = torch.cat([z_t, global_vars], dim=1)
+            output = self.decoder(decoder_input)  # [B, num_output_species]
+        
+        # NO CLAMPING - let the training handle the appropriate domain
         return output
-
+    
+    def get_dynamics_spectrum(self, global_vars: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute eigenvalues of A(g) for analysis/regularization.
+        
+        Returns dict with 'eigenvalues' and 'max_real_part'
+        """
+        A = self.compute_dynamics_matrix(global_vars)
+        eigenvalues = torch.linalg.eigvals(A)
+        max_real_part = eigenvalues.real.max(dim=1)[0]
+        
+        return {
+            'eigenvalues': eigenvalues,
+            'max_real_part': max_real_part,
+            'A_matrix': A
+        }
 
 
 def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     """Create and compile model with validation."""
     model_type = config["model"]["type"].lower()
-    prediction_mode = config.get("prediction", {}).get("mode", "absolute")
     
-    # Validate model-mode compatibility
-    if prediction_mode == "ratio" and model_type not in ["deeponet", "mlp"]:
-        raise ValueError(
-            f"Prediction mode 'ratio' is only compatible with model types 'deeponet' or 'mlp', "
-            f"but '{model_type}' was specified. Either:\n"
-            f"  1. Change model.type to 'deeponet' or 'mlp' in your config, or\n"
-            f"  2. Change prediction.mode to 'absolute'"
-        )
-    
-    if model_type == "mlp":
-        model = FiLMMLP(config)
-    elif model_type == "siren":
-        model = FiLMSIREN(config)
-    elif model_type == "deeponet":
-        model = FiLMDeepONet(config)
+    # Map model types
+    if model_type == "linear_latent":
+        model = LinearLatentDynamics(config)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
     model = model.to(device)
     
     logger = logging.getLogger(__name__)
+    prediction_mode = config.get("prediction", {}).get("mode", "absolute")
     logger.info(f"Created {model_type} model for {prediction_mode} mode")
+    
+    # Log model details
+    if model_type == "linear_latent":
+        logger.info(f"  Latent dimension: {model.latent_dim}")
+        logger.info(f"  Dynamics rank: {model.dynamics_rank}")
+        logger.info(f"  Stability margin α: {model.alpha}")
+        logger.info(f"  Time pre-normalized: {model.time_is_prenormalized}")
+        logger.info(f"  Use time normalization: {model.use_time_normalization}")
     
     # Compile model for performance
     if config["system"].get("use_torch_compile", False) and hasattr(torch, 'compile'):
@@ -561,26 +355,18 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
         logger.info(f"Compiling model with mode='{compile_mode}'...")
         
         try:
-            # A100-optimized compilation
             compile_options = {
                 "mode": compile_mode,
                 "fullgraph": False,
                 "dynamic": False,
             }
             
-            if compile_mode == "max-autotune":
-                # Additional options for maximum performance
-                compile_options["options"] = {
-                    "triton.cudagraphs": True,
-                    "triton.max_autotune": True,
-                }
-            
             model = torch.compile(model, **compile_options)
             logger.info("Model compilation successful")
             
         except Exception as e:
             logger.warning(f"Model compilation failed: {e}. Running in eager mode.")
-
+    
     # Convert to specified dtype
     dtype_str = config["system"].get("dtype", "float32")
     if dtype_str == "float64":
@@ -589,17 +375,63 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     elif dtype_str == "float32":
         model = model.float()
         logger.info("Using float32 precision")
-        
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total trainable parameters: {total_params:,}")
+    
     return model
 
 
+def add_spectral_regularization_loss(model: nn.Module, 
+                                   inputs: torch.Tensor,
+                                   lambda_reg: float = 0.01) -> torch.Tensor:
+    """
+    Add spectral regularization to encourage stable dynamics.
+    
+    Use this in your training loop:
+    ```python
+    # In trainer
+    outputs = model(inputs)
+    loss = criterion(outputs, targets)
+    
+    if isinstance(model, LinearLatentDynamics):
+        spectral_loss = add_spectral_regularization_loss(model, inputs, lambda_reg=0.01)
+        loss = loss + spectral_loss
+    ```
+    
+    Args:
+        model: LinearLatentDynamics model
+        inputs: Input batch
+        lambda_reg: Regularization strength
+        
+    Returns:
+        Spectral regularization loss
+    """
+    if not isinstance(model, LinearLatentDynamics):
+        return torch.tensor(0.0, device=inputs.device)
+    
+    # Extract global variables
+    global_vars = inputs[:, model.num_input_species:model.num_input_species + model.num_globals]
+    
+    # Get dynamics spectrum
+    spectrum_info = model.get_dynamics_spectrum(global_vars)
+    max_real_parts = spectrum_info['max_real_part']
+    
+    # Penalize positive real parts (eigenvalues > -alpha)
+    # ReLU(max_real_part + alpha) penalizes when real part > -alpha
+    penalty = torch.relu(max_real_parts + model.alpha).mean()
+    
+    return lambda_reg * penalty
+
+
 def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path):
-    """Export model with robust unwrapping and dynamic batch support."""
+    """Export model with robust unwrapping and dynamic batch/time support."""
     logger = logging.getLogger(__name__)
     
     model.eval()
     
-    # Safely handle compiled models with multiple fallback attempts
+    # Safely handle compiled models
     original_model = model
     if hasattr(model, '_orig_mod'):
         logger.info("Extracting original model from compiled wrapper (_orig_mod)")
@@ -608,73 +440,52 @@ def export_model(model: nn.Module, example_input: torch.Tensor, save_path: Path)
         logger.info("Extracting original model from compiled wrapper (_module)")
         model = model._module
     elif hasattr(model, 'module'):
-        logger.info("Extracting original model from DataParallel/DistributedDataParallel wrapper")
+        logger.info("Extracting original model from DataParallel wrapper")
         model = model.module
-    else:
-        # Try to detect if it's a compiled model by checking for graph attributes
-        if hasattr(model, '_graph') or hasattr(model, '_code'):
-            logger.warning(
-                "Model appears to be compiled but cannot find unwrapping attribute. "
-                "Export may fail or produce suboptimal results."
-            )
     
     with torch.no_grad():
         try:
             if hasattr(torch, 'export') and hasattr(torch.export, 'export'):
-                # Dynamic batch dimension
+                # Dynamic dimensions for both batch and time
                 batch_dim = Dim("batch", min=1, max=131072)
+                time_dim = Dim("time", min=1, max=4096)
                 
-                # Safely detect parameter name
+                # Detect parameter name
                 import inspect
                 try:
                     sig = inspect.signature(model.forward)
                     param_names = [p for p in sig.parameters.keys() if p != 'self']
                     param_name = param_names[0] if param_names else 'x'
                 except Exception:
-                    # Fallback if signature inspection fails
-                    param_name = 'x' if hasattr(model, 'forward') else 'input'
-                    logger.warning(f"Could not inspect forward signature, using '{param_name}' as parameter name")
+                    param_name = 'inputs'
                 
-                logger.info(f"Detected forward method parameter name: '{param_name}'")
+                # Set dynamic shapes for both batch and time dimensions
+                dynamic_shapes = {param_name: {0: batch_dim, -1: time_dim}}
                 
-                dynamic_shapes = {param_name: {0: batch_dim}}
-                
-                # Export with error handling
-                try:
-                    exported_program = torch.export.export(
-                        model, 
-                        (example_input,),
-                        dynamic_shapes=dynamic_shapes
-                    )
-                    torch.export.save(exported_program, str(save_path))
-                    logger.info(f"Model exported with torch.export to {save_path}")
-                except Exception as e:
-                    logger.warning(f"torch.export failed: {e}. Falling back to torch.jit")
-                    raise
-            else:
-                # Direct to JIT if torch.export not available
-                raise AttributeError("torch.export not available")
-                
-        except Exception:
-            # Fallback to JIT tracing
-            try:
-                # Try with the original model if unwrapping failed
-                model_to_trace = model
-                traced_model = torch.jit.trace(model_to_trace, example_input)
-                torch.jit.save(traced_model, str(save_path))
-                logger.info(f"Model exported with torch.jit to {save_path}")
-                logger.warning("JIT export may not support dynamic batch sizes as well as torch.export")
-            except Exception as jit_error:
-                # Last resort: try with the original compiled model
-                if model is not original_model:
-                    logger.warning("Trying JIT export with original (possibly compiled) model")
-                    try:
-                        traced_model = torch.jit.trace(original_model, example_input)
-                        torch.jit.save(traced_model, str(save_path))
-                        logger.info(f"Model exported with torch.jit (compiled version) to {save_path}")
-                    except Exception as final_error:
-                        logger.error(f"All export methods failed. Last error: {final_error}")
-                        raise
+                # Export with multi-time example to capture that path
+                if example_input.size(-1) == model.num_input_species + model.num_globals + 1:
+                    # Create a multi-time example
+                    single_time = example_input[..., -1:]
+                    multi_time = single_time.repeat(1, 3)  # 3 time points
+                    example_input_multi = torch.cat([
+                        example_input[..., :-1],
+                        multi_time
+                    ], dim=-1)
                 else:
-                    logger.error(f"JIT export failed: {jit_error}")
-                    raise
+                    example_input_multi = example_input
+                
+                # Export
+                exported_program = torch.export.export(
+                    model, 
+                    (example_input_multi,),
+                    dynamic_shapes=dynamic_shapes
+                )
+                torch.export.save(exported_program, str(save_path))
+                logger.info(f"Model exported with torch.export to {save_path} (supports variable batch and time dims)")
+                
+        except Exception as e:
+            # Fallback to JIT
+            logger.warning(f"torch.export failed: {e}. Using torch.jit")
+            traced_model = torch.jit.trace(model, example_input)
+            torch.jit.save(traced_model, str(save_path))
+            logger.info(f"Model exported with torch.jit to {save_path}")
