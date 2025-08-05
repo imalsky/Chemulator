@@ -19,8 +19,6 @@ from data.normalizer import NormalizationHelper
 from lion_pytorch import Lion
 import math
 
-from models.model import export_model
-
 
 class Trainer:
     """Unified trainer for chemical kinetics models."""
@@ -451,24 +449,68 @@ class Trainer:
             f"Train: {train_loss:.3e} | {val_str} | "
             f"Time: {epoch_time:.1f}s | LR: {lr:.2e}"
         )
-    
+        
     def _save_best_model(self):
-        """Save best model checkpoint and trigger export if enabled."""
+        """Save best model checkpoint and (optionally) export an inference artifact in-place."""
         checkpoint = {
             "epoch": self.current_epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
             "best_val_loss": self.best_val_loss,
-            "config": self.config
+            "config": self.config,
         }
-        
+
         checkpoint_path = self.save_dir / "best_model.pt"
         torch.save(checkpoint, checkpoint_path)
         self.logger.info(f"Saved best model checkpoint to {checkpoint_path}")
 
-        # --- NEW LOGIC FOR AUTOMATIC EXPORT ---
+        # Export directly from the live model (no re-instantiation), overwriting the prior export
         if self.system_config.get("use_torch_export", False):
-            self.logger.info("`use_torch_export` is true. Exporting best model...")
             exported_path = self.save_dir / "best_model_exported.pt"
-            export_model(checkpoint_path, exported_path)
+            self._export_from_live_model(exported_path)
+
+    @torch.inference_mode()
+    def _export_from_live_model(self, output_path: Path) -> None:
+        """
+        Export the current model (in-process) with torch.export, without rebuilding a new instance.
+        Overwrites the prior file at `output_path`.
+        """
+        try:
+            self.logger.info("Exporting best model (in-process, no reload)...")
+
+            # Unwrap compiled/DDP wrappers to get to the real nn.Module with live weights
+            model_to_export = self.model
+            if hasattr(model_to_export, "_orig_mod"):          # torch.compile wrapper
+                model_to_export = model_to_export._orig_mod
+            if hasattr(model_to_export, "module"):             # DDP / DataParallel
+                model_to_export = model_to_export.module
+
+            was_training = self.model.training
+            model_to_export.eval()
+
+            # Example input shape matches training: B=1, [x0_log (n_species), globals (n_globals), t_vec (M)]
+            n_species = len(self.data_config["species_variables"])
+            n_globals = len(self.data_config["global_variables"])
+            M = self.data_config["M_per_sample"]
+            input_dim = n_species + n_globals + M
+
+            # Use the model's parameter device/dtype to avoid casts/copies
+            p = next((p for p in model_to_export.parameters() if p.requires_grad), None)
+            dtype = p.dtype if p is not None else torch.float32
+            device = p.device if p is not None else torch.device("cpu")
+
+            example_input = torch.randn(1, input_dim, dtype=dtype, device=device)
+
+            # Perform export (device-agnostic). This overwrites the prior export each time.
+            exported = torch.export.export(model_to_export, (example_input,))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(exported, output_path)
+
+            self.logger.info(f"Exported model (overwritten) -> {output_path}")
+        except Exception as e:
+            self.logger.error(f"Export failed: {e}", exc_info=True)
+        finally:
+            # Restore training mode if we changed it
+            if 'was_training' in locals() and was_training:
+                self.model.train()

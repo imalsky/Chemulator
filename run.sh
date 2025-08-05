@@ -35,5 +35,5 @@ echo "------------------------------------------------"
 
 # --- Run the Application ---
 echo "Starting Python application..."
-python src/main.py --tune
+python src/main.py --train
 echo "Job completed successfully."

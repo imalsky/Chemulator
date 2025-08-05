@@ -213,20 +213,16 @@ class ChemicalKineticsPipeline:
         # Log memory status
         self._log_memory_status()
         
-        # Choose dataset type
-        index_path = self.processed_dir / "shard_index.json"
-        with open(index_path) as f:
-            shard_index = json.load(f)
-        
+        # Datasets: pass norm_stats so SequenceDataset can standardize inputs
         self.logger.info("Using SequenceDataset for sequence-mode shards.")
         train_dataset = SequenceDataset(
-            self.processed_dir, "train", self.config, self.device
+            self.processed_dir, "train", self.config, self.device, norm_stats
         )
         val_dataset = SequenceDataset(
-            self.processed_dir, "validation", self.config, self.device
+            self.processed_dir, "validation", self.config, self.device, norm_stats
         ) if self.config["training"]["val_fraction"] > 0 else None
         test_dataset = SequenceDataset(
-            self.processed_dir, "test", self.config, self.device
+            self.processed_dir, "test", self.config, self.device, norm_stats
         ) if self.config["training"]["test_fraction"] > 0 else None
 
         if train_dataset:
@@ -262,6 +258,7 @@ class ChemicalKineticsPipeline:
         }
         
         save_json(results, self.run_save_dir / "results.json")
+
     
     def run(self):
         """Execute the full training pipeline."""

@@ -55,16 +55,16 @@
 
   "model": {
     "type": "linear_latent_mixture",  // NEW: use hybrid variant
-    "latent_dim": 64,
-    "encoder_layers": [256,256,128],
-    "decoder_layers": [128,256,256],
+    "latent_dim": 32,
+    "encoder_layers": [1024, 1024, 1024, 1024],
+    "decoder_layers": [256, 1024, 1024, 1024],
 
     // Mixture and time-warp blocks (the code reads these)
-    "mixture": { "K": 3 }, 
+    "mixture": { "K": 5 }, 
     "time_warp": { "enabled": true,
-                   "J_terms": 3 },
+                   "J_terms": 5 },
 
-    "activation": "gelu",
+    "activation": "tanh",
     "dropout": 0.0
   },
 
@@ -90,9 +90,10 @@
     "drop_last": true,
 
     // OPTIMIZER
+    //"optimizer": "lion",
     "optimizer": "lion",
     "learning_rate": 1e-4,
-    "weight_decay": 1e-5,
+    "weight_decay": 1e-7,
     "betas": [0.9, 0.999],
     "eps": 1e-8,
     "gradient_clip": 5.0,
@@ -102,7 +103,7 @@
     "scheduler_params": { "T_0": 100, "T_mult": 2, "eta_min": 1e-8 },
 
     // AMP
-    "use_amp": false,
+    "use_amp": true,
     "amp_dtype": "bfloat16",
 
     "early_stopping_patience": 5000,
@@ -110,8 +111,8 @@
 
     // NEW: regularization weights consumed by Trainer for the mixture
     "regularization": {
-      "lambda_entropy": 0.01,
-      "lambda_diversity": 0.01
+      "lambda_entropy": 0.000,
+      "lambda_diversity": 0.00
     }
   },
 
@@ -119,7 +120,7 @@
     "seed": 42,
     "use_torch_compile": true,
     "compile_mode": "default",
-    "use_torch_export": true, // NEED TO ADD
+    "use_torch_export": true,
     "cudnn_benchmark": true,
     "tf32": true,
     "dtype": "float32",
