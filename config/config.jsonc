@@ -2,15 +2,15 @@
   "paths": {
     "raw_data_files": [
       "data/raw/run9001-result.h5",
-      "data/raw/run9002-result.h5",
-      "data/raw/run9003-result.h5",
-      "data/raw/run9004-result.h5",
-      "data/raw/run9005-result.h5",
-      "data/raw/run9006-result.h5",
-      "data/raw/run9007-result.h5",
-      "data/raw/run9008-result.h5",
-      "data/raw/run9009-result.h5",
-      "data/raw/run9010-result.h5"
+      //"data/raw/run9002-result.h5",
+      //"data/raw/run9003-result.h5",
+      //"data/raw/run9004-result.h5",
+      //"data/raw/run9005-result.h5",
+      //"data/raw/run9006-result.h5",
+      //"data/raw/run9007-result.h5",
+      //"data/raw/run9008-result.h5",
+      //"data/raw/run9009-result.h5",
+      //"data/raw/run9010-result.h5"
     ],
     "processed_data_dir": "data/processed",
     "model_save_dir": "data/models",
@@ -31,19 +31,14 @@
     "global_variables": ["P","T"],
     "time_variable": "t_time",
 
-    // NEW for sequence-mode
+    // Sequence-mode for lilian
     "sequence_mode": true,
     "M_per_sample": 16,
     "time_sampling": { "uniform": 0.5, "log_spaced": 0.5 }
   },
 
   "preprocessing": {
-    // IMPORTANT: this is trajectories-per-shard in sequence mode
-    "shard_size": 1000000,              // was 10,000,000 — don't do that
     "min_value_threshold": 1e-25,
-    "compression": null,              // ignored by sequence NPZ (uses compressed)
-    "num_workers": 8,
-    "parallel_enabled": true
   },
 
   "normalization": {
@@ -64,9 +59,6 @@
     "encoder_layers": [256,256,128],
     "decoder_layers": [128,256,256],
 
-    // Generator settings (matches code: model['generator']['rank'])
-    "generator": { "rank": 8 },
-
     // Mixture and time-warp blocks (the code reads these)
     "mixture": { "K": 3 }, 
     "time_warp": { "enabled": true,
@@ -76,24 +68,16 @@
     "dropout": 0.0
   },
 
-  "film": {
-    "enabled": false,
-    "hidden_dims": [64,64],
-    "activation": "relu"
-  },
-
-  "prediction": {
-    "mode": "absolute",
-    "output_clamp": null
-  },
 
   "training": {
     "val_fraction": 0.15,
     "test_fraction": 0.15,
     "use_fraction": 1.0,
 
+    "mixture_temperature_schedule": { "start": 1.0, "end": 0.3, "anneal_frac": 0.6 },
+
     "epochs": 100,
-    "batch_size": 16384,
+    "batch_size": 4096,
     "gradient_accumulation_steps": 1,
 
     // SequenceDataset will try to GPU-cache entire split; 'auto' is safer
@@ -124,10 +108,6 @@
     "early_stopping_patience": 5000,
     "min_delta": 1e-8,
 
-    "log_interval": 1000,
-    "save_interval": 5,
-    "empty_cache_interval": 50000,
-
     // NEW: regularization weights consumed by Trainer for the mixture
     "regularization": {
       "lambda_entropy": 0.01,
@@ -139,7 +119,7 @@
     "seed": 42,
     "use_torch_compile": true,
     "compile_mode": "default",
-    "use_torch_export": true,
+    "use_torch_export": true, // NEED TO ADD
     "cudnn_benchmark": true,
     "tf32": true,
     "dtype": "float32",

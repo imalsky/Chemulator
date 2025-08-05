@@ -4,10 +4,12 @@ import sys
 import time
 from pathlib import Path
 import torch
-from typing import Dict, Any, Union
+from typing import Dict, Union
 import hashlib
 import json
 import psutil
+
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,15 +28,15 @@ except RuntimeError:
 from utils.hardware import setup_device, optimize_hardware
 from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
 
-from data.preprocessor import DataPreprocessor         
-from data.dataset import NPYDataset, SequenceDataset   
+from data.preprocessor import DataPreprocessor
+from data.dataset import SequenceDataset
 from models.model import create_model
 from training.trainer import Trainer
 from data.normalizer import NormalizationHelper
 
 
 class ChemicalKineticsPipeline:
-    """Optimized training pipeline for A100 GPU."""
+    """Training pipeline for chemical kinetics models."""
     def __init__(self, config_or_path: Union[Path, Dict]):
         """Initialize the pipeline."""
         if isinstance(config_or_path, (Path, str)):
@@ -44,28 +46,25 @@ class ChemicalKineticsPipeline:
         else:
             raise TypeError("config_or_path must be a Path, str, or dict")
         
-        # Get prediction mode as early as possible
-        self.prediction_mode = self.config.get("prediction", {}).get("mode", "absolute")
-
-        # Bootstrap console logging so early failures are visible
+        # Bootstrap console logging
         setup_logging()
-
+        
         # Create directory tree
         self.setup_paths()
-
-        # Now attach a file handler
-        log_file = self.log_dir / f"pipeline_{self.prediction_mode}_{time.strftime('%Y%m%d_%H%M%S')}.log"
+        
+        # Attach file handler
+        log_file = self.log_dir / f"pipeline_{time.strftime('%Y%m%d_%H%M%S')}.log"
         setup_logging(log_file=log_file)
         
         self.logger = logging.getLogger(__name__)
-        self.logger.info(f"Chemical Kinetics Pipeline initialized - Mode: {self.prediction_mode}")
+        self.logger.info("Chemical Kinetics Pipeline initialized")
         
         seed_everything(self.config.get("system", {}).get("seed", 42))
         
         # Setup hardware
         self.device = setup_device()
         optimize_hardware(self.config["system"], self.device)
-        
+    
     def setup_paths(self):
         """Create directory structure."""
         paths = self.config["paths"]
@@ -77,47 +76,55 @@ class ChemicalKineticsPipeline:
         warp = self.config["model"].get("time_warp", {}).get("enabled", False)
         seq_tag = "seq" if self.config["data"].get("sequence_mode", False) else "row"
         extra = f"K{mix}_{'warp' if warp else 'nowarp'}_{seq_tag}"
-        self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{self.prediction_mode}_{extra}_{timestamp}"
-
+        self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{extra}_{timestamp}"
+        
         # Convert paths
         self.raw_data_files = [Path(f) for f in paths["raw_data_files"]]
         
-        # Mode-specific processed directory
+        # Processed data directory
         base_processed_dir = Path(paths["processed_data_dir"])
-        self.processed_dir = base_processed_dir / f"mode_{self.prediction_mode}_{seq_tag}"  
+        self.processed_dir = base_processed_dir / f"{seq_tag}_mode"
         
         self.log_dir = Path(paths["log_dir"])
         
         # Create directories
         ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
-
+    
     def _compute_data_hash(self) -> str:
-        """
-        Compute a hash of data-critical parameters.
-        """
+        """Compute a hash of data-critical parameters (including shard layout & dtype)."""
+        import hashlib, json
+
         data_params = {
+            # Raw data & variables
             "raw_files": sorted([str(f) for f in self.raw_data_files]),
             "species_variables": self.config["data"]["species_variables"],
             "global_variables": self.config["data"]["global_variables"],
             "time_variable": self.config["data"]["time_variable"],
+
+            # Filtering / sampling
             "min_value_threshold": self.config["preprocessing"]["min_value_threshold"],
             "use_fraction": self.config["training"]["use_fraction"],
-            "prediction_mode": self.prediction_mode,
-            "normalization_methods": self.config["normalization"].get("methods", {}),
-            "default_norm_method": self.config["normalization"]["default_method"],
-            # sequence-mode drivers
             "sequence_mode": self.config["data"].get("sequence_mode", False),
             "M_per_sample": self.config["data"].get("M_per_sample", 16),
             "time_sampling": self.config["data"].get("time_sampling", {"uniform": 1.0}),
-            "shard_size": self.config["preprocessing"].get("shard_size"),
-        }
-        
-        hash_str = json.dumps(data_params, sort_keys=True)
-        return hashlib.sha256(hash_str.encode()).hexdigest()[:16]
 
-    def normalize_only(self):
-        """Run only the data preprocessing and normalization step."""
-        self.logger.info("Running data normalization only...")
+            # Normalization choices
+            "normalization_methods": self.config["normalization"].get("methods", {}),
+            "default_norm_method": self.config["normalization"]["default_method"],
+
+            # Shard layout & storage details
+            "target_shard_bytes": self.config["preprocessing"].get("target_shard_bytes", None),
+            "trajectories_per_shard": self.config["preprocessing"].get("trajectories_per_shard", None),
+            "npz_compressed": self.config["preprocessing"].get("npz_compressed", True),
+            "system_dtype": self.config["system"].get("dtype", "float32"),
+        }
+
+        payload = json.dumps(data_params, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        
+    def preprocess_data(self):
+        """Preprocess data if needed."""
+        self.logger.info("Preprocessing data...")
         
         # Check if data already exists
         current_hash = self._compute_data_hash()
@@ -149,25 +156,17 @@ class ChemicalKineticsPipeline:
             # Save the hash
             save_json({
                 "hash": current_hash,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "mode": self.prediction_mode
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }, hash_file)
             
-            self.logger.info(f"Data normalization complete. Files saved to: {self.processed_dir}")
-
-    def preprocess_data(self):
-        """Preprocess data if needed."""
-        self.logger.info(f"Preprocessing data for {self.prediction_mode} mode...")
-        self.normalize_only()
-
+            self.logger.info(f"Data preprocessing complete. Files saved to: {self.processed_dir}")
+    
     def _log_memory_status(self):
         """Log current memory status."""
-            
-        
         # CPU memory
         mem = psutil.virtual_memory()
         self.logger.info(f"System memory: {mem.total/1024**3:.1f}GB total, "
-                         f"{mem.available/1024**3:.1f}GB available ({mem.percent:.1f}% used)")
+                        f"{mem.available/1024**3:.1f}GB available ({mem.percent:.1f}% used)")
         
         # GPU memory
         if self.device.type == "cuda":
@@ -175,33 +174,33 @@ class ChemicalKineticsPipeline:
             free_mem, total_mem = torch.cuda.mem_get_info(idx)
             used_mem = total_mem - free_mem
             self.logger.info(f"GPU memory: {total_mem/1024**3:.1f}GB total, "
-                             f"{free_mem/1024**3:.1f}GB free, "
-                             f"{used_mem/1024**3:.1f}GB used")
-
+                            f"{free_mem/1024**3:.1f}GB free, "
+                            f"{used_mem/1024**3:.1f}GB used")
+    
     def train_model(self):
         """Train the neural network model."""
         mode_str = "sequence" if self.config["data"].get("sequence_mode", False) else "row-wise"
         self.logger.info(f"Starting model training in {mode_str} mode...")
-
+        
         # Ensure data is preprocessed
         self.preprocess_data()
-
+        
         # Save config for this run
         save_json(self.config, self.run_save_dir / "config.json")
-
+        
         # Create model
         model = create_model(self.config, self.device)
-
+        
         # Log model info
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.logger.info(f"Model: {self.config['model']['type']} - Parameters: {total_params:,}")
-
+        
         # Load normalization stats
         norm_file = self.processed_dir / "normalization.json"
         if not norm_file.exists():
             raise FileNotFoundError(f"Normalization file missing: {norm_file}.")
         norm_stats = load_json(norm_file)
-
+        
         norm_helper = NormalizationHelper(
             norm_stats,
             self.device,
@@ -211,63 +210,27 @@ class ChemicalKineticsPipeline:
             self.config
         )
         
-        # Log memory status before creating datasets
+        # Log memory status
         self._log_memory_status()
-
-        # Choose dataset type by shard_index.json
+        
+        # Choose dataset type
         index_path = self.processed_dir / "shard_index.json"
         with open(index_path) as f:
             shard_index = json.load(f)
-        is_sequence = bool(shard_index.get("sequence_mode", False))
+        
+        self.logger.info("Using SequenceDataset for sequence-mode shards.")
+        train_dataset = SequenceDataset(
+            self.processed_dir, "train", self.config, self.device
+        )
+        val_dataset = SequenceDataset(
+            self.processed_dir, "validation", self.config, self.device
+        ) if self.config["training"]["val_fraction"] > 0 else None
+        test_dataset = SequenceDataset(
+            self.processed_dir, "test", self.config, self.device
+        ) if self.config["training"]["test_fraction"] > 0 else None
 
-        if is_sequence:
-            self.logger.info("Detected sequence-mode shards; using SequenceDataset.")
-            train_dataset = SequenceDataset(
-                shard_dir=self.processed_dir,
-                split_name="train",
-                config=self.config,
-                device=self.device
-            )
-            val_dataset = SequenceDataset(
-                shard_dir=self.processed_dir,
-                split_name="validation",
-                config=self.config,
-                device=self.device
-            ) if self.config["training"]["val_fraction"] > 0 else None
-            test_dataset = SequenceDataset(
-                shard_dir=self.processed_dir,
-                split_name="test",
-                config=self.config,
-                device=self.device
-            ) if self.config["training"]["test_fraction"] > 0 else None
+        if train_dataset:
             self.logger.info(f"Sequence train samples: {len(train_dataset)}")
-        else:
-            self.logger.info("Detected row-wise shards; using NPYDataset.")
-            train_dataset = NPYDataset(
-                shard_dir=self.processed_dir,
-                split_name="train",
-                config=self.config,
-                device=self.device
-            )
-            cache_info = train_dataset.get_cache_info()
-            if cache_info.get("type") == "gpu":
-                self.logger.info(f"GPU caching active for '{train_dataset.split_name}': {cache_info.get('size_gb', 0):.1f}GB loaded.")
-            elif cache_info.get("type") == "cpu":
-                self.logger.warning(f"CPU fallback active for '{train_dataset.split_name}'. Reason: {cache_info.get('message', 'N/A')}")
-            else:
-                self.logger.error(f"Cache status error for '{train_dataset.split_name}': {cache_info.get('status', 'unknown')}")
-            val_dataset = NPYDataset(
-                shard_dir=self.processed_dir,
-                split_name="validation",
-                config=self.config,
-                device=self.device
-            ) if self.config["training"]["val_fraction"] > 0 else None
-            test_dataset = NPYDataset(
-                shard_dir=self.processed_dir,
-                split_name="test",
-                config=self.config,
-                device=self.device
-            ) if self.config["training"]["test_fraction"] > 0 else None
         
         # Initialize trainer
         trainer = Trainer(
@@ -280,7 +243,7 @@ class ChemicalKineticsPipeline:
             device=self.device,
             norm_helper=norm_helper
         )
-
+        
         # Train model
         best_val_loss = trainer.train()
         
@@ -310,6 +273,7 @@ class ChemicalKineticsPipeline:
             self.logger.error(f"Pipeline failed: {e}", exc_info=True)
             sys.exit(1)
 
+
 def main():
     """Main entry point."""
     import argparse
@@ -320,37 +284,10 @@ def main():
         default=Path("config/config.jsonc"),
         help="Path to configuration file"
     )
-    
-    # Operation mode arguments
-    mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument(
-        "--normalize",
-        action="store_true",
-        help="Only preprocess and normalize the data"
-    )
-    mode_group.add_argument(
+    parser.add_argument(
         "--train",
         action="store_true",
         help="Train a model using the configuration"
-    )
-    mode_group.add_argument(
-        "--tune",
-        action="store_true",
-        help="Run hyperparameter optimization"
-    )
-    
-    # Additional arguments
-    parser.add_argument(
-        "--trials",
-        type=int,
-        default=100,
-        help="Number of Optuna trials for hyperparameter optimization"
-    )
-    parser.add_argument(
-        "--study-name",
-        type=str,
-        default="chemical_kinetics_opt",
-        help="Name for Optuna study"
     )
     
     args = parser.parse_args()
@@ -360,41 +297,14 @@ def main():
         print(f"Error: Configuration file not found: {args.config}", file=sys.stderr)
         sys.exit(1)
     
-    # Execute based on mode
-    if args.normalize:
-        pipeline = ChemicalKineticsPipeline(args.config)
-        pipeline.normalize_only()
-        print("\nData normalization complete!")
-        
-    elif args.train:
+    # Execute
+    if args.train:
         pipeline = ChemicalKineticsPipeline(args.config)
         pipeline.run()
-        
-    elif args.tune:
-        try:
-            import optuna
-        except ImportError:
-            print("Error: The 'optuna' package is not installed", file=sys.stderr)
-            sys.exit(1)
-        
-        from hyperparameter_tuning import optimize
-        
-        print(f"Starting hyperparameter optimization with {args.trials} trials...")
-        study = optimize(
-            config_path=args.config,
-            n_trials=args.trials,
-            n_jobs=1,
-            study_name=args.study_name
-        )
-        
-        print("\n" + "="*60)
-        print("Optimization Complete")
-        print("="*60)
-        print(f"Best validation loss: {study.best_value:.6f}")
-        print(f"Best trial: {study.best_trial.number}")
-        print("\nBest parameters:")
-        for key, value in study.best_params.items():
-            print(f"  {key}: {value}")
+    else:
+        print("Please specify --train to run training")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
