@@ -200,7 +200,7 @@ class LinearLatentMixture(nn.Module):
             layers.append(self.activation)
         
         return nn.Sequential(*layers)
-    
+        
     def _initialize_weights(self):
         """Initialize weights for stability (encoders/decoder + TimeWarp if present)."""
         # Encoders/decoder
@@ -211,26 +211,52 @@ class LinearLatentMixture(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-        # TimeWarp (if enabled): Xavier on all linear layers, then set final bias to near-identity
+        # TimeWarp (if enabled): Xavier on all linear layers, then set final bias via softplus-inverse
         if self.use_time_warp:
+            # 1) Initialize all TimeWarp linear layers
             for m in self.time_warp.param_net.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight, gain=0.5)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-            # Overwrite the LAST layer's bias to encode near-identity warp:
-            # s ≈ 1, a_j ≈ 0.01, b_j ≈ 1
-            with torch.no_grad():
-                last_bias = self.time_warp.param_net[-1].bias
-                J = self.time_warp.J_terms
-                # last_bias has shape [latent_dim * (1 + 2J)]
-                bias_view = last_bias.view(self.latent_dim, 1 + 2 * J)
-                bias_view[:, 0] = 1.0          # s
-                bias_view[:, 1:1+J] = 0.01     # a_j
-                bias_view[:, 1+J:] = 1.0       # b_j
+            # 2) Overwrite the LAST layer so output == bias at init (input-independent)
+            last = self.time_warp.param_net[-1]
+            if isinstance(last, nn.Linear):
+                # Make the last layer produce only the bias initially
+                nn.init.zeros_(last.weight)
+                if last.bias is None:
+                    last.bias = nn.Parameter(
+                        torch.zeros(self.latent_dim * (1 + 2 * self.time_warp.J_terms),
+                                    dtype=last.weight.dtype, device=last.weight.device)
+                    )
 
-        
+                with torch.no_grad():
+                    J = self.time_warp.J_terms
+
+                    # Desired *post-softplus* values (near identity)
+                    # s ≈ 1, a_j ≈ 0.01 (small), b_j ≈ 1
+                    desired_s = torch.full((self.latent_dim, 1), 1.0,
+                                        dtype=last.weight.dtype, device=last.weight.device)
+                    desired_a = torch.full((self.latent_dim, J), 0.01,
+                                        dtype=last.weight.dtype, device=last.weight.device)
+                    desired_b = torch.full((self.latent_dim, J), 1.0,
+                                        dtype=last.weight.dtype, device=last.weight.device)
+
+                    # Stable inverse softplus: x = log(exp(y) - 1)
+                    def softplus_inv(y: torch.Tensor) -> torch.Tensor:
+                        return torch.where(
+                            y > 20,
+                            y,  # for large y, softplus ~ y
+                            torch.log(torch.expm1(y))
+                        )
+
+                    bias_view = last.bias.view(self.latent_dim, 1 + 2 * J)
+                    bias_view[:, 0:1]           = softplus_inv(desired_s)  # s pre-activations
+                    bias_view[:, 1:1+J]         = softplus_inv(desired_a)  # a_j pre-activations
+                    bias_view[:, 1+J:1+2*J]     = softplus_inv(desired_b)  # b_j pre-activations
+
+            
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """
         Forward pass: latent linear dynamics with optional time warp, then decode.
@@ -363,90 +389,3 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     logger.info(f"Total trainable parameters: {total_params:,}")
     
     return model
-
-
-def export_model(checkpoint_path: Path, output_path: Path):
-    """
-    Load a trained checkpoint and export an inference graph using torch.export.
-    Exports a fixed-shape program matching the training config (B=1, M=M_per_sample).
-    """
-    logger = logging.getLogger(__name__)
-
-    if not checkpoint_path.exists():
-        logger.error(f"Checkpoint not found at: {checkpoint_path}")
-        return
-
-    logger.info(f"Starting model export from: {checkpoint_path}")
-
-    # 1) Load checkpoint on CPU
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    if "config" not in checkpoint or "model_state_dict" not in checkpoint:
-        logger.error("Checkpoint missing required keys: 'config' and/or 'model_state_dict'.")
-        return
-    config = checkpoint["config"]
-
-    # 2) Force eager (no torch.compile) during export by overriding config
-    system_cfg = config.setdefault("system", {})
-    system_cfg["use_torch_compile"] = False  # ensure create_model doesn't compile
-
-    # 3) Instantiate model on CPU
-    model = create_model(config, device=torch.device("cpu"))
-
-    # 4) Normalize state_dict keys from compiled / DP models
-    sd = checkpoint["model_state_dict"]
-    def _normalize_keys(state_dict):
-        new_sd = {}
-        for k, v in state_dict.items():
-            if k.startswith("_orig_mod."):
-                k = k[len("_orig_mod."):]
-            if k.startswith("module."):
-                k = k[len("module."):]
-            new_sd[k] = v
-        return new_sd
-
-    sd = _normalize_keys(sd)
-
-    # 5) Load weights (strict)
-    try:
-        model.load_state_dict(sd, strict=True)
-    except Exception as e:
-        # Give a helpful diff if it still fails
-        model_keys = set(model.state_dict().keys())
-        ckpt_keys = set(sd.keys())
-        missing = sorted(model_keys - ckpt_keys)
-        unexpected = sorted(ckpt_keys - model_keys)
-        logger.error(
-            "Failed to load state_dict after key normalization.\n"
-            f"Missing: {missing[:10]}{' ...' if len(missing) > 10 else ''}\n"
-            f"Unexpected: {unexpected[:10]}{' ...' if len(unexpected) > 10 else ''}"
-        )
-        logger.error(f"load_state_dict error: {e}", exc_info=True)
-        return
-
-    # 6) Eval mode
-    model.eval()
-    logger.info("Model loaded and set to evaluation mode.")
-
-    # 7) Build example input with correct dtype and shape (fixed B=1)
-    n_species = len(config["data"]["species_variables"])
-    n_globals = len(config["data"]["global_variables"])
-    M_per_sample = config["data"]["M_per_sample"]
-
-    try:
-        model_dtype = next(p for p in model.parameters() if p.requires_grad).dtype
-    except StopIteration:
-        model_dtype = torch.float32
-
-    input_dim = n_species + n_globals + M_per_sample
-    example_input = torch.randn(1, input_dim, dtype=model_dtype)  # CPU
-
-    logger.info(f"Example input shape: {tuple(example_input.shape)}, dtype: {example_input.dtype}")
-
-    # 8) Export
-    try:
-        exported_program = torch.export.export(model, (example_input,))
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(exported_program, output_path)
-        logger.info(f"SUCCESS: Exported model saved to: {output_path}")
-    except Exception as e:
-        logger.error(f"Model export failed: {e}", exc_info=True)
