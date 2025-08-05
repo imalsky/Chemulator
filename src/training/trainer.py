@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Unified training module for all model training logic.
+Unified training module for chemical kinetics models.
 """
 
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, Callable
-import numpy as np
+from typing import Dict, Any, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -18,6 +17,9 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlat
 
 from data.normalizer import NormalizationHelper
 from lion_pytorch import Lion
+import math
+
+from models.model import export_model
 
 
 class Trainer:
@@ -82,7 +84,7 @@ class Trainer:
         
         self.train_loader = create_dataloader(
             train_dataset, self.config, shuffle=True, 
-            device=self.device, drop_last=True
+            device=self.device, drop_last=False
         ) if train_dataset else None
         
         self.val_loader = create_dataloader(
@@ -126,9 +128,9 @@ class Trainer:
             opt_kwargs = {"lr": lr, "betas": betas, "eps": eps}
             
             # Try fused AdamW
-            if self.device.type == "cuda" and hasattr(torch.optim.AdamW, "fused"):
+            if self.device.type == "cuda":
                 try:
-                    _ = torch.optim.AdamW([torch.zeros(1, device=self.device)], fused=True)
+                    test_optimizer = AdamW([torch.zeros(1, device=self.device)], fused=True)
                     opt_kwargs["fused"] = True
                     self.logger.info("Using fused AdamW")
                 except:
@@ -148,9 +150,9 @@ class Trainer:
             self.scheduler_step_on_batch = False
             return
         
-        steps_per_epoch = len(self.train_loader) // self.gradient_accumulation_steps
-        if steps_per_epoch == 0:
-            steps_per_epoch = 1
+        steps_per_epoch = max(
+            1, math.ceil(len(self.train_loader) / self.gradient_accumulation_steps)
+        )
         
         params = self.train_config.get("scheduler_params", {})
         
@@ -201,7 +203,7 @@ class Trainer:
         self.amp_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float16
         
         # GradScaler only for float16
-        self.scaler = GradScaler(enabled=(self.amp_dtype == torch.float16))
+        self.scaler = GradScaler(enabled=(self.use_amp and self.amp_dtype == torch.float16))
     
     def _compute_loss(self, outputs: torch.Tensor, targets: torch.Tensor, 
                      inputs: torch.Tensor) -> torch.Tensor:
@@ -214,10 +216,10 @@ class Trainer:
             reg_losses = self.model.get_regularization_losses(inputs)
             
             # Gate entropy
-            if 'gate_entropy' in reg_losses:
+            if 'entropy_loss' in reg_losses:
                 lambda_entropy = self.train_config.get("regularization", {}).get("lambda_entropy", 0.01)
                 if lambda_entropy > 0:
-                    loss = loss + lambda_entropy * reg_losses['gate_entropy']
+                    loss = loss + lambda_entropy * reg_losses['entropy_loss']
             
             # Generator diversity
             if 'generator_diversity' in reg_losses:
@@ -258,11 +260,24 @@ class Trainer:
     def _run_training_loop(self):
         """Main training loop."""
         best_train_loss = float("inf")
-        
+
+        # Mixture temperature schedule (optional)
+        mix_sched = self.train_config.get("mixture_temperature_schedule", {})
+        t_start = float(mix_sched.get("start", 1.0))
+        t_end = float(mix_sched.get("end", 0.3))
+        t_anneal_frac = float(mix_sched.get("anneal_frac", 0.6))  # fraction of epochs
+
         for epoch in range(1, self.train_config["epochs"] + 1):
             self.current_epoch = epoch
             epoch_start = time.time()
-            
+
+            # Update gate temperature if model supports it
+            if hasattr(self.model, "set_gate_temperature") and self.model.K > 1:
+                progress = min(1.0, (epoch - 1) / max(1, int(self.train_config["epochs"] * t_anneal_frac)))
+                temp = t_start + (t_end - t_start) * progress
+                self.model.set_gate_temperature(temp)
+                self.logger.info(f"Mixture gate temperature set to {temp:.4f}")
+
             # Train
             train_loss, train_metrics = self._train_epoch()
             
@@ -313,10 +328,18 @@ class Trainer:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
             
-            with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+            with autocast(
+                device_type=self.device.type,
+                enabled=self.use_amp,
+                dtype=self.amp_dtype,
+            ):
                 outputs = self.model(inputs)
-                loss = self._compute_loss(outputs, targets, inputs)
-                loss = loss / self.gradient_accumulation_steps
+                loss_raw = self._compute_loss(outputs, targets, inputs)
+            
+            # Scale for gradient accumulation
+            step_start_idx = batch_idx - (batch_idx % self.gradient_accumulation_steps)
+            num_in_step = min(self.gradient_accumulation_steps, len(self.train_loader) - step_start_idx)
+            loss = loss_raw / num_in_step
             
             if self.scaler.is_enabled():
                 self.scaler.scale(loss).backward()
@@ -350,7 +373,7 @@ class Trainer:
                 self.global_step += 1
             
             batch_size = inputs.size(0)
-            total_loss += loss.item() * self.gradient_accumulation_steps * batch_size
+            total_loss += loss_raw.item() * batch_size
             total_samples += batch_size
         
         avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
@@ -430,7 +453,7 @@ class Trainer:
         )
     
     def _save_best_model(self):
-        """Save best model checkpoint."""
+        """Save best model checkpoint and trigger export if enabled."""
         checkpoint = {
             "epoch": self.current_epoch,
             "model_state_dict": self.model.state_dict(),
@@ -442,82 +465,10 @@ class Trainer:
         
         checkpoint_path = self.save_dir / "best_model.pt"
         torch.save(checkpoint, checkpoint_path)
-        self.logger.info(f"Saved best model to {checkpoint_path}")
-        
-        # Export model if enabled
+        self.logger.info(f"Saved best model checkpoint to {checkpoint_path}")
+
+        # --- NEW LOGIC FOR AUTOMATIC EXPORT ---
         if self.system_config.get("use_torch_export", False):
-            self._export_model()
-    
-    def _export_model(self):
-        """Export model for deployment."""
-        example_loader = self.val_loader or self.train_loader
-        if example_loader:
-            example_inputs, _ = next(iter(example_loader))
-            if example_inputs.device != torch.device("cpu"):
-                example_inputs = example_inputs.cpu()
-                self.model.cpu()
-            
-            from models.model import export_model
-            export_path = self.save_dir / "exported_model.pt"
-            export_model(self.model, example_inputs, export_path)
-            
-            # Restore to original device
-            self.model.to(self.device)
-
-
-# For Optuna integration
-class PrunableTrainer(Trainer):
-    """Trainer with Optuna pruning support."""
-    def __init__(self, *args, epoch_callback: Optional[Callable[[int, float], bool]] = None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.epoch_callback = epoch_callback
-    
-    def _run_training_loop(self):
-        """Training loop with pruning callbacks."""
-        best_train_loss = float("inf")
-        
-        for epoch in range(1, self.train_config["epochs"] + 1):
-            self.current_epoch = epoch
-            epoch_start = time.time()
-            
-            train_loss, train_metrics = self._train_epoch()
-            val_loss, val_metrics = self._validate()
-            
-            if self.scheduler and not self.scheduler_step_on_batch:
-                if isinstance(self.scheduler, ReduceLROnPlateau) and self.has_validation:
-                    self.scheduler.step(val_loss)
-                else:
-                    self.scheduler.step()
-            
-            epoch_time = time.time() - epoch_start
-            self.total_training_time += epoch_time
-            self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
-            
-            # Optuna callback
-            if self.epoch_callback:
-                loss_for_pruning = val_loss if self.has_validation and val_loss != float("inf") else train_loss
-                
-                if self.epoch_callback(epoch, loss_for_pruning):
-                    self.logger.info(f"Trial pruned at epoch {epoch} with loss {loss_for_pruning:.6f}")
-                    import optuna
-                    raise optuna.TrialPruned()
-            
-            # Early stopping logic
-            if self.has_validation:
-                if val_loss < (self.best_val_loss - self.min_delta):
-                    self.best_val_loss = val_loss
-                    self.best_epoch = epoch
-                    self.patience_counter = 0
-                    self._save_best_model()
-                else:
-                    self.patience_counter += 1
-                
-                if self.patience_counter >= self.early_stopping_patience:
-                    self.logger.info(f"Early stopping at epoch {epoch}")
-                    break
-            else:
-                if train_loss < (best_train_loss - self.min_delta):
-                    best_train_loss = train_loss
-                    self.best_val_loss = train_loss
-                    self.best_epoch = epoch
-                    self._save_best_model()
+            self.logger.info("`use_torch_export` is true. Exporting best model...")
+            exported_path = self.save_dir / "best_model_exported.pt"
+            export_model(checkpoint_path, exported_path)
