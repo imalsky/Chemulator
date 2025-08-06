@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
 Hyperparameter tuning for chemical kinetics models using Optuna.
-Simplified to target the LiLaN family (linear_latent / linear_latent_mixture)
-and sequence-mode datasets. No DeepONet/SIREN here — this is the fast, stable path.
+Optimized for LiLaN (linear_latent / linear_latent_mixture) architectures.
 """
 
 import copy
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional
 
 import optuna
 from optuna.samplers import TPESampler
@@ -17,18 +16,16 @@ from optuna.pruners import HyperbandPruner
 import torch
 import json
 
-from main import ChemicalKineticsPipeline
-from utils.hardware import setup_device, optimize_hardware
-from data.dataset import SequenceDataset, NPYDataset
+from utils.hardware import setup_device
+from data.dataset import SequenceDataset
 from models.model import create_model
 from training.trainer import Trainer
 from data.normalizer import NormalizationHelper
-from utils.utils import (seed_everything, ensure_directories, 
-                        load_json_config, save_json, load_json)
+from utils.utils import seed_everything, ensure_directories, load_json_config, save_json, load_json
 
 
 class OptunaPruningCallback:
-    """Report intermediate values to Optuna and allow pruning after a warmup."""
+    """Report intermediate values to Optuna for pruning."""
     def __init__(self, trial: optuna.Trial, min_epochs: int = 10):
         self.trial = trial
         self.min_epochs = min_epochs
@@ -40,106 +37,191 @@ class OptunaPruningCallback:
         return self.trial.should_prune()
 
 
-class OptunaTrialRunner:
-    """Prepares data once and executes trials with modified configs."""
-    def __init__(self, base_config_path: Path):
-        self.base_config_path = base_config_path
-        self.base_config = load_json_config(base_config_path)
+class HyperparameterTuner:
+    """Manages hyperparameter optimization for chemical kinetics models."""
+    
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.base_config = load_json_config(config_path)
         self.device = setup_device()
         self.logger = logging.getLogger(__name__)
-        self._pipelines = {}
-        self._prepare_current_mode()
-
-    def _prepare_current_mode(self):
-        """Preprocess data for the current prediction mode in the base config."""
-        mode = self.base_config["prediction"]["mode"]
-        self.logger.info(f"Preparing data for '{mode}' mode...")
-        pipeline = ChemicalKineticsPipeline(self.base_config)
-        pipeline.normalize_only()
-        self._pipelines[mode] = OptunaPipeline(self.base_config, pipeline.processed_dir)
-
-    def run_trial(self, trial: optuna.Trial) -> float:
-        """Configure and run a single trial."""
-        config = suggest_lilan_config(trial, self.base_config)
-        prediction_mode = config["prediction"]["mode"]
-        pipeline = self._pipelines[prediction_mode]
-        return pipeline.execute_trial(config, trial)
-
-
-class OptunaPipeline:
-    """Loads datasets and runs training for a specific processed_dir."""
-    def __init__(self, config: Dict[str, Any], processed_dir: Path):
-        self.config = config
-        self.device = setup_device()
-        self.logger = logging.getLogger(f"OptunaPipeline_{config['prediction']['mode']}")
-        self.processed_dir = processed_dir
-        self.model_save_root = Path(self.config["paths"]["model_save_dir"])
-
-        # Normalization stats
+        
+        # Preprocess data once
+        self.processed_dir = self._prepare_data()
+        
+        # Load normalization stats
         norm_stats_path = self.processed_dir / "normalization.json"
         if not norm_stats_path.exists():
-            raise FileNotFoundError(f"Normalization stats not found in {norm_stats_path}")
-        norm_stats = load_json(norm_stats_path)
+            raise FileNotFoundError(f"Normalization stats not found: {norm_stats_path}")
+        
+        self.norm_stats = load_json(norm_stats_path)
         self.norm_helper = NormalizationHelper(
-            stats=norm_stats,
+            stats=self.norm_stats,
             device=self.device,
-            species_vars=self.config["data"]["species_variables"],
-            global_vars=self.config["data"]["global_variables"],
-            time_var=self.config["data"]["time_variable"],
-            config=self.config
+            species_vars=self.base_config["data"]["species_variables"],
+            global_vars=self.base_config["data"]["global_variables"],
+            time_var=self.base_config["data"]["time_variable"],
+            config=self.base_config
         )
-
+        
+        # Load datasets once
         self._load_datasets()
-
+        
+    def _prepare_data(self) -> Path:
+        """Preprocess data if needed and return processed directory."""
+        from main import ChemicalKineticsPipeline
+        
+        self.logger.info("Preparing data for hyperparameter optimization...")
+        pipeline = ChemicalKineticsPipeline(self.base_config)
+        pipeline.preprocess_data()
+        return pipeline.processed_dir
+    
     def _load_datasets(self):
-        """Choose SequenceDataset when sequence-mode shards are present."""
+        """Load datasets once for reuse across trials."""
+        self.logger.info(f"Loading datasets from: {self.processed_dir}")
+        
+        # Load shard index to check if sequence mode
         index_path = self.processed_dir / "shard_index.json"
         with open(index_path) as f:
             shard_index = json.load(f)
+        
         is_sequence = bool(shard_index.get("sequence_mode", False))
-
-        self.logger.info(f"Loading datasets from: {self.processed_dir} (sequence_mode={is_sequence})")
-
-        if is_sequence:
-            self.train_dataset = SequenceDataset(self.processed_dir, "train", self.config, self.device)
-            self.val_dataset   = SequenceDataset(self.processed_dir, "validation", self.config, self.device)
-        else:
-            # Fallback to legacy row-wise dataset if needed
-            self.train_dataset = NPYDataset(self.processed_dir, "train", self.config, self.device)
-            self.val_dataset   = NPYDataset(self.processed_dir, "validation", self.config, self.device)
-
+        if not is_sequence:
+            raise ValueError("Hyperparameter tuning requires sequence mode data")
+        
+        self.train_dataset = SequenceDataset(
+            self.processed_dir, "train", self.base_config, self.device, self.norm_stats
+        )
+        self.val_dataset = SequenceDataset(
+            self.processed_dir, "validation", self.base_config, self.device, self.norm_stats
+        )
+        
         self.logger.info(f"Datasets loaded: train={len(self.train_dataset)}, val={len(self.val_dataset)}")
+    
+    def suggest_config(self, trial: optuna.Trial) -> Dict[str, Any]:
+        """Generate a trial configuration for LiLaN models."""
+        cfg = copy.deepcopy(self.base_config)
+        
+        # Model architecture
+        model_type = trial.suggest_categorical("model_type", ["linear_latent", "linear_latent_mixture"])
+        cfg["model"]["type"] = model_type
+        
+        # Core dimensions
+        cfg["model"]["latent_dim"] = trial.suggest_categorical("latent_dim", [32, 48, 64, 96])
+        
+        # Network architecture
+        enc_depth = trial.suggest_int("encoder_depth", 2, 4)
+        dec_depth = trial.suggest_int("decoder_depth", 2, 4)
+        
+        # Create layer widths with gradual sizing
+        enc_widths = []
+        dec_widths = []
+        base_width = trial.suggest_categorical("base_width", [128, 256, 512])
+        
+        for i in range(enc_depth):
+            width = int(base_width * (1 + i * 0.5))  # Gradually increase
+            enc_widths.append(min(width, 1024))  # Cap at 1024
+        
+        for i in range(dec_depth):
+            width = int(base_width * (1 + (dec_depth - i - 1) * 0.5))  # Gradually decrease
+            dec_widths.append(min(width, 1024))
+        
+        cfg["model"]["encoder_layers"] = enc_widths
+        cfg["model"]["decoder_layers"] = dec_widths
+        
+        # Generator configuration
+        cfg["model"]["generator"] = {
+            "rank": trial.suggest_categorical("generator_rank", [4, 8, 12, 16, 24])
+        }
+        
+        # Mixture configuration
+        if model_type == "linear_latent_mixture":
+            cfg["model"]["mixture"] = {
+                "K": trial.suggest_categorical("mixture_K", [2, 3, 4, 5]),
+                "temperature": trial.suggest_float("mixture_temperature", 0.5, 2.0)
+            }
+        else:
+            # remove any stale mixture block inherited from the template
+            cfg["model"].pop("mixture", None)
+        
+        # Time warp configuration
+        use_warp = trial.suggest_categorical("use_time_warp", [True, False])
+        if use_warp:
+            cfg["model"]["time_warp"] = {
+                "enabled": True,
+                "J_terms": trial.suggest_categorical("J_terms", [2, 3, 4, 5]),
+                "hidden_dim": trial.suggest_categorical("hidden_dim", [64, 128, 256])
 
-    def execute_trial(self, config: Dict[str, Any], trial: optuna.Trial) -> float:
-        """Run training for a trial with pruning and return best val loss."""
+            }
+        else:
+            cfg["model"]["time_warp"] = {"enabled": False}
+        
+        # Activation and regularization
+        cfg["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "tanh"])
+        cfg["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.15, step=0.05)
+        
+        # Training hyperparameters
+        cfg["training"]["learning_rate"] = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
+        cfg["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-7, 1e-4, log=True)
+        
+        # Optimizer choice
+        cfg["training"]["optimizer"] = trial.suggest_categorical("optimizer", ["adamw"])
+        
+        # Batch size (power of 2 for efficiency)
+        batch_power = trial.suggest_int("batch_power", 8, 12)  # 256 to 4096
+        cfg["training"]["batch_size"] = 2 ** batch_power
+        
+        # Regularization for mixtures
+        if model_type == "linear_latent_mixture":
+            cfg["training"]["regularization"] = {
+                "lambda_entropy": trial.suggest_float("lambda_entropy", 0.0, 0.1, step=0.01),
+                "lambda_diversity": trial.suggest_float("lambda_diversity", 0.0, 0.1, step=0.01),
+            }
+        
+        return cfg
+    
+    def run_trial(self, trial: optuna.Trial) -> float:
+        """Execute a single trial and return validation loss."""
+        config = self.suggest_config(trial)
+        
+        # Create save directory
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        trial_id = f"trial_{trial.number:04d}_{config['prediction']['mode']}"
-        save_dir = self.model_save_root / "optuna" / f"{timestamp}_{trial_id}"
+        trial_id = f"trial_{trial.number:04d}"
+        save_dir = Path(self.base_config["paths"]["model_save_dir"]) / "optuna" / f"{timestamp}_{trial_id}"
         ensure_directories(save_dir)
-
+        
         try:
-            seed_everything(config["system"]["seed"])
-            optimize_hardware(config["system"], self.device)
+            # Set seed for reproducibility
+            seed_everything(config.get("system", {}).get("seed", 42))
+            
+            # Create model
             model = create_model(config, self.device)
-
-            # Hyperband sets epochs via user_attrs; default to hpo_max_epochs
-            n_epochs = trial.user_attrs.get("n_epochs", config["training"]["hpo_max_epochs"])
+            
+            # Set epochs based on Hyperband if available
+            n_epochs = trial.user_attrs.get("n_epochs", config["training"].get("epochs", 100))
             config["training"]["epochs"] = n_epochs
-
-            min_epochs = config["training"]["hpo_min_epochs"]
+            
+            # Create pruning callback
+            min_epochs = config["training"].get("hpo_min_epochs", 10)
             pruning_callback = OptunaPruningCallback(trial, min_epochs)
+            
+            # Log trial configuration
+            self.logger.info(
+                f"Trial {trial.number}: type={config['model']['type']}, "
+                f"latent={config['model']['latent_dim']}, "
+                f"lr={config['training']['learning_rate']:.2e}, "
+                f"batch={config['training']['batch_size']}"
+            )
 
-            # Log this trial
-            self.logger.info(f"Trial {trial.number}: epochs={n_epochs} lr={config['training']['learning_rate']:.2e} "
-                             f"type={config['model']['type']} latent={config['model']['latent_dim']} "
-                             f"K={config['model'].get('mixture',{}).get('K','-')} "
-                             f"rank={config['model'].get('generator',{}).get('rank','-')} "
-                             f"warp={config['model'].get('time_warp',{}).get('enabled', False)}")
+
+            # build fresh datasets per worker to avoid CUDA-tensor pickling issues
+            train_dataset = SequenceDataset(self.processed_dir, "train", config, self.device, self.norm_stats)
+            val_dataset   = SequenceDataset(self.processed_dir, "validation", config, self.device, self.norm_stats)
 
             trainer = PrunableTrainer(
                 model=model,
-                train_dataset=self.train_dataset,
-                val_dataset=self.val_dataset,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
                 test_dataset=None,
                 config=config,
                 save_dir=save_dir,
@@ -148,58 +230,78 @@ class OptunaPipeline:
                 epoch_callback=pruning_callback
             )
 
+
+            
+            # Train and get best validation loss
             best_val_loss = trainer.train()
-
-            trial.set_user_attr("full_config", config)
-            trial.set_user_attr("final_lr", trainer.optimizer.param_groups[0]['lr'])
+            
+            # Save trial information
+            trial.set_user_attr("config", config)
+            trial.set_user_attr("best_epoch", trainer.best_epoch)
             save_json(config, save_dir / "config.json")
-
-            self.logger.info(f"Trial {trial.number} done. Best loss={best_val_loss:.6f} "
-                             f"Final LR={trainer.optimizer.param_groups[0]['lr']:.2e}")
+            
+            self.logger.info(
+                f"Trial {trial.number} completed: loss={best_val_loss:.6f}, "
+                f"best_epoch={trainer.best_epoch}"
+            )
+            
             return best_val_loss
-
+            
         except optuna.TrialPruned:
-            self.logger.info(f"Trial {trial.number} pruned.")
+            self.logger.info(f"Trial {trial.number} pruned")
             raise
+            
         except Exception as e:
             self.logger.error(f"Trial {trial.number} failed: {e}", exc_info=True)
             return float("inf")
+            
         finally:
+            # Clear GPU cache
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
 
 class PrunableTrainer(Trainer):
-    """Trainer with an epoch callback hook for Optuna pruning."""
-    def __init__(self, *args, epoch_callback: Optional[Callable[[int, float], bool]] = None, **kwargs):
+    """Trainer that supports Optuna pruning callbacks."""
+    
+    def __init__(self, *args, epoch_callback=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.epoch_callback = epoch_callback
-        
+    
     def _run_training_loop(self):
+        """Training loop with pruning support."""
         best_train_loss = float("inf")
+        
         for epoch in range(1, self.train_config["epochs"] + 1):
             self.current_epoch = epoch
             epoch_start = time.time()
-
+            
+            # Training epoch
             train_loss, train_metrics = self._train_epoch()
+            
+            # Validation
             val_loss, val_metrics = self._validate()
-
+            
+            # Update scheduler
             if self.scheduler and not self.scheduler_step_on_batch:
                 if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau) and self.has_validation:
                     self.scheduler.step(val_loss)
                 else:
                     self.scheduler.step()
-
+            
+            # Log epoch
             epoch_time = time.time() - epoch_start
             self.total_training_time += epoch_time
             self._log_epoch(train_loss, val_loss, train_metrics, val_metrics, epoch_time)
-
+            
+            # Check for pruning
             if self.epoch_callback:
-                loss_for_pruning = val_loss if self.has_validation and val_loss != float("inf") else train_loss
+                loss_for_pruning = val_loss if self.has_validation else train_loss
                 if self.epoch_callback(epoch, loss_for_pruning):
-                    self.logger.info(f"Trial pruned at epoch {epoch} with loss {loss_for_pruning:.6f}")
+                    self.logger.info(f"Trial pruned at epoch {epoch}")
                     raise optuna.TrialPruned()
-
+            
+            # Early stopping logic
             if self.has_validation:
                 if val_loss < (self.best_val_loss - self.min_delta):
                     self.best_val_loss = val_loss
@@ -208,7 +310,7 @@ class PrunableTrainer(Trainer):
                     self._save_best_model()
                 else:
                     self.patience_counter += 1
-
+                
                 if self.patience_counter >= self.early_stopping_patience:
                     self.logger.info(f"Early stopping at epoch {epoch}")
                     break
@@ -220,152 +322,87 @@ class PrunableTrainer(Trainer):
                     self._save_best_model()
 
 
-def suggest_lilan_config(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Produce a LiLaN (Linear Latent) config for this trial.
-    We keep the search space tight and relevant:
-      - type: linear_latent or linear_latent_mixture
-      - latent_dim
-      - generator.rank
-      - mixture.K (if mixture)
-      - time_warp.enabled + J_terms
-      - encoder/decoder depth/width
-      - learning rate and weight decay
-      - regularization weights for mixture (entropy/diversity)
-    """
-    cfg = copy.deepcopy(base_config)
-
-    # Always absolute mode for this benchmark
-    cfg["prediction"]["mode"] = "absolute"
-
-    # Ensure sequence mode stays on — HPO shouldn’t flip preprocessing mode
-    cfg["data"]["sequence_mode"] = True
-
-    # Model family choice: single generator vs mixture
-    model_type = trial.suggest_categorical("model_type", ["linear_latent", "linear_latent_mixture"])
-    cfg["model"]["type"] = model_type
-
-    # Core sizes
-    cfg["model"]["latent_dim"] = trial.suggest_categorical("latent_dim", [48, 64, 96])
-
-    # Encoder/decoder depths (compact)
-    enc_depth = trial.suggest_int("enc_depth", 2, 3)
-    dec_depth = trial.suggest_int("dec_depth", 2, 3)
-
-    def sample_width(tag: str) -> int:
-        return trial.suggest_categorical(tag, [128, 192, 256, 320])
-
-    cfg["model"]["encoder_layers"] = [sample_width(f"enc_w{i}") for i in range(enc_depth)]
-    cfg["model"]["decoder_layers"] = [sample_width(f"dec_w{i}") for i in range(dec_depth)]
-
-    # Generator rank
-    cfg["model"]["generator"] = {"rank": trial.suggest_categorical("generator_rank", [4, 8, 12, 16])}
-
-    # Mixture settings
-    if model_type == "linear_latent_mixture":
-        cfg["model"]["mixture"] = {"K": trial.suggest_categorical("mixture_K", [2, 3, 4])}
-    else:
-        cfg["model"].pop("mixture", None)
-
-    # Time warp
-    use_warp = trial.suggest_categorical("time_warp", [True, False])
-    if use_warp:
-        cfg["model"]["time_warp"] = {"enabled": True, "J_terms": trial.suggest_categorical("warp_J", [2, 3, 4])}
-    else:
-        cfg["model"]["time_warp"] = {"enabled": False}
-
-    # Activations / dropout
-    cfg["model"]["activation"] = trial.suggest_categorical("activation", ["gelu", "silu"])
-    cfg["model"]["dropout"] = trial.suggest_float("dropout", 0.0, 0.10, step=0.05)
-
-    # Training hyperparams
-    cfg["training"]["learning_rate"] = trial.suggest_float("lr", 3e-5, 3e-4, log=True)
-    cfg["training"]["weight_decay"] = trial.suggest_float("weight_decay", 1e-6, 1e-4, log=True)
-
-    # Mixture regularization weights (used by Trainer hooks)
-    cfg["training"]["regularization"] = {
-        "lambda_entropy": trial.suggest_float("lambda_entropy", 0.0, 0.05),
-        "lambda_diversity": trial.suggest_float("lambda_diversity", 0.0, 0.05),
-    }
-
-    # Keep batch size and sequence sampling fixed to avoid data reprocessing mid-HPO
-    # You can tune batch size if VRAM allows, but be consistent across trials.
-    return cfg
-
-
-def optimize(config_path: Path,
-             n_trials: int = 25,
-             n_jobs: int = 1,
-             study_name: str = "chemulator_hpo",
-             pruner: Optional[optuna.pruners.BasePruner] = None):
-    """Run Optuna with Hyperband on the LiLaN search space."""
+def optimize_hyperparameters(
+    config_path: Path,
+    n_trials: int = 50,
+    n_jobs: int = 1,
+    study_name: str = None,
+    use_hyperband: bool = True
+) -> optuna.Study:
+    """Run hyperparameter optimization."""
     logger = logging.getLogger(__name__)
-    base_config = load_json_config(config_path)
-
-    # Prepare data once
-    trial_runner = OptunaTrialRunner(config_path)
-    objective = trial_runner.run_trial
-
-    # Hyperband for budget allocation across epochs
-    if pruner is None:
-        min_resource = base_config["training"]["hpo_min_epochs"]
-        max_resource = base_config["training"]["hpo_max_epochs"]
-        pruner = HyperbandPruner(min_resource=min_resource, max_resource=max_resource, reduction_factor=3)
-        logger.info(f"Using Hyperband pruner: min={min_resource} max={max_resource} r=3")
-
+    
+    if study_name is None:
+        study_name = f"lilan_hpo_{time.strftime('%Y%m%d_%H%M%S')}"
+    
+    # Initialize tuner
+    tuner = HyperparameterTuner(config_path)
+    
+    # Setup pruner
+    if use_hyperband:
+        base_config = load_json_config(config_path)
+        min_epochs = base_config["training"].get("hpo_min_epochs", 10)
+        max_epochs = base_config["training"].get("hpo_max_epochs", 100)
+        pruner = HyperbandPruner(
+            min_resource=min_epochs,
+            max_resource=max_epochs,
+            reduction_factor=3
+        )
+        logger.info(f"Using Hyperband pruner: min={min_epochs}, max={max_epochs}")
+    else:
+        pruner = None
+    
+    # Create study
     study = optuna.create_study(
         direction="minimize",
-        sampler=TPESampler(seed=42, n_startup_trials=5),
+        sampler=TPESampler(seed=42, n_startup_trials=10),
         pruner=pruner,
         study_name=study_name,
         storage=f"sqlite:///{study_name}.db",
         load_if_exists=True
     )
-
-    logger.info(f"Starting optimization: n_trials={n_trials}, n_jobs={n_jobs}")
-    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
-
+    
+    logger.info(f"Starting optimization: {n_trials} trials, {n_jobs} parallel jobs")
+    
+    # Run optimization
+    study.optimize(tuner.run_trial, n_trials=n_trials, n_jobs=n_jobs)
+    
     # Save results
     results_dir = Path("optuna_results")
     ensure_directories(results_dir)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-
-    best_config = study.best_trial.user_attrs.get("full_config", {})
-    if not best_config:
-        logger.warning("Could not retrieve full config from user_attrs.")
-
-    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    pruned    = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
-
-    epoch_distribution = {}
-    for t in completed + pruned:
-        n_epochs = t.user_attrs.get("n_epochs", "unknown")
-        epoch_distribution[n_epochs] = epoch_distribution.get(n_epochs, 0) + 1
-
-    best_results = {
+    
+    best_config = study.best_trial.user_attrs.get("config", {})
+    
+    # Compute statistics
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+    
+    results = {
+        "study_name": study_name,
         "best_value": study.best_value,
-        "best_params": study.best_trial.params,
+        "best_params": study.best_params,
         "best_config": best_config,
-        "n_trials_completed": len(completed),
-        "n_trials_pruned": len(pruned),
-        "epoch_distribution": epoch_distribution,
-        "best_trial_final_lr": study.best_trial.user_attrs.get("final_lr", "unknown"),
-        "study_db": f"{study_name}.db"
+        "best_trial_number": study.best_trial.number,
+        "n_trials_completed": len(completed_trials),
+        "n_trials_pruned": len(pruned_trials),
+        "n_trials_failed": len([t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-
-    save_json(best_results, results_dir / f"best_config_{study_name}_{timestamp}.json")
-
-    print("\n" + "="*60)
-    print("OPTIMIZATION COMPLETE")
-    print("="*60)
-    print(f"Best validation loss: {best_results['best_value']:.6f}")
-    print(f"Best trial final LR: {best_results['best_trial_final_lr']}")
-    print(f"Trials: {best_results['n_trials_completed']} completed, {best_results['n_trials_pruned']} pruned")
-    print("\nEpoch distribution:")
-    for epochs, count in sorted(epoch_distribution.items(), key=lambda x: (str(x[0]), x[1])):
-        print(f"  {epochs} epochs: {count} trials")
-    print("\nBest parameters:")
-    for key, value in best_results['best_params'].items():
+    
+    # Save results
+    results_file = results_dir / f"{study_name}_results.json"
+    save_json(results, results_file)
+    
+    # Print summary
+    print("\n" + "=" * 60)
+    print("HYPERPARAMETER OPTIMIZATION COMPLETE")
+    print("=" * 60)
+    print(f"Best validation loss: {results['best_value']:.6f}")
+    print(f"Best trial: #{results['best_trial_number']}")
+    print(f"Completed: {results['n_trials_completed']}, Pruned: {results['n_trials_pruned']}")
+    print("\nBest hyperparameters:")
+    for key, value in study.best_params.items():
         print(f"  {key}: {value}")
-
+    print(f"\nResults saved to: {results_file}")
+    
     return study
