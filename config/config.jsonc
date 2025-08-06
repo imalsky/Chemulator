@@ -2,15 +2,15 @@
   "paths": {
     "raw_data_files": [
       "data/raw/run9001-result.h5",
-      //"data/raw/run9002-result.h5",
-      //"data/raw/run9003-result.h5",
-      //"data/raw/run9004-result.h5",
-      //"data/raw/run9005-result.h5",
-      //"data/raw/run9006-result.h5",
-      //"data/raw/run9007-result.h5",
-      //"data/raw/run9008-result.h5",
-      //"data/raw/run9009-result.h5",
-      //"data/raw/run9010-result.h5"
+      "data/raw/run9002-result.h5",
+      "data/raw/run9003-result.h5",
+      "data/raw/run9004-result.h5",
+      "data/raw/run9005-result.h5",
+      "data/raw/run9006-result.h5",
+      "data/raw/run9007-result.h5",
+      "data/raw/run9008-result.h5",
+      "data/raw/run9009-result.h5",
+      "data/raw/run9010-result.h5"
     ],
     "processed_data_dir": "data/processed",
     "model_save_dir": "data/models",
@@ -33,12 +33,12 @@
 
     // Sequence-mode for lilian
     "sequence_mode": true,
-    "M_per_sample": 16,
+    "M_per_sample": 100,
     "time_sampling": { "uniform": 0.5, "log_spaced": 0.5 }
   },
 
   "preprocessing": {
-    "min_value_threshold": 1e-25,
+    "min_value_threshold": 1e-25
   },
 
   "normalization": {
@@ -59,10 +59,10 @@
     "encoder_layers": [1024, 1024, 1024, 1024],
     "decoder_layers": [256, 1024, 1024, 1024],
 
-    // Mixture and time-warp blocks (the code reads these)
     "mixture": { "K": 5 }, 
     "time_warp": { "enabled": true,
-                   "J_terms": 5 },
+                   "J_terms": 5,
+                   "hidden_dim": 64},
 
     "activation": "tanh",
     "dropout": 0.0
