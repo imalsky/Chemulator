@@ -1,227 +1,132 @@
 #!/usr/bin/env python3
 """
-Data normalization module for chemical kinetics datasets.
-Simplified version without ratio mode complexity.
-
-Key points:
-- In SEQUENCE MODE your pipeline already logs species once (x0_log, y_mat_log).
-  This helper will NOT apply a second log/exp when `inputs_already_logged=True`.
-- Time normalization is handled upstream (dataset). We skip time in sequence mode.
-- Means/stds/min/max tensors are precomputed once and reused (no per-call sorting/stacking).
+Config-driven data normalization module for chemical kinetics datasets.
+This helper can normalize arbitrary subsets of variables and handle
+multi-dimensional tensors, correctly interpreting the normalization
+scheme defined in the project's config file.
 """
 
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Tuple
 
-import numpy as np
 import torch
 
 
-DEFAULT_EPSILON = 1e-30
-DEFAULT_MIN_STD = 1e-10
-DEFAULT_CLAMP = 50.0
-
-
 class NormalizationHelper:
-    """Apply pre-computed normalization statistics to torch tensors."""
+    """
+    Applies pre-computed normalization statistics to torch tensors based on a
+    flexible, config-driven scheme.
+    """
     def __init__(self,
                  stats: Dict[str, Any],
                  device: torch.device,
-                 species_vars: List[str],
-                 global_vars: List[str],
-                 time_var: str,
-                 config: Optional[Dict[str, Any]] = None):
-
-        dtype_name = (config or {}).get("system", {}).get("dtype", "float32")
-        self.torch_dtype = torch.float64 if dtype_name == "float64" else torch.float32
+                 config: Dict[str, Any]):
 
         self.stats = stats
         self.device = device
-        self.species_vars = species_vars
-        self.global_vars = global_vars
-        self.time_var = time_var
-
-        self.n_species = len(species_vars)
-        self.n_globals = len(global_vars)
-
-        # From stats.json
-        self.methods = stats["normalization_methods"]            # per-key method names
-        self.per_key_stats = stats.get("per_key_stats", {})      # stats for species/globals
-
-        # Sequence mode: species in shards are already log10; time is normalized upstream
-        self.is_sequence_mode = bool(stats.get("time_normalization")) or \
-                                bool((config or {}).get("data", {}).get("sequence_mode", False))
-        # In sequence mode, inputs are already logged once; do NOT log again here.
-        self.inputs_already_logged = self.is_sequence_mode
-
-        # Scalars
-        self.epsilon = torch.tensor(
-            float(stats.get("epsilon", DEFAULT_EPSILON)),
-            dtype=self.torch_dtype,
-            device=self.device,
-        )
-        self.clamp_value = float(stats.get("clamp_value", DEFAULT_CLAMP))
-
+        self.config = config
+        self.norm_config = config.get("normalization", {})
         self.logger = logging.getLogger(__name__)
 
-        # Will be filled by _precompute_parameters()
-        self.norm_params: Dict[str, Dict[str, torch.Tensor]] = {}
-        self.method_groups: Dict[str, List[str]] = {}
-        self.col_indices: Dict[str, List[int]] = {}
-        self.params_by_method: Dict[str, Dict[str, torch.Tensor]] = {}
+        dtype_name = config.get("system", {}).get("dtype", "float32")
+        self.dtype = torch.float64 if dtype_name == "float64" else torch.float32
 
-        # Precompute per-method tensors and column orders
-        self._precompute_parameters()
+        # Load normalization parameters from the stats dictionary
+        self.methods = self.stats.get("normalization_methods", {})
+        self.per_key_stats = self.stats.get("per_key_stats", {})
 
-        # Cache constant 10.0 for pow10 operations
-        self._ten = torch.tensor(10.0, dtype=self.torch_dtype, device=self.device)
+        # --- FUNCTIONALITY PRESERVED ---
+        # This logic is critical for sequence mode, where the preprocessor has already
+        # applied the initial log10 transform. This flag prevents a double-log transform.
+        self.inputs_already_logged = bool(self.stats.get("time_normalization")) or \
+                                     bool(self.config.get("data", {}).get("sequence_mode", False))
+        if self.inputs_already_logged:
+            self.logger.info("NormalizationHelper running in 'inputs_already_logged' mode.")
 
-    def _precompute_parameters(self) -> None:
-        """Cache normalization parameters and column orders on device."""
-        self.method_groups = {"standard": [], "log-standard": [],
-                              "min-max": [], "log-min-max": [], "none": []}
+        # Load scalar values from the config for consistent behavior
+        self.epsilon = torch.tensor(self.norm_config.get("epsilon", 1e-30), dtype=self.dtype, device=self.device)
+        self.clamp_val = self.norm_config.get("clamp_value", 50.0)
+        self.min_std = self.norm_config.get("min_std", 1e-10)
+        
+        # Cache tensor for pow(10, x) operations for performance
+        self._ten = torch.tensor(10.0, dtype=self.dtype, device=self.device)
 
-        # Column positions in a profile: [species..., globals..., time]
-        all_order = self.species_vars + self.global_vars + [self.time_var]
-        var_to_col = {v: i for i, v in enumerate(all_order)}
-
-        # Build var -> params on device
-        for var, method in self.methods.items():
-            # Skip time normalization inside the helper in sequence mode (handled upstream)
-            if self.is_sequence_mode and var == self.time_var:
-                self.method_groups["none"].append(var)
-                continue
-
-            # Stats for time are stored in stats["time_normalization"], not in per_key_stats
-            # So if missing from per_key_stats, skip it here.
-            if method == "none" or var not in self.per_key_stats:
-                self.method_groups["none"].append(var)
-                continue
-
-            normalized = method.replace("_", "-")  # allow "log-standard" / "log-min-max"
-            vs = self.per_key_stats[var]
-            pars: Dict[str, torch.Tensor] = {"method": torch.tensor(0)}  # dummy holder
-
-            if "standard" in normalized:
-                k_mean = "log_mean" if "log" in normalized else "mean"
-                k_std = "log_std" if "log" in normalized else "std"
-                mean_t = torch.tensor(float(vs[k_mean]), dtype=self.torch_dtype, device=self.device)
-                std_t = torch.tensor(float(vs[k_std]), dtype=self.torch_dtype, device=self.device).clamp_min(DEFAULT_MIN_STD)
-                pars = {"mean": mean_t, "std": std_t}
-
-            elif "min-max" in normalized:
-                # Species/globals stats include min/max in per_key_stats (time uses separate dict; we skip time here)
-                min_t = torch.tensor(float(vs["min"]), dtype=self.torch_dtype, device=self.device)
-                max_t = torch.tensor(float(vs["max"]), dtype=self.torch_dtype, device=self.device)
-                pars = {"min": min_t, "max": max_t}
-
-            self.norm_params[var] = pars
-            self.method_groups.setdefault(normalized, []).append(var)
-
-        # Build sorted column indices per method and pre-stack parameters in column order
-        self.col_indices = {}
-        self.params_by_method = {}
-
-        for method, var_list in self.method_groups.items():
-            if not var_list or method == "none":
-                continue
-
-            cols = [var_to_col[v] for v in var_list]
-            order = np.argsort(cols)
-            cols_sorted = [cols[i] for i in order]
-            vars_sorted = [var_list[i] for i in order]
-            self.col_indices[method] = cols_sorted
-
-            pack: Dict[str, torch.Tensor] = {}
-            if "standard" in method:
-                means = torch.stack([self.norm_params[v]["mean"] for v in vars_sorted])
-                stds = torch.stack([self.norm_params[v]["std"] for v in vars_sorted]).clamp_min(DEFAULT_MIN_STD)
-                pack["mean"] = means
-                pack["std"] = stds
-
-            elif "min-max" in method:
-                mins = torch.stack([self.norm_params[v]["min"] for v in vars_sorted])
-                maxs = torch.stack([self.norm_params[v]["max"] for v in vars_sorted])
-                rng = (maxs - mins).clamp_min(self.epsilon)
-                pack["min"] = mins
-                pack["max"] = maxs
-                pack["range"] = rng
-
-            self.params_by_method[method] = pack
-
-    def normalize_profile(self, profile: torch.Tensor) -> torch.Tensor:
+    def _get_params(self, var_list: List[str]) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
         """
-        Normalize a data profile.
-
-        profile shape: [N, n_species + n_globals + 1]
-        - species first (already log10 in sequence mode),
-        - then globals,
-        - last column is time (skipped here in sequence mode).
+        Dynamically builds mean, std, and method lists for a given set of variables.
+        This allows the helper to be flexible and not tied to a fixed data layout.
         """
-        if profile.device != self.device or profile.dtype != self.torch_dtype:
-            profile = profile.to(device=self.device, dtype=self.torch_dtype)
+        means, stds, methods = [], [], []
 
-        norm = profile.clone()
+        for var in var_list:
+            method = self.methods.get(var, "none")
+            s = self.per_key_stats.get(var, {})
+            
+            mean, std = 0.0, 1.0
+            if method == "log-standard":
+                mean = s.get("log_mean", 0.0)
+                std = s.get("log_std", 1.0)
+            elif method == "standard":
+                mean = s.get("mean", 0.0)
+                std = s.get("std", 1.0)
+            
+            means.append(mean)
+            stds.append(std)
+            methods.append(method)
 
-        for method, cols in self.col_indices.items():
-            if not cols:
-                continue
+        means_t = torch.tensor(means, dtype=self.dtype, device=self.device)
+        stds_t = torch.tensor(stds, dtype=self.dtype, device=self.device).clamp_min(self.min_std)
+        
+        return means_t, stds_t, methods
 
-            slice_ = norm[:, cols]  # [N, K]
-
-            if "standard" in method:
-                means = self.params_by_method[method]["mean"]  # [K]
-                stds = self.params_by_method[method]["std"]    # [K]
-                if "log" in method and not self.inputs_already_logged:
-                    data = torch.log10(torch.clamp(slice_, min=self.epsilon))
-                else:
-                    data = slice_
-                norm[:, cols] = torch.clamp((data - means) / stds,
-                                            -self.clamp_value, self.clamp_value)
-
-            elif "min-max" in method:
-                mins = self.params_by_method[method]["min"]     # [K]
-                rng = self.params_by_method[method]["range"]    # [K]
-                if "log" in method and not self.inputs_already_logged:
-                    data = torch.log10(torch.clamp(slice_, min=self.epsilon))
-                else:
-                    data = slice_
-                norm[:, cols] = torch.clamp((data - mins) / rng, 0.0, 1.0)
-
-        return norm
-
-    def denormalize_profile(self, profile: torch.Tensor) -> torch.Tensor:
+    def normalize(self, data: torch.Tensor, var_list: List[str]) -> torch.Tensor:
         """
-        Denormalize a data profile.
-
-        In sequence mode, species/globals are often kept in log space end-to-end.
-        This function will NOT exponentiate if inputs are already logged (to avoid double-exp).
+        Normalizes data according to the scheme for the given list of variables.
+        Handles multi-dimensional tensors by operating on the last dimension.
         """
-        if profile.device != self.device or profile.dtype != self.torch_dtype:
-            profile = profile.to(device=self.device, dtype=self.torch_dtype)
+        if data.shape[-1] != len(var_list):
+            raise ValueError(f"Data's last dimension ({data.shape[-1]}) must match var_list length ({len(var_list)})")
+        
+        # Ensure data is on the correct device and dtype
+        if data.device != self.device or data.dtype != self.dtype:
+            data = data.to(device=self.device, dtype=self.dtype)
 
-        denorm = profile.clone()
+        # Get normalization parameters for this specific list of variables
+        means, stds, methods = self._get_params(var_list)
+        
+        # Start with a copy to avoid modifying the original tensor
+        norm_data = data.clone()
 
-        for method, cols in self.col_indices.items():
-            if not cols:
-                continue
+        # Step 1: Apply log transform where specified, respecting 'inputs_already_logged'
+        for i, method in enumerate(methods):
+            if "log" in (method or "") and not self.inputs_already_logged:
+                norm_data[..., i] = torch.log10(norm_data[..., i].clamp_min(self.epsilon))
 
-            slice_ = denorm[:, cols]
+        # Step 2: Apply standardization (vectorized for performance)
+        norm_data = (norm_data - means) / stds
+        
+        # Step 3: Clamp the final values to prevent outliers
+        return torch.clamp(norm_data, -self.clamp_val, self.clamp_val)
 
-            if "standard" in method:
-                means = self.params_by_method[method]["mean"]
-                stds = self.params_by_method[method]["std"].clamp_min(DEFAULT_MIN_STD)
-                raw = slice_ * stds + means
-                if "log" in method and not self.inputs_already_logged:
-                    raw = torch.pow(self._ten, torch.clamp(raw, min=-38.0, max=38.0))
-                denorm[:, cols] = torch.clamp(raw, min=-3.4e38, max=3.4e38)
+    def denormalize(self, data: torch.Tensor, var_list: List[str]) -> torch.Tensor:
+        """
+        Denormalizes data according to the scheme for the given variables.
+        Handles multi-dimensional tensors and respects 'inputs_already_logged'.
+        """
+        if data.shape[-1] != len(var_list):
+            raise ValueError(f"Data's last dimension ({data.shape[-1]}) must match var_list length ({len(var_list)})")
 
-            elif "min-max" in method:
-                mins = self.params_by_method[method]["min"]
-                rng = self.params_by_method[method]["range"]
-                raw = slice_ * rng + mins
-                if "log" in method and not self.inputs_already_logged:
-                    raw = torch.pow(self._ten, torch.clamp(raw, min=-38.0, max=38.0))
-                denorm[:, cols] = raw
+        if data.device != self.device or data.dtype != self.dtype:
+            data = data.to(device=self.device, dtype=self.dtype)
 
-        return denorm
+        means, stds, methods = self._get_params(var_list)
+        
+        # Step 1: Invert standardization (vectorized)
+        denorm_data = data * stds + means
+
+        # Step 2: Invert log transform where specified, respecting 'inputs_already_logged'
+        for i, method in enumerate(methods):
+            if "log" in (method or "") and not self.inputs_already_logged:
+                denorm_data[..., i] = torch.pow(self._ten, denorm_data[..., i])
+                
+        return denorm_data

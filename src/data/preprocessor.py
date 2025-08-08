@@ -638,69 +638,94 @@ class DataPreprocessor:
         )
     
     def _collect_normalization_stats(self) -> Dict[str, Any]:
-        """Collect normalization statistics using chunked reading."""
+        """
+        Collects normalization statistics for all specified variables using a
+        config-driven approach. It respects the 'default_method' and per-variable
+        overrides in the 'methods' dictionary from the config.
+        """
+        self.logger.info("Collecting normalization statistics based on config...")
         stats: Dict[str, Any] = {"per_key_stats": {}, "normalization_methods": {}}
         accumulators: Dict[str, Dict[str, float]] = {}
-        
-        for var in self.config["data"]["species_variables"] + self.config["data"]["global_variables"]:
+
+        # --- Step 1: Read normalization settings from the main config ---
+        norm_cfg = self.config["normalization"]
+        default_method = norm_cfg.get("default_method", "log-standard")
+        methods_override = norm_cfg.get("methods", {})
+        all_vars = self.config["data"]["species_variables"] + self.config["data"]["global_variables"]
+
+        for var in all_vars:
             accumulators[var] = {
-                "count": 0,
-                "mean": 0.0,
-                "m2": 0.0,
-                "min": float("inf"),
-                "max": float("-inf"),
+                "count": 0, "mean": 0.0, "m2": 0.0,
+                "min": float("inf"), "max": float("-inf"),
             }
-        
-        reader = ChunkedHDF5Reader(self.raw_files[0] if self.raw_files else None, 
-                                  self.config["preprocessing"].get("hdf5_chunk_size", 10000))
-        
-        # Process each file
+
+        reader = ChunkedHDF5Reader(self.raw_files[0] if self.raw_files else None,
+                                self.config["preprocessing"].get("hdf5_chunk_size", 10000))
+
+        # --- Step 2: Iterate through data and accumulate stats in the correct space ---
+        self.logger.info("Processing raw data files to accumulate statistics...")
         for file_path in self.raw_files:
             with h5py.File(file_path, "r") as f:
                 for gname in f.keys():
                     grp = f[gname]
-                    
-                    # Species variables
-                    for var in self.config["data"]["species_variables"]:
-                        if var in grp:
-                            data = reader.read_dataset_chunked(grp, var)
-                            log_data = np.log10(np.maximum(data, 1e-30))
-                            self._update_accumulator(accumulators[var], log_data)
-                    
-                    # Global variables
-                    for var in self.config["data"]["global_variables"]:
-                        if var in grp.attrs:
-                            val = float(grp.attrs[var])
-                            self._update_accumulator(accumulators[var], np.array([val]))
-        
-        # Finalize statistics
+                    for var in all_vars:
+                        # Determine the normalization method for this specific variable
+                        var_method = methods_override.get(var, default_method)
+
+                        # Get the raw data from either dataset or attribute
+                        data = None
+                        if var in self.config["data"]["species_variables"]:
+                            if var in grp:
+                                data = reader.read_dataset_chunked(grp, var)
+                        elif var in self.config["data"]["global_variables"]:
+                            if var in grp.attrs:
+                                data = np.array([float(grp.attrs[var])])
+                        
+                        if data is None:
+                            continue # Skip if variable not found in this group
+
+                        # Apply log transform ONLY if specified by the determined method
+                        if "log" in var_method:
+                            # Use the epsilon from the config for consistency
+                            eps = norm_cfg.get("epsilon", 1e-30)
+                            data_to_process = np.log10(np.maximum(data, eps))
+                        else:
+                            data_to_process = data
+
+                        self._update_accumulator(accumulators[var], data_to_process)
+
+        # --- Step 3: Finalize statistics and structure the output dictionary ---
+        self.logger.info("Finalizing statistics and creating normalization.json content...")
         for var, acc in accumulators.items():
             if acc["count"] > 0:
+                var_method = methods_override.get(var, default_method)
+                stats["normalization_methods"][var] = var_method
+
                 mean = acc["mean"]
                 variance = acc["m2"] / (acc["count"] - 1) if acc["count"] > 1 else 0.0
                 std = float(np.sqrt(variance))
-                
-                if var in self.config["data"]["species_variables"]:
-                    stats["normalization_methods"][var] = "log-standard"
-                    stats["per_key_stats"][var] = {
-                        "method": "log-standard",
-                        "log_mean": float(mean),
-                        "log_std": float(max(std, 1e-10)),
-                        "min": float(acc["min"]),
-                        "max": float(acc["max"]),
-                    }
-                else:
-                    stats["normalization_methods"][var] = "standard"
-                    stats["per_key_stats"][var] = {
-                        "method": "standard",
-                        "mean": float(mean),
-                        "std": float(max(std, 1e-10)),
-                        "min": float(acc["min"]),
-                        "max": float(acc["max"]),
-                    }
-        
+                min_std = norm_cfg.get("min_std", 1e-10)
+
+                # This block will contain the stats for the given variable
+                stat_block = {
+                    "method": var_method,
+                    # Note: min/max are of the *transformed* data (e.g., in log space if applicable)
+                    "min": float(acc["min"]),
+                    "max": float(acc["max"]),
+                }
+
+                # Add mean/std keys conditionally with the correct prefix ('log_' or '')
+                if "standard" in var_method:
+                    key_prefix = "log_" if "log" in var_method else ""
+                    stat_block[f"{key_prefix}mean"] = float(mean)
+                    stat_block[f"{key_prefix}std"] = float(max(std, min_std))
+
+                stats["per_key_stats"][var] = stat_block
+
+        # Time normalization is handled separately and is not part of this loop
         stats["normalization_methods"][self.config["data"]["time_variable"]] = "log-min-max"
         
+        self.logger.info("Normalization statistics collection complete.")
         return stats
     
     def _update_accumulator(self, acc: Dict[str, float], data: np.ndarray):

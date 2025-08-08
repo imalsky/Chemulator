@@ -151,7 +151,6 @@ class HyperparameterTuner:
                 "enabled": True,
                 "J_terms": trial.suggest_categorical("J_terms", [2, 3, 4, 5]),
                 "hidden_dim": trial.suggest_categorical("hidden_dim", [64, 128, 256])
-
             }
         else:
             cfg["model"]["time_warp"] = {"enabled": False}
@@ -174,8 +173,14 @@ class HyperparameterTuner:
         # Regularization for mixtures
         if model_type == "linear_latent_mixture":
             cfg["training"]["regularization"] = {
-                "lambda_entropy": trial.suggest_float("lambda_entropy", 0.0, 0.1, step=0.01),
-                "lambda_diversity": trial.suggest_float("lambda_diversity", 0.0, 0.1, step=0.01),
+                "lambda_entropy": trial.suggest_float("lambda_entropy", 0.0, 0.0, step=0.01),
+                "lambda_diversity": trial.suggest_float("lambda_diversity", 0.0, 0.0, step=0.01),
+            }
+        else:
+            # Ensure regularization is set to zero for non-mixture models
+            cfg["training"]["regularization"] = {
+                "lambda_entropy": 0.0,
+                "lambda_diversity": 0.0,
             }
         
         return cfg
@@ -213,10 +218,9 @@ class HyperparameterTuner:
                 f"batch={config['training']['batch_size']}"
             )
 
-
             # build fresh datasets per worker to avoid CUDA-tensor pickling issues
             train_dataset = SequenceDataset(self.processed_dir, "train", config, self.device, self.norm_stats)
-            val_dataset   = SequenceDataset(self.processed_dir, "validation", config, self.device, self.norm_stats)
+            val_dataset = SequenceDataset(self.processed_dir, "validation", config, self.device, self.norm_stats)
 
             trainer = PrunableTrainer(
                 model=model,
@@ -229,8 +233,6 @@ class HyperparameterTuner:
                 norm_helper=self.norm_helper,
                 epoch_callback=pruning_callback
             )
-
-
             
             # Train and get best validation loss
             best_val_loss = trainer.train()
@@ -272,9 +274,21 @@ class PrunableTrainer(Trainer):
         """Training loop with pruning support."""
         best_train_loss = float("inf")
         
+        # Mixture temperature schedule (optional)
+        mix_sched = self.train_config.get("mixture_temperature_schedule", {})
+        t_start = float(mix_sched.get("start", 1.0))
+        t_end = float(mix_sched.get("end", 0.3))
+        t_anneal_frac = float(mix_sched.get("anneal_frac", 0.6))
+        
         for epoch in range(1, self.train_config["epochs"] + 1):
             self.current_epoch = epoch
             epoch_start = time.time()
+            
+            # Update gate temperature if model supports it
+            if hasattr(self.model, "set_gate_temperature") and self.model.K > 1:
+                progress = min(1.0, (epoch - 1) / max(1, int(self.train_config["epochs"] * t_anneal_frac)))
+                temp = t_start + (t_end - t_start) * progress
+                self.model.set_gate_temperature(temp)
             
             # Training epoch
             train_loss, train_metrics = self._train_epoch()
