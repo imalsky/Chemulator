@@ -12,6 +12,7 @@ from typing import Dict, Any, Tuple, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
@@ -217,41 +218,53 @@ class Trainer:
         self.criterion = nn.MSELoss()
     
     def _setup_amp(self):
-        """Setup automatic mixed precision."""
+        """Configure PyTorch AMP and gradient-scaler logic."""
         if self.dtype == torch.float64:
             self.use_amp = False
-            self.scaler = GradScaler(enabled=False)
             self.amp_dtype = None
+            self.scaler = GradScaler(enabled=False)
             return
-        
+
         self.use_amp = self.train_config.get("use_amp", True)
         dtype_str = str(self.train_config.get("amp_dtype", "bfloat16")).lower()
-        self.amp_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float16
-        
-        # GradScaler only for float16
-        self.scaler = GradScaler(enabled=(self.use_amp and self.amp_dtype == torch.float16))
+
+        if dtype_str == "bfloat16":
+            self.amp_dtype = torch.bfloat16
+        elif dtype_str in {"float32", "fp32"}:
+            self.amp_dtype = torch.float32
+        else:
+            self.logger.warning(f"Unknown amp_dtype '{dtype_str}', defaulting to float32")
+            self.amp_dtype = torch.float32
+
+        # Enable GradScaler for float-32 autocast (common) or for fp16 if you add it later.
+        enable_scaler = self.amp_dtype == torch.float16
+        self.scaler = GradScaler(enabled=enable_scaler)
     
-    def _compute_loss(self, outputs: torch.Tensor, targets: torch.Tensor, 
-                     inputs: torch.Tensor) -> torch.Tensor:
-        """Compute loss with regularization."""
-        # MSE loss
-        loss = self.criterion(outputs, targets)
+    def _compute_loss(self, preds: torch.Tensor, targets: torch.Tensor, 
+                     reg_losses: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
+        """
+        Compute total loss including regularization.
         
-        # Add regularization losses if available
-        if hasattr(self.model, 'get_regularization_losses'):
-            reg_losses = self.model.get_regularization_losses(inputs)
+        Args:
+            preds: Model predictions
+            targets: Target values
+            reg_losses: Dictionary of regularization losses
             
-            # Gate entropy
-            if 'entropy_loss' in reg_losses:
-                lambda_entropy = self.train_config.get("regularization", {}).get("lambda_entropy", 0.01)
-                if lambda_entropy > 0:
-                    loss = loss + lambda_entropy * reg_losses['entropy_loss']
-            
-            # Generator diversity
-            if 'generator_diversity' in reg_losses:
-                lambda_diversity = self.train_config.get("regularization", {}).get("lambda_diversity", 0.01)
-                if lambda_diversity > 0:
-                    loss = loss + lambda_diversity * reg_losses['generator_diversity']
+        Returns:
+            Total loss (scalar tensor)
+        """
+        reg_losses = reg_losses or {}
+        mse = F.mse_loss(preds, targets)
+        
+        # Get regularization lambdas from config
+        lambdas = self.train_config.get("regularization", {})
+        lambda_entropy = lambdas.get("lambda_entropy", 0.0)
+        lambda_diversity = lambdas.get("lambda_diversity", 0.0)
+        
+        # Total loss
+        loss = mse
+        loss = loss + lambda_entropy * reg_losses.get("gate_kl_to_uniform", 0.0)
+        loss = loss + lambda_diversity * reg_losses.get("generator_similarity", 0.0)
         
         return loss
     
@@ -343,64 +356,58 @@ class Trainer:
                     self._save_best_model()
         
     def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
-        """Train for one epoch with correct gradient-accumulation scaling."""
+        """Train for one epoch with proper gradient-accumulation scaling."""
         self.model.train()
-        total_loss    = 0.0
+        total_loss = 0.0
         total_samples = 0
 
-        k         = self.gradient_accumulation_steps
+        k = self.gradient_accumulation_steps
         n_batches = len(self.train_loader)
 
         for batch_idx, (inputs, targets) in enumerate(self.train_loader):
             # Move to device if necessary
             if inputs.device != self.device:
-                inputs   = inputs.to(self.device, non_blocking=True)
-                targets  = targets.to(self.device, non_blocking=True)
+                inputs = inputs.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
 
-            # Forward pass
-            with autocast(
-                device_type=self.device.type,
-                enabled=self.use_amp,
-                dtype = self.amp_dtype,
-            ):
-                outputs   = self.model(inputs)
-                loss_raw  = self._compute_loss(outputs, targets, inputs)
+            # ── Forward ─────────────────────────────────────────────────────────
+            with autocast(device_type=self.device.type,
+                          enabled=self.use_amp,
+                          dtype=self.amp_dtype):
+                # Model now returns tuple (predictions, auxiliary_data)
+                preds, aux = self.model(inputs)
+                
+                # Get regularization losses from model
+                reg_losses = self.model.get_regularization_losses(aux) if hasattr(self.model, 'get_regularization_losses') else {}
+                
+                # Compute total loss
+                loss_raw = self._compute_loss(preds, targets, reg_losses)
 
-            # Backward pass on the unscaled loss. We will average the gradients later.
+            # Determine how many micro-batches belong to *this* accumulation window
+            window_start = (batch_idx // k) * k
+            window_end = min(window_start + k, n_batches)
+            R = window_end - window_start  # 1 ≤ R ≤ k
+
+            # ── Back-prop (scale by R) ─────────────────────────────────────────
+            loss = loss_raw / R
             if self.scaler.is_enabled():
-                self.scaler.scale(loss_raw).backward()
+                self.scaler.scale(loss).backward()
             else:
-                loss_raw.backward()
+                loss.backward()
 
-            # Check if it's time to step the optimizer
+            # ── Step? ───────────────────────────────────────────────────────────
             is_last_batch = (batch_idx + 1) == n_batches
-            window_full   = ((batch_idx + 1) % k == 0)
+            window_full = ((batch_idx + 1) % k == 0)
 
             if window_full or is_last_batch:
-                # --- CORRECTNESS FIX: Manual Gradient Averaging ---
-                # Determine the number of micro-batches in this step's window
-                if is_last_batch and n_batches % k != 0:
-                    num_micro_batches = n_batches % k
-                else:
-                    num_micro_batches = k
-                
-                # Unscale gradients before we manipulate them
+                # Unscale before clipping / stepping
                 if self.scaler.is_enabled():
                     self.scaler.unscale_(self.optimizer)
-                
-                # Manually average the gradients across the window
-                if num_micro_batches > 1:
-                    for param in self.model.parameters():
-                        if param.grad is not None:
-                            param.grad.div_(num_micro_batches)
-                # --------------------------------------------------
 
-                # Optional grad-clip (applied to the now-averaged gradients)
                 clip_val = self.train_config.get("gradient_clip", 0.0)
                 if clip_val > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_val)
 
-                # Optimizer step
                 if self.scaler.is_enabled():
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -414,14 +421,13 @@ class Trainer:
 
                 self.global_step += 1
 
-            # Accumulate statistics using the raw, unscaled loss
-            batch_size   = inputs.size(0)
-            total_loss  += loss_raw.item() * batch_size
-            total_samples += batch_size
+            # ── Metrics ────────────────────────────────────────────────────────
+            batch_sz = inputs.size(0)
+            total_loss += loss_raw.item() * batch_sz
+            total_samples += batch_sz
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
         return avg_loss, {}
-
     
     @torch.inference_mode()
     def _validate(self) -> Tuple[float, Dict[str, float]]:
@@ -439,8 +445,14 @@ class Trainer:
                 targets = targets.to(self.device, non_blocking=True)
             
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-                outputs = self.model(inputs)
-                loss = self._compute_loss(outputs, targets, inputs)
+                # Model now returns tuple (predictions, auxiliary_data)
+                preds, aux = self.model(inputs)
+                
+                # Get regularization losses from model
+                reg_losses = self.model.get_regularization_losses(aux) if hasattr(self.model, 'get_regularization_losses') else {}
+                
+                # Compute total loss
+                loss = self._compute_loss(preds, targets, reg_losses)
             
             batch_size = inputs.size(0)
             total_loss += loss.item() * batch_size
@@ -466,8 +478,14 @@ class Trainer:
                 targets = targets.to(self.device, non_blocking=True)
             
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-                outputs = self.model(inputs)
-                loss = self._compute_loss(outputs, targets, inputs)
+                # Model now returns tuple (predictions, auxiliary_data)
+                preds, aux = self.model(inputs)
+                
+                # Get regularization losses from model
+                reg_losses = self.model.get_regularization_losses(aux) if hasattr(self.model, 'get_regularization_losses') else {}
+                
+                # Compute total loss
+                loss = self._compute_loss(preds, targets, reg_losses)
             
             batch_size = inputs.size(0)
             total_loss += loss.item() * batch_size
