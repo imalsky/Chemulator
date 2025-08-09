@@ -441,7 +441,8 @@ class CorePreprocessor:
 
                 n_t = grp[self.time_var].shape[0]
                 local_time_points += int(n_t)
-                if n_t <= self.M_per_sample:
+                # Only require 2 raw points to enable interpolation on [t_min, t_max]
+                if n_t < 2:
                     if self.stats_logger:
                         self.stats_logger.stats.dropped_insufficient_time += 1
                     local_stats.dropped_insufficient_time += 1

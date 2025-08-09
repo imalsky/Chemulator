@@ -197,18 +197,18 @@ class SequenceDataset(Dataset):
         for shard in self.shards:
             shard_path = self.split_dir / shard["filename"]
             with np.load(shard_path, allow_pickle=False) as data:
-                x0_log   = torch.from_numpy(data["x0_log"].astype(self.np_dtype))   # [N, S]
-                g_vec    = torch.from_numpy(data["globals"].astype(self.np_dtype))  # [N, G]
-                t_vec_np = data["t_vec"]                                            # [N, M] (numpy)
-                y_log    = torch.from_numpy(data["y_mat"].astype(self.np_dtype))    # [N, M, T_or_S]
+                x0_log   = torch.from_numpy(data["x0_log"].astype(self.np_dtype))   # [N, S] (log10)
+                g_vec    = torch.from_numpy(data["globals"].astype(self.np_dtype))  # [N, G] (raw)
+                t_vec_np = data["t_vec"]                                            # [N, M]
+                y_log    = torch.from_numpy(data["y_mat"].astype(self.np_dtype))    # [N, M, T] (log10)
 
-                t_norm_np = self._normalize_time(t_vec_np).astype(self.np_dtype)    # [N, M]
+                t_norm_np = self._normalize_time(t_vec_np).astype(self.np_dtype)
                 t_norm    = torch.from_numpy(t_norm_np)
 
                 if self.norm_helper:
-                    x0_n = self.norm_helper.normalize(x0_log, self.species_vars)
-                    g_n  = self.norm_helper.normalize(g_vec,  self.global_vars)
-                    y_n  = self.norm_helper.normalize(y_log,  self.target_vars)
+                    x0_n = self.norm_helper.normalize(x0_log, self.species_vars)  # species are already log10
+                    g_n  = self.norm_helper.normalize(g_vec,  self.global_vars)   # pass RAW; helper logs if needed
+                    y_n  = self.norm_helper.normalize(y_log,  self.target_vars)   # targets already log10
                 else:
                     x0_n, g_n, y_n = x0_log, g_vec, y_log
 
@@ -251,17 +251,15 @@ class SequenceDataset(Dataset):
         t_np      = raw["t_vec"][local_idx]                                     # [M]
         y_log_np  = raw["y_mat"][local_idx].astype(self.np_dtype, copy=False)   # [M, T]
 
-        x0_log = torch.from_numpy(x0_log_np)                                    # [S]
-        g_vec  = torch.from_numpy(g_np)                                         # [G]
-        t_norm = torch.from_numpy(self._normalize_time(t_np).astype(self.np_dtype, copy=False))  # [M]
-        y_log  = torch.from_numpy(y_log_np)                                     # [M, T]
+        x0_log = torch.from_numpy(x0_log_np)                                    # [S] (log10)
+        g_vec  = torch.from_numpy(g_np)                                         # [G] (raw)
+        t_norm = torch.from_numpy(self._normalize_time(t_np).astype(self.np_dtype, copy=False))
+        y_log  = torch.from_numpy(y_log_np)                                     # [M, T] (log10)
 
         if self.norm_helper:
-            # add batch dims where appropriate
-            x0_n = self.norm_helper.normalize(x0_log.unsqueeze(0), self.species_vars).squeeze(0)  # [S]
-            g_n  = self.norm_helper.normalize(g_vec.unsqueeze(0),  self.global_vars).squeeze(0)   # [G]
-            # For [M, T], treat M as batch and normalize across T
-            y_n  = self.norm_helper.normalize(y_log, self.target_vars)                             # [M, T]
+            x0_n = self.norm_helper.normalize(x0_log.unsqueeze(0), self.species_vars).squeeze(0)
+            g_n  = self.norm_helper.normalize(g_vec.unsqueeze(0),  self.global_vars).squeeze(0)  # RAW in, helper logs
+            y_n  = self.norm_helper.normalize(y_log, self.target_vars)
         else:
             x0_n, g_n, y_n = x0_log, g_vec, y_log
 

@@ -32,8 +32,8 @@
     "time_variable": "t_time",
 
     "sequence_mode": true,
-    "M_per_sample": 99,
-    "time_sampling": { "uniform": 0.5, "log_spaced": 0.5 }
+    "M_per_sample": 128,
+    "time_sampling": {"uniform": 0.2, "log_spaced": 0.8}
   },
 
   "preprocessing": {
