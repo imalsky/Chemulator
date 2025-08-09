@@ -2,15 +2,15 @@
   "paths": {
     "raw_data_files": [
       "data/raw/run9001-result.h5",
-      "data/raw/run9002-result.h5",
-      "data/raw/run9003-result.h5",
-      "data/raw/run9004-result.h5",
-      "data/raw/run9005-result.h5",
-      "data/raw/run9006-result.h5",
-      "data/raw/run9007-result.h5",
-      "data/raw/run9008-result.h5",
-      "data/raw/run9009-result.h5",
-      "data/raw/run9010-result.h5"
+      //"data/raw/run9002-result.h5",
+      //"data/raw/run9003-result.h5",
+      //"data/raw/run9004-result.h5",
+      //"data/raw/run9005-result.h5",
+      //"data/raw/run9006-result.h5",
+      //"data/raw/run9007-result.h5",
+      //"data/raw/run9008-result.h5",
+      //"data/raw/run9009-result.h5",
+      //"data/raw/run9010-result.h5"
     ],
     "processed_data_dir": "data/processed",
     "model_save_dir": "data/models",
@@ -32,7 +32,7 @@
     "time_variable": "t_time",
 
     "sequence_mode": true,
-    "M_per_sample": 32,
+    "M_per_sample": 99,
     "time_sampling": { "uniform": 0.5, "log_spaced": 0.5 }
   },
 
@@ -40,9 +40,9 @@
     "min_value_threshold": 1e-28,
     "num_workers": 8,
     "hdf5_chunk_size": 65536,
-    "target_shard_bytes": 1000000000,
+    "target_shard_bytes": 100000000,
     "npz_compressed": false,
-    "time_hist_bins": 4096
+    "time_hist_bins": 99
   },
 
   "normalization": {
@@ -79,26 +79,24 @@
     "mixture_temperature_schedule": { "start": 1.0, "end": 0.3, "anneal_frac": 0.6 },
 
     "epochs": 100,
-    "batch_size": 4096,
+    "batch_size": 512,
     "gradient_accumulation_steps": 1,
 
     "gpu_cache_dataset": "auto",
 
-    "num_workers": 0,
-    "prefetch_factor": null,
-
-    "optimizer": "lion",
+    "optimizer": "AdamW",
     "learning_rate": 1e-4,
-    "weight_decay": 1e-7,
+    "weight_decay": 1e-5,
     "betas": [0.9, 0.999],
     "eps": 1e-8,
-    "gradient_clip": 5.0,
+    "gradient_clip": 2.0,
 
     "scheduler": "cosine",
     "scheduler_params": { "T_0": 100, "T_mult": 2, "eta_min": 1e-8 },
 
-    "use_amp": true,
-    "amp_dtype": "bfloat16",
+    "use_amp": false,
+    //"amp_dtype": "bfloat16",
+    "amp_dtype": "float32",
 
     "early_stopping_patience": 5000,
     "min_delta": 1e-8,

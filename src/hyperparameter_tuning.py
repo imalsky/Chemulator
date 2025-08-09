@@ -43,7 +43,7 @@ HPO_SEED: int = 42
 HPO_STUDY_PREFIX: str = "lilan_hpo"
 
 # Hyperband resource bounds (fallbacks if training.hpo_* not in config)
-HPO_DEFAULT_MIN_EPOCHS: int = 5
+HPO_DEFAULT_MIN_EPOCHS: int = 10
 HPO_DEFAULT_MAX_EPOCHS: int = 50
 HPO_REDUCTION_FACTOR: int = 4  # aggressive down-selection
 
