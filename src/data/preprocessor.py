@@ -291,7 +291,7 @@ class CorePreprocessor:
         """Sample M time points according to time_sampling config."""
         if isinstance(self.time_sampling, dict):
             uniform_frac = float(self.time_sampling.get("uniform", 0.5))
-            log_frac = float(self.time_sampling.get("log_spaced", 0.5))
+            log_frac     = float(self.time_sampling.get("log_spaced", 0.5))
 
             if (uniform_frac + log_frac) <= 0.0:
                 self.logger.warning("time_sampling fractions sum to 0; defaulting to uniform")
@@ -300,20 +300,28 @@ class CorePreprocessor:
             Mu = int(round(self.M_per_sample * uniform_frac))
             Ml = self.M_per_sample - Mu
 
-            out = []
+            # strictly positive for geometric spacing
+            eps = 1e-12 * max(1.0, abs(t_min))
+            a = max(t_min, eps)
+            b = max(a * (1.0 + 1e-12), t_max)
+
+            parts = []
             if Mu > 0:
-                out.append(np.linspace(t_min, t_max, Mu, dtype=np.float64))
+                # avoid duplicating the upper endpoint (geomspace will include it)
+                parts.append(np.linspace(a, b, Mu, endpoint=False, dtype=np.float64))
             if Ml > 0:
-                # log-spaced on [t_min + eps, t_max]
-                eps = 1e-12 * max(1.0, abs(t_min))
-                a = max(t_min + eps, eps)
-                b = max(a, t_max)
-                # logspace in tau, then back to t
-                ls = np.logspace(0.0, 1.0, Ml, base=10.0, dtype=np.float64)
-                out.append(a + (b - a) * (ls - 1.0) / 9.0)
-            return np.sort(np.concatenate(out).astype(self.np_dtype))
+                parts.append(np.geomspace(a, b, Ml, dtype=np.float64))
+
+            t = np.unique(np.concatenate(parts))
+            # ensure exactly M points
+            if t.size < self.M_per_sample:
+                extra = np.geomspace(a, b, self.M_per_sample, dtype=np.float64)
+                t = np.unique(np.concatenate([t, extra]))[: self.M_per_sample]
+            elif t.size > self.M_per_sample:
+                t = t[: self.M_per_sample]
+
+            return t.astype(self.np_dtype)
         else:
-            # assume fraction (uniform)
             return np.linspace(t_min, t_max, self.M_per_sample, dtype=self.np_dtype)
 
     # -------------------
@@ -463,19 +471,18 @@ class CorePreprocessor:
                 t_min, t_max = float(time_data.min()), float(time_data.max())
                 sampled_times = self._sample_times(t_min, t_max)
 
-                # nearest neighbor indices
-                pos = np.searchsorted(time_data, sampled_times, side="left")
-                pos = np.clip(pos, 1, len(time_data) - 1)
-                prev = pos - 1
-                choose_prev = np.abs(sampled_times - time_data[prev]) <= np.abs(time_data[pos] - sampled_times)
-                time_indices = np.where(choose_prev, prev, pos).astype(np.int64)
+                # --- log–log interpolation onto the requested times ---
+                eps    = float(self.norm_cfg.get("epsilon", 1e-30))
+                log_t  = np.log10(np.maximum(time_data, eps))            # original grid (monotonic)
+                log_tq = np.log10(np.maximum(sampled_times, eps))        # requested grid
+                log_y  = np.log10(np.maximum(species_mat, eps))          # [Nt, T] in log10
 
-                # log-transforms
-                eps = float(self.norm_cfg.get("epsilon", 1e-30))
+                y_mat_log = np.empty((len(sampled_times), self.n_target_species), dtype=self.np_dtype)
+                for j in range(self.n_target_species):
+                    y_mat_log[:, j] = np.interp(log_tq, log_t, log_y[:, j])
+
                 x0_log = np.log10(np.maximum(x0, eps))
-                y_mat = species_mat[time_indices, :]
-                y_mat_log = np.log10(np.maximum(y_mat, eps))
-                t_vec = time_data[time_indices]
+                t_vec  = sampled_times.astype(self.np_dtype)   
 
                 # seeded split
                 split_hash = int(hashlib.sha256(f"{seed}:{gname}:split".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
