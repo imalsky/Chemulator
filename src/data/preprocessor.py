@@ -2,7 +2,7 @@
 """
 Chemical kinetics data preprocessor with sequence mode support for LiLaN.
 Improvements:
-- Streaming, two-pass time stats (no giant concatenations)
+- Streaming, two-pass time stats
 - Vectorized Welford accumulators (no Python per-element loops)
 - Optional multi-process fan-out (per-file) using ProcessPoolExecutor
 - Configurable shard compression and size preserved
@@ -15,24 +15,14 @@ import hashlib
 import json
 import logging
 import math
-import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
+from typing import Any, Dict, List, Optional, Tuple
 import h5py
 import numpy as np
-import torch
-
-from data.normalizer import NormalizationHelper
-from utils.utils import save_json, load_json
-
-
-# =========================
-# Stats structures / logger
-# =========================
+from utils.utils import save_json
 
 @dataclass
 class DataStatistics:
@@ -159,11 +149,6 @@ class DataStatisticsLogger:
         save_json(summary, summary_path)
         self.logger.info(f"Statistics summary saved to {summary_path}")
 
-
-# =================
-# HDF5 streaming IO
-# =================
-
 class ChunkedHDF5Reader:
     """Read HDF5 data in chunks to minimize memory usage."""
     def __init__(self, file_path: Optional[Path], chunk_size: int = 10000):
@@ -171,65 +156,18 @@ class ChunkedHDF5Reader:
         self.chunk_size = chunk_size
         self.logger = logging.getLogger(__name__)
 
-    def read_dataset_chunked(
-        self,
-        group: h5py.Group,
-        var_name: str,
-        indices: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """Read dataset in chunks, optionally at specific indices."""
+    def read_dataset_chunked(self, group, var_name, indices=None):
         if var_name not in group:
             raise KeyError(f"Variable {var_name} not found in group")
-
-        dataset = group[var_name]
-        total_size = dataset.shape[0]
-
+        dset = group[var_name]
         if indices is not None:
-            if len(indices) < self.chunk_size:
-                return dataset[indices]
-            # large fancy indexing in chunks
-            result = np.empty(len(indices), dtype=dataset.dtype)
-            for i in range(0, len(indices), self.chunk_size):
-                chunk_indices = indices[i : i + self.chunk_size]
-                result[i : i + len(chunk_indices)] = dataset[chunk_indices]
-            return result
-
-        if total_size <= self.chunk_size:
-            return dataset[:]
-
-        # NOTE: for callers that actually need the full array; stats paths should not use this.
-        chunks = []
-        for start in range(0, total_size, self.chunk_size):
-            end = min(start + self.chunk_size, total_size)
-            chunks.append(dataset[start:end])
+            return dset[indices]  # restore basic indexed read
+        total = dset.shape[0]
+        if total <= self.chunk_size:
+            return dset[:]
+        chunks = [dset[i:min(i+self.chunk_size,total)] for i in range(0,total,self.chunk_size)]
         return np.concatenate(chunks)
-
-    def stream_group_data(
-        self, group: h5py.Group, variables: List[str], chunk_size: Optional[int] = None
-    ) -> Iterable[Tuple[int, int, Dict[str, np.ndarray]]]:
-        """Yield (start, end, {var: array_chunk}) across the group's time axis."""
-        if not variables:
-            return
-        csz = chunk_size or self.chunk_size
-
-        first_var = next((v for v in variables if v in group), None)
-        if first_var is None:
-            return
-        total_size = group[first_var].shape[0]
-
-        for start in range(0, total_size, csz):
-            end = min(start + csz, total_size)
-            out: Dict[str, np.ndarray] = {}
-            for v in variables:
-                if v in group:
-                    out[v] = group[v][start:end]
-            yield start, end, out
-
-
-# ====================
-# NPZ sequence sharder
-# ====================
-
+    
 class SequenceShardWriter:
     """Writes trajectory sequences to NPZ shards with improved buffering."""
     def __init__(
@@ -345,18 +283,6 @@ class CorePreprocessor:
 
         self.min_value_threshold = float(self.proc_cfg.get("min_value_threshold", 1e-30))
         self.norm_stats = norm_stats or {}
-
-        self._create_index_mappings()
-
-        self.norm_helper = None
-        if norm_stats:
-            self.norm_helper = NormalizationHelper(stats=norm_stats, device=torch.device("cpu"), config=config)
-
-    def _create_index_mappings(self):
-        """Create index mappings for robust variable access."""
-        self.var_to_idx = {v: i for i, v in enumerate(self.species_vars + self.global_vars + [self.time_var])}
-        self.species_indices = [self.var_to_idx[v] for v in self.species_vars]
-        self.target_species_indices = [self.var_to_idx[v] for v in self.target_species_vars]
 
     # ----------------------
     # Time sampling utilities
@@ -602,15 +528,15 @@ class CorePreprocessor:
     # -------------------------------------
     def collect_time_stats(self, file_paths: List[Path]) -> Dict[str, float]:
         """
-        Compute tau0 (5th percentile of raw times > 1e-10) and log-min-max bounds
-        via streaming two-pass histogram. Avoids concatenating all times.
+        Compute tau0 (5th percentile of raw times > 1e-10) and both:
+        - tau min/max for 'time-norm' (paper)
+        - raw t min/max for 'log-min-max'
+        via streaming two-pass histogram.
         """
         if not file_paths:
             raise ValueError("No files provided")
 
-        reader = ChunkedHDF5Reader(file_paths[0], self.chunk_size)
-
-        # Pass 1: get global min/max and count of valid times
+        # Pass 1: global raw min/max and count
         global_min = float("inf")
         global_max = float("-inf")
         total_count = 0
@@ -625,6 +551,7 @@ class CorePreprocessor:
                     for start in range(0, ds.shape[0], self.chunk_size):
                         end = min(start + self.chunk_size, ds.shape[0])
                         chunk = ds[start:end]
+                        # strictly positive times for log/percentile
                         chunk = chunk[chunk > 1e-10]
                         if chunk.size == 0:
                             continue
@@ -638,11 +565,10 @@ class CorePreprocessor:
         if not math.isfinite(global_min) or not math.isfinite(global_max) or total_count == 0:
             raise ValueError("No valid time data found")
 
-        # Guard against degenerate range
         if not (global_max > global_min):
             global_max = global_min * (1.0 + 1e-12)
 
-        # Pass 2: fill histogram
+        # Pass 2: histogram for tau0 percentile
         num_bins = int(self.proc_cfg.get("time_hist_bins", 4096))
         edges = np.linspace(global_min, global_max, num_bins + 1, dtype=np.float64)
         hist = np.zeros(num_bins, dtype=np.int64)
@@ -660,16 +586,13 @@ class CorePreprocessor:
                         chunk = chunk[chunk > 1e-10]
                         if chunk.size == 0:
                             continue
-                        # np.histogram is vectorized
                         h, _ = np.histogram(chunk, bins=edges)
                         hist += h
 
-        # Find 5th percentile from histogram
         target_rank = max(0, int(0.05 * (hist.sum())))
         cumsum = np.cumsum(hist)
         bin_idx = int(np.searchsorted(cumsum, target_rank, side="left"))
         bin_idx = max(0, min(bin_idx, num_bins - 1))
-        # linear interpolation within the bin (fallback: left edge)
         left = edges[bin_idx]
         right = edges[bin_idx + 1]
         prev_cum = 0 if bin_idx == 0 else int(cumsum[bin_idx - 1])
@@ -678,22 +601,25 @@ class CorePreprocessor:
         frac = min(1.0, in_bin_rank / bin_count)
         tau0 = float(left + (right - left) * frac)
 
-        # log-min-max over tau = log(1 + t/tau0)
-        tmin_raw, tmax_raw = global_min, global_max
-        tau_min = float(np.log(1.0 + tmin_raw / tau0))
-        tau_max = float(np.log(1.0 + tmax_raw / tau0))
+        # Paper time-norm bounds in tau
+        tau_min = float(np.log(1.0 + global_min / tau0))
+        tau_max = float(np.log(1.0 + global_max / tau0))
+
+        # Which time method are we configured to use?
+        time_method = (
+            self.config.get("normalization", {})
+                    .get("methods", {})
+                    .get(self.time_var, "log-min-max")
+        )
 
         return {
             "tau0": tau0,
-            "tmin": tau_min,
-            "tmax": tau_max,
-            "time_transform": self.config.get("normalization", {}).get("methods", {}).get(self.time_var, "log-min-max"),
+            "tmin": tau_min,         # tau-space min (for time-norm)
+            "tmax": tau_max,         # tau-space max (for time-norm)
+            "tmin_raw": global_min,  # raw time min (>0) for log-min-max
+            "tmax_raw": global_max,  # raw time max
+            "time_transform": time_method,
         }
-
-
-# =================
-# Public orchestrator
-# =================
 
 def _process_one_file_worker(
     file_path_str: str,
@@ -750,7 +676,6 @@ class DataPreprocessor:
         c_min = float(d.min())
         c_max = float(d.max())
         c_mean = float(d.mean())
-        # m2 for chunk
         c_m2 = float(((d - c_mean) ** 2).sum())
 
         if acc_count == 0:
@@ -805,21 +730,25 @@ class DataPreprocessor:
                         # stream over time axis
                         for start in range(0, ds.shape[0], chunk_size):
                             end = min(start + chunk_size, ds.shape[0])
-                            arr = ds[start:end]
+
+                            arr_raw = ds[start:end]
+                            # keep the summary in RAW space only
+                            if self.stats_logger:
+                                self.stats_logger.update_species_range(var, arr_raw)
+
+                            # use a separate array for normalization stats
+                            arr = arr_raw
                             if "log" in var_method:
                                 eps = norm_cfg.get("epsilon", 1e-30)
-                                arr = np.log10(np.maximum(arr, eps))
-                            # merge chunk
+                                arr = np.log10(np.maximum(arr_raw, eps))
+
+                            # merge chunk (normalization stats accumulator stays in its own space)
                             a = accumulators[var]
                             n, m, m2, cmin, cmax = self._welford_merge(a["count"], a["mean"], a["m2"], arr)
                             a["count"], a["mean"], a["m2"] = n, m, m2
                             if math.isfinite(cmin):
                                 a["min"] = min(a["min"], cmin)
                                 a["max"] = max(a["max"], cmax)
-
-                            # stats logger species min/max
-                            if self.stats_logger:
-                                self.stats_logger.update_species_range(var, arr)
 
                     for var in self.config["data"]["global_variables"]:
                         if var in grp.attrs:
@@ -857,9 +786,12 @@ class DataPreprocessor:
 
             stats["per_key_stats"][var] = block
 
-        # time method tag
-        stats["normalization_methods"][self.config["data"]["time_variable"]] = self.config.get("normalization", {}).get("methods", {}).get(self.config["data"]["time_variable"],
-                                                                                                                                           self.config.get("normalization", {}).get("default_method", "log-min-max"))
+        time_var = self.config["data"]["time_variable"]
+        stats["normalization_methods"][time_var] = (
+            self.config.get("normalization", {})
+                .get("methods", {})
+                .get(time_var, "log-min-max")
+        )
 
         self.logger.info("Normalization statistics collection complete.")
         return stats
@@ -874,10 +806,19 @@ class DataPreprocessor:
         # streaming time stats
         processor = CorePreprocessor(self.config, stats_logger=self.stats_logger)
         time_stats = processor.collect_time_stats(self.raw_files)
-        self.logger.info(
-            f"Time normalization stats: tau0={time_stats['tau0']:.3e}, "
-            f"tmin={time_stats['tmin']:.3f}, tmax={time_stats['tmax']:.3f}"
-        )
+
+        # Log only the relevant stats based on configured method
+        tm = time_stats.get("time_transform", "log-min-max")
+        if tm == "log-min-max":
+            self.logger.info(
+                "Time normalization (log-min-max): "
+                f"tmin_raw={time_stats['tmin_raw']:.3e}, tmax_raw={time_stats['tmax_raw']:.3e}"
+            )
+        else:
+            self.logger.info(
+                "Time normalization (time-norm): "
+                f"tau0={time_stats['tau0']:.3e}, tmin={time_stats['tmin']:.3f}, tmax={time_stats['tmax']:.3f}"
+            )
 
         # normalization stats
         norm_stats = self._collect_normalization_stats()

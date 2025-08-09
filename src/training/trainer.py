@@ -39,6 +39,10 @@ class Trainer:
         self.train_config = config["training"]
         self.system_config = config["system"]
         self.data_config = config["data"]
+
+        # Detect HPO mode (Optuna) from config
+        self.is_hpo = bool(self.config.get("optuna", {}).get("enabled", False) or 
+                           self.config.get("hpo", {}).get("enabled", False))
         
         # Check sequence mode
         self.sequence_mode = self.data_config.get("sequence_mode", False)
@@ -150,7 +154,6 @@ class Trainer:
         elif opt_name == "adamw":
             opt_kwargs = {"lr": lr, "betas": betas, "eps": eps}
             
-            # Fixed: Try fused AdamW with actual param_groups
             if self.device.type == "cuda":
                 try:
                     # Test with actual parameters to catch edge cases
@@ -175,20 +178,18 @@ class Trainer:
             self.scheduler_step_on_batch = False
             return
         
-        steps_per_epoch = max(
-            1, math.ceil(len(self.train_loader) / self.gradient_accumulation_steps)
-        )
+        steps_per_epoch = max(1, math.ceil(len(self.train_loader) / self.gradient_accumulation_steps))
         
         params = self.train_config.get("scheduler_params", {})
         
         if scheduler_type == "cosine":
-            # Fixed: Document that T_0 is in epochs when specified, convert to steps
+            # T_0 is in epochs when specified, convert to steps
             T_0_epochs = params.get("T_0", 10)
             T_0_steps = T_0_epochs * steps_per_epoch
             
             self.scheduler = CosineAnnealingWarmRestarts(
                 self.optimizer,
-                T_0=T_0_steps,  # Now correctly in steps
+                T_0=T_0_steps,
                 T_mult=params.get("T_mult", 2),
                 eta_min=params.get("eta_min", 1e-8)
             )
@@ -214,48 +215,13 @@ class Trainer:
             raise ValueError(f"Unknown scheduler: {scheduler_type}")
     
     def _setup_loss(self):
-        """Setup loss function. Supports 'mse' (default) and 'paper' (Appendix A.2)."""
+        """Setup loss function. Supports 'mse' (default)."""
         loss_name = self.train_config.get("loss", "mse").lower()
         
         if loss_name == "mse":
             self.criterion = nn.MSELoss(reduction="mean")
             self.logger.info("Using MSE loss")
-            
-        elif loss_name == "paper":
-            target_vars = self.data_config.get(
-                "target_species_variables", self.data_config["species_variables"]
-            )
-            def paper_loss(preds, targets):
-                # CORRECTNESS FIX: This implementation is robust to both sequence and row-wise modes
-                # and uses the correct element-wise aggregation order.
-                if self.norm_helper is None:
-                    return F.mse_loss(preds, targets) # Fallback if no normalizer
-
-                # 1. Denormalize predictions and targets
-                preds_dn   = self.norm_helper.denormalize(preds, target_vars)
-                targets_dn = self.norm_helper.denormalize(targets, target_vars)
-                
-                # 2. Ensure both are in log10 space, as denormalize() can return linear units
-                #    in row-wise mode. This check makes the loss computation mode-agnostic.
-                methods = [self.norm_helper.methods.get(v, "none") for v in target_vars]
-                
-                # Helper to re-apply log10 if denormalize returned linear units
-                def as_log10(tensor, method_list):
-                    output = tensor.clone()
-                    for i, method in enumerate(method_list):
-                        if method == "log-standard" and not self.norm_helper.inputs_already_logged:
-                            output[..., i] = torch.log10(tensor[..., i].clamp_min(self.norm_helper.epsilon))
-                    return output
-
-                preds_log   = as_log10(preds_dn, methods)
-                targets_log = as_log10(targets_dn, methods)
-
-                # 3. Compute element-wise magnitude-balanced error, then average
-                delta = (preds_log - targets_log).abs()
-                return (torch.pow(10.0, delta) - 1.0).mean()
-
-            self.criterion = paper_loss
-            self.logger.info("Using paper loss (robust, element-wise) per Appendix A.2")
+        
     
     def _setup_amp(self):
         if self.dtype == torch.float64 or self.device.type == "mps":
@@ -342,7 +308,15 @@ class Trainer:
         try:
             self._run_training_loop()
             self.logger.info(f"Training completed. Best validation loss: {self.best_val_loss:.6f} "
-                           f"at epoch {self.best_epoch}")
+                        f"at epoch {self.best_epoch}")
+
+            # If HPO, export once at the end (pruned trials won’t reach here)
+            if self.is_hpo and self.system_config.get("use_torch_export", False):
+                exported_path = self.save_dir / "best_model_exported.pt"
+                self.logger.info("Exporting model once at end of HPO trial...")
+                success = self._export_from_live_model(exported_path)
+                if not success:
+                    self.logger.warning("Final export failed after HPO trial")
         except KeyboardInterrupt:
             self.logger.info("Training interrupted by user")
         except Exception as e:
@@ -436,7 +410,6 @@ class Trainer:
             if targets.dtype != self.dtype:
                 targets = targets.to(self.dtype)
 
-            # ── Forward ─────────────────────────────────────────────────────────
             with autocast(device_type=self.device.type,
                           enabled=self.use_amp,
                           dtype=self.amp_dtype):
@@ -454,14 +427,12 @@ class Trainer:
             window_end = min(window_start + k, n_batches)
             R = window_end - window_start  # 1 ≤ R ≤ k
 
-            # ── Back-prop (scale by R) ─────────────────────────────────────────
             loss = loss_raw / R
             if self.scaler.is_enabled():
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
 
-            # ── Step? ───────────────────────────────────────────────────────────
             is_last_batch = (batch_idx + 1) == n_batches
             window_full = ((batch_idx + 1) % k == 0)
 
@@ -487,7 +458,6 @@ class Trainer:
 
                 self.global_step += 1
 
-            # ── Metrics ────────────────────────────────────────────────────────
             batch_sz = inputs.size(0)
             total_loss += loss_raw.item() * batch_sz
             total_samples += batch_sz
@@ -614,7 +584,7 @@ class Trainer:
         self.logger.info(f"Saved best model checkpoint to {checkpoint_path}")
 
         # Export if requested
-        if self.system_config.get("use_torch_export", False):
+        if self.system_config.get("use_torch_export", False) and not self.is_hpo:
             exported_path = self.save_dir / "best_model_exported.pt"
             success = self._export_from_live_model(exported_path)
             if not success:
@@ -652,7 +622,7 @@ class Trainer:
 
             example_input = torch.randn(1, input_dim, dtype=dtype, device=device)
 
-            # Fixed: Support both positional and keyword arguments
+            # Support both positional and keyword arguments
             # Try export with positional args first
             try:
                 exported = torch.export.export(model_to_export, (example_input,))

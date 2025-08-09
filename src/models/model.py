@@ -1,411 +1,369 @@
 #!/usr/bin/env python3
 """
-Linear Latent Network models with constant-velocity latent dynamics and time warping.
-LiLaN form: z(t) = E(x0, p) + τ(t, x0, p) ∘ C(x0, p); outputs are y(t) = D([z(t), p]).
+model.py — Linear Latent Network (LiLaN) with optional mixture-of-experts and learned time warping.
+
+Core:
+    z(t) = E(x0, p) + τ(t, ·) ∘ C(x0, p)      (constant-velocity latent dynamics)
+    y(t) = D(z(t), p)
+
+Implements:
+  • Shared encoder backbone over [x0_log, globals] with two heads: E (y0) and C (velocity)
+  • Learned monotone time warp τ(t) per latent dim
+  • Optional mixture-of-experts (K experts) with temperature-controlled softmax gate
+  • Regularizers: gate KL-to-uniform; generator similarity (discourages expert collapse)
 """
 
 import logging
 import math
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ----------------------------- helpers -----------------------------
+
+def _get_activation(name: str) -> nn.Module:
+    name = (name or "gelu").lower()
+    table = {
+        "gelu": nn.GELU(),
+        "relu": nn.ReLU(inplace=True),
+        "tanh": nn.Tanh(),
+        "silu": nn.SiLU(inplace=True),
+        "elu": nn.ELU(inplace=True),
+    }
+    return table.get(name, nn.GELU())
+
+
+def _build_mlp(
+    in_dim: int,
+    hidden: List[int],
+    out_dim: int,
+    activation: nn.Module,
+    dropout_p: float = 0.0,
+    use_layernorm: bool = True,
+    final_activation: bool = False,
+) -> nn.Sequential:
+    layers: List[nn.Module] = []
+    prev = in_dim
+    for i, h in enumerate(hidden):
+        if i > 0 and use_layernorm:
+            layers.append(nn.LayerNorm(prev))
+        layers += [nn.Linear(prev, h), activation]
+        if dropout_p > 0:
+            layers.append(nn.Dropout(dropout_p))
+        prev = h
+    if hidden and use_layernorm:
+        layers.append(nn.LayerNorm(prev))
+    layers.append(nn.Linear(prev, out_dim))
+    if final_activation:
+        layers.append(activation)
+    return nn.Sequential(*layers)
+
+
+# ----------------------------- time warp -----------------------------
+
 class TimeWarp(nn.Module):
-    """Monotone time-warping module for multi-dimensional time τ(t)."""
-    def __init__(
-        self,
-        n_species: int,
-        n_globals: int,
-        latent_dim: int,
-        J_terms: int = 3,
-        hidden_dim: int = 64,
-    ):
+    """
+    Monotonic per-latent time warp:
+        τ_d(t) = s_d * t + Σ_{j=1..J} a_{d,j} * (1 - exp(-b_{d,j} * t))
+    with s, a, b constrained positive via softplus.
+    """
+    def __init__(self, context_dim: int, latent_dim: int, J_terms: int = 3, hidden_dim: int = 64):
         super().__init__()
-        self.J_terms = J_terms
         self.latent_dim = latent_dim
-
-        # Predict per-latent-dim parameters s, {a_j, b_j}
-        input_dim = n_species + n_globals
-        output_dim = latent_dim * (1 + 2 * J_terms)
-
-        self.param_net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        self.J_terms = J_terms
+        out_dim = latent_dim * (1 + 2 * J_terms)  # s, {a_j}, {b_j}
+        self.net = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dim, out_dim),
         )
 
-    def forward(self, t_norm: torch.Tensor, x0_log: torch.Tensor, g_params: torch.Tensor) -> torch.Tensor:
+    def forward(self, t_norm: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         """
-        Apply monotone time warp to produce multi-dimensional time.
-
-        Args:
-            t_norm: Normalized time in [0, 1], shape [B, M]
-            x0_log: Initial log-species, shape [B, n_species]
-            g_params: Global parameters, shape [B, n_globals]
-        Returns:
-            Warped time tau(t), shape [B, M, latent_dim]
+        t_norm:  [B, M] in [0,1]
+        context: [B, context_dim] (typically encoder features)
+        returns: τ(t) of shape [B, M, D]
         """
-        B = x0_log.size(0)
-        M = t_norm.size(1)
+        B, M = t_norm.shape
+        params = self.net(context).view(B, self.latent_dim, 1 + 2 * self.J_terms)
+        s = F.softplus(params[:, :, 0:1])                  # [B, D, 1]
+        a = F.softplus(params[:, :, 1:1 + self.J_terms])   # [B, D, J]
+        b = F.softplus(params[:, :, 1 + self.J_terms:])    # [B, D, J]
 
-        # Predict warp params
-        features = torch.cat([x0_log, g_params], dim=1)
-        params = self.param_net(features).view(B, self.latent_dim, 1 + 2 * self.J_terms)
+        t_exp = t_norm.unsqueeze(1).expand(B, self.latent_dim, M)  # [B, D, M]
+        tau = s * t_exp
+        # expm1 for stability: 1 - exp(-b t) = -expm1(-b t)
+        exp_terms = (a.unsqueeze(-1) * (-torch.expm1(-b.unsqueeze(-1) * t_exp.unsqueeze(2)))).sum(dim=2)
+        return (tau + exp_terms).transpose(1, 2)  # [B, M, D]
 
-        # Positive parameters via softplus
-        s = F.softplus(params[:, :, 0:1])                       # [B, D, 1]
-        a = F.softplus(params[:, :, 1:1+self.J_terms])          # [B, D, J]
-        b = F.softplus(params[:, :, 1+self.J_terms:])           # [B, D, J]
 
-        # Broadcast time
-        t_norm_expanded = t_norm.unsqueeze(1).expand(B, self.latent_dim, M)  # [B, D, M]
-
-        # tau(t) = s*t + Σ_j a_j * (1 - exp(-b_j * t))
-        # Use expm1 for better precision when b*t is small: 1 - exp(-x) = -expm1(-x)
-        tau = s.expand(B, self.latent_dim, M) * t_norm_expanded
-        t_be = t_norm_expanded.unsqueeze(2)                     # [B, D, 1, M]
-        a_be = a.unsqueeze(-1)                                  # [B, D, J, 1]
-        b_be = b.unsqueeze(-1)                                  # [B, D, J, 1]
-        tau = tau + (a_be * (-torch.expm1(-b_be * t_be))).sum(dim=2)  # sum over J
-
-        # [B, M, D]
-        return tau.transpose(1, 2)
-
+# ----------------------------- LiLaN model -----------------------------
 
 class LinearLatentMixture(nn.Module):
     """
-    Linear Latent Network with constant-velocity dynamics and optional
-    mixture-of-experts & monotone time-warp.
+    LiLaN with optional mixture-of-experts and learned time warp.
+    Inputs:  [x0_log (S), globals (G), times (M)]  →  outputs: [B, M, T]
     """
-
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
-        self.logger = logging.getLogger(__name__)
+        self.log = logging.getLogger(__name__)
+        data_cfg = config["data"]
+        model_cfg = config["model"]
 
-        # ----- dimensions --------------------------------------------------
-        self.num_species = len(config["data"]["species_variables"])
-        self.num_globals = len(config["data"]["global_variables"])
-        self.num_targets = len(
-            config["data"].get("target_species_variables", config["data"]["species_variables"])
-        )
+        # dims
+        self.num_species = len(data_cfg["species_variables"])
+        self.num_globals = len(data_cfg["global_variables"])
+        self.num_targets = len(data_cfg.get("target_species_variables", data_cfg["species_variables"]))
+        self.latent_dim = int(model_cfg.get("latent_dim", 64))
 
-        # ----- model-level hyper-params ------------------------------------
-        m_cfg = config["model"]
-        self.latent_dim = m_cfg.get("latent_dim", 64)
-        self.K = m_cfg.get("mixture", {}).get("K", 1)
-        self.use_time_warp = m_cfg.get("time_warp", {}).get("enabled", False)
+        # activations / dropout
+        self.activation = _get_activation(model_cfg.get("activation", "gelu"))
+        self.dropout_p = float(model_cfg.get("dropout", 0.0))
 
-        # layer sizes / activations
-        self.encoder_layers = m_cfg.get("encoder_layers", [256, 256, 128])
-        self.decoder_layers = m_cfg.get("decoder_layers", [128, 256, 256])
-        self.activation = self._get_activation(m_cfg.get("activation", "gelu"))
-        dropout_rate = m_cfg.get("dropout", 0.0)
-        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+        # mixture
+        mix_cfg = model_cfg.get("mixture", {})
+        self.K = int(mix_cfg.get("K", 1))
+        self.gate_temp = float(mix_cfg.get("temperature", 1.0))
+        # regularizer settings (keep both styles—no functionality lost)
+        self.diversity_mode = str(mix_cfg.get("diversity_mode", "per_sample"))  # 'per_sample' | 'batch_mean'
+        self.full_pair_threshold = int(mix_cfg.get("full_pair_threshold", 8))
+        self.sample_factor = int(mix_cfg.get("sample_factor", 8))
+        self.sample_pairs: Optional[int] = mix_cfg.get("sample_pairs", None)
+        self.gate_use_features = bool(mix_cfg.get("use_encoder_features", True))
 
-        # ----- shared encoder backbone + heads -----------------------------
+        # time warp
+        tw_cfg = model_cfg.get("time_warp", {})
+        self.use_time_warp = bool(tw_cfg.get("enabled", False))
+        self.warp_use_features = bool(tw_cfg.get("use_encoder_features", True))
+        self.warp_J = int(tw_cfg.get("J_terms", 3))
+        self.warp_hidden = int(tw_cfg.get("hidden_dim", 64))
+
+        # encoder backbone
+        enc_layers = list(model_cfg.get("encoder_layers", [256, 256, 128]))
         enc_in = self.num_species + self.num_globals
-        back_out = self.encoder_layers[-1] if self.encoder_layers else enc_in
-
-        self.encoder_backbone = self._build_mlp(
-            enc_in, self.encoder_layers, back_out, use_layernorm=True
+        enc_out = enc_layers[-1] if enc_layers else enc_in
+        self.encoder = _build_mlp(
+            in_dim=enc_in, hidden=enc_layers, out_dim=enc_out,
+            activation=self.activation, dropout_p=self.dropout_p,
+            use_layernorm=True, final_activation=False,
         )
-        self.y0_head = nn.Linear(back_out, self.latent_dim * self.K)
-        self.c_head = nn.Linear(back_out, self.latent_dim * self.K)
 
-        # ----- mixture gate -----------------------------------------------
+        # heads E (y0) and C (velocity)
+        self.y0_head = nn.Linear(enc_out, self.latent_dim * self.K)
+        self.c_head  = nn.Linear(enc_out, self.latent_dim * self.K)
+
+        # gate (optionally using encoder features)
         if self.K > 1:
-            gate_layers = m_cfg.get("mixture", {}).get("gate_layers", [64, 32])
-            layers, prev = [], enc_in
-            for dim in gate_layers:
-                layers.extend([nn.Linear(prev, dim), self.activation])
-                prev = dim
-            layers.append(nn.Linear(prev, self.K))
-            self.gate_net = nn.Sequential(*layers)
-
-            mix_cfg = m_cfg.get("mixture", {})
-            self.gate_temperature = float(mix_cfg.get("temperature", 1.0))
-            div_cfg = mix_cfg.get("diversity", {})
-            self.full_pair_threshold = div_cfg.get("full_pair_threshold", 8)
-            self.sample_factor = div_cfg.get("sample_factor", 8)
-
-        # ----- time-warp module -------------------------------------------
-        if self.use_time_warp:
-            tw_cfg = m_cfg.get("time_warp", {})
-            J_terms = tw_cfg.get("J_terms", 3)
-            tw_hidden = tw_cfg.get("hidden_dim", 64)
-            self.time_warp = TimeWarp(
-                self.num_species, self.num_globals, self.latent_dim,
-                J_terms=J_terms, hidden_dim=tw_hidden
+            gate_layers = list(mix_cfg.get("gate_layers", [64, 32]))
+            # default: no LayerNorm in gate to keep logits scale simple
+            self.gate = _build_mlp(
+                in_dim=(enc_out if self.gate_use_features else enc_in),
+                hidden=gate_layers, out_dim=self.K,
+                activation=self.activation, dropout_p=self.dropout_p,
+                use_layernorm=bool(mix_cfg.get("gate_use_layernorm", False)),
+                final_activation=False,
             )
 
-        # ----- decoder -----------------------------------------------------
+        # time warp (context: encoder features or raw encoder input)
+        if self.use_time_warp:
+            warp_context_dim = enc_out if self.warp_use_features else enc_in
+            self.time_warp = TimeWarp(warp_context_dim, self.latent_dim, self.warp_J, self.warp_hidden)
+
+        # decoder over [z(t), globals]
+        dec_layers = list(model_cfg.get("decoder_layers", [128, 256, 256]))
         dec_in = self.latent_dim + self.num_globals
-        self.decoder = self._build_mlp(
-            dec_in, self.decoder_layers, self.num_targets,
-            use_layernorm=True, final_activation=False
+        self.decoder = _build_mlp(
+            in_dim=dec_in, hidden=dec_layers, out_dim=self.num_targets,
+            activation=self.activation, dropout_p=self.dropout_p,
+            use_layernorm=True, final_activation=False,
         )
 
         self._initialize_weights()
 
-    def set_gate_temperature(self, temp: float):
-        """Set gate temperature with safety clamp."""
-        self.gate_temperature = float(max(1e-3, temp))
+    # ----- init -----
 
-    def _get_activation(self, name: str):
-        """Get activation function by name."""
-        activations = {
-            "gelu": nn.GELU(),
-            "relu": nn.ReLU(inplace=True),
-            "tanh": nn.Tanh(),
-            "silu": nn.SiLU(inplace=True),
-            "elu": nn.ELU(inplace=True)
-        }
-        return activations.get(name.lower(), nn.GELU())
+    def _initialize_weights(self) -> None:
+        # Xavier is a safe default across activations
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    def _build_mlp(self, input_dim: int, hidden_layers: List[int],
-                   output_dim: int, use_layernorm: bool = True,
-                   final_activation: bool = True) -> nn.Sequential:
-        """Build a multi-layer perceptron."""
-        layers = []
-        prev_dim = input_dim
+        # Gate: uniform at init (softmax(0)=uniform)
+        if self.K > 1:
+            for m in self.gate.modules():
+                if isinstance(m, nn.Linear) and m.out_features == self.K:
+                    nn.init.zeros_(m.weight)
+                    nn.init.zeros_(m.bias)
+                    break
 
-        for i, dim in enumerate(hidden_layers):
-            if i > 0 and use_layernorm:
-                layers.append(nn.LayerNorm(prev_dim))
-
-            layers.append(nn.Linear(prev_dim, dim))
-            layers.append(self.activation)
-
-            if self.dropout is not None:
-                layers.append(self.dropout)
-
-            prev_dim = dim
-
-        # Output layer
-        if use_layernorm:
-            layers.append(nn.LayerNorm(prev_dim))
-        layers.append(nn.Linear(prev_dim, output_dim))
-
-        if final_activation:
-            layers.append(self.activation)
-
-        return nn.Sequential(*layers)
-
-    def _initialize_weights(self):
-        """Initialize weights for stability (encoders/decoder + TimeWarp if present)."""
-        # Backbone and projection heads
-        for mod in [self.encoder_backbone, self.y0_head, self.c_head, self.decoder]:
-            for m in mod.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.5)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-
-        # TimeWarp (if enabled): Xavier on all linear layers, then set final bias via softplus-inverse
+        # TimeWarp: start as identity-ish (no context dependence)
         if self.use_time_warp:
-            # 1) Initialize all TimeWarp linear layers
-            for m in self.time_warp.param_net.modules():
+            last_linear = None
+            for m in self.time_warp.net.modules():
                 if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.5)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-
-            # 2) Overwrite the LAST layer so output == bias at init (input-independent)
-            last = self.time_warp.param_net[-1]
-            if isinstance(last, nn.Linear):
-                # Make the last layer produce only the bias initially
-                nn.init.zeros_(last.weight)
-                if last.bias is None:
-                    last.bias = nn.Parameter(
-                        torch.zeros(self.latent_dim * (1 + 2 * self.time_warp.J_terms),
-                                    dtype=last.weight.dtype, device=last.weight.device)
-                    )
-
+                    last_linear = m
+            if last_linear is not None:
+                nn.init.zeros_(last_linear.weight)  # output == bias initially
                 with torch.no_grad():
-                    J = self.time_warp.J_terms
+                    J, D = self.time_warp.J_terms, self.latent_dim
+                    bias = last_linear.bias.view(D, 1 + 2 * J)
+                    bias[:, 0] = 0.54      # softplus(0.54) ~ 1  => s ≈ 1
+                    bias[:, 1:1 + J] = -5  # softplus(-5)  ~ 0  => a ≈ 0
+                    bias[:, 1 + J:] = 0.54 # softplus(0.54) ~ 1  => b ≈ 1
 
-                    # Desired *post-softplus* values (near identity)
-                    # s ≈ 1, a_j ≈ 0.01 (small), b_j ≈ 1
-                    desired_s = torch.full((self.latent_dim, 1), 1.0,
-                                           dtype=last.weight.dtype, device=last.weight.device)
-                    desired_a = torch.full((self.latent_dim, J), 0.01,
-                                           dtype=last.weight.dtype, device=last.weight.device)
-                    desired_b = torch.full((self.latent_dim, J), 1.0,
-                                           dtype=last.weight.dtype, device=last.weight.device)
+    # ----- public api -----
 
-                    # Numerically stable inverse softplus
-                    def softplus_inv(y: torch.Tensor) -> torch.Tensor:
-                        """Stable inverse softplus: x = log(exp(y) - 1)"""
-                        tiny = torch.finfo(y.dtype).tiny
-                        # For small y, use log(expm1(y)) to avoid cancellation
-                        # For large y, use y + log1p(-exp(-y)) to avoid overflow
-                        use_small = (y < 1.0)
-                        small_branch = torch.log(torch.clamp(torch.expm1(y), min=tiny))
-                        large_branch = y + torch.log1p(-torch.exp(-y))
-                        return torch.where(use_small, small_branch, large_branch)
-
-                    bias_view = last.bias.view(self.latent_dim, 1 + 2 * J)
-                    bias_view[:, 0:1] = softplus_inv(desired_s)  # s pre-activations
-                    bias_view[:, 1:1+J] = softplus_inv(desired_a)  # a_j pre-activations
-                    bias_view[:, 1+J:1+2*J] = softplus_inv(desired_b)  # b_j pre-activations
+    def set_gate_temperature(self, temperature: float) -> None:
+        if self.K > 1:
+            self.gate_temp = max(1e-3, float(temperature))
 
     def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Args
-            inputs : [B, n_species + n_globals + M]
-                The last M entries are the **normalized physical time** t_norm ∈ [0,1].
-                If time-warp is enabled, the network maps t_norm -> τ(t, x0, p) internally.
-        Returns
-            Tuple of:
-            - log-abundance predictions : [B, M, n_targets]
-            - auxiliary dict with gate probabilities and velocities (if K > 1)
+        inputs: [B, S + G + M] where
+            S = num_species (already log-transformed in data pipeline)
+            G = num_globals (raw, normalized by NormalizationHelper)
+            M = number of normalized time points in [0,1]
+        returns:
+            predictions: [B, M, T]
+            aux: dict with 'gate_p' and 'c_all' (for regularization)
         """
         B = inputs.size(0)
-
-        # -------- split inputs -------------------------------------------
         x0_log = inputs[:, :self.num_species]
-        globals_vec = inputs[:, self.num_species : self.num_species + self.num_globals]
-        t_norm = inputs[:, self.num_species + self.num_globals :]  # [B, M]
+        g_vec  = inputs[:, self.num_species:self.num_species + self.num_globals]
+        t_norm = inputs[:, self.num_species + self.num_globals:]  # [B, M]
         M = t_norm.size(1)
 
-        # -------- shared encoder -----------------------------------------
-        enc_in = torch.cat([x0_log, globals_vec], dim=1)
-        features = self.encoder_backbone(enc_in)
-        y0_all = self.y0_head(features)  # [B, K*D] or [B, D]
-        c_all = self.c_head(features)    # same
+        enc_input = torch.cat([x0_log, g_vec], dim=1)             # [B, S+G]
+        features  = self.encoder(enc_input)                       # [B, enc_out]
 
-        # -------- time-warp ----------------------------------------------
+        y0_all = self.y0_head(features)                           # [B, K*D]
+        c_all  = self.c_head(features)                            # [B, K*D]
+
+        # τ(t)
         if self.use_time_warp:
-            tau = self.time_warp(t_norm, x0_log, globals_vec)  # [B, M, D]
+            warp_ctx = features if self.warp_use_features else enc_input
+            tau = self.time_warp(t_norm, warp_ctx)                # [B, M, D]
         else:
-            tau = t_norm.unsqueeze(-1).expand(B, M, self.latent_dim)  # [B, M, D]
+            tau = t_norm.unsqueeze(-1).expand(B, M, self.latent_dim)
 
-        # -------- mixture / single component -----------------------------
-        aux = {}
+        aux: Dict[str, torch.Tensor] = {}
+
         if self.K > 1:
-            y0_all = y0_all.view(B, self.K, self.latent_dim)
-            c_all = c_all.view(B, self.K, self.latent_dim)
+            y0_all = y0_all.view(B, self.K, self.latent_dim)      # [B, K, D]
+            c_all  = c_all.view(B, self.K, self.latent_dim)       # [B, K, D]
 
-            logits = self.gate_net(enc_in)
-            # FIXED: Clamp temperature to prevent division by zero
-            temp = max(float(self.gate_temperature), 1e-3)
-            p = F.softmax(logits / temp, dim=-1)  # [B, K]
-            
-            # Store auxiliary data for regularization
-            aux["gate_p"] = p
-            aux["c_all"] = c_all
+            gate_ctx = features if self.gate_use_features else enc_input
+            logits = self.gate(gate_ctx)                          # [B, K]
+            probs  = F.softmax(logits / max(self.gate_temp, 1e-3), dim=-1)  # [B, K]
 
-            z_t = (
-                (y0_all.unsqueeze(2) + tau.unsqueeze(1) * c_all.unsqueeze(2))  # [B, K, M, D]
-                * p.unsqueeze(-1).unsqueeze(-1)
-            ).sum(dim=1)  # [B, M, D]
+            aux["gate_p"] = probs
+            aux["c_all"]  = c_all
+
+            # z_k(t) and gated blend
+            z_all = y0_all.unsqueeze(2) + tau.unsqueeze(1) * c_all.unsqueeze(2)  # [B, K, M, D]
+            z_t   = (z_all * probs.view(B, self.K, 1, 1)).sum(dim=1)             # [B, M, D]
         else:
             y0 = y0_all.view(B, self.latent_dim)
-            c = c_all.view(B, self.latent_dim)
-            z_t = y0.unsqueeze(1) + tau * c.unsqueeze(1)  # [B, M, D]
+            c  = c_all.view(B, self.latent_dim)
+            z_t = y0.unsqueeze(1) + tau * c.unsqueeze(1)                          # [B, M, D]
 
-        # -------- decode --------------------------------------------------
-        globals_exp = globals_vec.unsqueeze(1).expand(B, M, self.num_globals)
-        dec_in = torch.cat([z_t, globals_exp], dim=-1)  # [B, M, D+G]
-        out_flat = self.decoder(dec_in.reshape(B * M, -1))  # [B*M, T]
-        
-        return out_flat.view(B, M, self.num_targets), aux
+        # decode
+        g_rep = g_vec.unsqueeze(1).expand(B, M, self.num_globals)                 # [B, M, G]
+        dec_in = torch.cat([z_t, g_rep], dim=-1).reshape(B * M, -1)               # [B*M, D+G]
+        out = self.decoder(dec_in).view(B, M, self.num_targets)                   # [B, M, T]
+        return out, aux
 
     def get_regularization_losses(self, aux: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Returns dict of positive regularization terms.
-        
-        Args:
-            aux: Auxiliary data from forward pass containing gate_p and c_all
-        Returns:
-            Dictionary with regularization losses
+        Returns unweighted regularizers to be added by the Trainer:
+          • gate_kl_to_uniform
+          • generator_similarity
         """
-        losses = {}
-        
+        losses: Dict[str, torch.Tensor] = {}
         if not aux or self.K == 1:
             return losses
-        
-        # Gate entropy penalty: KL(p || Uniform)
-        p = aux["gate_p"]  # [B, K]
-        K = p.size(-1)
-        probs = p.clamp_min(1e-8)
-        # FIX: Use torch.tensor with proper dtype and device
-        log_K = torch.tensor(math.log(K), dtype=probs.dtype, device=probs.device)
-        kl = (probs * (probs.log() + log_K)).sum(dim=-1).mean()
-        losses["gate_kl_to_uniform"] = kl  # ≥0
-        
-        # Generator diversity penalty (mean cosine similarity between directions)
-        c_all = aux["c_all"]  # [B, K, D]
-        
-        # NOTE: Current implementation computes diversity of batch-averaged experts
-        # This encourages global specialization across the dataset
-        # Alternative: For per-sample diversity, compute similarity per sample then average
-        
-        # Current approach (batch-level diversity):
-        w = F.normalize(c_all.mean(dim=0), dim=-1)  # [K, D]
-        cos_ut = (w @ w.T).triu(1)
-        # CORRECTNESS FIX: Use a fixed denominator to correctly average all pairwise similarities,
-        # including genuine zeros (from orthogonal experts), which `cos[cos != 0]` would exclude.
-        num_pairs = self.K * (self.K - 1) // 2
-        mean_sim = cos_ut.sum() / max(1, num_pairs)
-        losses["generator_similarity"] = mean_sim.clamp_min(0)
-        
-        # Alternative per-sample diversity (commented out - use if desired):
-        # # Compute cosine similarity per sample
-        # c_norm = F.normalize(c_all, dim=-1)  # [B, K, D]
-        # # Compute pairwise similarity for each sample
-        # cos_per_sample = torch.bmm(c_norm, c_norm.transpose(1, 2))  # [B, K, K]
-        # # Extract upper triangular (excluding diagonal)
-        # mask = torch.triu(torch.ones_like(cos_per_sample[0]), diagonal=1).bool()
-        # similarities = []
-        # for i in range(B):
-        #     sim = cos_per_sample[i][mask].mean()
-        #     similarities.append(sim)
-        # mean_sim = torch.stack(similarities).mean()
-        # losses["generator_similarity"] = mean_sim.clamp_min(0)
-        
+
+        # Gate KL(p || Uniform) = E_p[log p] + log K
+        p = aux["gate_p"].clamp_min(1e-8)        # [B, K]
+        losses["gate_kl_to_uniform"] = (p * (p.log() + math.log(self.K))).sum(dim=-1).mean()
+
+        # Generator diversity
+        c_all = aux["c_all"]                      # [B, K, D]
+        if self.diversity_mode == "batch_mean":
+            # legacy/global view: average experts over batch, then penalize pairwise similarity
+            w = F.normalize(c_all.mean(dim=0), dim=-1)   # [K, D]
+            sim = w @ w.T                                # [K, K]
+            i, j = torch.triu_indices(self.K, self.K, offset=1, device=sim.device)
+            sims = sim[i, j].clamp_min(0)
+            losses["generator_similarity"] = sims.mean() if sims.numel() else sim.new_tensor(0.0)
+            return losses
+
+        # per-sample view (default): discourage within-sample collapse
+        w = F.normalize(c_all, dim=-1)                   # [B, K, D]
+        sim = torch.einsum("bkd,bld->bkl", w, w)         # [B, K, K]
+        i, j = torch.triu_indices(self.K, self.K, offset=1, device=sim.device)
+        num_pairs = (self.K * (self.K - 1)) // 2
+
+        if self.K <= self.full_pair_threshold or num_pairs == 0:
+            sims = sim[:, i, j]                          # [B, P]
+        else:
+            # subsample pairs for efficiency
+            if self.sample_pairs is None:
+                S = min(self.sample_factor * self.K, num_pairs)
+            else:
+                S = min(int(self.sample_pairs), num_pairs)
+            choice = torch.randint(0, num_pairs, (S,), device=sim.device)
+            sims = sim[:, i[choice], j[choice]]          # [B, S]
+
+        sims = sims.clamp_min(0)                         # penalize only similarity, not anti-correlation
+        per_sample = sims.mean(dim=1)                    # [B]
+        losses["generator_similarity"] = per_sample.mean()
         return losses
 
 
-def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
-    """Create model based on configuration."""
-    model_type = config["model"]["type"].lower()
+# ----------------------------- factory -----------------------------
 
-    if model_type in ["linear_latent", "linear_latent_mixture"]:
-        model = LinearLatentMixture(config)
-    else:
+def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
+    """
+    Factory for LiLaN models. Supports:
+      • model.type in {"linear_latent", "linear_latent_mixture"} (K=1 degenerates to single expert)
+      • optional torch.compile
+      • dtype control (float64)
+    """
+    model_type = config["model"]["type"].lower()
+    if model_type not in {"linear_latent", "linear_latent_mixture"}:
         raise ValueError(f"Unknown model type: {model_type}")
 
-    # Set precision
-    dtype_str = config["system"].get("dtype", "float32")
-    if dtype_str == "float64":
+    model = LinearLatentMixture(config)
+
+    # dtype
+    if str(config["system"].get("dtype", "float32")).lower() == "float64":
         model = model.double()
 
     model = model.to(device)
 
+    # optional compile
     logger = logging.getLogger(__name__)
-    logger.info(f"Created {model_type} model with constant velocity dynamics")
-    logger.info(f"  Mixture components K: {model.K}")
-    logger.info(f"  Time warping: {model.use_time_warp}")
-    logger.info(f"  Latent dimension: {model.latent_dim}")
-
-    # Compile if requested
-    if config["system"].get("use_torch_compile", False) and hasattr(torch, 'compile'):
-        compile_mode = config["system"].get("compile_mode", "default")
+    if config["system"].get("use_torch_compile", False) and hasattr(torch, "compile"):
         try:
-            model = torch.compile(model, mode=compile_mode, fullgraph=False, dynamic=False)
-            logger.info("Model compilation successful")
+            model = torch.compile(model, mode=config["system"].get("compile_mode", "default"))
+            logger.info("Model compilation successful.")
         except Exception as e:
             logger.warning(f"Model compilation failed: {e}. Running in eager mode.")
 
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Total trainable parameters: {total_params:,}")
+    # log summary
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Created {model_type}: K={model.K}, D={model.latent_dim}, params={n_params:,}, "
+                f"time_warp={model.use_time_warp}, diversity_mode={getattr(model, 'diversity_mode', 'per_sample')}")
 
     return model

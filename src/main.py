@@ -4,7 +4,6 @@ Main entry point for chemical kinetics neural network training and hyperparamete
 """
 
 import os
-
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import logging
@@ -97,8 +96,6 @@ class ChemicalKineticsPipeline:
         train_cfg = self.config.get("training", {})
         data_cfg = self.config.get("data", {})
         sys_cfg = self.config.get("system", {})
-
-        # Filter out the time variable from normalization methods to avoid spurious rebuilds
         methods = dict(norm_cfg.get("methods", {}))
         time_var = data_cfg.get("time_variable")
 
@@ -226,7 +223,6 @@ class ChemicalKineticsPipeline:
             raise FileNotFoundError(f"Normalization file missing: {norm_file}")
         norm_stats = load_json(norm_file)
         
-        # FIXED: Use correct NormalizationHelper constructor signature
         norm_helper = NormalizationHelper(
             stats=norm_stats,
             device=self.device,
