@@ -14,8 +14,7 @@ def setup_device() -> torch.device:
     logger = logging.getLogger(__name__)
 
     if torch.cuda.is_available():
-        # Respect CUDA_VISIBLE_DEVICES and pick the current device
-        idx = torch.cuda.current_device()  # usually 0 under a single visible GPU/MIG slice
+        idx = torch.cuda.current_device()
         device = torch.device(f"cuda:{idx}")
         try:
             torch.cuda.set_device(idx)  # make it current explicitly

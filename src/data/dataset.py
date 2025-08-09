@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 High-performance dataset implementation with sequence mode support for LiLaN.
-This version uses a config-driven NormalizationHelper to correctly process
+This version uses a config-driven NormalizationHelper to process
 both inputs and targets into a standardized space.
 """
 
@@ -12,8 +12,6 @@ from typing import Dict, Any, Tuple, Optional
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-
-# Import the corrected NormalizationHelper
 from data.normalizer import NormalizationHelper
 
 
@@ -35,9 +33,7 @@ class SequenceDataset(Dataset):
         # Get dtype from config
         dtype_str = self.config["system"].get("dtype", "float32")
         self.dtype = getattr(torch, dtype_str)
-        # FIX: only use np.float64 when user explicitly requests float64; otherwise stay in float32 on host
         self.np_dtype = np.float64 if dtype_str == "float64" else np.float32
-
         self.norm_stats = norm_stats or {}
 
         # Load metadata from the master index file
@@ -62,9 +58,22 @@ class SequenceDataset(Dataset):
 
         # Time normalization parameters (handled separately)
         self.time_norm = self.shard_index.get("time_normalization", {})
+        self.time_method = (
+        self.config.get("normalization", {}).get("methods", {}).get(self.config["data"]["time_variable"], "log-min-max"))
+
         self.tau0 = self.time_norm.get("tau0", 1.0)
         self.tmin = self.time_norm.get("tmin", 0.0)
         self.tmax = self.time_norm.get("tmax", 1.0)
+            
+        time_var = self.config["data"]["time_variable"]
+        declared = (self.norm_stats.get("normalization_methods", {}) or {}).get(time_var)
+        configured = self.time_method
+
+        if declared and declared != configured:
+            raise ValueError(
+                f"Time variable '{time_var}' method mismatch: stats say '{declared}', "
+                f"but config requests '{configured}'."
+            )
 
         # Build shard info and lookup table
         self.shards = self.split_info.get("shards", [])
@@ -85,7 +94,7 @@ class SequenceDataset(Dataset):
 
         # Caching setup
         self.gpu_cache = None
-        self._shard_cache = {"name": None, "data": None}  # per-worker CPU cache
+        self._shard_cache = {"name": None, "data": None}
         self._try_gpu_cache()
 
     def _build_shard_lookup(self):
@@ -98,18 +107,39 @@ class SequenceDataset(Dataset):
             n = int(shard["n_trajectories"])
             cumsum += n
             self.shard_starts.append(cumsum)
+
         # Use int64 for robust searchsorted math, especially with large datasets
         self.shard_starts = np.array(self.shard_starts[:-1], dtype=np.int64)
         # Derive total from shards to avoid mismatches
         self.n_total_samples = cumsum
 
     def _normalize_time(self, t: np.ndarray) -> np.ndarray:
-        """Apply global log-min-max time normalization with configured floor."""
-        tau = np.log(1 + t / self.tau0)
-        # FIXED: Use configured min_std instead of magic number
-        min_scale = float(self.config.get("normalization", {}).get("min_std", 1e-10))
-        denom = max(self.tmax - self.tmin, min_scale)
-        return np.clip((tau - self.tmin) / denom, 0, 1)
+        """Normalize time to [0,1] using the configured method."""
+        norm_cfg = self.config.get("normalization", {})
+        min_scale = float(norm_cfg.get("min_std", 1e-12))
+
+        if self.time_method == "time-norm":
+            # paper τ = ln(1+t/τ0), then min-max with tau bounds
+            tau = np.log1p(t / self.tau0)
+            denom = max(self.tmax - self.tmin, min_scale)
+            z = (tau - self.tmin) / denom
+            return np.clip(z, 0.0, 1.0)
+
+        elif self.time_method == "log-min-max":
+            # base-10 log min-max on raw time
+            tmin_raw = float(self.time_norm.get("tmin_raw", 0.0))
+            tmax_raw = float(self.time_norm.get("tmax_raw", 1.0))
+            eps = float(norm_cfg.get("epsilon", 1e-30))
+            # guard if tmin_raw <= 0
+            lo = np.log10(max(tmin_raw, eps))
+            hi = np.log10(max(tmax_raw, tmin_raw + eps))
+            denom = max(hi - lo, min_scale)
+            z = (np.log10(np.maximum(t, eps)) - lo) / denom
+            return np.clip(z, 0.0, 1.0)
+
+        else:
+            raise ValueError(f"Unknown time normalization method: {self.time_method}")
+
 
     def _try_gpu_cache(self):
         """
@@ -178,7 +208,6 @@ class SequenceDataset(Dataset):
                 if self.norm_helper:
                     x0_n = self.norm_helper.normalize(x0_log, self.species_vars)
                     g_n  = self.norm_helper.normalize(g_vec,  self.global_vars)
-                    # FIX: normalize targets with the *target* variable list
                     y_n  = self.norm_helper.normalize(y_log,  self.target_vars)
                 else:
                     x0_n, g_n, y_n = x0_log, g_vec, y_log
@@ -252,8 +281,6 @@ class SequenceDataset(Dataset):
         else:
             return self._load_from_disk(idx)
 
-
-# This function is correct and does not need changes.
 def create_dataloader(dataset: Dataset,
                       config: Dict[str, Any],
                       shuffle: bool = True,

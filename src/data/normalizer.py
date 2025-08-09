@@ -8,14 +8,13 @@ class NormalizationHelper:
     Applies pre-computed normalization statistics to torch tensors based on a
     flexible, config-driven scheme. Supports:
       - "log-standard"  : log10(x) -> standardize
-      - "standard"      : standardize
-      - "log-min-max"   : time only, tau = ln(1 + t/tau0), then min-max
+      - "standard"      : standardize (subtract off mean, divide by std)
+      - "time-norm"   : time only, tau = ln(1 + t/tau0), then min-max
     """
-
     def __init__(self,
-                 stats: Dict[str, Any],
-                 device: torch.device,
-                 config: Dict[str, Any]):
+                stats: Dict[str, Any],
+                device: torch.device,
+                config: Dict[str, Any]):
 
         self.stats = stats
         self.device = device
@@ -27,12 +26,21 @@ class NormalizationHelper:
         self.dtype = torch.float64 if dtype_name == "float64" else torch.float32
 
         # Core stats
-        self.methods: Dict[str, str] = self.stats.get("normalization_methods", {})
+        raw_methods = self.stats.get("normalization_methods", {})
+        self.methods: Dict[str, str] = {k: ("none" if v is None else str(v).lower()) for k, v in raw_methods.items()}
         self.per_key_stats: Dict[str, Dict[str, float]] = self.stats.get("per_key_stats", {})
-        self.time_norm = self.stats.get("time_normalization", None)  # {"tau0","tmin","tmax","time_transform":"log-min-max"}
+        self.time_norm = self.stats.get("time_normalization", None)
+        self.time_var = config.get("data", {}).get("time_variable", "t")
+        self.time_method = (config.get("normalization", {}).get("methods", {}).get(self.time_var, "log-min-max"))
 
         # In sequence mode, species are already log10-transformed in the shards.
-        self.inputs_already_logged = bool(self.time_norm) or bool(self.config.get("data", {}).get("sequence_mode", False))
+        # Build a per-variable set so only species skip the extra log10; globals won't.
+        data_cfg = config.get("data", {})
+        seq_mode = bool(data_cfg.get("sequence_mode", False))
+        species_vars = list(data_cfg.get("species_variables", []))
+        self._already_logged_vars = set(species_vars) if seq_mode else set()
+
+        self.inputs_already_logged = bool(self.time_norm) or seq_mode
         if self.inputs_already_logged:
             self.logger.info("NormalizationHelper: sequence-mode detected; species are already in log10 space.")
 
@@ -46,13 +54,24 @@ class NormalizationHelper:
 
         # Time constants (if available)
         if self.time_norm:
+            # paper params
             self._tau0 = torch.tensor(float(self.time_norm["tau0"]), dtype=self.dtype, device=self.device)
-            # NOTE: stats use *tau* bounds: tau_min/tau_max = ln(1 + t/tau0)
             self._tau_min = torch.tensor(float(self.time_norm["tmin"]), dtype=self.dtype, device=self.device)
             self._tau_max = torch.tensor(float(self.time_norm["tmax"]), dtype=self.dtype, device=self.device)
             self._tau_range = torch.clamp(self._tau_max - self._tau_min, min=1e-12)
 
-    # ---------- helpers ----------
+            # log-min-max params (raw)
+            tmin_raw = float(self.time_norm.get("tmin_raw", 0.0))
+            tmax_raw = float(self.time_norm.get("tmax_raw", 1.0))
+            eps = float(self.norm_config.get("epsilon", 1e-30))
+            lo = max(tmin_raw, eps)
+            hi = max(tmax_raw, lo + eps)
+
+            self._tlog_min = torch.log10(torch.tensor(lo, dtype=self.dtype, device=self.device))
+            self._tlog_max = torch.log10(torch.tensor(hi, dtype=self.dtype, device=self.device))
+            self._tlog_range = torch.clamp(self._tlog_max - self._tlog_min, min=1e-12)
+
+
     def _get_params(self, var_list: List[str]) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
         """Build mean, std, and methods tensors aligned to var_list."""
         means, stds, methods = [], [], []
@@ -74,31 +93,50 @@ class NormalizationHelper:
         means_t = torch.tensor(means, dtype=self.dtype, device=self.device)
         stds_t  = torch.tensor(stds,  dtype=self.dtype, device=self.device)
         return means_t, stds_t, methods
+    
 
-    # ---------- time normalization ----------
     def _time_to_unit(self, t: torch.Tensor) -> torch.Tensor:
-        """Normalize raw time t -> [0,1] using tau = ln(1 + t/tau0), min/max over tau."""
+        """Normalize raw time to [0,1] per configured method."""
         if self.time_norm is None:
             raise RuntimeError("Time normalization stats not found.")
-        tau = torch.log1p(t / self._tau0)  # natural log
-        return (tau - self._tau_min) / self._tau_range
+
+        if self.time_method == "time-norm":
+            tau = torch.log1p(t / self._tau0)
+            return (tau - self._tau_min) / self._tau_range
+
+        if self.time_method == "log-min-max":
+            eps = self.epsilon
+            tlog = torch.log10(torch.clamp(t, min=eps))
+            return (tlog - self._tlog_min) / self._tlog_range
+
+        raise ValueError(f"Unknown time normalization method: {self.time_method}")
 
     def _unit_to_time(self, t_norm: torch.Tensor) -> torch.Tensor:
-        """Inverse of _time_to_unit."""
+        """Invert _time_to_unit back to RAW time."""
         if self.time_norm is None:
             raise RuntimeError("Time normalization stats not found.")
-        tau = t_norm * self._tau_range + self._tau_min
-        return self._tau0 * torch.expm1(tau)
 
-    # ---------- public API ----------
+        t_norm = torch.clamp(t_norm, 0.0, 1.0)
+
+        if self.time_method == "time-norm":
+            tau = t_norm * self._tau_range + self._tau_min
+            return self._tau0 * torch.expm1(tau)
+
+        if self.time_method == "log-min-max":
+            tlog = t_norm * self._tlog_range + self._tlog_min
+            return torch.pow(self._ten, tlog)
+
+        raise ValueError(f"Unknown time normalization method: {self.time_method}")
+
+
     def normalize(self, data: torch.Tensor, var_list: List[str]) -> torch.Tensor:
         """
         Normalize a tensor shaped (..., D) where D == len(var_list).
         Applies per-dimension transforms based on method:
-          - "log-standard" : ( (log10 x) or pass-through if already logged ) -> standardize -> clamp
-          - "standard"     : standardize -> clamp
-          - "log-min-max"  : time transform (ln1p + min-max) -> clamp to [0,1] then to +/- clamp_val (no-op if <=1)
-          - "none"         : pass-through (then clamp)
+        - "log-standard" : (log10 x) unless already in log space -> standardize -> clamp
+        - "standard"     : standardize -> clamp
+        - "time-norm"    : time transform (ln1p + min-max) -> clamp to [0,1]
+        - "none"         : pass-through (then clamp)
         """
         if data.shape[-1] != len(var_list):
             raise ValueError(f"Data last dim {data.shape[-1]} != var_list length {len(var_list)}")
@@ -112,22 +150,19 @@ class NormalizationHelper:
         for i, method in enumerate(methods):
             col = out[..., i]
             if method == "log-standard":
-                if not self.inputs_already_logged:
+                varname = var_list[i]
+                # Only skip log10 for variables that were pre-logged (species in sequence mode)
+                if varname not in self._already_logged_vars:
                     col = torch.log10(col.clamp_min(self.epsilon))
                 col = (col - means[i]) / stds[i]
             elif method == "standard":
                 col = (col - means[i]) / stds[i]
-            elif method == "log-min-max":
-                # time variable: expects *raw* t, never log10
+            elif method == "time-norm":
                 col = self._time_to_unit(col)
-                # keep in [0,1]; afterwards global clamp is harmless
                 col = torch.clamp(col, 0.0, 1.0)
             elif method == "none":
-                # no transform
                 pass
             else:
-                # Unknown method -> no transform but warn once.
-                # (Avoid accidental log10 on time due to substring matches.)
                 self.logger.warning(f"Unknown normalization method '{method}' for var '{var_list[i]}'; passing through.")
             out[..., i] = col
 
@@ -135,9 +170,11 @@ class NormalizationHelper:
 
     def denormalize(self, data: torch.Tensor, var_list: List[str]) -> torch.Tensor:
         """
-        Invert normalize() for supported methods.
-        NOTE: For species in sequence mode, this returns values in **log10 space** when method == "log-standard".
-              If you need linear units, exponentiate with 10**x after calling this.
+        Invert normalize() for all supported methods, returning RAW values:
+        - log-standard -> linear space (10**(x*std+mean))
+        - standard     -> linear space (x*std+mean)
+        - time-norm  -> raw time (inverse tau min-max)
+        - none         -> pass-through
         """
         if data.shape[-1] != len(var_list):
             raise ValueError(f"Data last dim {data.shape[-1]} != var_list length {len(var_list)}")
@@ -151,22 +188,23 @@ class NormalizationHelper:
         for i, method in enumerate(methods):
             col = out[..., i]
             if method == "log-standard":
-                col = col * stds[i] + means[i]        # back to log10 space
-                if not self.inputs_already_logged:
-                    col = torch.pow(self._ten, col)   # back to linear units
+                # back to log10 space, then ALWAYS exponentiate to linear space
+                col = col * stds[i] + means[i]     # log10(x)
+                col = torch.pow(self._ten, col)    # -> x (raw linear)
             elif method == "standard":
-                col = col * stds[i] + means[i]
-            elif method == "log-min-max":
-                # back to raw t
+                col = col * stds[i] + means[i]     # -> raw linear
+            elif method == "time-norm":
+                # from [0,1] back to raw time
                 col = torch.clamp(col, 0.0, 1.0)
-                col = self._unit_to_time(col)
+                col = self._unit_to_time(col)      # -> raw time
             elif method == "none":
-                pass
+                pass                                # already raw
             else:
                 self.logger.warning(f"Unknown normalization method '{method}' for var '{var_list[i]}'; passing through.")
             out[..., i] = col
 
         return out
+
 
     # Convenience methods if you keep time separate in your dataset code
     def normalize_time(self, t: torch.Tensor) -> torch.Tensor:
