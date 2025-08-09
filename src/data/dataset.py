@@ -8,11 +8,10 @@ both inputs and targets into a standardized space.
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Dict, Any, Tuple, Optional
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-import math
 
 # Import the corrected NormalizationHelper
 from data.normalizer import NormalizationHelper
@@ -36,7 +35,8 @@ class SequenceDataset(Dataset):
         # Get dtype from config
         dtype_str = self.config["system"].get("dtype", "float32")
         self.dtype = getattr(torch, dtype_str)
-        self.np_dtype = np.float32 if dtype_str == "float32" else np.float64
+        # FIX: only use np.float64 when user explicitly requests float64; otherwise stay in float32 on host
+        self.np_dtype = np.float64 if dtype_str == "float64" else np.float32
 
         self.norm_stats = norm_stats or {}
 
@@ -54,8 +54,10 @@ class SequenceDataset(Dataset):
         self.split_info = self.shard_index["splits"][split_name]
         self.M = self.shard_index["M_per_sample"]
         self.species_vars = self.config["data"]["species_variables"]
+        self.target_vars = self.config["data"].get("target_species_variables", self.species_vars)
         self.global_vars = self.config["data"]["global_variables"]
         self.n_species = len(self.species_vars)
+        self.n_targets = len(self.target_vars)
         self.n_globals = len(self.global_vars)
 
         # Time normalization parameters (handled separately)
@@ -73,10 +75,9 @@ class SequenceDataset(Dataset):
         
         self._build_shard_lookup()
 
-        # --- CRITICAL CHANGE: Instantiate the NormalizationHelper ---
+        # Normalization helper
         self.norm_helper = None
         if self.norm_stats and self.norm_stats.get("per_key_stats"):
-            # Instantiate on CPU. It will be used for pre-caching data before moving to GPU.
             self.norm_helper = NormalizationHelper(self.norm_stats, torch.device("cpu"), self.config)
             self.logger.info(f"NormalizationHelper initialized for '{split_name}' dataset.")
         else:
@@ -84,28 +85,36 @@ class SequenceDataset(Dataset):
 
         # Caching setup
         self.gpu_cache = None
-        self._shard_cache = {"name": None, "data": None} # Per-worker cache for CPU fallback
+        self._shard_cache = {"name": None, "data": None}  # per-worker CPU cache
         self._try_gpu_cache()
 
     def _build_shard_lookup(self):
-        """Build lookup arrays for shard access. Correct as is."""
+        """Build lookup arrays for shard access using n_trajectories only."""
         self.shard_starts = [0]
         cumsum = 0
         for shard in self.shards:
-            cumsum += shard["n_samples"]
+            if "n_trajectories" not in shard:
+                raise KeyError(f"Shard metadata missing n_trajectories: {shard}")
+            n = int(shard["n_trajectories"])
+            cumsum += n
             self.shard_starts.append(cumsum)
         # Use int64 for robust searchsorted math, especially with large datasets
         self.shard_starts = np.array(self.shard_starts[:-1], dtype=np.int64)
+        # Derive total from shards to avoid mismatches
+        self.n_total_samples = cumsum
 
     def _normalize_time(self, t: np.ndarray) -> np.ndarray:
-        """Apply global log-min-max time normalization. Correct as is."""
+        """Apply global log-min-max time normalization with configured floor."""
         tau = np.log(1 + t / self.tau0)
-        return np.clip((tau - self.tmin) / max(self.tmax - self.tmin, 1e-10), 0, 1)
+        # FIXED: Use configured min_std instead of magic number
+        min_scale = float(self.config.get("normalization", {}).get("min_std", 1e-10))
+        denom = max(self.tmax - self.tmin, min_scale)
+        return np.clip((tau - self.tmin) / denom, 0, 1)
 
     def _try_gpu_cache(self):
         """
-        Corrected method. Tries to load, fully normalize, and cache the entire
-        dataset on the GPU. Normalizes both inputs AND targets.
+        Tries to load, fully normalize, and cache the entire dataset on the GPU.
+        Normalizes both inputs AND targets.
         """
         if self.n_total_samples == 0:
             return
@@ -114,71 +123,78 @@ class SequenceDataset(Dataset):
         if gpu_cache_setting is False or self.device.type != "cuda":
             return
 
-        # --- Memory budget calculation (correct as is) ---
-        bytes_per_float = 8 if self.dtype == torch.float64 else 4
-        # Note: This is an estimate of the *final* data size. Raw data may be larger.
+        # Memory budget calculation with overhead (conservative)
+        if self.dtype == torch.float64:
+            bytes_per_float = 8
+        elif self.dtype in (torch.float16, torch.bfloat16):
+            bytes_per_float = 2
+        else:
+            bytes_per_float = 4
+
+        # Inputs: [N, S+G+M]; Targets: [N, M, T]
         bytes_needed = self.n_total_samples * (
-            self.n_species + self.n_globals + self.M + self.n_species * self.M
+            self.n_species + self.n_globals + self.M + self.n_targets * self.M
         ) * bytes_per_float
 
         try:
             idx = 0 if self.device.index is None else self.device.index
             total_mem = torch.cuda.get_device_properties(idx).total_memory
             tcfg = self.config.get("training", {})
-            max_frac = float(tcfg.get("gpu_cache_max_fraction", 0.5))
-            reserve_bytes = int(tcfg.get("gpu_cache_reserved_bytes", 2e9))
-            budget = max(0, int(total_mem * max_frac) - reserve_bytes)
 
-            if bytes_needed > budget:
+            max_frac = float(tcfg.get("gpu_cache_max_fraction", 0.5))
+            reserve_bytes = int(tcfg.get("gpu_cache_reserved_bytes", 3_000_000_000))  # 3GB
+            overhead = float(tcfg.get("gpu_cache_overhead_factor", 1.15))             # +15%
+
+            budget = max(0, int(total_mem * max_frac) - reserve_bytes)
+            need = int(bytes_needed * overhead)
+
+            if need > budget:
                 self.logger.warning(
-                    f"GPU cache for '{self.split_name}' disabled: "
-                    f"need {bytes_needed/1e9:.2f} GB > budget {budget/1e9:.2f} GB"
+                    f"GPU cache for '{self.split_name}' disabled: need {need/1e9:.2f} GB > budget {budget/1e9:.2f} GB"
                 )
                 return
         except Exception as e:
             self.logger.warning(f"Could not assess GPU memory for caching, disabling. Error: {e}")
             return
 
-        # --- Data Loading and Normalization ---
-        self.logger.info(f"Loading and normalizing '{self.split_name}' data for GPU cache ({bytes_needed/1e9:.1f} GB)...")
-        
+        # Load + normalize on CPU
+        self.logger.info(
+            f"Loading and normalizing '{self.split_name}' data for GPU cache ({bytes_needed/1e9:.1f} GB est)..."
+        )
+
         all_x0_norm, all_g_norm, all_t_norm, all_y_norm = [], [], [], []
 
         for shard in self.shards:
             shard_path = self.split_dir / shard["filename"]
             with np.load(shard_path, allow_pickle=False) as data:
-                # Load raw data from shards and convert to CPU tensors
-                x0_log = torch.from_numpy(data["x0_log"].astype(self.np_dtype))
-                g_vec = torch.from_numpy(data["globals"].astype(self.np_dtype))
-                t_vec_raw = data["t_vec"]
-                y_mat_log = torch.from_numpy(data["y_mat"].astype(self.np_dtype))
+                x0_log   = torch.from_numpy(data["x0_log"].astype(self.np_dtype))   # [N, S]
+                g_vec    = torch.from_numpy(data["globals"].astype(self.np_dtype))  # [N, G]
+                t_vec_np = data["t_vec"]                                            # [N, M] (numpy)
+                y_log    = torch.from_numpy(data["y_mat"].astype(self.np_dtype))    # [N, M, T_or_S]
 
-                # Normalize time separately
-                t_vec_norm = torch.from_numpy(self._normalize_time(t_vec_raw).astype(self.np_dtype))
-                
-                # Normalize all other features using the helper
+                t_norm_np = self._normalize_time(t_vec_np).astype(self.np_dtype)    # [N, M]
+                t_norm    = torch.from_numpy(t_norm_np)
+
                 if self.norm_helper:
-                    x0_norm = self.norm_helper.normalize(x0_log, self.species_vars)
-                    g_norm = self.norm_helper.normalize(g_vec, self.global_vars)
-                    y_norm = self.norm_helper.normalize(y_mat_log, self.species_vars)
+                    x0_n = self.norm_helper.normalize(x0_log, self.species_vars)
+                    g_n  = self.norm_helper.normalize(g_vec,  self.global_vars)
+                    # FIX: normalize targets with the *target* variable list
+                    y_n  = self.norm_helper.normalize(y_log,  self.target_vars)
                 else:
-                    x0_norm, g_norm, y_norm = x0_log, g_vec, y_mat_log
+                    x0_n, g_n, y_n = x0_log, g_vec, y_log
 
-                all_x0_norm.append(x0_norm)
-                all_g_norm.append(g_norm)
-                all_t_norm.append(t_vec_norm)
-                all_y_norm.append(y_norm)
-        
-        # Concatenate all normalized tensors on the CPU
-        x0_full = torch.cat(all_x0_norm, dim=0)
-        g_full = torch.cat(all_g_norm, dim=0)
-        t_full = torch.cat(all_t_norm, dim=0)
-        y_full = torch.cat(all_y_norm, dim=0)
+                all_x0_norm.append(x0_n)
+                all_g_norm.append(g_n)
+                all_t_norm.append(t_norm)
+                all_y_norm.append(y_n)
 
-        # Pre-build final inputs and targets tensors
+        x0_full = torch.cat(all_x0_norm, dim=0).to(self.dtype)
+        g_full  = torch.cat(all_g_norm,  dim=0).to(self.dtype)
+        t_full  = torch.cat(all_t_norm,  dim=0).to(self.dtype)
+        y_full  = torch.cat(all_y_norm,  dim=0).to(self.dtype)
+
         inputs_full = torch.cat([x0_full, g_full, t_full], dim=1)
 
-        # Move final, fully-processed tensors to GPU in the correct dtype
         self.gpu_cache = {
             "inputs": inputs_full.to(device=self.device, dtype=self.dtype, non_blocking=True),
             "targets": y_full.to(device=self.device, dtype=self.dtype, non_blocking=True),
@@ -187,41 +203,41 @@ class SequenceDataset(Dataset):
 
     def _load_from_disk(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Corrected method for CPU fallback. Loads a single item from a shard
-        and applies the full, correct normalization to both inputs and targets.
+        CPU fallback. Loads a single item from a shard and applies full normalization
+        to both inputs and targets.
         """
         shard_idx = np.searchsorted(self.shard_starts, idx, side='right') - 1
         local_idx = idx - self.shard_starts[shard_idx]
         shard_info = self.shards[shard_idx]
 
-        # LRU-1 cache for raw shard data to reduce disk reads by workers
+        # LRU-1 cache for raw shard data
         if self._shard_cache.get("name") != shard_info["filename"]:
             with np.load(self.split_dir / shard_info["filename"], allow_pickle=False) as data:
                 self._shard_cache = {"name": shard_info["filename"], "data": dict(data)}
-        
-        raw_data = self._shard_cache["data"]
 
-        # Extract raw data for the specific index and convert to CPU tensors
-        x0_log = torch.from_numpy(raw_data['x0_log'][local_idx].astype(self.np_dtype))
-        g_vec = torch.from_numpy(raw_data['globals'][local_idx].astype(self.np_dtype))
-        t_vec_raw = raw_data['t_vec'][local_idx]
-        y_mat_log = torch.from_numpy(raw_data['y_mat'][local_idx].astype(self.np_dtype))
+        raw = self._shard_cache["data"]
 
-        # Normalize time
-        t_vec_norm = torch.from_numpy(self._normalize_time(t_vec_raw).astype(self.np_dtype))
+        x0_log_np = raw["x0_log"][local_idx].astype(self.np_dtype, copy=False)  # [S]
+        g_np      = raw["globals"][local_idx].astype(self.np_dtype, copy=False) # [G]
+        t_np      = raw["t_vec"][local_idx]                                     # [M]
+        y_log_np  = raw["y_mat"][local_idx].astype(self.np_dtype, copy=False)   # [M, T]
 
-        # Normalize all other features using the helper
+        x0_log = torch.from_numpy(x0_log_np)                                    # [S]
+        g_vec  = torch.from_numpy(g_np)                                         # [G]
+        t_norm = torch.from_numpy(self._normalize_time(t_np).astype(self.np_dtype, copy=False))  # [M]
+        y_log  = torch.from_numpy(y_log_np)                                     # [M, T]
+
         if self.norm_helper:
-            x0_norm = self.norm_helper.normalize(x0_log, self.species_vars)
-            g_norm = self.norm_helper.normalize(g_vec, self.global_vars)
-            y_norm = self.norm_helper.normalize(y_mat_log, self.species_vars)
+            # add batch dims where appropriate
+            x0_n = self.norm_helper.normalize(x0_log.unsqueeze(0), self.species_vars).squeeze(0)  # [S]
+            g_n  = self.norm_helper.normalize(g_vec.unsqueeze(0),  self.global_vars).squeeze(0)   # [G]
+            # For [M, T], treat M as batch and normalize across T
+            y_n  = self.norm_helper.normalize(y_log, self.target_vars)                             # [M, T]
         else:
-            x0_norm, g_norm, y_norm = x0_log, g_vec, y_mat_log
+            x0_n, g_n, y_n = x0_log, g_vec, y_log
 
-        # Build final input and target tensors in the correct data type
-        inputs_tensor = torch.cat([x0_norm, g_norm, t_vec_norm]).to(self.dtype)
-        targets_tensor = y_norm.to(self.dtype)
-        
+        inputs_tensor  = torch.cat([x0_n, g_n, t_norm], dim=0).to(self.dtype)  # [S+G+M]
+        targets_tensor = y_n.to(self.dtype)                                     # [M, T]
         return inputs_tensor, targets_tensor
 
     def __len__(self) -> int:
@@ -235,6 +251,7 @@ class SequenceDataset(Dataset):
             return self.gpu_cache["inputs"][idx], self.gpu_cache["targets"][idx]
         else:
             return self._load_from_disk(idx)
+
 
 # This function is correct and does not need changes.
 def create_dataloader(dataset: Dataset,

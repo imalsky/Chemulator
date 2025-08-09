@@ -107,7 +107,7 @@ class Trainer:
         
         self.train_loader = create_dataloader(
             train_dataset, self.config, shuffle=True, 
-            device=self.device, drop_last=False
+            device=self.device, drop_last=True
         ) if train_dataset else None
         
         self.val_loader = create_dataloader(
@@ -214,58 +214,118 @@ class Trainer:
             raise ValueError(f"Unknown scheduler: {scheduler_type}")
     
     def _setup_loss(self):
-        """Setup loss function."""
-        self.criterion = nn.MSELoss()
+        """Setup loss function. Supports 'mse' (default) and 'paper' (Appendix A.2)."""
+        loss_name = self.train_config.get("loss", "mse").lower()
+        
+        if loss_name == "mse":
+            self.criterion = nn.MSELoss(reduction="mean")
+            self.logger.info("Using MSE loss")
+            
+        elif loss_name == "paper":
+            target_vars = self.data_config.get(
+                "target_species_variables", self.data_config["species_variables"]
+            )
+            def paper_loss(preds, targets):
+                # CORRECTNESS FIX: This implementation is robust to both sequence and row-wise modes
+                # and uses the correct element-wise aggregation order.
+                if self.norm_helper is None:
+                    return F.mse_loss(preds, targets) # Fallback if no normalizer
+
+                # 1. Denormalize predictions and targets
+                preds_dn   = self.norm_helper.denormalize(preds, target_vars)
+                targets_dn = self.norm_helper.denormalize(targets, target_vars)
+                
+                # 2. Ensure both are in log10 space, as denormalize() can return linear units
+                #    in row-wise mode. This check makes the loss computation mode-agnostic.
+                methods = [self.norm_helper.methods.get(v, "none") for v in target_vars]
+                
+                # Helper to re-apply log10 if denormalize returned linear units
+                def as_log10(tensor, method_list):
+                    output = tensor.clone()
+                    for i, method in enumerate(method_list):
+                        if method == "log-standard" and not self.norm_helper.inputs_already_logged:
+                            output[..., i] = torch.log10(tensor[..., i].clamp_min(self.norm_helper.epsilon))
+                    return output
+
+                preds_log   = as_log10(preds_dn, methods)
+                targets_log = as_log10(targets_dn, methods)
+
+                # 3. Compute element-wise magnitude-balanced error, then average
+                delta = (preds_log - targets_log).abs()
+                return (torch.pow(10.0, delta) - 1.0).mean()
+
+            self.criterion = paper_loss
+            self.logger.info("Using paper loss (robust, element-wise) per Appendix A.2")
     
     def _setup_amp(self):
-        """Configure PyTorch AMP and gradient-scaler logic."""
-        if self.dtype == torch.float64:
+        if self.dtype == torch.float64 or self.device.type == "mps":
             self.use_amp = False
             self.amp_dtype = None
             self.scaler = GradScaler(enabled=False)
+            if self.device.type == "mps":
+                self.logger.info("AMP disabled on MPS device (limited support)")
             return
 
         self.use_amp = self.train_config.get("use_amp", True)
         dtype_str = str(self.train_config.get("amp_dtype", "bfloat16")).lower()
 
-        if dtype_str == "bfloat16":
+        if dtype_str in {"bfloat16","bf16"}:
             self.amp_dtype = torch.bfloat16
-        elif dtype_str in {"float32", "fp32"}:
+        elif dtype_str in {"float16","fp16","half"}:
+            self.amp_dtype = torch.float16
+        elif dtype_str in {"float32","fp32"}:
             self.amp_dtype = torch.float32
         else:
             self.logger.warning(f"Unknown amp_dtype '{dtype_str}', defaulting to float32")
             self.amp_dtype = torch.float32
 
-        # Enable GradScaler for float-32 autocast (common) or for fp16 if you add it later.
-        enable_scaler = self.amp_dtype == torch.float16
-        self.scaler = GradScaler(enabled=enable_scaler)
-    
-    def _compute_loss(self, preds: torch.Tensor, targets: torch.Tensor, 
-                     reg_losses: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
-        """
-        Compute total loss including regularization.
+        # Enable autocast only for supported mixed-precision dtypes
+        if self.use_amp and self.amp_dtype not in {torch.float16, torch.bfloat16}:
+            # fp32 isn't a mixed-precision mode; disable autocast
+            self.use_amp = False
+
+        # GradScaler is only meaningful for fp16
+        self.scaler = GradScaler(enabled=(self.use_amp and self.amp_dtype == torch.float16))
+
         
-        Args:
-            preds: Model predictions
-            targets: Target values
-            reg_losses: Dictionary of regularization losses
-            
-        Returns:
-            Total loss (scalar tensor)
+    def _compute_loss(self, preds: torch.Tensor, targets: torch.Tensor, 
+                    reg_losses: Optional[Dict[str, torch.Tensor]] = None,
+                    include_reg: bool = True) -> torch.Tensor:
+        """
+        Compute total loss; optionally include regularization terms.
         """
         reg_losses = reg_losses or {}
-        mse = F.mse_loss(preds, targets)
-        
-        # Get regularization lambdas from config
-        lambdas = self.train_config.get("regularization", {})
-        lambda_entropy = lambdas.get("lambda_entropy", 0.0)
-        lambda_diversity = lambdas.get("lambda_diversity", 0.0)
-        
-        # Total loss
-        loss = mse
-        loss = loss + lambda_entropy * reg_losses.get("gate_kl_to_uniform", 0.0)
-        loss = loss + lambda_diversity * reg_losses.get("generator_similarity", 0.0)
-        
+
+        # Use the configured loss function
+        if callable(self.criterion):
+            main_loss = self.criterion(preds, targets)
+        else:
+            main_loss = self.criterion(preds, targets)
+
+        if not isinstance(main_loss, torch.Tensor):
+            main_loss = torch.tensor(main_loss, dtype=preds.dtype, device=preds.device)
+
+        loss = main_loss
+
+        if include_reg:
+            lambdas = self.train_config.get("regularization", {})
+            # gate KL
+            if lambdas.get("lambda_entropy", 0.0) and "gate_kl_to_uniform" in reg_losses:
+                entropy_term = reg_losses["gate_kl_to_uniform"]
+                if entropy_term.device != loss.device:
+                    entropy_term = entropy_term.to(loss.device)
+                if entropy_term.dtype != loss.dtype:
+                    entropy_term = entropy_term.to(loss.dtype)
+                loss = loss + float(lambdas["lambda_entropy"]) * entropy_term
+            # generator similarity
+            if lambdas.get("lambda_diversity", 0.0) and "generator_similarity" in reg_losses:
+                diversity_term = reg_losses["generator_similarity"]
+                if diversity_term.device != loss.device:
+                    diversity_term = diversity_term.to(loss.device)
+                if diversity_term.dtype != loss.dtype:
+                    diversity_term = diversity_term.to(loss.dtype)
+                loss = loss + float(lambdas["lambda_diversity"]) * diversity_term
+
         return loss
     
     def train(self) -> float:
@@ -312,7 +372,7 @@ class Trainer:
             epoch_start = time.time()
 
             # Update gate temperature if model supports it
-            if hasattr(self.model, "set_gate_temperature") and self.model.K > 1:
+            if hasattr(self.model, "set_gate_temperature") and hasattr(self.model, "K") and self.model.K > 1:
                 progress = min(1.0, (epoch - 1) / max(1, int(self.train_config["epochs"] * t_anneal_frac)))
                 temp = t_start + (t_end - t_start) * progress
                 self.model.set_gate_temperature(temp)
@@ -369,6 +429,12 @@ class Trainer:
             if inputs.device != self.device:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
+            
+            # Ensure correct dtype
+            if inputs.dtype != self.dtype:
+                inputs = inputs.to(self.dtype)
+            if targets.dtype != self.dtype:
+                targets = targets.to(self.dtype)
 
             # ── Forward ─────────────────────────────────────────────────────────
             with autocast(device_type=self.device.type,
@@ -444,15 +510,16 @@ class Trainer:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
             
+            # Ensure correct dtype
+            if inputs.dtype != self.dtype:
+                inputs = inputs.to(self.dtype)
+            if targets.dtype != self.dtype:
+                targets = targets.to(self.dtype)
+            
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-                # Model now returns tuple (predictions, auxiliary_data)
                 preds, aux = self.model(inputs)
-                
-                # Get regularization losses from model
                 reg_losses = self.model.get_regularization_losses(aux) if hasattr(self.model, 'get_regularization_losses') else {}
-                
-                # Compute total loss
-                loss = self._compute_loss(preds, targets, reg_losses)
+                loss = self._compute_loss(preds, targets, reg_losses, include_reg=False)
             
             batch_size = inputs.size(0)
             total_loss += loss.item() * batch_size
@@ -477,15 +544,16 @@ class Trainer:
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
             
+            # Ensure correct dtype
+            if inputs.dtype != self.dtype:
+                inputs = inputs.to(self.dtype)
+            if targets.dtype != self.dtype:
+                targets = targets.to(self.dtype)
+            
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-                # Model now returns tuple (predictions, auxiliary_data)
                 preds, aux = self.model(inputs)
-                
-                # Get regularization losses from model
                 reg_losses = self.model.get_regularization_losses(aux) if hasattr(self.model, 'get_regularization_losses') else {}
-                
-                # Compute total loss
-                loss = self._compute_loss(preds, targets, reg_losses)
+                loss = self._compute_loss(preds, targets, reg_losses, include_reg=False)
             
             batch_size = inputs.size(0)
             total_loss += loss.item() * batch_size
