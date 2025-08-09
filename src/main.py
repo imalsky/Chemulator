@@ -3,6 +3,10 @@
 Main entry point for chemical kinetics neural network training and hyperparameter tuning.
 """
 
+import os
+
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 import logging
 import sys
 import time
@@ -10,6 +14,7 @@ from pathlib import Path
 import torch
 from typing import Dict, Union
 import psutil
+
 
 # Setup multiprocessing strategy early
 import torch.multiprocessing
@@ -82,30 +87,62 @@ class ChemicalKineticsPipeline:
         ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
     
     def _compute_data_hash(self) -> str:
-        """Compute a hash of data-critical parameters."""
+        """Compute a hash of data-critical parameters that affect shard content or normalization."""
         import hashlib
         import json
-        
+
+        # Effective values with defaults matching the preprocessor
+        norm_cfg = self.config.get("normalization", {})
+        precfg = self.config.get("preprocessing", {})
+        train_cfg = self.config.get("training", {})
+        data_cfg = self.config.get("data", {})
+        sys_cfg = self.config.get("system", {})
+
+        # Filter out the time variable from normalization methods to avoid spurious rebuilds
+        methods = dict(norm_cfg.get("methods", {}))
+        time_var = data_cfg.get("time_variable")
+
         data_params = {
+            # Inputs & schema
             "raw_files": sorted([str(f) for f in self.raw_data_files]),
-            "species_variables": self.config["data"]["species_variables"],
-            "global_variables": self.config["data"]["global_variables"],
-            "time_variable": self.config["data"]["time_variable"],
-            "min_value_threshold": self.config["preprocessing"]["min_value_threshold"],
-            "use_fraction": self.config.get("training", {}).get("use_fraction", 1.0),
-            "sequence_mode": self.config["data"].get("sequence_mode", False),
-            "M_per_sample": self.config["data"].get("M_per_sample", 16),
-            "time_sampling": self.config["data"].get("time_sampling", {"uniform": 1.0}),
-            "normalization_methods": self.config["normalization"].get("methods", {}),
-            "default_norm_method": self.config.get("normalization", {}).get("default_method", "standard"),
-            "target_shard_bytes": self.config["preprocessing"].get("target_shard_bytes", None),
-            "trajectories_per_shard": self.config["preprocessing"].get("trajectories_per_shard", None),
-            "npz_compressed": self.config["preprocessing"].get("npz_compressed", True),
-            "system_dtype": self.config["system"].get("dtype", "float32"),
+            "species_variables": data_cfg.get("species_variables", []),
+            "target_species_variables": data_cfg.get("target_species_variables", data_cfg.get("species_variables", [])),
+            "global_variables": data_cfg.get("global_variables", []),
+            "time_variable": time_var,
+
+            # Sampling / supervision
+            "sequence_mode": data_cfg.get("sequence_mode", False),
+            "M_per_sample": data_cfg.get("M_per_sample", 16),
+            "time_sampling": data_cfg.get("time_sampling", {"uniform": 1.0}),
+
+            # Preprocessing knobs that change outputs
+            "min_value_threshold": precfg.get("min_value_threshold", 1e-30),
+            "target_shard_bytes": precfg.get("target_shard_bytes", None),
+            "trajectories_per_shard": precfg.get("trajectories_per_shard", None),
+            "npz_compressed": precfg.get("npz_compressed", True),
+            "time_hist_bins": precfg.get("time_hist_bins", 4096),  # affects tau0 estimate
+
+            # Normalization behavior that changes normalization.json
+            "default_norm_method": norm_cfg.get("default_method", "standard"),
+            "normalization_methods_no_time": methods,
+            "epsilon": norm_cfg.get("epsilon", 1e-30),
+            "min_std": norm_cfg.get("min_std", 1e-10),
+
+            # Split policy (changes which sample lands in which split)
+            "use_fraction": train_cfg.get("use_fraction", 1.0),
+            "val_fraction": train_cfg.get("val_fraction", 0.0),
+            "test_fraction": train_cfg.get("test_fraction", 0.0),
+
+            # Seed controlling deterministic split hashing
+            "seed": sys_cfg.get("seed", 42),
+
+            # Dtype baked into saved arrays
+            "system_dtype": sys_cfg.get("dtype", "float32"),
         }
-        
+
         payload = json.dumps(data_params, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
     
     def preprocess_data(self):
         """Preprocess data if needed."""
@@ -189,13 +226,11 @@ class ChemicalKineticsPipeline:
             raise FileNotFoundError(f"Normalization file missing: {norm_file}")
         norm_stats = load_json(norm_file)
         
+        # FIXED: Use correct NormalizationHelper constructor signature
         norm_helper = NormalizationHelper(
-            norm_stats,
-            self.device,
-            self.config["data"]["species_variables"],
-            self.config["data"]["global_variables"],
-            self.config["data"]["time_variable"],
-            self.config
+            stats=norm_stats,
+            device=self.device,
+            config=self.config
         )
         
         # Log memory status

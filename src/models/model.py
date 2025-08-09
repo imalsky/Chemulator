@@ -154,6 +154,7 @@ class LinearLatentMixture(nn.Module):
         self._initialize_weights()
 
     def set_gate_temperature(self, temp: float):
+        """Set gate temperature with safety clamp."""
         self.gate_temperature = float(max(1e-3, temp))
 
     def _get_activation(self, name: str):
@@ -238,13 +239,16 @@ class LinearLatentMixture(nn.Module):
                     desired_b = torch.full((self.latent_dim, J), 1.0,
                                            dtype=last.weight.dtype, device=last.weight.device)
 
-                    # Stable inverse softplus: x = log(exp(y) - 1)
+                    # Numerically stable inverse softplus
                     def softplus_inv(y: torch.Tensor) -> torch.Tensor:
-                        return torch.where(
-                            y > 20,
-                            y,  # for large y, softplus ~ y
-                            torch.log(torch.expm1(y))
-                        )
+                        """Stable inverse softplus: x = log(exp(y) - 1)"""
+                        tiny = torch.finfo(y.dtype).tiny
+                        # For small y, use log(expm1(y)) to avoid cancellation
+                        # For large y, use y + log1p(-exp(-y)) to avoid overflow
+                        use_small = (y < 1.0)
+                        small_branch = torch.log(torch.clamp(torch.expm1(y), min=tiny))
+                        large_branch = y + torch.log1p(-torch.exp(-y))
+                        return torch.where(use_small, small_branch, large_branch)
 
                     bias_view = last.bias.view(self.latent_dim, 1 + 2 * J)
                     bias_view[:, 0:1] = softplus_inv(desired_s)  # s pre-activations
@@ -254,7 +258,9 @@ class LinearLatentMixture(nn.Module):
     def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Args
-            inputs : [B, n_species + n_globals + M]  (last M entries are τ-normalised time)
+            inputs : [B, n_species + n_globals + M]
+                The last M entries are the **normalized physical time** t_norm ∈ [0,1].
+                If time-warp is enabled, the network maps t_norm -> τ(t, x0, p) internally.
         Returns
             Tuple of:
             - log-abundance predictions : [B, M, n_targets]
@@ -287,7 +293,9 @@ class LinearLatentMixture(nn.Module):
             c_all = c_all.view(B, self.K, self.latent_dim)
 
             logits = self.gate_net(enc_in)
-            p = F.softmax(logits / self.gate_temperature, dim=-1)  # [B, K]
+            # FIXED: Clamp temperature to prevent division by zero
+            temp = max(float(self.gate_temperature), 1e-3)
+            p = F.softmax(logits / temp, dim=-1)  # [B, K]
             
             # Store auxiliary data for regularization
             aux["gate_p"] = p
@@ -327,16 +335,40 @@ class LinearLatentMixture(nn.Module):
         p = aux["gate_p"]  # [B, K]
         K = p.size(-1)
         probs = p.clamp_min(1e-8)
-        kl = (probs * (probs.log() + math.log(K))).sum(dim=-1).mean()
+        # FIX: Use torch.tensor with proper dtype and device
+        log_K = torch.tensor(math.log(K), dtype=probs.dtype, device=probs.device)
+        kl = (probs * (probs.log() + log_K)).sum(dim=-1).mean()
         losses["gate_kl_to_uniform"] = kl  # ≥0
         
         # Generator diversity penalty (mean cosine similarity between directions)
         c_all = aux["c_all"]  # [B, K, D]
-        # Average over batch to get mean direction vectors
+        
+        # NOTE: Current implementation computes diversity of batch-averaged experts
+        # This encourages global specialization across the dataset
+        # Alternative: For per-sample diversity, compute similarity per sample then average
+        
+        # Current approach (batch-level diversity):
         w = F.normalize(c_all.mean(dim=0), dim=-1)  # [K, D]
-        cos = (w @ w.T).triu(1)
-        mean_sim = cos[cos != 0].mean() if cos.numel() > 0 else torch.tensor(0.0)
+        cos_ut = (w @ w.T).triu(1)
+        # CORRECTNESS FIX: Use a fixed denominator to correctly average all pairwise similarities,
+        # including genuine zeros (from orthogonal experts), which `cos[cos != 0]` would exclude.
+        num_pairs = self.K * (self.K - 1) // 2
+        mean_sim = cos_ut.sum() / max(1, num_pairs)
         losses["generator_similarity"] = mean_sim.clamp_min(0)
+        
+        # Alternative per-sample diversity (commented out - use if desired):
+        # # Compute cosine similarity per sample
+        # c_norm = F.normalize(c_all, dim=-1)  # [B, K, D]
+        # # Compute pairwise similarity for each sample
+        # cos_per_sample = torch.bmm(c_norm, c_norm.transpose(1, 2))  # [B, K, K]
+        # # Extract upper triangular (excluding diagonal)
+        # mask = torch.triu(torch.ones_like(cos_per_sample[0]), diagonal=1).bool()
+        # similarities = []
+        # for i in range(B):
+        #     sim = cos_per_sample[i][mask].mean()
+        #     similarities.append(sim)
+        # mean_sim = torch.stack(similarities).mean()
+        # losses["generator_similarity"] = mean_sim.clamp_min(0)
         
         return losses
 

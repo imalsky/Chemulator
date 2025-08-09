@@ -19,34 +19,38 @@
 
   "data": {
     "species_variables": [
-      "C2H2_evolution","CH4_evolution","CO2_evolution","CO_evolution",
-      "H2O_evolution","H2_evolution","HCN_evolution","H_evolution",
-      "N2_evolution","NH3_evolution","OH_evolution","O_evolution"
+      "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
+      "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
+      "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
     "target_species_variables": [
-      "C2H2_evolution","CH4_evolution","CO2_evolution","CO_evolution",
-      "H2O_evolution","H2_evolution","HCN_evolution","H_evolution",
-      "N2_evolution","NH3_evolution","OH_evolution","O_evolution"
+      "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
+      "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
+      "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
-    "global_variables": ["P","T"],
+    "global_variables": ["P", "T"],
     "time_variable": "t_time",
 
-    // Sequence-mode for lilian
     "sequence_mode": true,
-    "M_per_sample": 32,
+    "M_per_sample": 64,
     "time_sampling": { "uniform": 0.5, "log_spaced": 0.5 }
   },
 
   "preprocessing": {
-    "min_value_threshold": 1e-25
+    "min_value_threshold": 1e-25,
+    "num_workers": 8,
+    "hdf5_chunk_size": 65536,
+    "target_shard_bytes": 800000000,
+    "npz_compressed": false,
+    "time_hist_bins": 4096
   },
 
   "normalization": {
     "default_method": "log-standard",
     "methods": {
       "T": "standard",
-      "P": "standard",                // changed from log-min-max
-      "t_time": "log-min-max"         // time is still log-min-max (global)
+      "P": "log-min-max",
+      "t_time": "log-min-max"
     },
     "epsilon": 1e-30,
     "min_std": 1e-10,
@@ -54,22 +58,20 @@
   },
 
   "model": {
-    "type": "linear_latent_mixture",  // NEW: use hybrid variant
+    "type": "linear_latent_mixture",
     "latent_dim": 32,
     "encoder_layers": [1024, 1024, 1024, 1024],
     "decoder_layers": [256, 1024, 1024, 1024],
 
-    "mixture": { "K": 5 }, 
-    "time_warp": { "enabled": true,
-                   "J_terms": 5,
-                   "hidden_dim": 64},
+    "mixture": { "K": 5 },
+    "time_warp": { "enabled": true, "J_terms": 5, "hidden_dim": 64 },
 
     "activation": "tanh",
     "dropout": 0.0
   },
 
-
   "training": {
+    "loss": "mse",
     "val_fraction": 0.15,
     "test_fraction": 0.15,
     "use_fraction": 1.0,
@@ -80,17 +82,11 @@
     "batch_size": 4096,
     "gradient_accumulation_steps": 1,
 
-    // SequenceDataset will try to GPU-cache entire split; 'auto' is safer
-    "gpu_cache_dataset": "auto",      // was true; keep if you know it fits
+    "gpu_cache_dataset": "auto",
 
     "num_workers": 0,
-    "pin_memory": false,
-    "persistent_workers": false,
     "prefetch_factor": null,
-    "drop_last": true,
 
-    // OPTIMIZER
-    //"optimizer": "lion",
     "optimizer": "lion",
     "learning_rate": 1e-4,
     "weight_decay": 1e-7,
@@ -98,24 +94,20 @@
     "eps": 1e-8,
     "gradient_clip": 5.0,
 
-    // SCHEDULER
     "scheduler": "cosine",
     "scheduler_params": { "T_0": 100, "T_mult": 2, "eta_min": 1e-8 },
 
-    // AMP
     "use_amp": true,
     "amp_dtype": "bfloat16",
 
     "early_stopping_patience": 5000,
     "min_delta": 1e-8,
 
-    // NEW: regularization weights consumed by Trainer for the mixture
     "regularization": {
-      "lambda_entropy": 0.000,
-      "lambda_diversity": 0.00
+      "lambda_entropy": 0.0,
+      "lambda_diversity": 0.0
     }
   },
-
   "system": {
     "seed": 42,
     "use_torch_compile": true,
@@ -125,14 +117,5 @@
     "tf32": true,
     "dtype": "float32",
     "cuda_memory_fraction": 0.95
-  },
-
-  "optuna": {
-    "enabled": true,
-    "algorithm": "hyperband",
-    "hyperband_min_resource": 10,
-    "hyperband_max_resource": 50,
-    "hyperband_reduction_factor": 3,
-    "n_trials": 100
   }
 }
