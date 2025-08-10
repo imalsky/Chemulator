@@ -447,6 +447,8 @@ def optimize_hyperparameters(
             epoch_callback=pruning_cb,
         )
 
+        prunable.trial = trial
+
         # Train
         best_val = prunable.train()
 
