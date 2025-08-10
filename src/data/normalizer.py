@@ -9,7 +9,9 @@ class NormalizationHelper:
     flexible, config-driven scheme. Supports:
       - "log-standard"  : log10(x) -> standardize
       - "standard"      : standardize (subtract off mean, divide by std)
-      - "time-norm"   : time only, tau = ln(1 + t/tau0), then min-max
+      - "time-norm"     : time only, tau = ln(1 + t/tau0), then min-max
+      - "min-max"       : (x - min) / (max - min)
+      - "log-min-max"   : (log10 x - log_min) / (log_max - log_min)
     """
     def __init__(self,
                 stats: Dict[str, Any],
@@ -33,16 +35,23 @@ class NormalizationHelper:
         self.time_var = config.get("data", {}).get("time_variable", "t")
         self.time_method = (config.get("normalization", {}).get("methods", {}).get(self.time_var, "log-min-max"))
 
-        # In sequence mode, species are already log10-transformed in the shards.
-        # Build a per-variable set so only species skip the extra log10; globals won't.
-        data_cfg = config.get("data", {})
-        seq_mode = bool(data_cfg.get("sequence_mode", False))
-        species_vars = list(data_cfg.get("species_variables", []))
-        self._already_logged_vars = set(species_vars) if seq_mode else set()
+        # Prefer source-of-truth from normalization.json written by the preprocessor.
+        stats_logged = set((self.stats or {}).get("already_logged_vars", []))
 
-        self.inputs_already_logged = bool(self.time_norm) or seq_mode
-        if self.inputs_already_logged:
-            self.logger.info("NormalizationHelper: sequence-mode detected; species are already in log10 space.")
+        # Fallback (older shards): infer from sequence_mode if metadata is missing.
+        data_cfg = config.get("data", {})
+        if not stats_logged and bool(data_cfg.get("sequence_mode", False)):
+            stats_logged = set(list(data_cfg.get("species_variables", [])))
+
+        self._already_logged_vars = stats_logged
+
+        if self._already_logged_vars:
+            self.logger.info("NormalizationHelper: %d variables are already in log10 space (from shards).",
+                             len(self._already_logged_vars))
+
+        # Validate config vs stats (no 'standard' on already-logged vars; require stats to exist)
+        self._validate_no_double_log()
+        self._validate_stats_for_methods()
 
         # Scalars
         self.epsilon = torch.tensor(self.norm_config.get("epsilon", 1e-30), dtype=self.dtype, device=self.device)
@@ -71,6 +80,48 @@ class NormalizationHelper:
             self._tlog_max = torch.log10(torch.tensor(hi, dtype=self.dtype, device=self.device))
             self._tlog_range = torch.clamp(self._tlog_max - self._tlog_min, min=1e-12)
 
+
+    def _is_log_method(self, m: str) -> bool:
+        if not m:
+            return False
+        m = m.lower()
+        return m == "log" or m == "log10" or m.startswith("log_") or m == "log-standard"
+
+    def _require_keys(self, var: str, needed: List[str]) -> None:
+        blk = self.per_key_stats.get(var, {})
+        missing = [k for k in needed if k not in blk]
+        if missing:
+            raise ValueError(f"Normalization stats missing for '{var}': need {missing} in per_key_stats[{var}]")
+
+    def _validate_no_double_log(self) -> None:
+        # For variables already log10-transformed in shards:
+        # 1) It's OK to use 'log-standard' (we'll skip the extra log op).
+        # 2) It's NOT OK to use plain 'standard' (that would standardize log-values with linear stats).
+        for var in self._already_logged_vars:
+            method = self.methods.get(var, "none")
+            if method == "standard":
+                raise ValueError(
+                    f"Config requests 'standard' for '{var}', but shards store it in log10 space. "
+                    f"Use 'log-standard' or change preprocessing."
+                )
+
+    def _validate_stats_for_methods(self) -> None:
+        for var, method in self.methods.items():
+            if method == "log-standard":
+                self._require_keys(var, ["log_mean", "log_std"])
+            elif method == "standard":
+                self._require_keys(var, ["mean", "std"])
+            elif method == "min-max":
+                self._require_keys(var, ["min", "max"])
+                # If shards are already log10, plain min-max would be wrong domain.
+                if var in self._already_logged_vars:
+                    raise ValueError(f"'min-max' requested for '{var}', but shards are log10. Use 'log-min-max'.")
+            elif method == "log-min-max":
+                self._require_keys(var, ["log_min", "log_max"])
+            elif method in ("none", "time-norm"):
+                continue
+            else:
+                pass
 
     def _get_params(self, var_list: List[str]) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
         """Build mean, std, and methods tensors aligned to var_list."""
@@ -151,12 +202,38 @@ class NormalizationHelper:
             col = out[..., i]
             if method == "log-standard":
                 varname = var_list[i]
-                # Only skip log10 for variables that were pre-logged (species in sequence mode)
+                # Skip extra log if already in log10 space from shards
                 if varname not in self._already_logged_vars:
                     col = torch.log10(col.clamp_min(self.epsilon))
                 col = (col - means[i]) / stds[i]
             elif method == "standard":
+                varname = var_list[i]
+                if varname in self._already_logged_vars:
+                    raise ValueError(
+                        f"'standard' requested for '{varname}', but shards are log10. "
+                        f"Use 'log-standard' instead."
+                    )
                 col = (col - means[i]) / stds[i]
+            elif method == "min-max":
+                varname = var_list[i]
+                # Using linear-domain min/max
+                vmin = torch.as_tensor(self.per_key_stats[varname]["min"], dtype=self.dtype, device=self.device)
+                vmax = torch.as_tensor(self.per_key_stats[varname]["max"], dtype=self.dtype, device=self.device)
+                denom = torch.clamp(vmax - vmin, min=1e-12)
+                if varname in self._already_logged_vars:
+                    raise ValueError(f"'min-max' on '{varname}' is invalid because shards are log10. Use 'log-min-max'.")
+                col = (col - vmin) / denom
+                col = torch.clamp(col, 0.0, 1.0)
+            elif method == "log-min-max":
+                varname = var_list[i]
+                # Use log-domain min/max; log only if not already in log space
+                if varname not in self._already_logged_vars:
+                    col = torch.log10(col.clamp_min(self.epsilon))
+                lmin = torch.as_tensor(self.per_key_stats[varname]["log_min"], dtype=self.dtype, device=self.device)
+                lmax = torch.as_tensor(self.per_key_stats[varname]["log_max"], dtype=self.dtype, device=self.device)
+                denom = torch.clamp(lmax - lmin, min=1e-12)
+                col = (col - lmin) / denom
+                col = torch.clamp(col, 0.0, 1.0)
             elif method == "time-norm":
                 col = self._time_to_unit(col)
                 col = torch.clamp(col, 0.0, 1.0)
@@ -193,10 +270,22 @@ class NormalizationHelper:
                 col = torch.pow(self._ten, col)    # -> x (raw linear)
             elif method == "standard":
                 col = col * stds[i] + means[i]     # -> raw linear
-            elif method == "time-norm":
-                # from [0,1] back to raw time
+            elif method == "min-max":
+                varname = var_list[i]
+                vmin = torch.as_tensor(self.per_key_stats[varname]["min"], dtype=self.dtype, device=self.device)
+                vmax = torch.as_tensor(self.per_key_stats[varname]["max"], dtype=self.dtype, device=self.device)
                 col = torch.clamp(col, 0.0, 1.0)
-                col = self._unit_to_time(col)      # -> raw time
+                col = col * (vmax - vmin) + vmin
+            elif method == "log-min-max":
+                varname = var_list[i]
+                lmin = torch.as_tensor(self.per_key_stats[varname]["log_min"], dtype=self.dtype, device=self.device)
+                lmax = torch.as_tensor(self.per_key_stats[varname]["log_max"], dtype=self.dtype, device=self.device)
+                col = torch.clamp(col, 0.0, 1.0)
+                logx = col * (lmax - lmin) + lmin
+                col = torch.pow(self._ten, logx)  # back to linear
+            elif method == "time-norm":
+                col = torch.clamp(col, 0.0, 1.0)
+                col = self._unit_to_time(col)
             elif method == "none":
                 pass                                # already raw
             else:

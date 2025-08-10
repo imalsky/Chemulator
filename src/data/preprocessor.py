@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
 Chemical kinetics data preprocessor with sequence mode support for LiLaN.
-Improvements:
-- Streaming, two-pass time stats
-- Vectorized Welford accumulators (no Python per-element loops)
-- Optional multi-process fan-out (per-file) using ProcessPoolExecutor
-- Configurable shard compression and size preserved
-- Statistics preserved and merged across workers
+
+Key changes:
+- Use ONE global, fixed, log-spaced time grid shared by every trajectory.
+- Grid always includes both endpoints (endpoint=True).
+- Grid range comes from config.data.fixed_time_range {min,max} if present,
+  otherwise falls back to the global raw time min/max found by collect_time_stats().
+- Enforce coverage: any trajectory whose raw time window does not cover the
+  fixed grid is dropped (no extrapolation).
+- Remove per-trajectory time sampling and the uniform/log_spaced mixer.
+- Keep normalization choice for time (time-norm or log-min-max) driven by config.
+- Propagate the fixed grid metadata into normalization.json and shard_index.json.
 """
 
 from __future__ import annotations
@@ -16,13 +21,16 @@ import json
 import logging
 import math
 import time
+import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
 import h5py
 import numpy as np
 from utils.utils import save_json
+
 
 @dataclass
 class DataStatistics:
@@ -43,7 +51,6 @@ class DataStatistics:
     split_distribution: Dict[str, int] = field(default_factory=lambda: {"train": 0,
                                                                         "validation": 0,
                                                                         "test": 0})
-
     processing_times: Dict[str, float] = field(default_factory=dict)
     file_stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
@@ -58,7 +65,6 @@ class DataStatistics:
         self.dropped_use_fraction += other.dropped_use_fraction
         self.total_time_points += other.total_time_points
 
-        # merge min/max by variable
         for k, (mn, mx) in other.species_min_max.items():
             if k in self.species_min_max:
                 omn, omx = self.species_min_max[k]
@@ -73,17 +79,14 @@ class DataStatistics:
             else:
                 self.global_min_max[k] = (mn, mx)
 
-        # time range
         self.time_range = (
             min(self.time_range[0], other.time_range[0]),
             max(self.time_range[1], other.time_range[1]),
         )
 
-        # split distribution
         for split, cnt in other.split_distribution.items():
             self.split_distribution[split] = self.split_distribution.get(split, 0) + cnt
 
-        # processing times / file stats
         self.processing_times.update(other.processing_times)
         self.file_stats.update(other.file_stats)
 
@@ -149,6 +152,7 @@ class DataStatisticsLogger:
         save_json(summary, summary_path)
         self.logger.info(f"Statistics summary saved to {summary_path}")
 
+
 class ChunkedHDF5Reader:
     """Read HDF5 data in chunks to minimize memory usage."""
     def __init__(self, file_path: Optional[Path], chunk_size: int = 10000):
@@ -161,13 +165,14 @@ class ChunkedHDF5Reader:
             raise KeyError(f"Variable {var_name} not found in group")
         dset = group[var_name]
         if indices is not None:
-            return dset[indices]  # restore basic indexed read
+            return dset[indices]  # basic indexed read
         total = dset.shape[0]
         if total <= self.chunk_size:
             return dset[:]
-        chunks = [dset[i:min(i+self.chunk_size,total)] for i in range(0,total,self.chunk_size)]
+        chunks = [dset[i:min(i + self.chunk_size, total)] for i in range(0, total, self.chunk_size)]
         return np.concatenate(chunks)
-    
+
+
 class SequenceShardWriter:
     """Writes trajectory sequences to NPZ shards with improved buffering."""
     def __init__(
@@ -242,7 +247,7 @@ class SequenceShardWriter:
 # ==================
 
 class CorePreprocessor:
-    """Core preprocessing logic with chunked reading support."""
+    """Core preprocessing logic with chunked reading support and a fixed global time grid."""
 
     def __init__(
         self,
@@ -265,7 +270,6 @@ class CorePreprocessor:
 
         # Sequence mode settings
         self.M_per_sample = int(self.data_cfg.get("M_per_sample", 16))
-        self.time_sampling = self.data_cfg.get("time_sampling", {"uniform": 1.0})
 
         # Dtype
         dtype_str = self.system_cfg.get("dtype", "float32")
@@ -284,45 +288,35 @@ class CorePreprocessor:
         self.min_value_threshold = float(self.proc_cfg.get("min_value_threshold", 1e-30))
         self.norm_stats = norm_stats or {}
 
-    # ----------------------
-    # Time sampling utilities
-    # ----------------------
-    def _sample_times(self, t_min: float, t_max: float) -> np.ndarray:
-        """Sample M time points according to time_sampling config."""
-        if isinstance(self.time_sampling, dict):
-            uniform_frac = float(self.time_sampling.get("uniform", 0.5))
-            log_frac     = float(self.time_sampling.get("log_spaced", 0.5))
+        # Build the fixed global time grid (geomspace) once
+        self.fixed_grid = self._init_fixed_time_grid()
+        self.fixed_grid = self.fixed_grid.astype(np.float64)  # keep high precision for interpolation
+        self.fixed_grid_cast = self.fixed_grid.astype(self.np_dtype)  # cast when storing
+        self.log_tq = np.log10(np.maximum(self.fixed_grid, float(self.norm_cfg.get("epsilon", 1e-30))))
 
-            if (uniform_frac + log_frac) <= 0.0:
-                self.logger.warning("time_sampling fractions sum to 0; defaulting to uniform")
-                uniform_frac, log_frac = 1.0, 0.0
-
-            Mu = int(round(self.M_per_sample * uniform_frac))
-            Ml = self.M_per_sample - Mu
-
-            # strictly positive for geometric spacing
-            eps = 1e-12 * max(1.0, abs(t_min))
-            a = max(t_min, eps)
-            b = max(a * (1.0 + 1e-12), t_max)
-
-            parts = []
-            if Mu > 0:
-                # avoid duplicating the upper endpoint (geomspace will include it)
-                parts.append(np.linspace(a, b, Mu, endpoint=False, dtype=np.float64))
-            if Ml > 0:
-                parts.append(np.geomspace(a, b, Ml, dtype=np.float64))
-
-            t = np.unique(np.concatenate(parts))
-            # ensure exactly M points
-            if t.size < self.M_per_sample:
-                extra = np.geomspace(a, b, self.M_per_sample, dtype=np.float64)
-                t = np.unique(np.concatenate([t, extra]))[: self.M_per_sample]
-            elif t.size > self.M_per_sample:
-                t = t[: self.M_per_sample]
-
-            return t.astype(self.np_dtype)
+    def _init_fixed_time_grid(self) -> np.ndarray:
+        """Initialize a single global log-spaced time grid with endpoints included."""
+        # Highest priority: explicit config override
+        cfg_range = self.data_cfg.get("fixed_time_range", None)
+        if cfg_range is not None:
+            tmin = float(cfg_range.get("min"))
+            tmax = float(cfg_range.get("max"))
         else:
-            return np.linspace(t_min, t_max, self.M_per_sample, dtype=self.np_dtype)
+            # Next: from norm_stats (propagated by DataPreprocessor)
+            tn = (self.norm_stats or {}).get("time_normalization", {})
+            if "tmin_raw" in tn and "tmax_raw" in tn:
+                tmin = float(tn["tmin_raw"])
+                tmax = float(tn["tmax_raw"])
+            else:
+                raise ValueError("Time not specified")
+
+        # strict positivity for geomspace
+        eps = 1e-12 * max(1.0, abs(tmin))
+        a = max(tmin, eps)
+        b = max(a * (1.0 + 1e-12), tmax)
+
+        grid = np.geomspace(a, b, int(self.M_per_sample), endpoint=True, dtype=np.float64)
+        return grid
 
     # -------------------
     # Group data extraction
@@ -441,7 +435,7 @@ class CorePreprocessor:
 
                 n_t = grp[self.time_var].shape[0]
                 local_time_points += int(n_t)
-                # Only require 2 raw points to enable interpolation on [t_min, t_max]
+                # Need at least 2 raw points for interpolation
                 if n_t < 2:
                     if self.stats_logger:
                         self.stats_logger.stats.dropped_insufficient_time += 1
@@ -459,31 +453,39 @@ class CorePreprocessor:
 
                 extracted = self._extract_trajectory_chunked(grp, gname, reader)
                 if extracted is None:
-                    # individual drop counters were updated in extractor if stats_logger exists;
-                    # reflect a conservative increment on local stats already done above.
                     continue
 
                 time_data, x0, globals_vec, species_mat = extracted
+
+                # Enforce coverage: raw time must span the fixed grid range
+                raw_min = float(np.min(time_data))
+                raw_max = float(np.max(time_data))
+                gmin = float(self.fixed_grid[0])
+                gmax = float(self.fixed_grid[-1])
+
+                # Relative tolerance on bounds
+                rtol = float(self.proc_cfg.get("grid_coverage_rtol", 1e-6))
+                if (raw_min > gmin * (1.0 + rtol)) or (raw_max < gmax * (1.0 - rtol)):
+                    if self.stats_logger:
+                        self.stats_logger.stats.dropped_insufficient_time += 1
+                    local_stats.dropped_insufficient_time += 1
+                    continue
+
                 local_stats.valid_trajectories += 1
                 if self.stats_logger:
                     self.stats_logger.stats.valid_trajectories += 1
 
-                # Sample M time points in [t_min, t_max]
-                t_min, t_max = float(time_data.min()), float(time_data.max())
-                sampled_times = self._sample_times(t_min, t_max)
+                # --- log–log interpolation onto the fixed grid ---
+                eps = float(self.norm_cfg.get("epsilon", 1e-30))
+                log_t = np.log10(np.maximum(time_data, eps))      # original grid (monotonic)
+                log_y = np.log10(np.maximum(species_mat, eps))    # [Nt, T] in log10
 
-                # --- log–log interpolation onto the requested times ---
-                eps    = float(self.norm_cfg.get("epsilon", 1e-30))
-                log_t  = np.log10(np.maximum(time_data, eps))            # original grid (monotonic)
-                log_tq = np.log10(np.maximum(sampled_times, eps))        # requested grid
-                log_y  = np.log10(np.maximum(species_mat, eps))          # [Nt, T] in log10
-
-                y_mat_log = np.empty((len(sampled_times), self.n_target_species), dtype=self.np_dtype)
+                y_mat_log = np.empty((len(self.fixed_grid), self.n_target_species), dtype=self.np_dtype)
                 for j in range(self.n_target_species):
-                    y_mat_log[:, j] = np.interp(log_tq, log_t, log_y[:, j])
+                    y_mat_log[:, j] = np.interp(self.log_tq, log_t, log_y[:, j]).astype(self.np_dtype, copy=False)
 
-                x0_log = np.log10(np.maximum(x0, eps))
-                t_vec  = sampled_times.astype(self.np_dtype)   
+                x0_log = np.log10(np.maximum(x0, eps)).astype(self.np_dtype, copy=False)
+                t_vec = self.fixed_grid_cast  # identical for all trajectories
 
                 # seeded split
                 split_hash = int(hashlib.sha256(f"{seed}:{gname}:split".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
@@ -629,6 +631,7 @@ class CorePreprocessor:
             "time_transform": time_method,
         }
 
+
 def _process_one_file_worker(
     file_path_str: str,
     output_dir_str: str,
@@ -675,7 +678,6 @@ class DataPreprocessor:
         acc_count: int, acc_mean: float, acc_m2: float, chunk: np.ndarray
     ) -> Tuple[int, float, float, float, float]:
         """Merge a chunk into (count, mean, m2, min, max) using Chan-Welford."""
-        # finite only
         d = chunk[np.isfinite(chunk)]
         if d.size == 0:
             return acc_count, acc_mean, acc_m2, float("inf"), float("-inf")
@@ -698,7 +700,7 @@ class DataPreprocessor:
 
     def _collect_normalization_stats(self) -> Dict[str, Any]:
         """
-        Collect normalization statistics for all specified variables using a config-driven approach.
+        Collect normalization statistics for species/globals using a config-driven approach.
         Uses chunk-wise vectorized updates (no Python per-element loops).
         """
         self.logger.info("Collecting normalization statistics based on config...")
@@ -717,8 +719,12 @@ class DataPreprocessor:
                 "count": 0,
                 "mean": 0.0,
                 "m2": 0.0,
-                "min": float("inf"),
-                "max": float("-inf"),
+                # linear-domain min/max
+                "lin_min": float("inf"),
+                "lin_max": float("-inf"),
+                # log-domain min/max
+                "log_min": float("inf"),
+                "log_max": float("-inf"),
             }
 
         chunk_size = int(self.config["preprocessing"].get("hdf5_chunk_size", 10000))
@@ -750,30 +756,56 @@ class DataPreprocessor:
                                 eps = norm_cfg.get("epsilon", 1e-30)
                                 arr = np.log10(np.maximum(arr_raw, eps))
 
-                            # merge chunk (normalization stats accumulator stays in its own space)
                             a = accumulators[var]
                             n, m, m2, cmin, cmax = self._welford_merge(a["count"], a["mean"], a["m2"], arr)
                             a["count"], a["mean"], a["m2"] = n, m, m2
-                            if math.isfinite(cmin):
-                                a["min"] = min(a["min"], cmin)
-                                a["max"] = max(a["max"], cmax)
 
-                    for var in self.config["data"]["global_variables"]:
-                        if var in grp.attrs:
-                            value = float(grp.attrs[var])
-                            var_method = methods_override.get(var, default_method)
-                            # log if required
-                            v = math.log10(max(value, norm_cfg.get("epsilon", 1e-30))) if "log" in var_method else value
-                            a = accumulators[var]
-                            # merge scalar
-                            n, m, m2, cmin, cmax = self._welford_merge(a["count"], a["mean"], a["m2"], np.array([v], dtype=np.float64))
-                            a["count"], a["mean"], a["m2"] = n, m, m2
-                            if math.isfinite(cmin):
-                                a["min"] = min(a["min"], cmin)
-                                a["max"] = max(a["max"], cmax)
+                            # Update linear-domain min/max from raw values
+                            finite_lin = arr_raw[np.isfinite(arr_raw)]
+                            if finite_lin.size:
+                                lin_min = float(finite_lin.min())
+                                lin_max = float(finite_lin.max())
+                                a["lin_min"] = min(a["lin_min"], lin_min)
+                                a["lin_max"] = max(a["lin_max"], lin_max)
 
-                            if self.stats_logger:
-                                self.stats_logger.update_global_range(var, value)
+                            # Update log-domain min/max from log10(raw)
+                            eps = float(norm_cfg.get("epsilon", 1e-30))
+                            raw_pos = np.maximum(arr_raw, eps)
+                            finite_log = raw_pos[np.isfinite(raw_pos)]
+                            if finite_log.size:
+                                log_vals = np.log10(finite_log)
+                                log_min = float(log_vals.min())
+                                log_max = float(log_vals.max())
+                                a["log_min"] = min(a["log_min"], log_min)
+                                a["log_max"] = max(a["log_max"], log_max)
+
+                        for var in self.config["data"]["global_variables"]:
+                            if var in grp.attrs:
+                                value = float(grp.attrs[var])
+                                var_method = methods_override.get(var, default_method)
+
+                                # 1) Update mean/std in the domain required by the method
+                                a = accumulators[var]
+                                if "standard" in var_method:  # 'standard' or 'log-standard'
+                                    v = (math.log10(max(value, norm_cfg.get("epsilon", 1e-30)))
+                                        if "log" in var_method else value)
+                                    n, m, m2, cmin, cmax = self._welford_merge(
+                                        a["count"], a["mean"], a["m2"],
+                                        np.array([v], dtype=np.float64),
+                                    )
+                                    a["count"], a["mean"], a["m2"] = n, m, m2
+
+                                # 2) Always track min/max in BOTH domains
+                                if math.isfinite(value):
+                                    a["lin_min"] = min(a["lin_min"], value)
+                                    a["lin_max"] = max(a["lin_max"], value)
+                                    eps = float(norm_cfg.get("epsilon", 1e-30))
+                                    v_log = math.log10(max(value, eps))
+                                    a["log_min"] = min(a["log_min"], v_log)
+                                    a["log_max"] = max(a["log_max"], v_log)
+
+                                if self.stats_logger:
+                                    self.stats_logger.update_global_range(var, value)
 
         # finalize
         for var, a in accumulators.items():
@@ -815,22 +847,28 @@ class DataPreprocessor:
         processor = CorePreprocessor(self.config, stats_logger=self.stats_logger)
         time_stats = processor.collect_time_stats(self.raw_files)
 
-        # Log only the relevant stats based on configured method
-        tm = time_stats.get("time_transform", "log-min-max")
-        if tm == "log-min-max":
-            self.logger.info(
-                "Time normalization (log-min-max): "
-                f"tmin_raw={time_stats['tmin_raw']:.3e}, tmax_raw={time_stats['tmax_raw']:.3e}"
-            )
+        # Choose fixed grid bounds: config override or global raw min/max
+        cfg_range = self.config.get("data", {}).get("fixed_time_range")
+        if cfg_range is not None:
+            grid_min = float(cfg_range.get("min"))
+            grid_max = float(cfg_range.get("max"))
         else:
-            self.logger.info(
-                "Time normalization (time-norm): "
-                f"tau0={time_stats['tau0']:.3e}, tmin={time_stats['tmin']:.3f}, tmax={time_stats['tmax']:.3f}"
-            )
+            grid_min = float(time_stats["tmin_raw"])
+            grid_max = float(time_stats["tmax_raw"])
 
         # normalization stats
         norm_stats = self._collect_normalization_stats()
         norm_stats["time_normalization"] = time_stats
+        # Save the fixed grid metadata so workers/serial path can reconstruct it identically
+        norm_stats["fixed_time_grid"] = {
+            "min": grid_min,
+            "max": grid_max,
+            "M": int(self.config["data"]["M_per_sample"]),
+            "endpoint": True,
+            "spacing": "log",
+        }
+        # NEW: explicitly record variables that are already log10-transformed in shards
+        norm_stats["already_logged_vars"] = list(self.config["data"]["species_variables"])
         save_json(norm_stats, self.output_dir / "normalization.json")
 
         # per-file fan-out
@@ -847,7 +885,7 @@ class DataPreprocessor:
             self.logger.info(f"Parallel preprocessing with {num_workers} workers...")
             cfg_json = json.dumps(self.config)
             norm_json = json.dumps(norm_stats)
-            with ProcessPoolExecutor(max_workers=num_workers, mp_context=None) as ex:
+            with ProcessPoolExecutor(max_workers=num_workers, mp_context=mp.get_context("spawn")) as ex:
                 futures = [
                     ex.submit(
                         _process_one_file_worker,
@@ -866,7 +904,7 @@ class DataPreprocessor:
                         worker_stats = DataStatistics(**metadata["_worker_stats"])
                         self.stats_logger.stats.merge_inplace(worker_stats)
         else:
-            # serial path (unchanged behavior)
+            # serial path
             for file_path in self.raw_files:
                 self.logger.info(f"Processing file: {file_path}")
                 cproc = CorePreprocessor(self.config, norm_stats, self.stats_logger)
@@ -883,6 +921,14 @@ class DataPreprocessor:
             "compression": "npz",
             "splits": all_metadata["splits"],
             "time_normalization": time_stats,
+            "time_grid": {
+                "type": "logspace",
+                "min": grid_min,
+                "max": grid_max,
+                "M": int(self.config["data"]["M_per_sample"]),
+                "endpoint": True,
+            },
+            "already_logged_vars": list(self.config["data"]["species_variables"]),
         }
         save_json(shard_index, self.output_dir / "shard_index.json")
 
