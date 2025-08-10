@@ -121,6 +121,11 @@ class SequenceDataset(Dataset):
         self.species_vars = data_config["species_variables"]
         self.target_vars = data_config.get("target_species_variables", self.species_vars)
         self.global_vars = data_config["global_variables"]
+
+        # Compute counts
+        self.n_species = len(self.species_vars)
+        self.n_targets = len(self.target_vars)
+        self.n_globals = len(self.global_vars)
         
         # Verify counts against shard_index.json
         si = self.shard_index
@@ -131,7 +136,8 @@ class SequenceDataset(Dataset):
                 "Mismatch between config variable counts and shard_index.json "
                 f"(species {self.n_species} vs {si['n_input_species']}, "
                 f"targets {self.n_targets} vs {si['n_target_species']}, "
-                f"globals {self.n_globals} vs {si['n_globals']})")
+                f"globals {self.n_globals} vs {si['n_globals']})"
+            )
 
     def _validate_time_normalization(self) -> None:
         """Check for consistency between saved and configured time normalization."""
@@ -216,7 +222,6 @@ class SequenceDataset(Dataset):
             denom = max(tmax - tmin, min_scale)
             z = (tau - tmin) / denom
             return np.clip(z, 0.0, 1.0)
-            
         elif time_method == "log-min-max":
             # Log-space min-max normalization
             tmin_raw = float(time_norm.get("tmin_raw", 0.0))
@@ -229,6 +234,9 @@ class SequenceDataset(Dataset):
             
             z = (np.log10(np.maximum(t, eps)) - lo) / denom
             return np.clip(z, 0.0, 1.0)
+        elif time_method in ("none", None):
+            # Pass-through
+            return t.astype(self.np_dtype, copy=False)
         else:
             raise ValueError(f"Unknown time normalization method: {time_method}")
 
