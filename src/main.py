@@ -383,10 +383,10 @@ def main():
         pipeline.run()
         
     elif args.tune:
-        # Hyperparameter optimization
         from hyperparameter_tuning import optimize_hyperparameters
-        
-        # Run optimization
+        cfg = load_json_config(args.config)
+        device = setup_device()
+        optimize_hardware(cfg.get("system", {}), device)
         study = optimize_hyperparameters(
             config_path=args.config,
             n_trials=args.n_trials,

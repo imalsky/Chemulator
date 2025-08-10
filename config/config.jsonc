@@ -2,15 +2,15 @@
   "paths": {
     "raw_data_files": [
       "data/raw/run9001-result.h5",
-      //"data/raw/run9002-result.h5",
-      //"data/raw/run9003-result.h5",
-      //"data/raw/run9004-result.h5",
-      //"data/raw/run9005-result.h5",
-      //"data/raw/run9006-result.h5",
-      //"data/raw/run9007-result.h5",
-      //"data/raw/run9008-result.h5",
-      //"data/raw/run9009-result.h5",
-      //"data/raw/run9010-result.h5"
+      "data/raw/run9002-result.h5",
+      "data/raw/run9003-result.h5",
+      "data/raw/run9004-result.h5",
+      "data/raw/run9005-result.h5",
+      "data/raw/run9006-result.h5",
+      "data/raw/run9007-result.h5",
+      "data/raw/run9008-result.h5",
+      "data/raw/run9009-result.h5",
+      "data/raw/run9010-result.h5"
     ],
     "processed_data_dir": "data/processed",
     "model_save_dir": "data/models",
@@ -32,7 +32,7 @@
     "time_variable": "t_time",
 
     "sequence_mode": true,
-    "M_per_sample": 100,
+    "M_per_sample": 200,
     "fixed_time_range": { "min": 1e-3, "max": 1e8 } 
   },
 
@@ -59,8 +59,8 @@
   },
 
   "model": {
-    "type": "linear_latent_mixture",
-    "variant": "independent",  // Choose "full" or "independent"
+    "type": "linear_latent",
+    "variant": "full",  // Choose "full" or "independent"
     "latent_dim": 32,
     "encoder_layers": [1024, 1024, 1024, 1024],
     "decoder_layers": [256, 1024, 1024, 1024],
@@ -81,8 +81,8 @@
     "mixture_temperature_schedule": { "start": 1.0, "end": 0.3, "anneal_frac": 0.6 },
 
     "epochs": 100,
-    "batch_size": 512,
-    "gradient_accumulation_steps": 1,
+    "batch_size": 1024,
+    "gradient_accumulation_steps": 4,
 
     "gpu_cache_dataset": "auto",
 
@@ -113,8 +113,8 @@
     "use_torch_compile": true,
     "compile_mode": "default",
     "use_torch_export": true,
-    "cudnn_benchmark": true,
-    "tf32": true,
+    "cudnn_benchmark": false,
+    "tf32": false,
     "dtype": "float32",
     "cuda_memory_fraction": 0.95
   }

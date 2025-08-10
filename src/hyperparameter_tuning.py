@@ -44,7 +44,7 @@ HPO_STUDY_PREFIX: str = "lilan_hpo"
 
 # Hyperband resource bounds (fallbacks if training.hpo_* not in config)
 HPO_DEFAULT_MIN_EPOCHS: int = 10
-HPO_DEFAULT_MAX_EPOCHS: int = 50
+HPO_DEFAULT_MAX_EPOCHS: int = 100
 HPO_REDUCTION_FACTOR: int = 4  # aggressive down-selection
 
 # TPE exploration settings
@@ -52,9 +52,11 @@ HPO_TPE_STARTUP: int = 20
 HPO_TPE_EI_CANDIDATES: int = 64
 
 # ---- Search spaces (comment out to freeze at config value) ----
-MODEL_TYPE_CHOICES = ["linear_latent", "linear_latent_mixture"]
+#MODEL_TYPE_CHOICES = ["linear_latent", "linear_latent_mixture"]
+MODEL_TYPE_CHOICES = ["linear_latent"]
 
-LATENT_CHOICES = [32, 64, 128, 256]
+
+LATENT_CHOICES = [32, 64, 128, 256, 512, 1024]
 
 # Encoder/decoder depth ranges (inclusive)
 ENC_DEPTH_RANGE: Tuple[int, int] = (2, 6)
@@ -70,11 +72,11 @@ GROWTH_RANGE: Tuple[float, float] = (0.3, 0.8)  # if removed -> constant width p
 
 # Time warp
 TIME_WARP_ENABLE_CHOICES = [True, False]
-J_TERMS_CHOICES = [2, 4, 8]
+J_TERMS_CHOICES = [2, 4, 8, 16]
 WARP_HIDDEN_CHOICES = [64, 128, 256, 512]
 
 # Activations / dropout
-ACTIVATION_CHOICES = ["gelu", "tanh"]
+ACTIVATION_CHOICES = ["gelu", "tanh", "silu", "relu"]
 DROPOUT_RANGE: Tuple[float, float, float] = (0.0, 0.2, 0.05)  # (min, max, step)
 
 # Training hyperparams

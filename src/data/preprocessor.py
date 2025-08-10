@@ -735,32 +735,33 @@ class DataPreprocessor:
                 for gname in f.keys():
                     grp = f[gname]
 
+                    # ----- species datasets (time axis streamed) -----
                     for var in self.config["data"]["species_variables"]:
                         if var not in grp:
                             continue
                         ds = grp[var]
                         var_method = methods_override.get(var, default_method)
 
-                        # stream over time axis
                         for start in range(0, ds.shape[0], chunk_size):
                             end = min(start + chunk_size, ds.shape[0])
 
                             arr_raw = ds[start:end]
-                            # keep the summary in RAW space only
+
+                            # keep raw-space ranges for reporting
                             if self.stats_logger:
                                 self.stats_logger.update_species_range(var, arr_raw)
 
-                            # use a separate array for normalization stats
+                            # choose domain for mean/std accumulation
                             arr = arr_raw
                             if "log" in var_method:
                                 eps = norm_cfg.get("epsilon", 1e-30)
                                 arr = np.log10(np.maximum(arr_raw, eps))
 
                             a = accumulators[var]
-                            n, m, m2, cmin, cmax = self._welford_merge(a["count"], a["mean"], a["m2"], arr)
+                            n, m, m2, _, _ = self._welford_merge(a["count"], a["mean"], a["m2"], arr)
                             a["count"], a["mean"], a["m2"] = n, m, m2
 
-                            # Update linear-domain min/max from raw values
+                            # update linear-domain min/max from raw values
                             finite_lin = arr_raw[np.isfinite(arr_raw)]
                             if finite_lin.size:
                                 lin_min = float(finite_lin.min())
@@ -768,7 +769,7 @@ class DataPreprocessor:
                                 a["lin_min"] = min(a["lin_min"], lin_min)
                                 a["lin_max"] = max(a["lin_max"], lin_max)
 
-                            # Update log-domain min/max from log10(raw)
+                            # update log-domain min/max from log10(raw)
                             eps = float(norm_cfg.get("epsilon", 1e-30))
                             raw_pos = np.maximum(arr_raw, eps)
                             finite_log = raw_pos[np.isfinite(raw_pos)]
@@ -779,50 +780,60 @@ class DataPreprocessor:
                                 a["log_min"] = min(a["log_min"], log_min)
                                 a["log_max"] = max(a["log_max"], log_max)
 
-                        for var in self.config["data"]["global_variables"]:
-                            if var in grp.attrs:
-                                value = float(grp.attrs[var])
-                                var_method = methods_override.get(var, default_method)
+                    # ----- globals from attributes (process ONCE per group) -----
+                    for var in self.config["data"]["global_variables"]:
+                        if var in grp.attrs:
+                            value = float(grp.attrs[var])
+                            var_method = methods_override.get(var, default_method)
+                            a = accumulators[var]
 
-                                # 1) Update mean/std in the domain required by the method
-                                a = accumulators[var]
-                                if "standard" in var_method:  # 'standard' or 'log-standard'
-                                    v = (math.log10(max(value, norm_cfg.get("epsilon", 1e-30)))
-                                        if "log" in var_method else value)
-                                    n, m, m2, cmin, cmax = self._welford_merge(
-                                        a["count"], a["mean"], a["m2"],
-                                        np.array([v], dtype=np.float64),
-                                    )
-                                    a["count"], a["mean"], a["m2"] = n, m, m2
+                            # accumulate mean/std only for *standard* families, in the right domain
+                            if "standard" in var_method:  # 'standard' or 'log-standard'
+                                v = (math.log10(max(value, norm_cfg.get("epsilon", 1e-30)))
+                                    if "log" in var_method else value)
+                                n, m, m2, _, _ = self._welford_merge(
+                                    a["count"], a["mean"], a["m2"],
+                                    np.array([v], dtype=np.float64),
+                                )
+                                a["count"], a["mean"], a["m2"] = n, m, m2
 
-                                # 2) Always track min/max in BOTH domains
-                                if math.isfinite(value):
-                                    a["lin_min"] = min(a["lin_min"], value)
-                                    a["lin_max"] = max(a["lin_max"], value)
-                                    eps = float(norm_cfg.get("epsilon", 1e-30))
-                                    v_log = math.log10(max(value, eps))
-                                    a["log_min"] = min(a["log_min"], v_log)
-                                    a["log_max"] = max(a["log_max"], v_log)
+                            # always track min/max in BOTH domains
+                            if math.isfinite(value):
+                                a["lin_min"] = min(a["lin_min"], value)
+                                a["lin_max"] = max(a["lin_max"], value)
+                                eps = float(norm_cfg.get("epsilon", 1e-30))
+                                v_log = math.log10(max(value, eps))
+                                a["log_min"] = min(a["log_min"], v_log)
+                                a["log_max"] = max(a["log_max"], v_log)
 
-                                if self.stats_logger:
-                                    self.stats_logger.update_global_range(var, value)
+                            if self.stats_logger:
+                                self.stats_logger.update_global_range(var, value)
 
-        # finalize
+        # -------- finalize per-key stats --------
         for var, a in accumulators.items():
-            if a["count"] == 0:
+            # Skip vars with no observed data at all
+            if not (math.isfinite(a["lin_min"]) and math.isfinite(a["lin_max"])):
                 continue
+
             var_method = methods_override.get(var, default_method)
             stats["normalization_methods"][var] = var_method
 
-            variance = a["m2"] / (a["count"] - 1) if a["count"] > 1 else 0.0
-            std = float(np.sqrt(max(variance, 0.0)))
-            min_std = float(norm_cfg.get("min_std", 1e-10))
-            block = {"method": var_method, "min": float(a["min"]), "max": float(a["max"])}
+            # persist both linear and log ranges so runtime can switch methods safely
+            block = {
+                "method": var_method,
+                "min": float(a["lin_min"]),
+                "max": float(a["lin_max"]),
+                "log_min": float(a["log_min"]),
+                "log_max": float(a["log_max"]),
+            }
 
             if "standard" in var_method:
+                variance = a["m2"] / (a["count"] - 1) if a["count"] > 1 else 0.0
+                std = float(np.sqrt(max(variance, 0.0)))
+                min_std = float(norm_cfg.get("min_std", 1e-10))
                 key_prefix = "log_" if "log" in var_method else ""
                 block[f"{key_prefix}mean"] = float(a["mean"])
-                block[f"{key_prefix}std"] = float(max(std, min_std))
+                block[f"{key_prefix}std"]  = float(max(std, min_std))
 
             stats["per_key_stats"][var] = block
 
@@ -835,6 +846,7 @@ class DataPreprocessor:
 
         self.logger.info("Normalization statistics collection complete.")
         return stats
+
 
     # ----------------------------------------
     # End-to-end preprocessing orchestration
