@@ -64,12 +64,9 @@ DEC_DEPTH_RANGE: Tuple[int, int] = (2, 6)
 BASE_WIDTH_CHOICES = [128, 256, 512, 1024, 2048]
 GROWTH_RANGE: Tuple[float, float] = (0.3, 0.8)  # if removed -> constant width per layer
 
-# Low-rank generator
-GEN_RANK_CHOICES = [4, 8, 12, 16, 24, 32, 48, 64]
-
 # Mixture-of-experts
-MIXTURE_K_CHOICES = [2, 4, 8]
-MIXTURE_TEMPERATURE_RANGE: Tuple[float, float] = (0.1, 3.0)  # log-uniform
+#MIXTURE_K_CHOICES = [2, 4, 8]
+#MIXTURE_TEMPERATURE_RANGE: Tuple[float, float] = (0.1, 3.0)  # log-uniform
 
 # Time warp
 TIME_WARP_ENABLE_CHOICES = [True, False]
@@ -89,13 +86,13 @@ DROPOUT_RANGE: Tuple[float, float, float] = (0.0, 0.2, 0.05)  # (min, max, step)
 #BATCH_POWER_RANGE: Tuple[int, int] = (8, 13)  # -> 2**8 .. 2**13 (256..8192)
 
 # Mixture regularizers (only if mixture type used)
-LAMBDA_ENTROPY_RANGE: Tuple[float, float] = (1e-6, 1e-2)   # log-uniform
-LAMBDA_DIVERSITY_RANGE: Tuple[float, float] = (1e-6, 1e-2) # log-uniform
+#LAMBDA_ENTROPY_RANGE: Tuple[float, float] = (1e-6, 1e-2)   # log-uniform
+#LAMBDA_DIVERSITY_RANGE: Tuple[float, float] = (1e-6, 1e-2) # log-uniform
 
 # Gate temperature schedule (for PrunableTrainer)
-T_START_RANGE: Tuple[float, float] = (0.5, 2.0)
-T_END_RANGE: Tuple[float, float] = (0.1, 1.0)
-T_ANNEAL_FRAC_RANGE: Tuple[float, float] = (0.3, 0.9)
+#T_START_RANGE: Tuple[float, float] = (0.5, 2.0)
+#T_END_RANGE: Tuple[float, float] = (0.1, 1.0)
+#T_ANNEAL_FRAC_RANGE: Tuple[float, float] = (0.3, 0.9)
 
 # Early stopping (if Trainer respects it)
 #EARLY_STOP_PATIENCE_RANGE: Tuple[int, int] = (10, 40)
@@ -266,7 +263,6 @@ def optimize_hyperparameters(
 
     # --- Device + normalization helper ---
     device = setup_device()
-    norm_helper = NormalizationHelper(stats=norm_stats, device=device, config=base_config)
 
     # --- Epoch budgets & pruner ---
     min_epochs = int(base_config.get("training", {}).get("hpo_min_epochs", _existing("HPO_DEFAULT_MIN_EPOCHS") or 10))
@@ -343,11 +339,6 @@ def optimize_hyperparameters(
 
         cfg["model"]["encoder_layers"] = enc_widths
         cfg["model"]["decoder_layers"] = dec_widths
-
-        # ----- Generator rank -----
-        cfg["model"]["generator"] = {
-            "rank": _maybe_cat(trial, "generator_rank", _existing("GEN_RANK_CHOICES"), (cfg["model"].get("generator", {}) or {}).get("rank", 8))
-        }
 
         # ----- Mixture settings -----
         if cfg["model"]["type"] == "linear_latent_mixture":

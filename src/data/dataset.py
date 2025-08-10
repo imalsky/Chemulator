@@ -56,23 +56,16 @@ class SequenceDataset(Dataset):
         self.n_targets = len(self.target_vars)
         self.n_globals = len(self.global_vars)
 
-        # Time normalization parameters (handled separately)
-        self.time_norm = self.shard_index.get("time_normalization", {})
-        self.time_method = (
-        self.config.get("normalization", {}).get("methods", {}).get(self.config["data"]["time_variable"], "log-min-max"))
-
-        self.tau0 = self.time_norm.get("tau0", 1.0)
-        self.tmin = self.time_norm.get("tmin", 0.0)
-        self.tmax = self.time_norm.get("tmax", 1.0)
-            
-        time_var = self.config["data"]["time_variable"]
-        declared = (self.norm_stats.get("normalization_methods", {}) or {}).get(time_var)
-        configured = self.time_method
-
-        if declared and declared != configured:
-            raise ValueError(
-                f"Time variable '{time_var}' method mismatch: stats say '{declared}', "
-                f"but config requests '{configured}'."
+        # Time normalization is delegated to NormalizationHelper (supports time-norm and log-min-max).
+        self.time_var = self.config["data"]["time_variable"]
+        self.saved_time_method = (self.norm_stats.get("normalization_methods", {}) or {}).get(self.time_var)
+        self.config_time_method = (
+            self.config.get("normalization", {}).get("methods", {}).get(self.time_var, "log-min-max")
+        )
+        if self.saved_time_method and self.saved_time_method != self.config_time_method:
+            self.logger.warning(
+                "Time normalization differs: stats=%s, config=%s. Proceeding; runtime helper will apply normalization.",
+                self.saved_time_method, self.config_time_method
             )
 
         # Build shard info and lookup table
@@ -113,32 +106,40 @@ class SequenceDataset(Dataset):
         # Derive total from shards to avoid mismatches
         self.n_total_samples = cumsum
 
+
     def _normalize_time(self, t: np.ndarray) -> np.ndarray:
-        """Normalize time to [0,1] using the configured method."""
+        """Normalize time to [0,1]; prefer NormalizationHelper, fallback to legacy path."""
+        if self.norm_helper:
+            t_t = torch.from_numpy(t.astype(self.np_dtype, copy=False))
+            t_norm_t = self.norm_helper.normalize_time(t_t)  # handles time-norm or log-min-max
+            return t_norm_t.cpu().numpy().astype(self.np_dtype, copy=False)
+
+        # Legacy fallback if helper is not available
         norm_cfg = self.config.get("normalization", {})
         min_scale = float(norm_cfg.get("min_std", 1e-12))
+        time_norm = self.shard_index.get("time_normalization", {})
+        time_method = self.config.get("normalization", {}).get("methods", {}).get(self.config["data"]["time_variable"], "log-min-max")
 
-        if self.time_method == "time-norm":
-            # paper τ = ln(1+t/τ0), then min-max with tau bounds
-            tau = np.log1p(t / self.tau0)
-            denom = max(self.tmax - self.tmin, min_scale)
-            z = (tau - self.tmin) / denom
+        if time_method == "time-norm":
+            tau0 = float(time_norm.get("tau0", 1.0))
+            tmin = float(time_norm.get("tmin", 0.0))
+            tmax = float(time_norm.get("tmax", 1.0))
+            tau = np.log1p(t / tau0)
+            denom = max(tmax - tmin, min_scale)
+            z = (tau - tmin) / denom
             return np.clip(z, 0.0, 1.0)
-
-        elif self.time_method == "log-min-max":
-            # base-10 log min-max on raw time
-            tmin_raw = float(self.time_norm.get("tmin_raw", 0.0))
-            tmax_raw = float(self.time_norm.get("tmax_raw", 1.0))
+        elif time_method == "log-min-max":
+            tmin_raw = float(time_norm.get("tmin_raw", 0.0))
+            tmax_raw = float(time_norm.get("tmax_raw", 1.0))
             eps = float(norm_cfg.get("epsilon", 1e-30))
-            # guard if tmin_raw <= 0
             lo = np.log10(max(tmin_raw, eps))
             hi = np.log10(max(tmax_raw, tmin_raw + eps))
             denom = max(hi - lo, min_scale)
             z = (np.log10(np.maximum(t, eps)) - lo) / denom
             return np.clip(z, 0.0, 1.0)
-
         else:
-            raise ValueError(f"Unknown time normalization method: {self.time_method}")
+            raise ValueError(f"Unknown time normalization method: {time_method}")
+
 
 
     def _try_gpu_cache(self):

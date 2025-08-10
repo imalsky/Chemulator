@@ -6,11 +6,9 @@ Core:
     z(t) = E(x0, p) + τ(t, ·) ∘ C(x0, p)      (constant-velocity latent dynamics)
     y(t) = D(z(t), p)
 
-Implements:
-  • Shared encoder backbone over [x0_log, globals] with two heads: E (y0) and C (velocity)
-  • Learned monotone time warp τ(t) per latent dim
-  • Optional mixture-of-experts (K experts) with temperature-controlled softmax gate
-  • Regularizers: gate KL-to-uniform; generator similarity (discourages expert collapse)
+Supports two architectural variants:
+  • "full": Single model for all output dimensions (shared encoder/decoder)
+  • "independent": Separate model for each output dimension
 """
 
 import logging
@@ -102,14 +100,14 @@ class TimeWarp(nn.Module):
         return (tau + exp_terms).transpose(1, 2)  # [B, M, D]
 
 
-# ----------------------------- LiLaN model -----------------------------
+# ----------------------------- Base LiLaN model -----------------------------
 
 class LinearLatentMixture(nn.Module):
     """
     LiLaN with optional mixture-of-experts and learned time warp.
     Inputs:  [x0_log (S), globals (G), times (M)]  →  outputs: [B, M, T]
     """
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], output_dim: Optional[int] = None):
         super().__init__()
         self.log = logging.getLogger(__name__)
         data_cfg = config["data"]
@@ -118,7 +116,11 @@ class LinearLatentMixture(nn.Module):
         # dims
         self.num_species = len(data_cfg["species_variables"])
         self.num_globals = len(data_cfg["global_variables"])
-        self.num_targets = len(data_cfg.get("target_species_variables", data_cfg["species_variables"]))
+        # Allow override for independent models
+        if output_dim is not None:
+            self.num_targets = output_dim
+        else:
+            self.num_targets = len(data_cfg.get("target_species_variables", data_cfg["species_variables"]))
         self.latent_dim = int(model_cfg.get("latent_dim", 64))
 
         # activations / dropout
@@ -129,8 +131,8 @@ class LinearLatentMixture(nn.Module):
         mix_cfg = model_cfg.get("mixture", {})
         self.K = int(mix_cfg.get("K", 1))
         self.gate_temp = float(mix_cfg.get("temperature", 1.0))
-        # regularizer settings (keep both styles—no functionality lost)
-        self.diversity_mode = str(mix_cfg.get("diversity_mode", "per_sample"))  # 'per_sample' | 'batch_mean'
+        # regularizer settings
+        self.diversity_mode = str(mix_cfg.get("diversity_mode", "per_sample"))
         self.full_pair_threshold = int(mix_cfg.get("full_pair_threshold", 8))
         self.sample_factor = int(mix_cfg.get("sample_factor", 8))
         self.sample_pairs: Optional[int] = mix_cfg.get("sample_pairs", None)
@@ -155,12 +157,11 @@ class LinearLatentMixture(nn.Module):
 
         # heads E (y0) and C (velocity)
         self.y0_head = nn.Linear(enc_out, self.latent_dim * self.K)
-        self.c_head  = nn.Linear(enc_out, self.latent_dim * self.K)
+        self.c_head = nn.Linear(enc_out, self.latent_dim * self.K)
 
         # gate (optionally using encoder features)
         if self.K > 1:
             gate_layers = list(mix_cfg.get("gate_layers", [64, 32]))
-            # default: no LayerNorm in gate to keep logits scale simple
             self.gate = _build_mlp(
                 in_dim=(enc_out if self.gate_use_features else enc_in),
                 hidden=gate_layers, out_dim=self.K,
@@ -184,8 +185,6 @@ class LinearLatentMixture(nn.Module):
         )
 
         self._initialize_weights()
-
-    # ----- init -----
 
     def _initialize_weights(self) -> None:
         # Xavier is a safe default across activations
@@ -213,15 +212,13 @@ class LinearLatentMixture(nn.Module):
                 if isinstance(m, nn.Linear):
                     last_linear = m
             if last_linear is not None:
-                nn.init.zeros_(last_linear.weight)  # output == bias initially
+                nn.init.zeros_(last_linear.weight)
                 with torch.no_grad():
                     J, D = self.time_warp.J_terms, self.latent_dim
                     bias = last_linear.bias.view(D, 1 + 2 * J)
                     bias[:, 0] = 0.54      # softplus(0.54) ~ 1  => s ≈ 1
                     bias[:, 1:1 + J] = -5  # softplus(-5)  ~ 0  => a ≈ 0
                     bias[:, 1 + J:] = 0.54 # softplus(0.54) ~ 1  => b ≈ 1
-
-    # ----- public api -----
 
     def set_gate_temperature(self, temperature: float) -> None:
         if self.K > 1:
@@ -239,15 +236,15 @@ class LinearLatentMixture(nn.Module):
         """
         B = inputs.size(0)
         x0_log = inputs[:, :self.num_species]
-        g_vec  = inputs[:, self.num_species:self.num_species + self.num_globals]
+        g_vec = inputs[:, self.num_species:self.num_species + self.num_globals]
         t_norm = inputs[:, self.num_species + self.num_globals:]  # [B, M]
         M = t_norm.size(1)
 
         enc_input = torch.cat([x0_log, g_vec], dim=1)             # [B, S+G]
-        features  = self.encoder(enc_input)                       # [B, enc_out]
+        features = self.encoder(enc_input)                         # [B, enc_out]
 
         y0_all = self.y0_head(features)                           # [B, K*D]
-        c_all  = self.c_head(features)                            # [B, K*D]
+        c_all = self.c_head(features)                             # [B, K*D]
 
         # τ(t)
         if self.use_time_warp:
@@ -260,22 +257,22 @@ class LinearLatentMixture(nn.Module):
 
         if self.K > 1:
             y0_all = y0_all.view(B, self.K, self.latent_dim)      # [B, K, D]
-            c_all  = c_all.view(B, self.K, self.latent_dim)       # [B, K, D]
+            c_all = c_all.view(B, self.K, self.latent_dim)        # [B, K, D]
 
             gate_ctx = features if self.gate_use_features else enc_input
             logits = self.gate(gate_ctx)                          # [B, K]
-            probs  = F.softmax(logits / max(self.gate_temp, 1e-3), dim=-1)  # [B, K]
+            probs = F.softmax(logits / max(self.gate_temp, 1e-3), dim=-1)  # [B, K]
 
             aux["gate_p"] = probs
-            aux["c_all"]  = c_all
+            aux["c_all"] = c_all
 
             # z_k(t) and gated blend
             z_all = y0_all.unsqueeze(2) + tau.unsqueeze(1) * c_all.unsqueeze(2)  # [B, K, M, D]
-            z_t   = (z_all * probs.view(B, self.K, 1, 1)).sum(dim=1)             # [B, M, D]
+            z_t = (z_all * probs.view(B, self.K, 1, 1)).sum(dim=1)               # [B, M, D]
         else:
             y0 = y0_all.view(B, self.latent_dim)
-            c  = c_all.view(B, self.latent_dim)
-            z_t = y0.unsqueeze(1) + tau * c.unsqueeze(1)                          # [B, M, D]
+            c = c_all.view(B, self.latent_dim)
+            z_t = y0.unsqueeze(1) + tau * c.unsqueeze(1)          # [B, M, D]
 
         # decode
         g_rep = g_vec.unsqueeze(1).expand(B, M, self.num_globals)                 # [B, M, G]
@@ -294,21 +291,20 @@ class LinearLatentMixture(nn.Module):
             return losses
 
         # Gate KL(p || Uniform) = E_p[log p] + log K
-        p = aux["gate_p"].clamp_min(1e-8)        # [B, K]
+        p = aux["gate_p"].clamp_min(1e-8)
         losses["gate_kl_to_uniform"] = (p * (p.log() + math.log(self.K))).sum(dim=-1).mean()
 
-        # Generator diversity
+        # Generator diversity (actually C vectors diversity)
         c_all = aux["c_all"]                      # [B, K, D]
         if self.diversity_mode == "batch_mean":
-            # legacy/global view: average experts over batch, then penalize pairwise similarity
             w = F.normalize(c_all.mean(dim=0), dim=-1)   # [K, D]
-            sim = w @ w.T                                # [K, K]
+            sim = w @ w.T                                 # [K, K]
             i, j = torch.triu_indices(self.K, self.K, offset=1, device=sim.device)
             sims = sim[i, j].clamp_min(0)
             losses["generator_similarity"] = sims.mean() if sims.numel() else sim.new_tensor(0.0)
             return losses
 
-        # per-sample view (default): discourage within-sample collapse
+        # per-sample view (default)
         w = F.normalize(c_all, dim=-1)                   # [B, K, D]
         sim = torch.einsum("bkd,bld->bkl", w, w)         # [B, K, K]
         i, j = torch.triu_indices(self.K, self.K, offset=1, device=sim.device)
@@ -317,7 +313,6 @@ class LinearLatentMixture(nn.Module):
         if self.K <= self.full_pair_threshold or num_pairs == 0:
             sims = sim[:, i, j]                          # [B, P]
         else:
-            # subsample pairs for efficiency
             if self.sample_pairs is None:
                 S = min(self.sample_factor * self.K, num_pairs)
             else:
@@ -325,33 +320,144 @@ class LinearLatentMixture(nn.Module):
             choice = torch.randint(0, num_pairs, (S,), device=sim.device)
             sims = sim[:, i[choice], j[choice]]          # [B, S]
 
-        sims = sims.clamp_min(0)                         # penalize only similarity, not anti-correlation
+        sims = sims.clamp_min(0)
         per_sample = sims.mean(dim=1)                    # [B]
         losses["generator_similarity"] = per_sample.mean()
         return losses
 
 
-# ----------------------------- factory -----------------------------
+# ----------------------------- Independent Architecture -----------------------------
+
+class IndependentLinearLatentMixture(nn.Module):
+    """
+    Independent architecture: separate LiLaN model for each output dimension.
+    This typically performs better than the full architecture.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
+        self.log = logging.getLogger(__name__)
+        
+        data_cfg = config["data"]
+        self.target_vars = data_cfg.get("target_species_variables", data_cfg["species_variables"])
+        self.num_targets = len(self.target_vars)
+        
+        # Create independent model for each target
+        self.models = nn.ModuleList()
+        for i in range(self.num_targets):
+            # Each model predicts only one output dimension
+            model = LinearLatentMixture(config, output_dim=1)
+            self.models.append(model)
+        
+        self.log.info(f"Created independent architecture with {self.num_targets} separate models")
+    
+    def set_gate_temperature(self, temperature: float) -> None:
+        """Set gate temperature for all sub-models."""
+        for model in self.models:
+            model.set_gate_temperature(temperature)
+    
+    def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Run each model independently and concatenate outputs.
+        
+        inputs: [B, S + G + M]
+        returns:
+            predictions: [B, M, T] where T = num_targets
+            aux: combined auxiliary data from all models
+        """
+        outputs = []
+        all_aux = {}
+        
+        for i, model in enumerate(self.models):
+            out, aux = model(inputs)  # out: [B, M, 1]
+            outputs.append(out)
+            
+            # Combine auxiliary data with model index
+            for key, val in aux.items():
+                if key not in all_aux:
+                    all_aux[key] = []
+                all_aux[key].append(val)
+        
+        # Concatenate outputs
+        predictions = torch.cat(outputs, dim=-1)  # [B, M, T]
+        
+        # Stack auxiliary tensors
+        for key in all_aux:
+            if len(all_aux[key]) > 0:
+                all_aux[key] = torch.stack(all_aux[key], dim=0)  # [T, ...]
+        
+        return predictions, all_aux
+    
+    def get_regularization_losses(self, aux: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Compute regularization losses for all sub-models.
+        """
+        losses = {}
+        
+        # Average regularization losses across all models
+        if "gate_p" in aux:
+            gate_losses = []
+            for i in range(self.num_targets):
+                if aux["gate_p"].size(0) > i:
+                    p = aux["gate_p"][i].clamp_min(1e-8)
+                    K = p.size(-1)
+                    gate_loss = (p * (p.log() + math.log(K))).sum(dim=-1).mean()
+                    gate_losses.append(gate_loss)
+            if gate_losses:
+                losses["gate_kl_to_uniform"] = torch.stack(gate_losses).mean()
+        
+        if "c_all" in aux:
+            sim_losses = []
+            for i in range(self.num_targets):
+                if aux["c_all"].size(0) > i:
+                    c = aux["c_all"][i]
+                    if c.dim() == 3 and c.size(1) > 1:  # [B, K, D] with K > 1
+                        w = F.normalize(c, dim=-1)
+                        sim = torch.einsum("bkd,bld->bkl", w, w)
+                        K = c.size(1)
+                        i_idx, j_idx = torch.triu_indices(K, K, offset=1, device=sim.device)
+                        if i_idx.numel() > 0:
+                            sims = sim[:, i_idx, j_idx].clamp_min(0)
+                            sim_losses.append(sims.mean())
+            if sim_losses:
+                losses["generator_similarity"] = torch.stack(sim_losses).mean()
+        
+        return losses
+
+
+# ----------------------------- Factory -----------------------------
 
 def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     """
     Factory for LiLaN models. Supports:
-      • model.type in {"linear_latent", "linear_latent_mixture"} (K=1 degenerates to single expert)
+      • model.variant: "full" (default) or "independent"
+      • model.type: "linear_latent" or "linear_latent_mixture"
       • optional torch.compile
       • dtype control (float64)
     """
-    model_type = config["model"]["type"].lower()
+    model_cfg = config["model"]
+    model_type = model_cfg.get("type", "linear_latent_mixture").lower()
+    model_variant = model_cfg.get("variant", "full").lower()
+    
     if model_type not in {"linear_latent", "linear_latent_mixture"}:
         raise ValueError(f"Unknown model type: {model_type}")
-
-    model = LinearLatentMixture(config)
-
+    
+    if model_variant not in {"full", "independent"}:
+        raise ValueError(f"Unknown model variant: {model_variant}. Choose 'full' or 'independent'")
+    
+    # Create model based on variant
+    if model_variant == "independent":
+        model = IndependentLinearLatentMixture(config)
+        variant_str = "independent"
+    else:
+        model = LinearLatentMixture(config)
+        variant_str = "full"
+    
     # dtype
     if str(config["system"].get("dtype", "float32")).lower() == "float64":
         model = model.double()
-
+    
     model = model.to(device)
-
+    
     # optional compile
     logger = logging.getLogger(__name__)
     if config["system"].get("use_torch_compile", False) and hasattr(torch, "compile"):
@@ -360,10 +466,9 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
             logger.info("Model compilation successful.")
         except Exception as e:
             logger.warning(f"Model compilation failed: {e}. Running in eager mode.")
-
+    
     # log summary
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Created {model_type}: K={model.K}, D={model.latent_dim}, params={n_params:,}, "
-                f"time_warp={model.use_time_warp}, diversity_mode={getattr(model, 'diversity_mode', 'per_sample')}")
-
+    logger.info(f"Created {variant_str} {model_type}: params={n_params:,}")
+    
     return model

@@ -32,17 +32,18 @@
     "time_variable": "t_time",
 
     "sequence_mode": true,
-    "M_per_sample": 128,
-    "time_sampling": {"uniform": 0.2, "log_spaced": 0.8}
+    "M_per_sample": 100,
+    "fixed_time_range": { "min": 1e-3, "max": 1e8 } 
   },
 
   "preprocessing": {
     "min_value_threshold": 1e-28,
-    "num_workers": 8,
+    "num_workers": 12,
     "hdf5_chunk_size": 65536,
     "target_shard_bytes": 100000000,
     "npz_compressed": false,
-    "time_hist_bins": 99
+    "time_hist_bins": 512,
+    "grid_coverage_rtol": 1e-6
   },
 
   "normalization": {
@@ -59,11 +60,12 @@
 
   "model": {
     "type": "linear_latent_mixture",
+    "variant": "independent",  // Choose "full" or "independent"
     "latent_dim": 32,
     "encoder_layers": [1024, 1024, 1024, 1024],
     "decoder_layers": [256, 1024, 1024, 1024],
 
-    "mixture": { "K": 5 },
+    "mixture": { "K": 1 },
     "time_warp": { "enabled": true, "J_terms": 5, "hidden_dim": 64 },
 
     "activation": "tanh",

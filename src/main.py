@@ -86,7 +86,9 @@ class ChemicalKineticsPipeline:
         ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
     
     def _compute_data_hash(self) -> str:
-        """Compute a hash of data-critical parameters that affect shard content or normalization."""
+        """
+        Compute a hash of data-critical parameters that affect shard content or normalization.
+        """
         import hashlib
         import json
 
@@ -96,7 +98,15 @@ class ChemicalKineticsPipeline:
         train_cfg = self.config.get("training", {})
         data_cfg = self.config.get("data", {})
         sys_cfg = self.config.get("system", {})
+
+        # Variable-wise normalization methods (species/globals); time handled explicitly below
         methods = dict(norm_cfg.get("methods", {}))
+
+        # Time normalization config (now included in the hash)
+        time_norm_cfg = norm_cfg.get("time", {})
+        time_norm_method = time_norm_cfg.get("method", None)
+        time_norm_params = time_norm_cfg.get("params", {})
+
         time_var = data_cfg.get("time_variable")
 
         data_params = {
@@ -110,7 +120,10 @@ class ChemicalKineticsPipeline:
             # Sampling / supervision
             "sequence_mode": data_cfg.get("sequence_mode", False),
             "M_per_sample": data_cfg.get("M_per_sample", 16),
-            "time_sampling": data_cfg.get("time_sampling", {"uniform": 1.0}),
+
+            # Fixed global time grid metadata
+            "fixed_time_range": data_cfg.get("fixed_time_range", None),
+            "grid_coverage_rtol": precfg.get("grid_coverage_rtol", 1e-6),
 
             # Preprocessing knobs that change outputs
             "min_value_threshold": precfg.get("min_value_threshold", 1e-30),
@@ -121,7 +134,8 @@ class ChemicalKineticsPipeline:
 
             # Normalization behavior that changes normalization.json
             "default_norm_method": norm_cfg.get("default_method", "standard"),
-            "normalization_methods_no_time": methods,
+            "time_norm_method": time_norm_method,
+            "time_norm_params": time_norm_params,
             "epsilon": norm_cfg.get("epsilon", 1e-30),
             "min_std": norm_cfg.get("min_std", 1e-10),
 
