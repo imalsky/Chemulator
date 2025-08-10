@@ -13,9 +13,7 @@ Supports multiple normalization strategies:
 """
 
 import logging
-import math
-from typing import Dict, List, Any, Tuple, Optional
-
+from typing import Dict, List, Any, Tuple
 import torch
 
 
@@ -128,7 +126,11 @@ class NormalizationHelper:
                     if not self.time_norm:
                         raise ValueError("Time normalization stats missing")
                     continue
+                if method in ("none", None):
+                    # pass-through time; no stats required
+                    continue
                 raise ValueError(f"Unsupported time normalization method for '{self.time_var}': {method}")
+
             
             # Check required stats for each method
             if method == "log-standard":
@@ -251,19 +253,20 @@ class NormalizationHelper:
         Returns:
             Normalized time in [0,1]
         """
+        if self.time_method in ("none", None):
+            return t  # pass-through
+
         if self.time_norm is None:
             raise RuntimeError("Time normalization stats not found.")
-        
+
         if self.time_method == "time-norm":
-            # Paper's tau-space normalization
             tau = torch.log1p(t / self._tau0)
             return (tau - self._tau_min) / self._tau_range
-        
+
         if self.time_method == "log-min-max":
-            # Log-space min-max normalization
             tlog = torch.log10(torch.clamp(t, min=self.epsilon))
             return (tlog - self._tlog_min) / self._tlog_range
-        
+
         raise ValueError(f"Unknown time normalization method: {self.time_method}")
     
     def _unit_to_time(self, t_norm: torch.Tensor) -> torch.Tensor:
@@ -276,19 +279,22 @@ class NormalizationHelper:
         Returns:
             Raw time values
         """
+        if self.time_method in ("none", None):
+            return t_norm  # pass-through
+
         if self.time_norm is None:
             raise RuntimeError("Time normalization stats not found.")
-        
+
         t_norm = torch.clamp(t_norm, 0.0, 1.0)
-        
+
         if self.time_method == "time-norm":
             tau = t_norm * self._tau_range + self._tau_min
             return self._tau0 * torch.expm1(tau)
-        
+
         if self.time_method == "log-min-max":
             tlog = t_norm * self._tlog_range + self._tlog_min
             return torch.pow(self._ten, tlog)
-        
+
         raise ValueError(f"Unknown time normalization method: {self.time_method}")
     
     def normalize(self, data: torch.Tensor, var_list: List[str]) -> torch.Tensor:
