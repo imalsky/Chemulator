@@ -192,13 +192,16 @@ class SequenceDataset(Dataset):
 
     def _normalize_time(self, t: np.ndarray) -> np.ndarray:
         """
-        Normalize time values to [0,1].
-        
+        Normalize time values according to the configured method.
+
+        - "time-norm" / "log-min-max": returns values in [0, 1]
+        - "none": returns raw time unchanged
+
         Args:
             t: Raw time values
-            
+
         Returns:
-            Normalized time values in [0,1]
+            Time values normalized per config (or raw if method is "none").
         """
         if self.norm_helper:
             # Use helper for consistent normalization

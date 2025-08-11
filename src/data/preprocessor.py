@@ -730,26 +730,16 @@ class CorePreprocessor:
         log_t = np.log10(np.maximum(time_data, eps))
         log_y = np.log10(np.maximum(species_mat, eps))
 
-        # Sort and de-duplicate time for robust interpolation
-        order = np.argsort(log_t, kind="mergesort")
-        log_t = log_t[order]
-        log_y = log_y[order, :]
-
-        log_t_u, uniq_idx = np.unique(log_t, return_index=True)
-        log_y = log_y[uniq_idx, :]
-
-        if not np.all(np.isfinite(log_t_u)):
+        # Enforce strictly increasing and unique times (required by np.interp)
+        if not np.all(np.isfinite(log_t)):
             raise ValueError("Non-finite time values encountered after epsilon clamp.")
-        if log_t_u.shape[0] < 2:
-            raise ValueError("Insufficient unique time points after de-duplication.")
-        # Should be strictly increasing now
-        if np.any(np.diff(log_t_u) <= 0):
-            raise ValueError("Time array must be strictly increasing after de-duplication.")
-
+        if np.any(np.diff(log_t) <= 0):
+            raise ValueError("Time array must be strictly increasing with unique values for interpolation.")
+        
         # Interpolate each species
         y_mat_log = np.empty((len(self.fixed_grid), self.n_target_species), dtype=self.np_dtype)
         for j in range(self.n_target_species):
-            y_mat_log[:, j] = np.interp(self.log_tq, log_t_u, log_y[:, j])
+            y_mat_log[:, j] = np.interp(self.log_tq, log_t, log_y[:, j])
             y_mat_log[:, j] = y_mat_log[:, j].astype(self.np_dtype, copy=False)
         
         return y_mat_log
