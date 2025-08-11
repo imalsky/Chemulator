@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 import torch
 from typing import Dict, Union
+
+
 import psutil
 
 
@@ -84,7 +86,7 @@ class ChemicalKineticsPipeline:
         
         # Create directories
         ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
-    
+        
     def _compute_data_hash(self) -> str:
         """
         Compute a hash of data-critical parameters that affect shard content or normalization.
@@ -92,28 +94,34 @@ class ChemicalKineticsPipeline:
         import hashlib
         import json
 
-        # Effective values with defaults matching the preprocessor
         norm_cfg = self.config.get("normalization", {})
-        precfg = self.config.get("preprocessing", {})
+        precfg  = self.config.get("preprocessing", {})
         train_cfg = self.config.get("training", {})
-        data_cfg = self.config.get("data", {})
-        sys_cfg = self.config.get("system", {})
-
-        # Variable-wise normalization methods (species/globals); time handled explicitly below
-        methods = dict(norm_cfg.get("methods", {}))
-
-        # Time normalization config (now included in the hash)
-        time_norm_cfg = norm_cfg.get("time", {})
-        time_norm_method = time_norm_cfg.get("method", None)
-        time_norm_params = time_norm_cfg.get("params", {})
+        data_cfg  = self.config.get("data", {})
+        sys_cfg   = self.config.get("system", {})
 
         time_var = data_cfg.get("time_variable")
+
+        # Normalization methods (make deterministic: lowercased, sorted)
+        norm_methods = norm_cfg.get("methods", {}) or {}
+        norm_methods_norm = {
+            k: (None if v is None else str(v).lower()) for k, v in norm_methods.items()
+        }
+        norm_methods_items = sorted(norm_methods_norm.items())
+
+        # Time method as actually used by the code (fallback matches CorePreprocessor/Normalizer)
+        time_method_used = norm_methods_norm.get(time_var, "log-min-max")
+
+        # If you change preprocessing math (e.g., tau0 logic), bump this string:
+        preprocessor_version = "2025-08-10_tau0-log1p-hist-v1"
 
         data_params = {
             # Inputs & schema
             "raw_files": sorted([str(f) for f in self.raw_data_files]),
             "species_variables": data_cfg.get("species_variables", []),
-            "target_species_variables": data_cfg.get("target_species_variables", data_cfg.get("species_variables", [])),
+            "target_species_variables": data_cfg.get(
+                "target_species_variables", data_cfg.get("species_variables", [])
+            ),
             "global_variables": data_cfg.get("global_variables", []),
             "time_variable": time_var,
 
@@ -127,19 +135,16 @@ class ChemicalKineticsPipeline:
 
             # Preprocessing knobs that change outputs
             "min_value_threshold": precfg.get("min_value_threshold", 1e-30),
-            "target_shard_bytes": precfg.get("target_shard_bytes", None),
-            "trajectories_per_shard": precfg.get("trajectories_per_shard", None),
-            "npz_compressed": precfg.get("npz_compressed", True),
-            "time_hist_bins": precfg.get("time_hist_bins", 4096),  # affects tau0 estimate
+            "time_hist_bins": precfg.get("time_hist_bins", 4096),
 
             # Normalization behavior that changes normalization.json
             "default_norm_method": norm_cfg.get("default_method", "standard"),
-            "time_norm_method": time_norm_method,
-            "time_norm_params": time_norm_params,
+            "norm_methods": norm_methods_items,            # <-- include overrides
+            "time_method": time_method_used,               # <-- include actual time method
             "epsilon": norm_cfg.get("epsilon", 1e-30),
             "min_std": norm_cfg.get("min_std", 1e-10),
 
-            # Split policy (changes which sample lands in which split)
+            # Split policy (affects which traj lands in which split deterministically)
             "use_fraction": train_cfg.get("use_fraction", 1.0),
             "val_fraction": train_cfg.get("val_fraction", 0.0),
             "test_fraction": train_cfg.get("test_fraction", 0.0),
@@ -149,7 +154,14 @@ class ChemicalKineticsPipeline:
 
             # Dtype baked into saved arrays
             "system_dtype": sys_cfg.get("dtype", "float32"),
+
+            # Preprocessor logic version
+            "preprocessor_version": preprocessor_version,
         }
+
+        # NOTE: If you do NOT want shard regrouping or compression tweaks to force a regen,
+        # keep 'trajectories_per_shard' and 'npz_compressed' out of the hash.
+        # If you *do* want that to trigger regen, add them here.
 
         payload = json.dumps(data_params, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -322,81 +334,92 @@ class ChemicalKineticsPipeline:
 def main():
     """Main entry point."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Chemical Kinetics Neural Network")
     parser.add_argument(
         "--config",
         type=Path,
         default=Path("config/config.jsonc"),
-        help="Path to configuration file"
+        help="Path to configuration file",
     )
-    
+
     # Add mutually exclusive group for train/tune
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         "--train",
         action="store_true",
-        help="Train a model using the configuration"
+        help="Train a model using the configuration",
     )
     group.add_argument(
         "--tune",
         action="store_true",
-        help="Run hyperparameter optimization"
+        help="Run hyperparameter optimization",
     )
-    
+
     # Hyperparameter tuning specific arguments
     parser.add_argument(
         "--n-trials",
         type=int,
         default=50,
-        help="Number of trials for hyperparameter optimization"
+        help="Number of trials for hyperparameter optimization",
     )
     parser.add_argument(
         "--n-jobs",
         type=int,
         default=1,
-        help="Number of parallel jobs for optimization"
+        help="Number of parallel jobs for optimization",
     )
     parser.add_argument(
         "--study-name",
         type=str,
         default=None,
-        help="Name for the Optuna study"
+        help="Name for the Optuna study",
     )
     parser.add_argument(
         "--no-hyperband",
         action="store_true",
-        help="Disable Hyperband pruning"
+        help="Disable Hyperband pruning",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Validate config path
     if not args.config.exists():
         print(f"Error: Configuration file not found: {args.config}", file=sys.stderr)
         sys.exit(1)
-    
-    # Execute based on mode
+
     if args.train:
         # Regular training
         pipeline = ChemicalKineticsPipeline(args.config)
         pipeline.run()
-        
+
     elif args.tune:
+        # HPO run
         from hyperparameter_tuning import optimize_hyperparameters
+
+        # Set up logging for HPO so Optuna & our tuner logs are captured
         cfg = load_json_config(args.config)
-        device = setup_device()
-        optimize_hardware(cfg.get("system", {}), device)
+        log_dir = Path(cfg["paths"]["log_dir"])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        setup_logging(log_file=log_dir / f"hpo_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        logging.getLogger().setLevel(logging.INFO)
+
+        # Optional: enable TF32 matmul on A100s for speed (and silence warning)
+        if torch.cuda.is_available():
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+
         study = optimize_hyperparameters(
             config_path=args.config,
             n_trials=args.n_trials,
             n_jobs=args.n_jobs,
             study_name=args.study_name,
-            use_hyperband=not args.no_hyperband
+            use_hyperband=not args.no_hyperband,
         )
-        
         print(f"\nOptimization complete. Study saved as: {study.study_name}")
-    
+
     else:
         parser.print_help()
         sys.exit(1)

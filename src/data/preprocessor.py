@@ -25,6 +25,7 @@ import math
 import time
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm.auto import tqdm
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -553,7 +554,8 @@ class CorePreprocessor:
         local_time_points = 0
         
         with h5py.File(file_path, "r") as f:
-            for gname in sorted(f.keys()):
+            keys = sorted(f.keys())
+            for gname in tqdm(keys, desc=f"Sharding {file_path.name}", unit="traj"):
                 grp = f[gname]
                 local_stats.total_groups += 1
                 if self.stats_logger:
@@ -803,26 +805,32 @@ class CorePreprocessor:
         if not (global_max > global_min):
             global_max = global_min * (1.0 + 1e-12)
         
-        # Pass 2: Build histogram for percentile calculation
-        tau0 = self._compute_tau0_percentile(file_paths, global_min, global_max)
-        
-        # Compute normalization bounds
-        tau_min = float(np.log(1.0 + global_min / tau0))
-        tau_max = float(np.log(1.0 + global_max / tau0))
-        
-        # Get configured time method
+        # Get configured time method (decides what we need to compute)
         time_method = self.config.get("normalization", {}).get("methods", {}).get(
             self.time_var, "log-min-max"
         )
-        
-        return {
-            "tau0": tau0,
-            "tmin": tau_min,  # tau-space min
-            "tmax": tau_max,  # tau-space max
-            "tmin_raw": global_min,  # raw time min
-            "tmax_raw": global_max,  # raw time max
+
+        result = {
+            "tmin_raw": global_min,   # raw time min
+            "tmax_raw": global_max,   # raw time max
             "time_transform": time_method,
         }
+
+        if time_method == "time-norm":
+            # Pass 2: Build histogram only if needed
+            tau0 = self._compute_tau0_percentile(file_paths, global_min, global_max)
+
+            # Compute normalization bounds (use log1p for stability)
+            tau_min = float(np.log1p(global_min / tau0))
+            tau_max = float(np.log1p(global_max / tau0))
+
+            result.update({
+                "tau0": tau0,
+                "tmin": tau_min,   # tau-space min
+                "tmax": tau_max,   # tau-space max
+            })
+
+        return result
     
     def _find_time_range(
         self,
@@ -833,7 +841,7 @@ class CorePreprocessor:
         global_max = float("-inf")
         total_count = 0
         
-        for file_path in file_paths:
+        for file_path in tqdm(file_paths, desc="Pass 1: time range", unit="file"):
             with h5py.File(file_path, "r") as f:
                 for gname in f.keys():
                     grp = f[gname]
@@ -869,7 +877,7 @@ class CorePreprocessor:
         hist = np.zeros(num_bins, dtype=np.int64)
         
         # Build histogram
-        for file_path in file_paths:
+        for file_path in tqdm(file_paths, desc="Pass 2: tau0 histogram", unit="file"):
             with h5py.File(file_path, "r") as f:
                 for gname in f.keys():
                     grp = f[gname]
@@ -1046,7 +1054,7 @@ class DataPreprocessor:
         chunk_size = int(self.config["preprocessing"].get("hdf5_chunk_size", 10000))
         
         # Process all files
-        for file_path in self.raw_files:
+        for file_path in tqdm(self.raw_files, desc="Collecting norm stats", unit="file"):
             with h5py.File(file_path, "r") as f:
                 for gname in f.keys():
                     grp = f[gname]
@@ -1251,18 +1259,17 @@ class DataPreprocessor:
                     )
                     for file_path in self.raw_files
                 ]
-                
-                for fut in as_completed(futures):
-                    metadata = fut.result()
-                    self._merge_metadata(all_metadata, metadata)
-                    
-                    # Merge worker stats
-                    if "_worker_stats" in metadata:
-                        worker_stats = DataStatistics(**metadata["_worker_stats"])
-                        self.stats_logger.stats.merge_inplace(worker_stats)
+                with tqdm(total=len(futures), desc="Preprocessing files (parallel)", unit="file") as pbar:
+                    for fut in as_completed(futures):
+                        metadata = fut.result()
+                        self._merge_metadata(all_metadata, metadata)
+                        if "_worker_stats" in metadata:
+                            worker_stats = DataStatistics(**metadata["_worker_stats"])
+                            self.stats_logger.stats.merge_inplace(worker_stats)
+                        pbar.update(1)
         else:
             # Serial processing
-            for file_path in self.raw_files:
+            for file_path in tqdm(self.raw_files, desc="Preprocessing files (serial)", unit="file"):
                 self.logger.info(f"Processing file: {file_path}")
                 cproc = CorePreprocessor(self.config, norm_stats, self.stats_logger)
                 metadata = cproc.process_file_for_sequence_shards(file_path, self.processed_dir)

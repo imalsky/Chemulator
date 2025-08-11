@@ -114,17 +114,20 @@ class NormalizationHelper:
     def _validate_stats_for_methods(self) -> None:
         """Verify required statistics exist for each normalization method."""
         for var, method in self.methods.items():
-            # Time variable uses special handling
+            # Time variable uses special handling (always validate against runtime config)
             if var == self.time_var:
-                if method in ("time-norm", "log-min-max"):
-                    if not self.time_norm:
-                        raise ValueError("Time normalization stats missing")
+                tm = self.time_method
+                if tm == "time-norm":
+                    if not self.time_norm or not all(k in self.time_norm for k in ("tau0", "tmin", "tmax")):
+                        raise ValueError("Time normalization stats missing required keys for 'time-norm' (tau0,tmin,tmax).")
                     continue
-                if method in ("none", None):
-                    # pass-through time; no stats required
+                if tm == "log-min-max":
+                    if not self.time_norm or not all(k in self.time_norm for k in ("tmin_raw", "tmax_raw")):
+                        raise ValueError("Time normalization stats missing required keys for 'log-min-max' (tmin_raw,tmax_raw).")
                     continue
-                raise ValueError(f"Unsupported time normalization method for '{self.time_var}': {method}")
-
+                if tm in ("none", None):
+                    continue
+                raise ValueError(f"Unsupported time normalization method for '{self.time_var}': {tm}")
             
             # Check required stats for each method
             if method == "log-standard":
@@ -168,39 +171,40 @@ class NormalizationHelper:
         self._ten = torch.tensor(10.0, dtype=self.dtype, device=self.device)
     
     def _setup_time_normalization(self) -> None:
-        """Initialize time normalization parameters if available."""
+        """Initialize time normalization parameters based on the runtime method."""
         if not self.time_norm:
             return
-        
-        # Paper's tau-space parameters
-        self._tau0 = torch.tensor(
-            float(self.time_norm["tau0"]),
-            dtype=self.dtype,
-            device=self.device
-        )
-        self._tau_min = torch.tensor(
-            float(self.time_norm["tmin"]),
-            dtype=self.dtype,
-            device=self.device
-        )
-        self._tau_max = torch.tensor(
-            float(self.time_norm["tmax"]),
-            dtype=self.dtype,
-            device=self.device
-        )
-        self._tau_range = torch.clamp(self._tau_max - self._tau_min, min=1e-12)
-        
-        # Log-min-max parameters (raw time space)
-        tmin_raw = float(self.time_norm.get("tmin_raw", 0.0))
-        tmax_raw = float(self.time_norm.get("tmax_raw", 1.0))
-        eps = float(self.norm_config.get("epsilon", 1e-30))
-        
-        lo = max(tmin_raw, eps)
-        hi = max(tmax_raw, lo + eps)
-        
-        self._tlog_min = torch.log10(torch.tensor(lo, dtype=self.dtype, device=self.device))
-        self._tlog_max = torch.log10(torch.tensor(hi, dtype=self.dtype, device=self.device))
-        self._tlog_range = torch.clamp(self._tlog_max - self._tlog_min, min=1e-12)
+
+        tm = self.time_method
+
+        if tm == "time-norm":
+            # Tau-space parameters (used by tau = log1p(t / tau0))
+            self._tau0 = torch.tensor(
+                float(self.time_norm["tau0"]),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._tau_min = torch.tensor(
+                float(self.time_norm["tmin"]),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._tau_max = torch.tensor(
+                float(self.time_norm["tmax"]),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._tau_range = torch.clamp(self._tau_max - self._tau_min, min=1e-12)
+
+        elif tm == "log-min-max":
+            # Raw-time log10 min-max parameters
+            eps = float(self.norm_config.get("epsilon", 1e-30))
+            lo = max(float(self.time_norm["tmin_raw"]), eps)
+            hi = max(float(self.time_norm["tmax_raw"]), lo + eps)
+            self._tlog_min = torch.log10(torch.tensor(lo, dtype=self.dtype, device=self.device))
+            self._tlog_max = torch.log10(torch.tensor(hi, dtype=self.dtype, device=self.device))
+            self._tlog_range = torch.clamp(self._tlog_max - self._tlog_min, min=1e-12)
+        # elif tm in ("none", None): no parameters needed
     
     def _get_params(self, var_list: List[str]) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
         """
