@@ -76,12 +76,6 @@ class NormalizationHelper:
         # Identify variables already in log space from preprocessing
         self._already_logged_vars = set(self.stats.get("already_logged_vars", []))
         
-        # Fallback for older shards
-        if not self._already_logged_vars:
-            data_cfg = config.get("data", {})
-            if data_cfg.get("sequence_mode", False):
-                self._already_logged_vars = set(data_cfg.get("species_variables", []))
-        
         if self._already_logged_vars:
             self.logger.info(
                 "NormalizationHelper: %d variables already in log10 space from shards.",
@@ -484,24 +478,30 @@ class NormalizationHelper:
     # Convenience methods for time normalization
     def normalize_time(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Normalize time values to [0,1].
-        
+        Normalize time values according to the configured method.
+
+        - "time-norm" / "log-min-max": returns values in [0, 1]
+        - "none": pass-through (returns t unchanged)
+
         Args:
             t: Raw time values
-            
+
         Returns:
-            Normalized time tensor
+            Time tensor normalized per config (or raw if "none").
         """
         return self._time_to_unit(t.to(device=self.device, dtype=self.dtype))
     
     def denormalize_time(self, t_norm: torch.Tensor) -> torch.Tensor:
         """
-        Denormalize time values from [0,1] to raw values.
-        
+        Invert time normalization.
+
+        - "time-norm" / "log-min-max": map from [0, 1] back to raw time
+        - "none": pass-through (returns input unchanged)
+
         Args:
-            t_norm: Normalized time values
-            
+            t_norm: Time values to invert
+
         Returns:
-            Raw time tensor
+            Raw time tensor (or unchanged if "none").
         """
         return self._unit_to_time(t_norm.to(device=self.device, dtype=self.dtype))
