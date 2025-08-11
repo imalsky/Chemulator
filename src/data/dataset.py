@@ -302,7 +302,10 @@ class SequenceDataset(Dataset):
     def _calculate_memory_budget(self) -> int:
         """Calculate available GPU memory budget."""
         try:
-            idx = 0 if self.device.index is None else self.device.index
+            if self.device.index is None:
+                idx = torch.cuda.current_device()
+            else:
+                idx = self.device.index
             total_mem = torch.cuda.get_device_properties(idx).total_memory
             
             tcfg = self.config.get("training", {})
