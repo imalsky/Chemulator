@@ -38,9 +38,9 @@
 
   "preprocessing": {
     "min_value_threshold": 1e-28,
-    "num_workers": 12,
-    "hdf5_chunk_size": 65536,
-    "target_shard_bytes": 100000000,
+    "num_workers": 8,
+    "hdf5_chunk_size": 16384,
+    "target_shard_bytes": 10000000,
     "npz_compressed": false,
     "time_hist_bins": 512,
     "grid_coverage_rtol": 1e-6

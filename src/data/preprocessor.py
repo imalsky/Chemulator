@@ -1,19 +1,36 @@
 #!/usr/bin/env python3
 """
-Chemical kinetics data preprocessor with sequence mode support for LiLaN.
+Chemical kinetics data preprocessor for LiLaN.
 
-This module handles the preprocessing pipeline:
-1. Loads raw HDF5 trajectory data
-2. Applies quality filters and validation
-3. Interpolates trajectories onto a fixed global time grid
-4. Collects normalization statistics
-5. Saves processed data as NPZ shards for efficient loading
+This module preprocesses raw HDF5 trajectory data for training LiLaN models:
 
-Key features:
-- Fixed log-spaced time grid shared across all trajectories
-- Config-driven normalization methods
-- Parallel processing support
-- Streaming statistics collection for large datasets
+1. Data Loading and Validation:
+   - Loads trajectories from HDF5 files
+   - Validates data integrity (no NaNs, finite values, positive concentrations)
+   - Checks for monotonic time arrays
+   - Drops trajectories with any invalid data points
+
+2. Data Transformation:
+   - Applies log10 transformation to species concentrations
+   - Preserves original time grids from HDF5 (no interpolation)
+   - Maintains trajectory structure for sequence learning
+
+3. Normalization Statistics:
+   - Collects per-variable statistics (mean, std, min, max)
+   - Supports configurable normalization methods per variable
+   - Saves statistics for use during training/inference
+
+4. Data Sharding:
+   - Splits data into train/validation/test sets
+   - Creates efficient NPZ shards for fast loading
+   - Supports parallel processing for large datasets
+
+Key Features:
+- No interpolation - preserves original simulation grids
+- Strict validation - drops entire trajectory on any bad value
+- Configurable normalization per variable
+- Efficient sharding for large-scale training
+- Comprehensive logging and statistics
 """
 
 from __future__ import annotations
@@ -36,6 +53,10 @@ import numpy as np
 from utils.utils import save_json
 
 
+# ============================================================================
+# DATA STATISTICS TRACKING
+# ============================================================================
+
 @dataclass
 class DataStatistics:
     """Track comprehensive preprocessing statistics."""
@@ -48,7 +69,7 @@ class DataStatistics:
     dropped_missing_keys: int = 0
     dropped_non_finite: int = 0
     dropped_below_threshold: int = 0
-    dropped_insufficient_time: int = 0
+    dropped_non_monotonic_time: int = 0
     dropped_use_fraction: int = 0
     
     # Data statistics
@@ -74,7 +95,7 @@ class DataStatistics:
         self.dropped_missing_keys += other.dropped_missing_keys
         self.dropped_non_finite += other.dropped_non_finite
         self.dropped_below_threshold += other.dropped_below_threshold
-        self.dropped_insufficient_time += other.dropped_insufficient_time
+        self.dropped_non_monotonic_time += other.dropped_non_monotonic_time
         self.dropped_use_fraction += other.dropped_use_fraction
         self.total_time_points += other.total_time_points
         
@@ -159,7 +180,7 @@ class DataStatisticsLogger:
                 "missing_keys": self.stats.dropped_missing_keys,
                 "non_finite": self.stats.dropped_non_finite,
                 "below_threshold": self.stats.dropped_below_threshold,
-                "insufficient_time": self.stats.dropped_insufficient_time,
+                "non_monotonic_time": self.stats.dropped_non_monotonic_time,
                 "use_fraction": self.stats.dropped_use_fraction,
             },
             "data_ranges": {
@@ -176,23 +197,24 @@ class DataStatisticsLogger:
         self.logger.info(f"Statistics summary saved to {summary_path}")
 
 
+# ============================================================================
+# HDF5 READING UTILITIES
+# ============================================================================
+
 class ChunkedHDF5Reader:
     """
     Memory-efficient HDF5 reader with chunked loading.
     
-    Reads large datasets in chunks to minimize memory usage
-    during preprocessing.
+    Reads large datasets in chunks to minimize memory usage.
     """
     
-    def __init__(self, file_path: Optional[Path], chunk_size: int = 10000):
+    def __init__(self, chunk_size: int = 10000):
         """
         Initialize chunked reader.
         
         Args:
-            file_path: Path to HDF5 file
             chunk_size: Maximum chunk size for reading
         """
-        self.file_path = file_path
         self.chunk_size = chunk_size
         self.logger = logging.getLogger(__name__)
     
@@ -237,12 +259,15 @@ class ChunkedHDF5Reader:
         return np.concatenate(chunks)
 
 
+# ============================================================================
+# DATA WRITING UTILITIES
+# ============================================================================
+
 class SequenceShardWriter:
     """
     Efficient writer for trajectory sequence shards.
     
-    Buffers trajectories and writes them in batches to NPZ files
-    for efficient storage and loading.
+    Buffers trajectories and writes them in batches to NPZ files.
     """
     
     def __init__(
@@ -250,7 +275,6 @@ class SequenceShardWriter:
         output_dir: Path,
         trajectories_per_shard: int,
         shard_idx_base: str,
-        M: int,
         n_species: int,
         n_globals: int,
         dtype: np.dtype,
@@ -263,7 +287,6 @@ class SequenceShardWriter:
             output_dir: Directory to write shards
             trajectories_per_shard: Number of trajectories per shard file
             shard_idx_base: Base name for shard files
-            M: Number of time points per trajectory
             n_species: Number of species variables
             n_globals: Number of global variables
             dtype: Data type for arrays
@@ -272,7 +295,6 @@ class SequenceShardWriter:
         self.output_dir = output_dir
         self.trajectories_per_shard = max(1, int(trajectories_per_shard))
         self.shard_idx_base = shard_idx_base
-        self.M = M
         self.n_species = n_species
         self.n_globals = n_globals
         self.dtype = dtype
@@ -289,14 +311,22 @@ class SequenceShardWriter:
         x0_log: np.ndarray,
         globals_vec: np.ndarray,
         t_vec: np.ndarray,
-        y_mat: np.ndarray
+        y_mat_log: np.ndarray
     ) -> None:
-        """Add trajectory to buffer, writing shard when full."""
+        """
+        Add trajectory to buffer, writing shard when full.
+        
+        Args:
+            x0_log: Log-transformed initial conditions [n_species]
+            globals_vec: Global parameters [n_globals]
+            t_vec: Time points [n_timepoints]
+            y_mat_log: Log-transformed species evolution [n_timepoints, n_species]
+        """
         self.buffer.append({
             "x0_log": x0_log.astype(self.dtype, copy=False),
             "globals": globals_vec.astype(self.dtype, copy=False),
             "t_vec": t_vec.astype(self.dtype, copy=False),
-            "y_mat": y_mat.astype(self.dtype, copy=False),
+            "y_mat": y_mat_log.astype(self.dtype, copy=False),
         })
         
         if len(self.buffer) >= self.trajectories_per_shard:
@@ -307,23 +337,30 @@ class SequenceShardWriter:
         if not self.buffer:
             return
         
-        # Stack all trajectories
-        x0_log = np.stack([t["x0_log"] for t in self.buffer])
-        globals_vec = np.stack([t["globals"] for t in self.buffer])
-        t_vec = np.stack([t["t_vec"] for t in self.buffer])
-        y_mat = np.stack([t["y_mat"] for t in self.buffer])
+        # Create lists to handle variable-length trajectories
+        x0_log_list = [t["x0_log"] for t in self.buffer]
+        globals_list = [t["globals"] for t in self.buffer]
+        t_vec_list = [t["t_vec"] for t in self.buffer]
+        y_mat_list = [t["y_mat"] for t in self.buffer]
         
-        # Write to file
+        # Write to file with object arrays for variable-length data
         filename = f"shard_{self.shard_idx_base}_{self.shard_id:04d}.npz"
         filepath = self.output_dir / filename
         
         save_fn = np.savez_compressed if self.compressed else np.savez
-        save_fn(filepath, x0_log=x0_log, globals=globals_vec, t_vec=t_vec, y_mat=y_mat)
+        save_fn(
+            filepath,
+            x0_log=np.array(x0_log_list, dtype=object),
+            globals=np.array(globals_list, dtype=object),
+            t_vec=np.array(t_vec_list, dtype=object),
+            y_mat=np.array(y_mat_list, dtype=object),
+        )
         
         # Record metadata
         self.shard_metadata.append({
             "filename": filename,
-            "n_trajectories": len(self.buffer)
+            "n_trajectories": len(self.buffer),
+            "time_points": [len(t["t_vec"]) for t in self.buffer]
         })
         
         # Clear buffer for next shard
@@ -336,18 +373,20 @@ class SequenceShardWriter:
             self._write_shard()
 
 
+# ============================================================================
+# CORE PREPROCESSING LOGIC
+# ============================================================================
+
 class CorePreprocessor:
     """
-    Core preprocessing logic with fixed global time grid.
+    Core preprocessing logic for chemical kinetics data.
     
-    Handles trajectory extraction, validation, interpolation,
-    and normalization for chemical kinetics data.
+    Handles trajectory extraction, validation, and transformation.
     """
     
     def __init__(
         self,
         config: Dict[str, Any],
-        norm_stats: Optional[Dict[str, Any]] = None,
         stats_logger: Optional[DataStatisticsLogger] = None,
     ):
         """
@@ -355,13 +394,11 @@ class CorePreprocessor:
         
         Args:
             config: Configuration dictionary
-            norm_stats: Optional pre-computed normalization statistics
             stats_logger: Optional statistics logger
         """
         self.logger = logging.getLogger(__name__)
         self.config = config
         self.stats_logger = stats_logger
-        self.norm_stats = norm_stats or {}
         
         # Extract config sections
         self.data_cfg = config["data"]
@@ -372,22 +409,11 @@ class CorePreprocessor:
         
         # Setup parameters
         self._setup_parameters()
-        
-        # Initialize fixed time grid
-        self.fixed_grid = self._init_fixed_time_grid()
-        self.fixed_grid_cast = self.fixed_grid.astype(self.np_dtype)
-        
-        # Pre-compute log grid for interpolation
-        eps = float(self.norm_cfg.get("epsilon", 1e-30))
-        self.log_tq = np.log10(np.maximum(self.fixed_grid, eps))
     
     def _setup_parameters(self) -> None:
         """Setup preprocessing parameters from config."""
         # Chunking
         self.chunk_size = int(self.proc_cfg.get("hdf5_chunk_size", 10000))
-        
-        # Sequence mode
-        self.M_per_sample = int(self.data_cfg.get("M_per_sample", 16))
         
         # Data type
         dtype_str = self.system_cfg.get("dtype", "float32")
@@ -399,7 +425,7 @@ class CorePreprocessor:
             self.data_cfg.get("target_species_variables", self.species_vars)
         )
         self.global_vars = list(self.data_cfg["global_variables"])
-        self.time_var = str(self.data_cfg["time_variable"])
+        self.time_var = str(self.data_cfg.get("time_variable", "t_time"))
         
         # Dimensions
         self.n_target_species = len(self.target_species_vars)
@@ -408,38 +434,9 @@ class CorePreprocessor:
         
         # Thresholds
         self.min_value_threshold = float(self.proc_cfg.get("min_value_threshold", 1e-30))
+        self.epsilon = float(self.norm_cfg.get("epsilon", 1e-30))
     
-    def _init_fixed_time_grid(self) -> np.ndarray:
-        """
-        Initialize global log-spaced time grid.
-        
-        Returns:
-            Fixed time grid with M_per_sample points
-        """
-        # Get time range from config or stats
-        cfg_range = self.data_cfg.get("fixed_time_range", None)
-        if cfg_range is not None:
-            tmin = float(cfg_range.get("min"))
-            tmax = float(cfg_range.get("max"))
-        else:
-            # Fallback to stats
-            tn = self.norm_stats.get("time_normalization", {})
-            if "tmin_raw" in tn and "tmax_raw" in tn:
-                tmin = float(tn["tmin_raw"])
-                tmax = float(tn["tmax_raw"])
-            else:
-                raise ValueError("Time range not specified in config or stats")
-        
-        # Ensure positive values for geomspace
-        eps = 1e-12 * max(1.0, abs(tmin))
-        a = max(tmin, eps)
-        b = max(a * (1.0 + 1e-12), tmax)
-        
-        # Create log-spaced grid with endpoints
-        grid = np.geomspace(a, b, int(self.M_per_sample), endpoint=True, dtype=np.float64)
-        return grid
-    
-    def _extract_trajectory_chunked(
+    def _extract_and_validate_trajectory(
         self,
         group: h5py.Group,
         gname: str,
@@ -447,6 +444,12 @@ class CorePreprocessor:
     ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         """
         Extract and validate trajectory data from HDF5 group.
+        
+        Performs comprehensive validation:
+        - Checks for missing variables
+        - Validates finite values (no NaNs or Infs)
+        - Ensures positive concentrations above threshold
+        - Verifies monotonic time array
         
         Args:
             group: HDF5 group containing trajectory
@@ -459,16 +462,39 @@ class CorePreprocessor:
         # Check for required global variables
         missing = [k for k in self.global_vars if k not in group.attrs]
         if missing:
+            self.logger.debug(f"Group {gname}: Missing global variables {missing}")
+            if self.stats_logger:
+                self.stats_logger.stats.dropped_missing_keys += 1
+            return None
+        
+        # Check time variable exists
+        if self.time_var not in group:
+            self.logger.debug(f"Group {gname}: Missing time variable {self.time_var}")
             if self.stats_logger:
                 self.stats_logger.stats.dropped_missing_keys += 1
             return None
         
         # Load and validate time data
         time_data = reader.read_dataset_chunked(group, self.time_var)
-        if not np.all(np.isfinite(time_data)) or time_data.size == 0:
+        if time_data.size == 0:
+            self.logger.debug(f"Group {gname}: Empty time array")
+            if self.stats_logger:
+                self.stats_logger.stats.dropped_missing_keys += 1
+            return None
+        
+        # Check for finite time values
+        if not np.all(np.isfinite(time_data)):
+            self.logger.debug(f"Group {gname}: Non-finite time values")
             if self.stats_logger:
                 self.stats_logger.stats.dropped_non_finite += 1
             return None
+        
+        # Check for monotonic time (strictly increasing)
+        if np.any(np.diff(time_data) <= 0):
+            self.logger.error(f"Group {gname}: Non-monotonic time array detected!")
+            if self.stats_logger:
+                self.stats_logger.stats.dropped_non_monotonic_time += 1
+            raise ValueError(f"Non-monotonic time array in group {gname}. Time must be strictly increasing.")
         
         if self.stats_logger:
             self.stats_logger.update_time_range(time_data)
@@ -477,54 +503,94 @@ class CorePreprocessor:
         x0 = np.empty(self.n_species, dtype=self.np_dtype)
         for i, var in enumerate(self.species_vars):
             if var not in group:
+                self.logger.debug(f"Group {gname}: Missing species {var}")
                 if self.stats_logger:
                     self.stats_logger.stats.dropped_missing_keys += 1
                 return None
             
+            # Get initial value
             v0 = float(group[var][0])
-            if not np.isfinite(v0) or v0 <= self.min_value_threshold:
+            
+            # Check finite and above threshold
+            if not np.isfinite(v0):
+                self.logger.debug(f"Group {gname}: Non-finite initial value for {var}")
+                if self.stats_logger:
+                    self.stats_logger.stats.dropped_non_finite += 1
+                return None
+            
+            if v0 <= self.min_value_threshold:
+                self.logger.debug(f"Group {gname}: Initial {var} below threshold: {v0}")
                 if self.stats_logger:
                     self.stats_logger.stats.dropped_below_threshold += 1
                 return None
+            
             x0[i] = v0
         
         # Extract full species time series
-        species_mat = np.empty((time_data.shape[0], self.n_target_species), dtype=self.np_dtype)
+        n_times = time_data.shape[0]
+        species_mat = np.empty((n_times, self.n_target_species), dtype=self.np_dtype)
+        
         for j, var in enumerate(self.target_species_vars):
             if var not in group:
+                self.logger.debug(f"Group {gname}: Missing target species {var}")
                 if self.stats_logger:
                     self.stats_logger.stats.dropped_missing_keys += 1
                 return None
             
+            # Read full time series
             arr = reader.read_dataset_chunked(group, var)
-            if not np.all(np.isfinite(arr)) or np.any(arr <= self.min_value_threshold):
+            
+            # Validate length matches time array
+            if arr.shape[0] != n_times:
+                self.logger.debug(f"Group {gname}: Length mismatch for {var}")
+                if self.stats_logger:
+                    self.stats_logger.stats.dropped_missing_keys += 1
+                return None
+            
+            # Check for any non-finite values
+            if not np.all(np.isfinite(arr)):
+                self.logger.debug(f"Group {gname}: Non-finite values in {var}")
+                if self.stats_logger:
+                    self.stats_logger.stats.dropped_non_finite += 1
+                return None
+            
+            # Check all values above threshold
+            if np.any(arr <= self.min_value_threshold):
+                self.logger.debug(f"Group {gname}: Values below threshold in {var}")
                 if self.stats_logger:
                     self.stats_logger.stats.dropped_below_threshold += 1
                 return None
             
             species_mat[:, j] = arr
+            
             if self.stats_logger:
                 self.stats_logger.update_species_range(var, arr)
         
         # Extract global variables
-        globals_vec = np.array(
-            [float(group.attrs[k]) for k in self.global_vars],
-            dtype=self.np_dtype
-        )
-        
-        if self.stats_logger:
-            for i, var in enumerate(self.global_vars):
-                self.stats_logger.update_global_range(var, globals_vec[i])
+        globals_vec = np.empty(self.n_globals, dtype=self.np_dtype)
+        for i, var in enumerate(self.global_vars):
+            value = float(group.attrs[var])
+            
+            if not np.isfinite(value):
+                self.logger.debug(f"Group {gname}: Non-finite global {var}")
+                if self.stats_logger:
+                    self.stats_logger.stats.dropped_non_finite += 1
+                return None
+            
+            globals_vec[i] = value
+            
+            if self.stats_logger:
+                self.stats_logger.update_global_range(var, value)
         
         return time_data, x0, globals_vec, species_mat
     
-    def process_file_for_sequence_shards(
+    def process_file_for_shards(
         self,
         file_path: Path,
         output_dir: Path
     ) -> Dict[str, Any]:
         """
-        Process single file and write sequence shards.
+        Process single HDF5 file and write trajectory shards.
         
         Args:
             file_path: Path to input HDF5 file
@@ -546,70 +612,56 @@ class CorePreprocessor:
         
         # Process trajectories
         split_counts = {"train": 0, "validation": 0, "test": 0}
-        reader = ChunkedHDF5Reader(file_path, self.chunk_size)
-        seed = int(self.config["system"].get("seed", 42))
+        reader = ChunkedHDF5Reader(self.chunk_size)
+        seed = int(self.system_cfg.get("seed", 42))
         
         # Local statistics
         local_stats = DataStatistics()
-        local_time_points = 0
         
         with h5py.File(file_path, "r") as f:
             keys = sorted(f.keys())
-            for gname in tqdm(keys, desc=f"Sharding {file_path.name}", unit="traj"):
+            for gname in tqdm(keys, desc=f"Processing {file_path.name}", unit="traj"):
                 grp = f[gname]
                 local_stats.total_groups += 1
                 if self.stats_logger:
                     self.stats_logger.stats.total_groups += 1
                 
-                # Basic validation
-                if self.time_var not in grp:
-                    self._update_drop_stats(local_stats, "dropped_missing_keys")
-                    continue
-                
-                n_t = grp[self.time_var].shape[0]
-                local_time_points += int(n_t)
-                
-                # Need at least 2 points for interpolation
-                if n_t < 2:
-                    self._update_drop_stats(local_stats, "dropped_insufficient_time")
-                    continue
-                
                 # Apply use_fraction filter
                 if not self._should_use_trajectory(gname, seed):
-                    self._update_drop_stats(local_stats, "dropped_use_fraction")
+                    local_stats.dropped_use_fraction += 1
+                    if self.stats_logger:
+                        self.stats_logger.stats.dropped_use_fraction += 1
                     continue
                 
-                # Extract trajectory data
-                extracted = self._extract_trajectory_chunked(grp, gname, reader)
+                # Extract and validate trajectory
+                extracted = self._extract_and_validate_trajectory(grp, gname, reader)
                 if extracted is None:
                     continue
                 
                 time_data, x0, globals_vec, species_mat = extracted
                 
-                # Check time coverage
-                if not self._check_time_coverage(time_data):
-                    self._update_drop_stats(local_stats, "dropped_insufficient_time")
-                    continue
-                
-                # Valid trajectory
+                # Valid trajectory - increment counter
                 local_stats.valid_trajectories += 1
                 if self.stats_logger:
                     self.stats_logger.stats.valid_trajectories += 1
                 
-                # Interpolate onto fixed grid
-                y_mat_log = self._interpolate_to_grid(time_data, species_mat)
-                x0_log = np.log10(np.maximum(x0, self.norm_cfg.get("epsilon", 1e-30)))
-                x0_log = x0_log.astype(self.np_dtype, copy=False)
+                # Apply log transformation to species data
+                x0_log = np.log10(np.maximum(x0, self.epsilon))
+                y_mat_log = np.log10(np.maximum(species_mat, self.epsilon))
                 
                 # Determine split
                 split = self._determine_split(gname, seed)
                 
                 # Add to appropriate writer
                 writers[split].add_trajectory(
-                    x0_log, globals_vec, self.fixed_grid_cast, y_mat_log
+                    x0_log.astype(self.np_dtype),
+                    globals_vec.astype(self.np_dtype),
+                    time_data.astype(self.np_dtype),
+                    y_mat_log.astype(self.np_dtype)
                 )
                 split_counts[split] += 1
                 
+                local_stats.split_distribution[split] += 1
                 if self.stats_logger:
                     self.stats_logger.stats.split_distribution[split] += 1
         
@@ -619,7 +671,6 @@ class CorePreprocessor:
         
         # Record processing time
         elapsed = time.time() - start_time
-        local_stats.total_time_points += local_time_points
         local_stats.processing_times[str(file_path)] = elapsed
         local_stats.file_stats[str(file_path)] = {
             "groups_processed": local_stats.total_groups,
@@ -629,9 +680,7 @@ class CorePreprocessor:
         
         if self.stats_logger:
             self.stats_logger.stats.processing_times[str(file_path)] = elapsed
-            self.stats_logger.stats.file_stats[str(file_path)] = dict(
-                local_stats.file_stats[str(file_path)]
-            )
+            self.stats_logger.stats.file_stats[str(file_path)] = local_stats.file_stats[str(file_path)]
         
         # Build metadata
         metadata = self._build_metadata(writers, split_counts)
@@ -640,25 +689,14 @@ class CorePreprocessor:
         return metadata
     
     def _calculate_shard_size(self) -> int:
-        """Calculate optimal trajectories per shard."""
+        """Calculate optimal trajectories per shard based on target file size."""
         trajectories_per_shard = self.proc_cfg.get("trajectories_per_shard", None)
         
         if trajectories_per_shard is None:
-            # Calculate based on target size
-            target_bytes = int(self.proc_cfg.get("target_shard_bytes", 200 * 1024 * 1024))
-            bytes_per_val = 8 if self.np_dtype == np.float64 else 4
-            
-            vals_per_traj = (
-                self.n_species +  # x0
-                self.n_globals +  # globals
-                self.M_per_sample +  # time
-                self.M_per_sample * self.n_target_species  # targets
-            )
-            
-            traj_bytes = max(bytes_per_val * vals_per_traj, 1)
-            trajectories_per_shard = max(1, target_bytes // traj_bytes)
+            # Use a reasonable default
+            trajectories_per_shard = 100
         
-        return trajectories_per_shard
+        return max(1, int(trajectories_per_shard))
     
     def _init_shard_writers(
         self,
@@ -674,20 +712,12 @@ class CorePreprocessor:
                 output_dir / split,
                 trajectories_per_shard,
                 file_stem,
-                self.M_per_sample,
                 self.n_species,
                 self.n_globals,
                 self.np_dtype,
                 compressed=compressed,
             )
         return writers
-    
-    def _update_drop_stats(self, stats: DataStatistics, reason: str) -> None:
-        """Update drop statistics."""
-        setattr(stats, reason, getattr(stats, reason) + 1)
-        if self.stats_logger:
-            setattr(self.stats_logger.stats, reason, 
-                   getattr(self.stats_logger.stats, reason) + 1)
     
     def _should_use_trajectory(self, gname: str, seed: int) -> bool:
         """Check if trajectory should be used based on use_fraction."""
@@ -698,53 +728,6 @@ class CorePreprocessor:
         # Deterministic hash-based sampling
         hash_val = int(hashlib.sha256(f"{seed}:{gname}:use".encode()).hexdigest()[:8], 16)
         return (hash_val / 0xFFFFFFFF) < use_fraction
-    
-    def _check_time_coverage(self, time_data: np.ndarray) -> bool:
-        """Check if trajectory time span covers the fixed grid."""
-        raw_min = float(np.min(time_data))
-        raw_max = float(np.max(time_data))
-        gmin = float(self.fixed_grid[0])
-        gmax = float(self.fixed_grid[-1])
-        
-        # Relative tolerance for coverage check
-        rtol = float(self.proc_cfg.get("grid_coverage_rtol", 1e-6))
-        
-        return (raw_min <= gmin * (1.0 + rtol)) and (raw_max >= gmax * (1.0 - rtol))
-    
-    def _interpolate_to_grid(
-        self,
-        time_data: np.ndarray,
-        species_mat: np.ndarray
-    ) -> np.ndarray:
-        """
-        Interpolate species data onto fixed time grid using log-log interpolation.
-        
-        Args:
-            time_data: Original time points
-            species_mat: Species concentrations [Nt, n_species]
-            
-        Returns:
-            Interpolated data on fixed grid [M, n_species]
-        """
-        eps = float(self.norm_cfg.get("epsilon", 1e-30))
-        
-        # Convert to log space
-        log_t = np.log10(np.maximum(time_data, eps))
-        log_y = np.log10(np.maximum(species_mat, eps))
-
-        # Enforce strictly increasing and unique times (required by np.interp)
-        if not np.all(np.isfinite(log_t)):
-            raise ValueError("Non-finite time values encountered after epsilon clamp.")
-        if np.any(np.diff(log_t) <= 0):
-            raise ValueError("Time array must be strictly increasing with unique values for interpolation.")
-        
-        # Interpolate each species
-        y_mat_log = np.empty((len(self.fixed_grid), self.n_target_species), dtype=self.np_dtype)
-        for j in range(self.n_target_species):
-            y_mat_log[:, j] = np.interp(self.log_tq, log_t, log_y[:, j])
-            y_mat_log[:, j] = y_mat_log[:, j].astype(self.np_dtype, copy=False)
-        
-        return y_mat_log
     
     def _determine_split(self, gname: str, seed: int) -> str:
         """Determine train/val/test split for trajectory."""
@@ -774,150 +757,235 @@ class CorePreprocessor:
             metadata["splits"][split] = {
                 "shards": writers[split].shard_metadata,
                 "n_trajectories": split_counts[split],
-                "total_samples": split_counts[split],
             }
         
         return metadata
-    
-    def collect_time_stats(self, file_paths: List[Path]) -> Dict[str, float]:
-        """
-        Collect time statistics using streaming histogram approach.
-        
-        Computes:
-        - tau0: 5th percentile of positive times
-        - Time ranges for normalization
-        
-        Args:
-            file_paths: List of HDF5 files to process
-            
-        Returns:
-            Dictionary with time normalization parameters
-        """
-        if not file_paths:
-            raise ValueError("No files provided")
-        
-        # Pass 1: Find global min/max
-        global_min, global_max, total_count = self._find_time_range(file_paths)
-        
-        if not math.isfinite(global_min) or not math.isfinite(global_max) or total_count == 0:
-            raise ValueError("No valid time data found")
-        
-        if not (global_max > global_min):
-            global_max = global_min * (1.0 + 1e-12)
-        
-        # Get configured time method (decides what we need to compute)
-        time_method = self.config.get("normalization", {}).get("methods", {}).get(
-            self.time_var, "log-min-max"
-        )
 
-        result = {
-            "tmin_raw": global_min,   # raw time min
-            "tmax_raw": global_max,   # raw time max
-            "time_transform": time_method,
+
+# ============================================================================
+# STATISTICS COLLECTION
+# ============================================================================
+
+def _collect_normalization_stats(
+    raw_files: List[Path],
+    config: Dict[str, Any],
+    logger: logging.Logger
+) -> Dict[str, Any]:
+    """
+    Collect normalization statistics for all variables.
+    
+    Args:
+        raw_files: List of HDF5 files to process
+        config: Configuration dictionary
+        logger: Logger instance
+        
+    Returns:
+        Dictionary with per-variable statistics and methods
+    """
+    logger.info("Collecting normalization statistics...")
+    
+    stats: Dict[str, Any] = {"per_key_stats": {}, "normalization_methods": {}}
+    accumulators: Dict[str, Dict[str, Any]] = {}
+    
+    # Get configuration
+    norm_cfg = config["normalization"]
+    default_method = norm_cfg.get("default_method", "log-standard")
+    methods_override = norm_cfg.get("methods", {})
+    
+    # Get all variables
+    species_vars = config["data"]["species_variables"]
+    global_vars = config["data"]["global_variables"]
+    all_vars = species_vars + global_vars
+    
+    # Initialize accumulators
+    for var in all_vars:
+        accumulators[var] = {
+            "count": 0,
+            "mean": 0.0,
+            "m2": 0.0,
+            "min": float("inf"),
+            "max": float("-inf"),
+            "log_min": float("inf"),
+            "log_max": float("-inf"),
         }
-
-        if time_method == "time-norm":
-            # Pass 2: Build histogram only if needed
-            tau0 = self._compute_tau0_percentile(file_paths, global_min, global_max)
-
-            # Compute normalization bounds (use log1p for stability)
-            tau_min = float(np.log1p(global_min / tau0))
-            tau_max = float(np.log1p(global_max / tau0))
-
-            result.update({
-                "tau0": tau0,
-                "tmin": tau_min,   # tau-space min
-                "tmax": tau_max,   # tau-space max
-            })
-
-        return result
     
-    def _find_time_range(
-        self,
-        file_paths: List[Path]
-    ) -> Tuple[float, float, int]:
-        """Find global time range across all files."""
-        global_min = float("inf")
-        global_max = float("-inf")
-        total_count = 0
-        
-        for file_path in tqdm(file_paths, desc="Pass 1: time range", unit="file"):
-            with h5py.File(file_path, "r") as f:
-                for gname in f.keys():
-                    grp = f[gname]
-                    if self.time_var not in grp:
+    # Add time variable
+    time_var = config["data"].get("time_variable", "t_time")
+    accumulators[time_var] = {
+        "count": 0,
+        "mean": 0.0,
+        "m2": 0.0,
+        "min": float("inf"),
+        "max": float("-inf"),
+        "log_min": float("inf"),
+        "log_max": float("-inf"),
+    }
+    
+    chunk_size = int(config["preprocessing"].get("hdf5_chunk_size", 10000))
+    epsilon = float(norm_cfg.get("epsilon", 1e-30))
+    
+    # Process all files
+    for file_path in tqdm(raw_files, desc="Collecting stats", unit="file"):
+        with h5py.File(file_path, "r") as f:
+            for gname in f.keys():
+                grp = f[gname]
+                
+                # Process time variable
+                if time_var in grp:
+                    times = grp[time_var][:]
+                    if np.all(np.isfinite(times)) and times.size > 0:
+                        acc = accumulators[time_var]
+                        acc["count"] += times.size
+                        acc["min"] = min(acc["min"], float(times.min()))
+                        acc["max"] = max(acc["max"], float(times.max()))
+                        
+                        # Log statistics for time
+                        log_times = np.log10(np.maximum(times, epsilon))
+                        acc["log_min"] = min(acc["log_min"], float(log_times.min()))
+                        acc["log_max"] = max(acc["log_max"], float(log_times.max()))
+                        
+                        # Running mean and variance
+                        for t in times:
+                            delta = t - acc["mean"]
+                            acc["mean"] += delta / acc["count"]
+                            acc["m2"] += delta * (t - acc["mean"])
+                
+                # Process species variables
+                for var in species_vars:
+                    if var not in grp:
                         continue
                     
-                    ds = grp[self.time_var]
-                    for start in range(0, ds.shape[0], self.chunk_size):
-                        end = min(start + self.chunk_size, ds.shape[0])
-                        chunk = ds[start:end]
+                    ds = grp[var]
+                    for start in range(0, ds.shape[0], chunk_size):
+                        end = min(start + chunk_size, ds.shape[0])
+                        arr = ds[start:end]
                         
-                        # Filter positive times
-                        chunk = chunk[chunk > 1e-10]
-                        if chunk.size == 0:
+                        # Filter valid values
+                        valid = arr[np.isfinite(arr)]
+                        if valid.size == 0:
                             continue
                         
-                        total_count += int(chunk.size)
-                        cmin, cmax = float(chunk.min()), float(chunk.max())
-                        global_min = min(global_min, cmin)
-                        global_max = max(global_max, cmax)
-        
-        return global_min, global_max, total_count
+                        acc = accumulators[var]
+                        var_method = methods_override.get(var, default_method)
+                        
+                        # Update count and min/max
+                        acc["count"] += valid.size
+                        acc["min"] = min(acc["min"], float(valid.min()))
+                        acc["max"] = max(acc["max"], float(valid.max()))
+                        
+                        # Log statistics
+                        if "log" in var_method or var_method == "log10":
+                            log_vals = np.log10(np.maximum(valid, epsilon))
+                            acc["log_min"] = min(acc["log_min"], float(log_vals.min()))
+                            acc["log_max"] = max(acc["log_max"], float(log_vals.max()))
+                            
+                            # Use log values for mean/std
+                            data_for_stats = log_vals
+                        else:
+                            data_for_stats = valid
+                            log_vals = np.log10(np.maximum(valid, epsilon))
+                            acc["log_min"] = min(acc["log_min"], float(log_vals.min()))
+                            acc["log_max"] = max(acc["log_max"], float(log_vals.max()))
+                        
+                        # Update running mean and variance
+                        for val in data_for_stats:
+                            delta = val - acc["mean"]
+                            acc["mean"] += delta / acc["count"]
+                            acc["m2"] += delta * (val - acc["mean"])
+                
+                # Process global variables
+                for var in global_vars:
+                    if var in grp.attrs:
+                        value = float(grp.attrs[var])
+                        if not np.isfinite(value):
+                            continue
+                        
+                        acc = accumulators[var]
+                        var_method = methods_override.get(var, default_method)
+                        
+                        acc["count"] += 1
+                        acc["min"] = min(acc["min"], value)
+                        acc["max"] = max(acc["max"], value)
+                        
+                        # Log statistics
+                        if value > 0:
+                            log_val = math.log10(max(value, epsilon))
+                            acc["log_min"] = min(acc["log_min"], log_val)
+                            acc["log_max"] = max(acc["log_max"], log_val)
+                        
+                        # Value for statistics
+                        if "log" in var_method or var_method == "log10":
+                            stat_val = math.log10(max(value, epsilon))
+                        else:
+                            stat_val = value
+                        
+                        # Update running mean and variance
+                        delta = stat_val - acc["mean"]
+                        acc["mean"] += delta / acc["count"]
+                        acc["m2"] += delta * (stat_val - acc["mean"])
     
-    def _compute_tau0_percentile(
-        self,
-        file_paths: List[Path],
-        global_min: float,
-        global_max: float
-    ) -> float:
-        """Compute tau0 as 5th percentile using histogram."""
-        num_bins = int(self.proc_cfg.get("time_hist_bins", 4096))
-        edges = np.linspace(global_min, global_max, num_bins + 1, dtype=np.float64)
-        hist = np.zeros(num_bins, dtype=np.int64)
+    # Finalize statistics
+    for var, acc in accumulators.items():
+        if acc["count"] == 0:
+            continue
         
-        # Build histogram
-        for file_path in tqdm(file_paths, desc="Pass 2: tau0 histogram", unit="file"):
-            with h5py.File(file_path, "r") as f:
-                for gname in f.keys():
-                    grp = f[gname]
-                    if self.time_var not in grp:
-                        continue
-                    
-                    ds = grp[self.time_var]
-                    for start in range(0, ds.shape[0], self.chunk_size):
-                        end = min(start + self.chunk_size, ds.shape[0])
-                        chunk = ds[start:end]
-                        chunk = chunk[chunk > 1e-10]
-                        
-                        if chunk.size == 0:
-                            continue
-                        
-                        h, _ = np.histogram(chunk, bins=edges)
-                        hist += h
+        var_method = methods_override.get(var, default_method)
         
-        # Find 5th percentile
-        target_rank = max(0, int(0.05 * hist.sum()))
-        cumsum = np.cumsum(hist)
-        bin_idx = int(np.searchsorted(cumsum, target_rank, side="left"))
-        bin_idx = max(0, min(bin_idx, num_bins - 1))
+        # Special handling for time variable
+        if var == time_var:
+            var_method = norm_cfg.get("methods", {}).get(time_var, "log-min-max")
         
-        # Linear interpolation within bin
-        left = edges[bin_idx]
-        right = edges[bin_idx + 1]
-        prev_cum = 0 if bin_idx == 0 else int(cumsum[bin_idx - 1])
-        in_bin_rank = max(0, target_rank - prev_cum)
-        bin_count = int(hist[bin_idx]) if hist[bin_idx] > 0 else 1
-        frac = min(1.0, in_bin_rank / bin_count)
+        stats["normalization_methods"][var] = var_method
         
-        return float(left + (right - left) * frac)
+        # Compute standard deviation
+        variance = acc["m2"] / max(1, acc["count"] - 1)
+        std = math.sqrt(max(0, variance))
+        min_std = float(norm_cfg.get("min_std", 1e-10))
+        
+        # Build statistics block
+        block = {
+            "method": var_method,
+            "min": float(acc["min"]) if math.isfinite(acc["min"]) else 0.0,
+            "max": float(acc["max"]) if math.isfinite(acc["max"]) else 1.0,
+            "log_min": float(acc["log_min"]) if math.isfinite(acc["log_min"]) else -30.0,
+            "log_max": float(acc["log_max"]) if math.isfinite(acc["log_max"]) else 0.0,
+        }
+        
+        # Add mean/std for methods that need them
+        if "standard" in var_method:
+            if "log" in var_method:
+                block["log_mean"] = float(acc["mean"])
+                block["log_std"] = max(std, min_std)
+            else:
+                block["mean"] = float(acc["mean"])
+                block["std"] = max(std, min_std)
+        
+        stats["per_key_stats"][var] = block
+    
+    # Mark which variables are stored in log space
+    stats["already_logged_vars"] = species_vars
+    
+    # Add time statistics
+    if time_var in accumulators and accumulators[time_var]["count"] > 0:
+        acc = accumulators[time_var]
+        stats["time_normalization"] = {
+            "tmin_raw": float(acc["min"]),
+            "tmax_raw": float(acc["max"]),
+            "time_transform": var_method,
+        }
+    
+    logger.info("Normalization statistics collection complete.")
+    return stats
 
+
+# ============================================================================
+# PARALLEL PROCESSING
+# ============================================================================
 
 def _process_one_file_worker(
     file_path_str: str,
     output_dir_str: str,
     config_json: str,
-    norm_stats_json: Optional[str],
 ) -> Dict[str, Any]:
     """
     Worker function for parallel file processing.
@@ -926,7 +994,6 @@ def _process_one_file_worker(
         file_path_str: Path to input file as string
         output_dir_str: Output directory as string
         config_json: Serialized config
-        norm_stats_json: Serialized normalization stats
         
     Returns:
         Metadata dictionary with processing results
@@ -934,14 +1001,13 @@ def _process_one_file_worker(
     file_path = Path(file_path_str)
     output_dir = Path(output_dir_str)
     config = json.loads(config_json)
-    norm_stats = json.loads(norm_stats_json) if norm_stats_json else None
     
     # Create local statistics logger
     stats_logger = DataStatisticsLogger(output_dir)
-    processor = CorePreprocessor(config, norm_stats, stats_logger)
+    processor = CorePreprocessor(config, stats_logger)
     
     # Process file
-    meta = processor.process_file_for_sequence_shards(file_path, output_dir)
+    meta = processor.process_file_for_shards(file_path, output_dir)
     
     # Attach stats for merging
     meta["_worker_stats"] = asdict(stats_logger.stats)
@@ -949,15 +1015,18 @@ def _process_one_file_worker(
     return meta
 
 
+# ============================================================================
+# MAIN PREPROCESSOR
+# ============================================================================
+
 class DataPreprocessor:
     """
     Main preprocessor orchestrating the full pipeline.
     
     Coordinates:
-    1. Time statistics collection
-    2. Normalization statistics collection  
-    3. Parallel/serial trajectory processing
-    4. Metadata generation and saving
+    1. Normalization statistics collection
+    2. Parallel/serial trajectory processing
+    3. Metadata generation and saving
     """
     
     def __init__(self, raw_files: List[Path], output_dir: Path, config: Dict[str, Any]):
@@ -973,264 +1042,46 @@ class DataPreprocessor:
         self.raw_files = sorted(raw_files)
         self.output_dir = output_dir
         self.config = config
-        self.sequence_mode = True
         self.processed_dir = output_dir
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         
         self.stats_logger = DataStatisticsLogger(output_dir)
     
-    def _welford_merge(
-        self,
-        acc_count: int,
-        acc_mean: float,
-        acc_m2: float,
-        chunk: np.ndarray
-    ) -> Tuple[int, float, float, float, float]:
-        """
-        Merge chunk into running statistics using Welford's algorithm.
-        
-        Args:
-            acc_count: Accumulated count
-            acc_mean: Accumulated mean
-            acc_m2: Accumulated sum of squared differences
-            chunk: New data chunk
-            
-        Returns:
-            Updated (count, mean, m2, min, max)
-        """
-        d = chunk[np.isfinite(chunk)]
-        if d.size == 0:
-            return acc_count, acc_mean, acc_m2, float("inf"), float("-inf")
-        
-        # Chunk statistics
-        n1 = int(d.size)
-        c_min = float(d.min())
-        c_max = float(d.max())
-        c_mean = float(d.mean())
-        c_m2 = float(((d - c_mean) ** 2).sum())
-        
-        if acc_count == 0:
-            return n1, c_mean, c_m2, c_min, c_max
-        
-        # Merge using Chan-Welford algorithm
-        n0 = acc_count
-        delta = c_mean - acc_mean
-        n = n0 + n1
-        mean = acc_mean + delta * (n1 / n)
-        m2 = acc_m2 + c_m2 + (delta * delta) * (n0 * n1 / n)
-        
-        return n, mean, m2, c_min, c_max
-    
-    def _collect_normalization_stats(self) -> Dict[str, Any]:
-        """
-        Collect normalization statistics for all variables.
-        
-        Returns:
-            Dictionary with per-variable statistics and methods
-        """
-        self.logger.info("Collecting normalization statistics...")
-        
-        stats: Dict[str, Any] = {"per_key_stats": {}, "normalization_methods": {}}
-        accumulators: Dict[str, Dict[str, float]] = {}
-        
-        # Get configuration
-        norm_cfg = self.config["normalization"]
-        default_method = norm_cfg.get("default_method", "log-standard")
-        methods_override = norm_cfg.get("methods", {})
-        all_vars = self.config["data"]["species_variables"] + self.config["data"]["global_variables"]
-        
-        # Initialize accumulators
-        for var in all_vars:
-            accumulators[var] = {
-                "count": 0,
-                "mean": 0.0,
-                "m2": 0.0,
-                "lin_min": float("inf"),
-                "lin_max": float("-inf"),
-                "log_min": float("inf"),
-                "log_max": float("-inf"),
-            }
-        
-        chunk_size = int(self.config["preprocessing"].get("hdf5_chunk_size", 10000))
-        
-        # Process all files
-        for file_path in tqdm(self.raw_files, desc="Collecting norm stats", unit="file"):
-            with h5py.File(file_path, "r") as f:
-                for gname in f.keys():
-                    grp = f[gname]
-                    
-                    # Process species datasets
-                    for var in self.config["data"]["species_variables"]:
-                        if var not in grp:
-                            continue
-                        
-                        ds = grp[var]
-                        var_method = methods_override.get(var, default_method)
-                        
-                        for start in range(0, ds.shape[0], chunk_size):
-                            end = min(start + chunk_size, ds.shape[0])
-                            arr_raw = ds[start:end]
-                            
-                            # Update species range
-                            if self.stats_logger:
-                                self.stats_logger.update_species_range(var, arr_raw)
-                            
-                            # Choose domain for statistics
-                            if "log" in var_method or var_method == "log10":
-                                eps = norm_cfg.get("epsilon", 1e-30)
-                                arr = np.log10(np.maximum(arr_raw, eps))
-                            else:
-                                arr = arr_raw
-                            
-                            # Update statistics
-                            a = accumulators[var]
-                            n, m, m2, _, _ = self._welford_merge(
-                                a["count"], a["mean"], a["m2"], arr
-                            )
-                            a["count"], a["mean"], a["m2"] = n, m, m2
-                            
-                            # Update min/max in both domains
-                            finite_lin = arr_raw[np.isfinite(arr_raw)]
-                            if finite_lin.size:
-                                a["lin_min"] = min(a["lin_min"], float(finite_lin.min()))
-                                a["lin_max"] = max(a["lin_max"], float(finite_lin.max()))
-                            
-                            eps = float(norm_cfg.get("epsilon", 1e-30))
-                            raw_pos = np.maximum(arr_raw, eps)
-                            finite_log = raw_pos[np.isfinite(raw_pos)]
-                            if finite_log.size:
-                                log_vals = np.log10(finite_log)
-                                a["log_min"] = min(a["log_min"], float(log_vals.min()))
-                                a["log_max"] = max(a["log_max"], float(log_vals.max()))
-                    
-                    # Process global attributes
-                    for var in self.config["data"]["global_variables"]:
-                        if var in grp.attrs:
-                            value = float(grp.attrs[var])
-                            var_method = methods_override.get(var, default_method)
-                            a = accumulators[var]
-                            
-                            # Accumulate for standardization methods
-                            if "standard" in var_method:
-                                if "log" in var_method or var_method == "log10":
-                                    v = math.log10(max(value, norm_cfg.get("epsilon", 1e-30)))
-                                else:
-                                    v = value
-                                
-                                n, m, m2, _, _ = self._welford_merge(
-                                    a["count"], a["mean"], a["m2"],
-                                    np.array([v], dtype=np.float64),
-                                )
-                                a["count"], a["mean"], a["m2"] = n, m, m2
-                            
-                            # Track min/max
-                            if math.isfinite(value):
-                                a["lin_min"] = min(a["lin_min"], value)
-                                a["lin_max"] = max(a["lin_max"], value)
-                                
-                                eps = float(norm_cfg.get("epsilon", 1e-30))
-                                v_log = math.log10(max(value, eps))
-                                a["log_min"] = min(a["log_min"], v_log)
-                                a["log_max"] = max(a["log_max"], v_log)
-                            
-                            if self.stats_logger:
-                                self.stats_logger.update_global_range(var, value)
-        
-        # Finalize statistics
-        for var, a in accumulators.items():
-            if not (math.isfinite(a["lin_min"]) and math.isfinite(a["lin_max"])):
-                continue
-            
-            var_method = methods_override.get(var, default_method)
-            stats["normalization_methods"][var] = var_method
-            
-            # Build stats block
-            block = {
-                "method": var_method,
-                "min": float(a["lin_min"]),
-                "max": float(a["lin_max"]),
-                "log_min": float(a["log_min"]),
-                "log_max": float(a["log_max"]),
-            }
-            
-            # Add mean/std for standardization methods
-            if "standard" in var_method:
-                variance = a["m2"] / (a["count"] - 1) if a["count"] > 1 else 0.0
-                std = float(np.sqrt(max(variance, 0.0)))
-                min_std = float(norm_cfg.get("min_std", 1e-10))
-                
-                key_prefix = "log_" if ("log" in var_method or var_method == "log10") else ""
-                block[f"{key_prefix}mean"] = float(a["mean"])
-                block[f"{key_prefix}std"] = float(max(std, min_std))
-            
-            stats["per_key_stats"][var] = block
-        
-        # Add time method
-        time_var = self.config["data"]["time_variable"]
-        stats["normalization_methods"][time_var] = (
-            self.config.get("normalization", {})
-                .get("methods", {})
-                .get(time_var, "log-min-max")
-        )
-        
-        self.logger.info("Normalization statistics collection complete.")
-        return stats
-    
     def process_to_npy_shards(self) -> None:
         """
         Execute the full preprocessing pipeline.
         
-        Processes raw HDF5 files into normalized NPZ shards
-        ready for training.
+        Processes raw HDF5 files into normalized NPZ shards ready for training.
         """
-        self.logger.info("Processing data in SEQUENCE MODE for LiLaN")
-        
-        # Collect time statistics
-        processor = CorePreprocessor(self.config, stats_logger=self.stats_logger)
-        time_stats = processor.collect_time_stats(self.raw_files)
-        
-        # Determine fixed grid bounds
-        cfg_range = self.config.get("data", {}).get("fixed_time_range")
-        if cfg_range is not None:
-            grid_min = float(cfg_range.get("min"))
-            grid_max = float(cfg_range.get("max"))
-        else:
-            grid_min = float(time_stats["tmin_raw"])
-            grid_max = float(time_stats["tmax_raw"])
+        self.logger.info("Starting data preprocessing for LiLaN")
         
         # Collect normalization statistics
-        norm_stats = self._collect_normalization_stats()
-        norm_stats["time_normalization"] = time_stats
-        norm_stats["fixed_time_grid"] = {
-            "min": grid_min,
-            "max": grid_max,
-            "M": int(self.config["data"]["M_per_sample"]),
-            "endpoint": True,
-            "spacing": "log",
-        }
-        norm_stats["already_logged_vars"] = list(self.config["data"]["species_variables"])
+        norm_stats = _collect_normalization_stats(
+            self.raw_files, self.config, self.logger
+        )
         
         # Save normalization stats
         save_json(norm_stats, self.output_dir / "normalization.json")
+        self.logger.info(f"Saved normalization statistics to {self.output_dir / 'normalization.json'}")
         
         # Process files
-        all_metadata = self._process_files(norm_stats)
+        all_metadata = self._process_files()
         
         # Save shard index
-        self._save_shard_index(all_metadata, time_stats, grid_min, grid_max)
+        self._save_shard_index(all_metadata, norm_stats)
         
         # Save statistics summary
         self.stats_logger.save_summary()
         
         # Log summary
         self.logger.info(
-            "Sequence mode preprocessing complete. "
+            "Preprocessing complete. "
             f"Train: {all_metadata['splits']['train']['n_trajectories']} trajectories, "
             f"Val: {all_metadata['splits']['validation']['n_trajectories']}, "
             f"Test: {all_metadata['splits']['test']['n_trajectories']}"
         )
     
-    def _process_files(self, norm_stats: Dict[str, Any]) -> Dict[str, Any]:
+    def _process_files(self) -> Dict[str, Any]:
         """Process all files either in parallel or serial."""
         all_metadata = {
             "splits": {
@@ -1246,7 +1097,6 @@ class DataPreprocessor:
             # Parallel processing
             self.logger.info(f"Parallel preprocessing with {num_workers} workers...")
             cfg_json = json.dumps(self.config)
-            norm_json = json.dumps(norm_stats)
             
             with ProcessPoolExecutor(max_workers=num_workers, mp_context=mp.get_context("spawn")) as ex:
                 futures = [
@@ -1255,11 +1105,11 @@ class DataPreprocessor:
                         str(file_path),
                         str(self.processed_dir),
                         cfg_json,
-                        norm_json,
                     )
                     for file_path in self.raw_files
                 ]
-                with tqdm(total=len(futures), desc="Preprocessing files (parallel)", unit="file") as pbar:
+                
+                with tqdm(total=len(futures), desc="Processing files", unit="file") as pbar:
                     for fut in as_completed(futures):
                         metadata = fut.result()
                         self._merge_metadata(all_metadata, metadata)
@@ -1269,10 +1119,10 @@ class DataPreprocessor:
                         pbar.update(1)
         else:
             # Serial processing
-            for file_path in tqdm(self.raw_files, desc="Preprocessing files (serial)", unit="file"):
+            for file_path in tqdm(self.raw_files, desc="Processing files", unit="file"):
                 self.logger.info(f"Processing file: {file_path}")
-                cproc = CorePreprocessor(self.config, norm_stats, self.stats_logger)
-                metadata = cproc.process_file_for_sequence_shards(file_path, self.processed_dir)
+                processor = CorePreprocessor(self.config, self.stats_logger)
+                metadata = processor.process_file_for_shards(file_path, self.processed_dir)
                 self._merge_metadata(all_metadata, metadata)
         
         return all_metadata
@@ -1280,14 +1130,11 @@ class DataPreprocessor:
     def _save_shard_index(
         self,
         all_metadata: Dict[str, Any],
-        time_stats: Dict[str, float],
-        grid_min: float,
-        grid_max: float
+        norm_stats: Dict[str, Any]
     ) -> None:
         """Save shard index with all metadata."""
         shard_index = {
-            "sequence_mode": True,
-            "M_per_sample": self.config["data"]["M_per_sample"],
+            "variable_length": True,  # Trajectories have different lengths
             "n_input_species": len(self.config["data"]["species_variables"]),
             "n_target_species": len(
                 self.config["data"].get(
@@ -1298,17 +1145,11 @@ class DataPreprocessor:
             "n_globals": len(self.config["data"]["global_variables"]),
             "compression": "npz",
             "splits": all_metadata["splits"],
-            "time_normalization": time_stats,
-            "time_grid": {
-                "type": "logspace",
-                "min": grid_min,
-                "max": grid_max,
-                "M": int(self.config["data"]["M_per_sample"]),
-                "endpoint": True,
-            },
+            "time_normalization": norm_stats.get("time_normalization", {}),
             "already_logged_vars": list(self.config["data"]["species_variables"]),
         }
         save_json(shard_index, self.output_dir / "shard_index.json")
+        self.logger.info(f"Saved shard index to {self.output_dir / 'shard_index.json'}")
     
     @staticmethod
     def _merge_metadata(all_meta: Dict[str, Any], meta: Dict[str, Any]) -> None:

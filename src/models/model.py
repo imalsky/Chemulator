@@ -7,22 +7,18 @@ Latent Network Approach for Real-Time Solutions of Stiff Nonlinear Ordinary
 Differential Equations" by Nockolds et al.
 
 Core idea:
-    z(t) = E(x0, p) + τ(t, x0, p) ∘ C(x0, p)   # Linear latent dynamics
-    y(t) = D(z(t), p)                          # Decode to physical space
+    y(t) = E(x0, p) + τ(t, x0, p) ⊙ C(x0, p)   # Linear latent dynamics
+    x(t) = D(y(t), p)                           # Decode to physical space
 
-Key innovations:
-- Constant-velocity latent dynamics (analytically solvable)
-- Learned time warping for handling multiple timescales
-- Optional mixture-of-experts for complex dynamics
-
-Supports two architectural variants:
-- "full": Single model for all output dimensions (shared encoder/decoder)
-- "independent": Separate model for each output dimension (better performance)
+Key components:
+- Encoder E: Maps (x0, p) to initial latent state
+- Encoder C: Maps (x0, p) to constant latent velocity  
+- Time transformation τ: Maps (t, x0, p) to monotonic time scaling per latent dimension
+- Decoder D: Maps latent state (and optionally globals) to physical space
 """
 
 import logging
-import math
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -38,342 +34,336 @@ def _get_activation(name: str) -> nn.Module:
     Get activation function by name.
     
     Args:
-        name: Activation function name (gelu, relu, tanh, silu, elu)
+        name: Activation function name
         
     Returns:
         PyTorch activation module
     """
-    name = (name or "gelu").lower()
+    name = (name or "tanh").lower()
     activations = {
-        "gelu": nn.GELU(),
-        "relu": nn.ReLU(inplace=True),
         "tanh": nn.Tanh(),
-        "silu": nn.SiLU(inplace=True),
-        "elu": nn.ELU(inplace=True),
+        "gelu": nn.GELU(),
+        "relu": nn.ReLU(),
+        "silu": nn.SiLU(),
+        "elu": nn.ELU(),
     }
-    return activations.get(name, nn.GELU())
+    return activations.get(name, nn.Tanh())
 
 
 def _build_mlp(
-    in_dim: int,
-    hidden: List[int],
-    out_dim: int,
+    layers: List[int],
     activation: nn.Module,
     dropout_p: float = 0.0,
-    use_layernorm: bool = True,
+    use_layernorm: bool = False,
     final_activation: bool = False,
 ) -> nn.Sequential:
     """
-    Build a multi-layer perceptron with optional normalization and dropout.
+    Build a multi-layer perceptron.
     
     Args:
-        in_dim: Input dimension
-        hidden: List of hidden layer dimensions
-        out_dim: Output dimension
+        layers: List of layer dimensions [input, hidden1, hidden2, ..., output]
         activation: Activation function module
-        dropout_p: Dropout probability (0 = no dropout)
+        dropout_p: Dropout probability
         use_layernorm: Whether to use layer normalization
         final_activation: Whether to apply activation after final layer
         
     Returns:
         Sequential MLP module
     """
-    layers: List[nn.Module] = []
-    prev = in_dim
+    if len(layers) < 2:
+        raise ValueError("MLP must have at least input and output dimensions")
     
-    # Build hidden layers
-    for i, h in enumerate(hidden):
+    modules: List[nn.Module] = []
+    
+    for i in range(len(layers) - 1):
         # Add layer norm before linear (except first layer)
         if i > 0 and use_layernorm:
-            layers.append(nn.LayerNorm(prev))
+            modules.append(nn.LayerNorm(layers[i]))
         
-        # Linear layer + activation
-        layers.extend([nn.Linear(prev, h), activation])
+        # Linear layer
+        modules.append(nn.Linear(layers[i], layers[i + 1]))
         
-        # Optional dropout
-        if dropout_p > 0:
-            layers.append(nn.Dropout(dropout_p))
+        # Activation (except last layer unless specified)
+        if i < len(layers) - 2 or final_activation:
+            modules.append(activation)
         
-        prev = h
+        # Dropout (except last layer)
+        if dropout_p > 0 and i < len(layers) - 2:
+            modules.append(nn.Dropout(dropout_p))
     
-    # Final layer
-    if hidden and use_layernorm:
-        layers.append(nn.LayerNorm(prev))
-    layers.append(nn.Linear(prev, out_dim))
-    
-    # Optional final activation
-    if final_activation:
-        layers.append(activation)
-    
-    return nn.Sequential(*layers)
+    return nn.Sequential(*modules)
 
 
 # ============================================================================
-# TIME WARP MODULE
+# TIME TRANSFORMATION MODULE
 # ============================================================================
 
-class TimeWarp(nn.Module):
+class MonotonicTimeTransform(nn.Module):
     """
-    Learned monotonic time transformation for each latent dimension.
+    Monotonic time transformation for each latent dimension.
     
-    Implements per-dimension time warping:
+    Implements per-dimension time warping following the paper's formulation:
         τ_d(t) = s_d * t + Σ_{j=1..J} a_{d,j} * (1 - exp(-b_{d,j} * t))
     
     where s, a, b are constrained positive via softplus to ensure monotonicity.
     This allows the model to "stretch" or "compress" time differently for each
     latent dimension, crucial for handling multiple timescales in stiff systems.
+    
+    The transformation is anchored so that τ(0) = 0 to match the paper's
+    initial condition y(0) = E(x0, p).
     """
     
     def __init__(
         self, 
         context_dim: int, 
         latent_dim: int, 
-        J_terms: int = 3, 
-        hidden_dim: int = 64
+        J_terms: int = 5,
+        hidden_layers: List[int] = None
     ):
         """
-        Initialize time warp module.
+        Initialize monotonic time transform.
         
         Args:
-            context_dim: Dimension of context features (encoder output)
-            latent_dim: Number of latent dimensions to warp
+            context_dim: Dimension of context features (x0, p)
+            latent_dim: Number of latent dimensions to transform
             J_terms: Number of expansion terms per dimension
-            hidden_dim: Hidden layer size for parameter network
+            hidden_layers: Hidden layer sizes for parameter network
         """
         super().__init__()
         self.latent_dim = latent_dim
         self.J_terms = J_terms
         
-        # Network to predict warp parameters from context
+        if hidden_layers is None:
+            hidden_layers = [128, 128]
+        
+        # Network to predict transform parameters from context
         # Output: s (scale), a_j (amplitudes), b_j (rates) for each latent dim
         out_dim = latent_dim * (1 + 2 * J_terms)
-        self.net = nn.Sequential(
-            nn.Linear(context_dim, hidden_dim),
+        layers = [context_dim] + hidden_layers + [out_dim]
+        
+        self.param_network = _build_mlp(
+            layers,
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
+            dropout_p=0.0,
+            use_layernorm=False,
+            final_activation=False
         )
-
-    def forward(self, t_norm: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        
+        # Initialize near identity transformation
+        self._initialize_near_identity()
+    
+    def _initialize_near_identity(self):
+        """Initialize the network to produce near-identity transformation."""
+        # Find the last linear layer
+        for module in reversed(list(self.param_network.modules())):
+            if isinstance(module, nn.Linear):
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    with torch.no_grad():
+                        # Reshape bias to access individual parameters
+                        bias = module.bias.view(self.latent_dim, 1 + 2 * self.J_terms)
+                        # Set s ≈ 1 (softplus(0.54) ≈ 1)
+                        bias[:, 0] = 0.54
+                        # Set a ≈ 0 (softplus(-5) ≈ 0)  
+                        bias[:, 1:1 + self.J_terms] = -5
+                        # Set b ≈ 1 (softplus(0.54) ≈ 1)
+                        bias[:, 1 + self.J_terms:] = 0.54
+                break
+    
+    def forward(self, t_batch: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         """
-        Apply time warping to normalized time values.
+        Apply monotonic time transformation.
         
         Args:
-            t_norm: Normalized time values in [0,1], shape [B, M]
-            context: Context features from encoder, shape [B, context_dim]
+            t_batch: Time values, shape [B*M, 1] (vectorized over time)
+            context: Context features (x0, p), shape [B, context_dim]
             
         Returns:
-            Warped time values, shape [B, M, D] where D is latent_dim
+            Transformed time values, shape [B*M, latent_dim]
         """
-        B, M = t_norm.shape
+        B_times_M = t_batch.shape[0]
+        B = context.shape[0]
+        M = B_times_M // B
         
-        # Predict warp parameters from context
-        params = self.net(context).view(B, self.latent_dim, 1 + 2 * self.J_terms)
+        # Predict transform parameters from context
+        params = self.param_network(context)  # [B, latent_dim * (1 + 2*J)]
+        params = params.view(B, self.latent_dim, 1 + 2 * self.J_terms)
         
         # Extract and constrain parameters to be positive
-        s = F.softplus(params[:, :, 0:1])                      # Scale: [B, D, 1]
-        a = F.softplus(params[:, :, 1:1 + self.J_terms])       # Amplitudes: [B, D, J]
-        b = F.softplus(params[:, :, 1 + self.J_terms:])        # Rates: [B, D, J]
+        s = F.softplus(params[:, :, 0])                        # [B, D]
+        a = F.softplus(params[:, :, 1:1 + self.J_terms])       # [B, D, J]
+        b = F.softplus(params[:, :, 1 + self.J_terms:])        # [B, D, J]
         
-        # Expand time for broadcasting: [B, D, M]
-        t_exp = t_norm.unsqueeze(1).expand(B, self.latent_dim, M)
+        # Expand for all time points
+        s = s.unsqueeze(1).expand(B, M, self.latent_dim).reshape(B_times_M, self.latent_dim)
+        a = a.unsqueeze(1).expand(B, M, self.latent_dim, self.J_terms).reshape(B_times_M, self.latent_dim, self.J_terms)
+        b = b.unsqueeze(1).expand(B, M, self.latent_dim, self.J_terms).reshape(B_times_M, self.latent_dim, self.J_terms)
+        
+        # Expand time for each latent dimension
+        t_exp = t_batch.expand(B_times_M, self.latent_dim)  # [B*M, D]
         
         # Linear component
-        tau = s * t_exp
+        tau = s * t_exp  # [B*M, D]
         
         # Nonlinear components: sum over J terms
         # Using expm1 for numerical stability: 1 - exp(-x) = -expm1(-x)
-        exp_terms = (a.unsqueeze(-1) * (-torch.expm1(-b.unsqueeze(-1) * t_exp.unsqueeze(2)))).sum(dim=2)
+        for j in range(self.J_terms):
+            tau = tau + a[:, :, j] * (-torch.expm1(-b[:, :, j] * t_exp))
         
-        # Combine and transpose to [B, M, D] format
-        return (tau + exp_terms).transpose(1, 2)
+        return tau  # [B*M, latent_dim]
 
 
 # ============================================================================
 # MAIN LILAN MODEL
 # ============================================================================
 
-class LinearLatentMixture(nn.Module):
+class LinearLatentNetwork(nn.Module):
     """
-    Linear Latent Network with optional mixture-of-experts and time warping.
+    Linear Latent Network (LiLaN) for solving stiff ODEs.
     
-    Architecture:
-    1. Encoder networks (E, C) map initial conditions to latent initial state and velocity
-    2. Time warp network τ transforms physical time to latent time
-    3. Latent evolution: z(τ) = E(x0, p) + τ ∘ C(x0, p) (analytically solved)
-    4. Decoder network D maps latent state back to physical space
+    Architecture from the paper:
+    1. Encoder E maps (x0, p) to initial latent state y0
+    2. Encoder C maps (x0, p) to constant latent velocity dy/dτ
+    3. Time transformation τ maps (t, x0, p) to scaled time for each latent dimension
+    4. Latent solution: y(t) = E(x0, p) + τ(t, x0, p) ⊙ C(x0, p)
+    5. Decoder D maps latent state y(t) (and optionally p) to physical solution x(t)
     
-    Inputs: [x0_log (S), globals (G), times (M)]
-    Outputs: [B, M, T] predictions for target species
+    The key insight is that the latent dynamics are linear (constant velocity),
+    allowing analytical solution without numerical integration.
     """
     
-    def __init__(self, config: Dict[str, Any], output_dim: Optional[int] = None):
+    def __init__(self, config: Dict[str, Any]):
         """
         Initialize LiLaN model.
         
         Args:
-            config: Configuration dictionary with model/data/training settings
-            output_dim: Optional override for number of outputs (for independent models)
+            config: Configuration dictionary with model/data settings
         """
         super().__init__()
-        self.log = logging.getLogger(__name__)
+        self.logger = logging.getLogger(__name__)
         
+        # Extract configuration
         data_cfg = config["data"]
         model_cfg = config["model"]
-
-        # Extract dimensions from config
+        
+        # Problem dimensions
         self.num_species = len(data_cfg["species_variables"])
         self.num_globals = len(data_cfg["global_variables"])
+        self.num_targets = len(data_cfg.get("target_species_variables", data_cfg["species_variables"]))
         
-        # Allow output dimension override for independent architecture
-        if output_dim is not None:
-            self.num_targets = output_dim
-        else:
-            self.num_targets = len(data_cfg.get("target_species_variables", data_cfg["species_variables"]))
-        
-        self.latent_dim = int(model_cfg.get("latent_dim", 64))
-
-        # Activation and regularization
-        self.activation = _get_activation(model_cfg.get("activation", "gelu"))
+        # Model hyperparameters
+        self.latent_dim = model_cfg.get("latent_dim", 32)
+        activation_name = model_cfg.get("activation", "tanh")
+        self.activation = _get_activation(activation_name)
         self.dropout_p = float(model_cfg.get("dropout", 0.0))
-
-        # Mixture-of-experts configuration
-        mix_cfg = model_cfg.get("mixture", {})
-        self.K = int(mix_cfg.get("K", 1))  # Number of experts
-        self.gate_temp = float(mix_cfg.get("temperature", 1.0))
+        use_layernorm = model_cfg.get("use_layernorm", True)
         
-        # Regularization settings for mixtures
-        self.diversity_mode = str(mix_cfg.get("diversity_mode", "per_sample"))
-        self.full_pair_threshold = int(mix_cfg.get("full_pair_threshold", 8))
-        self.sample_factor = int(mix_cfg.get("sample_factor", 8))
-        self.sample_pairs: Optional[int] = mix_cfg.get("sample_pairs", None)
-        self.gate_use_features = bool(mix_cfg.get("use_encoder_features", True))
-
+        # Whether to include globals in decoder (practical enhancement)
+        self.decoder_use_globals = model_cfg.get("decoder_use_globals", True)
+        
         # Time warp configuration
-        tw_cfg = model_cfg.get("time_warp", {})
-        self.use_time_warp = bool(tw_cfg.get("enabled", False))
-        self.warp_use_features = bool(tw_cfg.get("use_encoder_features", True))
-        self.warp_J = int(tw_cfg.get("J_terms", 3))
-        self.warp_hidden = int(tw_cfg.get("hidden_dim", 64))
-
-        # ====== Build network components ======
+        self.use_monotonic_tau = model_cfg.get("use_monotonic_tau", True)
+        self.tau_J_terms = model_cfg.get("tau_J_terms", 5)
         
-        # Encoder backbone: processes initial conditions and parameters
-        enc_layers = list(model_cfg.get("encoder_layers", [256, 256, 128]))
-        enc_in = self.num_species + self.num_globals
-        enc_out = enc_layers[-1] if enc_layers else enc_in
+        # Input dimension: initial conditions + global parameters
+        input_dim = self.num_species + self.num_globals
         
-        self.encoder = _build_mlp(
-            in_dim=enc_in, 
-            hidden=enc_layers, 
-            out_dim=enc_out,
-            activation=self.activation, 
-            dropout_p=self.dropout_p,
-            use_layernorm=True, 
-            final_activation=False,
+        # ====== Build encoder networks ======
+        
+        # Encoder E: (x0, p) → y0 (initial latent state)
+        encoder_E_layers = [input_dim] + list(model_cfg.get("encoder_layers", [256, 256, 128])) + [self.latent_dim]
+        self.encoder_E = _build_mlp(
+            encoder_E_layers,
+            self.activation,
+            self.dropout_p,
+            use_layernorm,
+            final_activation=False
         )
-
-        # Heads for latent initial state (E) and velocity (C)
-        # Output K experts if using mixture
-        self.y0_head = nn.Linear(enc_out, self.latent_dim * self.K)
-        self.c_head = nn.Linear(enc_out, self.latent_dim * self.K)
-
-        # Gating network for mixture-of-experts
-        if self.K > 1:
-            gate_layers = list(mix_cfg.get("gate_layers", [64, 32]))
-            gate_input_dim = enc_out if self.gate_use_features else enc_in
+        
+        # Encoder C: (x0, p) → dy/dτ (constant latent velocity)
+        encoder_C_layers = [input_dim] + list(model_cfg.get("encoder_layers", [256, 256, 128])) + [self.latent_dim]
+        self.encoder_C = _build_mlp(
+            encoder_C_layers,
+            self.activation,
+            self.dropout_p,
+            use_layernorm,
+            final_activation=False
+        )
+        
+        # Time transformation τ: (t, x0, p) → τ (scaled time per latent dimension)
+        if self.use_monotonic_tau:
+            # Use monotonic parameterization for stability
+            self.tau_network = MonotonicTimeTransform(
+                context_dim=input_dim,
+                latent_dim=self.latent_dim,
+                J_terms=self.tau_J_terms,
+                hidden_layers=model_cfg.get("tau_hidden_layers", [128, 128])
+            )
+        else:
+            # Use unconstrained neural network (as in paper, but less stable)
+            time_input_dim = 1 + self.num_species + self.num_globals
+            tau_layers = [time_input_dim] + list(model_cfg.get("tau_layers", [256, 256, 128])) + [self.latent_dim]
+            self.tau_network = _build_mlp(
+                tau_layers,
+                self.activation,
+                self.dropout_p,
+                use_layernorm,
+                final_activation=False
+            )
+        
+        # ====== Build decoder network ======
+        
+        # Decoder D: y (+ optionally p) → x (latent to physical space)
+        if self.decoder_use_globals:
+            decoder_input_dim = self.latent_dim + self.num_globals
+        else:
+            decoder_input_dim = self.latent_dim
             
-            self.gate = _build_mlp(
-                in_dim=gate_input_dim,
-                hidden=gate_layers, 
-                out_dim=self.K,
-                activation=self.activation, 
-                dropout_p=self.dropout_p,
-                use_layernorm=bool(mix_cfg.get("gate_use_layernorm", False)),
-                final_activation=False,
-            )
-
-        # Time warp module
-        if self.use_time_warp:
-            warp_context_dim = enc_out if self.warp_use_features else enc_in
-            self.time_warp = TimeWarp(
-                warp_context_dim, self.latent_dim, self.warp_J, self.warp_hidden
-            )
-
-        # Decoder: maps latent state + globals to target species
-        dec_layers = list(model_cfg.get("decoder_layers", [128, 256, 256]))
-        dec_in = self.latent_dim + self.num_globals
-        
-        self.decoder = _build_mlp(
-            in_dim=dec_in, 
-            hidden=dec_layers, 
-            out_dim=self.num_targets,
-            activation=self.activation, 
-            dropout_p=self.dropout_p,
-            use_layernorm=True, 
-            final_activation=False,
+        decoder_layers = [decoder_input_dim] + list(model_cfg.get("decoder_layers", [128, 256, 256])) + [self.num_targets]
+        self.decoder_D = _build_mlp(
+            decoder_layers,
+            self.activation,
+            self.dropout_p,
+            use_layernorm,
+            final_activation=False
         )
-
+        
         # Initialize weights
         self._initialize_weights()
-
+        
+        # Restore near-identity init for τ AFTER global init so it is not overwritten
+        if self.use_monotonic_tau and hasattr(self.tau_network, "_initialize_near_identity"):
+            self.tau_network._initialize_near_identity()
+        
+        self.logger.info(
+            f"Created LiLaN model: latent_dim={self.latent_dim}, "
+            f"activation={activation_name}, "
+            f"monotonic_tau={self.use_monotonic_tau}, "
+            f"decoder_use_globals={self.decoder_use_globals}, "
+            f"n_params={sum(p.numel() for p in self.parameters() if p.requires_grad):,}"
+        )
+    
     def _initialize_weights(self) -> None:
-        """
-        Initialize network weights with sensible defaults.
-        
-        Uses Xavier initialization for most layers, with special handling for:
-        - Gate network: initialized to uniform probabilities
-        - Time warp: initialized close to identity transformation
-        """
-        # Standard Xavier initialization
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-
-        # Gate network: start with uniform expert probabilities
-        if self.K > 1:
-            for m in self.gate.modules():
-                if isinstance(m, nn.Linear) and m.out_features == self.K:
-                    nn.init.zeros_(m.weight)
-                    nn.init.zeros_(m.bias)
-                    break
-
-        # Time warp: initialize close to identity (τ ≈ t)
-        if self.use_time_warp:
-            # Find last linear layer in time warp network
-            last_linear = None
-            for m in self.time_warp.net.modules():
-                if isinstance(m, nn.Linear):
-                    last_linear = m
-            
-            if last_linear is not None:
-                nn.init.zeros_(last_linear.weight)
-                with torch.no_grad():
-                    J, D = self.time_warp.J_terms, self.latent_dim
-                    bias = last_linear.bias.view(D, 1 + 2 * J)
-                    bias[:, 0] = 0.54      # softplus(0.54) ≈ 1  => s ≈ 1
-                    bias[:, 1:1 + J] = -5  # softplus(-5)  ≈ 0  => a ≈ 0
-                    bias[:, 1 + J:] = 0.54 # softplus(0.54) ≈ 1  => b ≈ 1
-
-    def set_gate_temperature(self, temperature: float) -> None:
-        """
-        Set temperature for mixture-of-experts gating.
-        
-        Args:
-            temperature: Temperature for softmax (lower = more peaked distribution)
-        """
-        if self.K > 1:
-            self.gate_temp = max(1e-3, float(temperature))
-
+        """Initialize network weights using Xavier initialization."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+    
     def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Forward pass through the LiLaN model.
+        
+        Following the paper's formulation:
+        1. Parse inputs into x0 (initial conditions), p (parameters), and t (times)
+        2. Compute y0 = E(x0, p) and c = C(x0, p)
+        3. Compute τ = τ(t, x0, p) for each time point (vectorized)
+        4. Compute latent trajectory: y(t) = y0 + τ ⊙ c
+        5. Decode to physical space: x(t) = D(y(t), p)
         
         Args:
             inputs: Tensor of shape [B, S + G + M] containing:
@@ -383,271 +373,66 @@ class LinearLatentMixture(nn.Module):
                 
         Returns:
             predictions: Model outputs of shape [B, M, T]
-            aux: Dictionary with auxiliary outputs for regularization:
-                - 'gate_p': Gating probabilities if using mixture
-                - 'c_all': All velocity vectors for diversity loss
+            aux: Empty dictionary (for compatibility)
         """
         B = inputs.size(0)
         
         # Parse inputs
-        x0_log = inputs[:, :self.num_species]
-        g_vec = inputs[:, self.num_species:self.num_species + self.num_globals]
-        t_norm = inputs[:, self.num_species + self.num_globals:]  # [B, M]
+        x0_log = inputs[:, :self.num_species]                                      # [B, S]
+        g_vec = inputs[:, self.num_species:self.num_species + self.num_globals]    # [B, G]
+        t_norm = inputs[:, self.num_species + self.num_globals:]                   # [B, M]
         M = t_norm.size(1)
-
-        # Encode initial conditions and parameters
-        enc_input = torch.cat([x0_log, g_vec], dim=1)  # [B, S+G]
-        features = self.encoder(enc_input)              # [B, enc_out]
-
-        # Predict latent initial state and velocity
-        y0_all = self.y0_head(features)  # [B, K*D]
-        c_all = self.c_head(features)    # [B, K*D]
-
-        # Apply time warping if enabled
-        if self.use_time_warp:
-            warp_ctx = features if self.warp_use_features else enc_input
-            tau = self.time_warp(t_norm, warp_ctx)  # [B, M, D]
+        
+        # Combine initial conditions and parameters for encoders
+        encoder_input = torch.cat([x0_log, g_vec], dim=1)  # [B, S+G]
+        
+        # Compute initial latent state and velocity
+        y0 = self.encoder_E(encoder_input)  # [B, latent_dim]
+        c = self.encoder_C(encoder_input)   # [B, latent_dim]
+        
+        # Compute time transformation (vectorized)
+        if self.use_monotonic_tau:
+            # Monotonic transform expects [B*M, 1] times and [B, context_dim] context
+            t_flat = t_norm.reshape(B * M, 1)  # [B*M, 1]
+            tau_flat = self.tau_network(t_flat, encoder_input)  # [B*M, latent_dim]
+            tau = tau_flat.view(B, M, self.latent_dim)  # [B, M, latent_dim]
         else:
-            # No warping: use normalized time directly
-            tau = t_norm.unsqueeze(-1).expand(B, M, self.latent_dim)
-
-        # Auxiliary outputs for regularization
-        aux: Dict[str, torch.Tensor] = {}
-
-        if self.K > 1:
-            # === Mixture-of-experts path ===
-            
-            # Reshape to separate experts
-            y0_all = y0_all.view(B, self.K, self.latent_dim)  # [B, K, D]
-            c_all = c_all.view(B, self.K, self.latent_dim)    # [B, K, D]
-
-            # Compute gating probabilities
-            gate_ctx = features if self.gate_use_features else enc_input
-            logits = self.gate(gate_ctx)  # [B, K]
-            probs = F.softmax(logits / max(self.gate_temp, 1e-3), dim=-1)  # [B, K]
-
-            # Store for regularization
-            aux["gate_p"] = probs
-            aux["c_all"] = c_all
-
-            # Compute latent trajectories for each expert
-            # z_k(t) = y0_k + tau * c_k
-            z_all = y0_all.unsqueeze(2) + tau.unsqueeze(1) * c_all.unsqueeze(2)  # [B, K, M, D]
-            
-            # Weighted sum over experts
-            z_t = (z_all * probs.view(B, self.K, 1, 1)).sum(dim=1)  # [B, M, D]
+            # Unconstrained neural network
+            # Prepare input: concatenate time with context for each time point
+            t_flat = t_norm.reshape(B * M, 1)  # [B*M, 1]
+            context_expanded = encoder_input.unsqueeze(1).expand(B, M, -1).reshape(B * M, -1)  # [B*M, S+G]
+            tau_input = torch.cat([t_flat, context_expanded[:, :self.num_species], context_expanded[:, self.num_species:]], dim=1)  # [B*M, 1+S+G]
+            tau_flat = self.tau_network(tau_input)  # [B*M, latent_dim]
+            tau = tau_flat.view(B, M, self.latent_dim)  # [B, M, latent_dim]
+        
+        # Anchor tau so that tau(t_start) = 0 (enforces y(0) = E(x0, p))
+        tau = tau - tau[:, :1, :]  # Subtract first time point
+        
+        # Compute latent trajectory: y(t) = y0 + τ ⊙ c
+        # Expand y0 and c for broadcasting
+        y0_expanded = y0.unsqueeze(1).expand(B, M, self.latent_dim)  # [B, M, latent_dim]
+        c_expanded = c.unsqueeze(1).expand(B, M, self.latent_dim)    # [B, M, latent_dim]
+        
+        # Element-wise multiplication of tau and c, then add y0
+        y_t = y0_expanded + tau * c_expanded  # [B, M, latent_dim]
+        
+        # Decode each time point
+        if self.decoder_use_globals:
+            # Include global parameters in decoder (practical enhancement)
+            g_expanded = g_vec.unsqueeze(1).expand(B, M, self.num_globals)  # [B, M, G]
+            decoder_input = torch.cat([y_t, g_expanded], dim=-1)  # [B, M, latent_dim + G]
+            decoder_input_flat = decoder_input.reshape(B * M, -1)  # [B*M, latent_dim + G]
         else:
-            # === Single expert path ===
-            y0 = y0_all.view(B, self.latent_dim)
-            c = c_all.view(B, self.latent_dim)
-            
-            # Linear evolution in latent space
-            z_t = y0.unsqueeze(1) + tau * c.unsqueeze(1)  # [B, M, D]
-
-        # Decode latent trajectories to physical space
-        # Replicate global parameters for each time step
-        g_rep = g_vec.unsqueeze(1).expand(B, M, self.num_globals)  # [B, M, G]
+            # Decoder uses only latent state (strict paper interpretation)
+            decoder_input_flat = y_t.reshape(B * M, self.latent_dim)  # [B*M, latent_dim]
         
-        # Concatenate latent state with globals and decode
-        dec_in = torch.cat([z_t, g_rep], dim=-1).reshape(B * M, -1)  # [B*M, D+G]
-        out = self.decoder(dec_in).view(B, M, self.num_targets)       # [B, M, T]
+        x_flat = self.decoder_D(decoder_input_flat)  # [B*M, num_targets]
         
-        return out, aux
-
-    def get_regularization_losses(self, aux: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Compute regularization losses for mixture-of-experts.
+        # Reshape back to [B, M, num_targets]
+        predictions = x_flat.view(B, M, self.num_targets)
         
-        Args:
-            aux: Auxiliary outputs from forward pass
-            
-        Returns:
-            Dictionary with unweighted regularization losses:
-            - 'gate_kl_to_uniform': KL divergence of gate from uniform
-            - 'generator_similarity': Similarity between expert generators
-        """
-        losses: Dict[str, torch.Tensor] = {}
-        
-        if not aux or self.K == 1:
-            return losses
-
-        # Gate entropy regularization: encourage uniform gate usage
-        # KL(p || Uniform) = E_p[log p] + log K
-        p = aux["gate_p"].clamp_min(1e-8)
-        losses["gate_kl_to_uniform"] = (p * (p.log() + math.log(self.K))).sum(dim=-1).mean()
-
-        # Generator diversity regularization: encourage diverse experts
-        c_all = aux["c_all"]  # [B, K, D]
-        
-        if self.diversity_mode == "batch_mean":
-            # Compute similarity on batch-averaged generators
-            w = F.normalize(c_all.mean(dim=0), dim=-1)  # [K, D]
-            sim = w @ w.T  # [K, K]
-            
-            # Extract upper triangular similarities
-            i, j = torch.triu_indices(self.K, self.K, offset=1, device=sim.device)
-            sims = sim[i, j].clamp_min(0)
-            losses["generator_similarity"] = sims.mean() if sims.numel() else sim.new_tensor(0.0)
-        else:
-            # Per-sample diversity (default)
-            w = F.normalize(c_all, dim=-1)  # [B, K, D]
-            sim = torch.einsum("bkd,bld->bkl", w, w)  # [B, K, K]
-            
-            # Get upper triangular indices
-            i, j = torch.triu_indices(self.K, self.K, offset=1, device=sim.device)
-            num_pairs = (self.K * (self.K - 1)) // 2
-
-            # Sample pairs if too many
-            if self.K <= self.full_pair_threshold or num_pairs == 0:
-                sims = sim[:, i, j]  # [B, P]
-            else:
-                # Subsample pairs for efficiency
-                if self.sample_pairs is None:
-                    S = min(self.sample_factor * self.K, num_pairs)
-                else:
-                    S = min(int(self.sample_pairs), num_pairs)
-                
-                choice = torch.randint(0, num_pairs, (S,), device=sim.device)
-                sims = sim[:, i[choice], j[choice]]  # [B, S]
-
-            sims = sims.clamp_min(0)
-            per_sample = sims.mean(dim=1)  # [B]
-            losses["generator_similarity"] = per_sample.mean()
-        
-        return losses
-
-
-# ============================================================================
-# INDEPENDENT ARCHITECTURE
-# ============================================================================
-
-class IndependentLinearLatentMixture(nn.Module):
-    """
-    Independent LiLaN architecture with separate models per output.
-    
-    Creates K independent LiLaN models, one for each target dimension.
-    This typically achieves better performance than the full architecture
-    at the cost of more parameters, as each output gets its own specialized
-    encoder, latent dynamics, and decoder.
-    """
-    
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize independent architecture.
-        
-        Args:
-            config: Configuration dictionary
-        """
-        super().__init__()
-        self.log = logging.getLogger(__name__)
-        
-        data_cfg = config["data"]
-        self.target_vars = data_cfg.get("target_species_variables", data_cfg["species_variables"])
-        self.num_targets = len(self.target_vars)
-        
-        # Create independent model for each target dimension
-        self.models = nn.ModuleList()
-        for i in range(self.num_targets):
-            # Each model predicts only one output dimension
-            model = LinearLatentMixture(config, output_dim=1)
-            self.models.append(model)
-        
-        self.log.info(f"Created independent architecture with {self.num_targets} separate models")
-    
-    def set_gate_temperature(self, temperature: float) -> None:
-        """
-        Set gate temperature for all sub-models.
-        
-        Args:
-            temperature: Temperature for softmax gating
-        """
-        for model in self.models:
-            model.set_gate_temperature(temperature)
-    
-    def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Run each model independently and concatenate outputs.
-        
-        Args:
-            inputs: Input tensor of shape [B, S + G + M]
-            
-        Returns:
-            predictions: Concatenated outputs [B, M, T]
-            aux: Combined auxiliary data from all models
-        """
-        outputs = []
-        all_aux = {}
-        
-        # Run each model independently
-        for i, model in enumerate(self.models):
-            out, aux = model(inputs)  # out: [B, M, 1]
-            outputs.append(out)
-            
-            # Collect auxiliary data from each model
-            for key, val in aux.items():
-                if key not in all_aux:
-                    all_aux[key] = []
-                all_aux[key].append(val)
-        
-        # Concatenate outputs along target dimension
-        predictions = torch.cat(outputs, dim=-1)  # [B, M, T]
-        
-        # Stack auxiliary tensors along model dimension
-        for key in all_aux:
-            if len(all_aux[key]) > 0:
-                all_aux[key] = torch.stack(all_aux[key], dim=0)  # [T, ...]
-        
-        return predictions, all_aux
-    
-    def get_regularization_losses(self, aux: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Compute regularization losses averaged over all sub-models.
-        
-        Args:
-            aux: Stacked auxiliary outputs from all models
-            
-        Returns:
-            Dictionary with averaged regularization losses
-        """
-        losses = {}
-        
-        # Gate KL regularization
-        if "gate_p" in aux:
-            gate_losses = []
-            for model_idx in range(self.num_targets):
-                if aux["gate_p"].size(0) > model_idx:
-                    p = aux["gate_p"][model_idx].clamp_min(1e-8)
-                    K = p.size(-1)
-                    if K > 1:  # Only compute for mixture models
-                        gate_loss = (p * (p.log() + math.log(K))).sum(dim=-1).mean()
-                        gate_losses.append(gate_loss)
-            
-            if gate_losses:
-                losses["gate_kl_to_uniform"] = torch.stack(gate_losses).mean()
-        
-        # Generator diversity regularization
-        if "c_all" in aux:
-            sim_losses = []
-            for model_idx in range(self.num_targets):
-                if aux["c_all"].size(0) > model_idx:
-                    c = aux["c_all"][model_idx]
-                    
-                    # Check if this is a mixture model
-                    if c.dim() == 3 and c.size(1) > 1:  # [B, K, D] with K > 1
-                        w = F.normalize(c, dim=-1)
-                        sim = torch.einsum("bkd,bld->bkl", w, w)
-                        
-                        K = c.size(1)
-                        i_idx, j_idx = torch.triu_indices(K, K, offset=1, device=sim.device)
-                        
-                        if i_idx.numel() > 0:
-                            sims = sim[:, i_idx, j_idx].clamp_min(0)
-                            sim_losses.append(sims.mean())
-            
-            if sim_losses:
-                losses["generator_similarity"] = torch.stack(sim_losses).mean()
-        
-        return losses
+        # Return predictions and empty aux dict
+        return predictions, {}
 
 
 # ============================================================================
@@ -656,13 +441,7 @@ class IndependentLinearLatentMixture(nn.Module):
 
 def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     """
-    Factory function to create LiLaN models.
-    
-    Supports:
-    - Model variants: "full" (default) or "independent"
-    - Model types: "linear_latent" or "linear_latent_mixture"
-    - Optional torch.compile for optimization
-    - Configurable precision (float32/float64)
+    Factory function to create LiLaN model.
     
     Args:
         config: Configuration dictionary with model specifications
@@ -670,32 +449,12 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
         
     Returns:
         Configured and initialized model
-        
-    Raises:
-        ValueError: If unknown model type or variant specified
     """
-    model_cfg = config["model"]
-    model_type = model_cfg.get("type", "linear_latent_mixture").lower()
-    model_variant = model_cfg.get("variant", "full").lower()
-    
-    # Validate model type
-    if model_type not in {"linear_latent", "linear_latent_mixture"}:
-        raise ValueError(f"Unknown model type: {model_type}")
-    
-    # Validate model variant
-    if model_variant not in {"full", "independent"}:
-        raise ValueError(f"Unknown model variant: {model_variant}. Choose 'full' or 'independent'")
-    
-    # Create model based on variant
-    if model_variant == "independent":
-        model = IndependentLinearLatentMixture(config)
-        variant_str = "independent"
-    else:
-        model = LinearLatentMixture(config)
-        variant_str = "full"
+    # Create model
+    model = LinearLatentNetwork(config)
     
     # Set precision
-    if str(config["system"].get("dtype", "float32")).lower() == "float64":
+    if str(config.get("system", {}).get("dtype", "float32")).lower() == "float64":
         model = model.double()
     
     # Move to device
@@ -703,20 +462,12 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
     
     # Optional torch.compile for performance
     logger = logging.getLogger(__name__)
-    if config["system"].get("use_torch_compile", False) and hasattr(torch, "compile"):
+    if config.get("system", {}).get("use_torch_compile", False) and hasattr(torch, "compile"):
         try:
             compile_mode = config["system"].get("compile_mode", "default")
             model = torch.compile(model, mode=compile_mode)
             logger.info(f"Model compilation successful (mode={compile_mode})")
         except Exception as e:
             logger.warning(f"Model compilation failed: {e}. Running in eager mode.")
-    
-    # Log model summary
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(
-        f"Created {variant_str} {model_type}: "
-        f"{n_params:,} parameters, "
-        f"latent_dim={model_cfg.get('latent_dim', 64)}"
-    )
     
     return model
