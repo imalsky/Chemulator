@@ -12,12 +12,7 @@ import time
 from pathlib import Path
 import torch
 from typing import Dict, Union
-
-
 import psutil
-
-
-# Setup multiprocessing strategy early
 import torch.multiprocessing
 try:
     torch.multiprocessing.set_sharing_strategy('file_system')
@@ -64,23 +59,21 @@ class ChemicalKineticsPipeline:
     
     def setup_paths(self):
         """Create directory structure."""
+        import uuid
         paths = self.config["paths"]
         
-        # Create run directory
-        model_type = self.config["model"]["type"]
+        # Create run directory with unique identifier
+        model_type = self.config["model"].get("type", "LiLaN")
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        mix = self.config["model"].get("mixture", {}).get("K", 1)
-        warp = self.config["model"].get("time_warp", {}).get("enabled", False)
-        seq_tag = "seq" if self.config["data"].get("sequence_mode", False) else "row"
-        extra = f"K{mix}_{'warp' if warp else 'nowarp'}_{seq_tag}"
-        self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{extra}_{timestamp}"
+        unique_id = str(uuid.uuid4())[:8]
+        self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{timestamp}_{unique_id}"
         
         # Convert paths
         self.raw_data_files = [Path(f) for f in paths["raw_data_files"]]
         
         # Processed data directory
         base_processed_dir = Path(paths["processed_data_dir"])
-        self.processed_dir = base_processed_dir / f"{seq_tag}_mode"
+        self.processed_dir = base_processed_dir
         
         self.log_dir = Path(paths["log_dir"])
         
@@ -104,45 +97,34 @@ class ChemicalKineticsPipeline:
 
         # Normalization methods (make deterministic: lowercased, sorted)
         norm_methods = norm_cfg.get("methods", {}) or {}
-        norm_methods_norm = {
-            k: (None if v is None else str(v).lower()) for k, v in norm_methods.items()
-        }
+        norm_methods_norm = {k: (None if v is None else str(v).lower()) for k, v in norm_methods.items()}
         norm_methods_items = sorted(norm_methods_norm.items())
 
         # Time method as actually used by the code (fallback matches CorePreprocessor/Normalizer)
-        time_method_used = norm_methods_norm.get(time_var, "log-min-max")
+        default_method = norm_cfg.get("default_method", "log-standard")
+        time_method_used = norm_methods_norm.get(time_var, default_method.lower())
 
         # If you change preprocessing math (e.g., tau0 logic), bump this string:
-        preprocessor_version = "2025-08-10_tau0-log1p-hist-v1"
+        preprocessor_version = "fixed"
 
         data_params = {
             # Inputs & schema
             "raw_files": sorted([str(f) for f in self.raw_data_files]),
             "species_variables": data_cfg.get("species_variables", []),
-            "target_species_variables": data_cfg.get(
-                "target_species_variables", data_cfg.get("species_variables", [])
-            ),
+            "target_species_variables": data_cfg.get("target_species_variables", data_cfg.get("species_variables", [])),
             "global_variables": data_cfg.get("global_variables", []),
             "time_variable": time_var,
 
-            # Sampling / supervision
-            "sequence_mode": data_cfg.get("sequence_mode", False),
-            "M_per_sample": data_cfg.get("M_per_sample", 16),
-
-            # Fixed global time grid metadata
-            "fixed_time_range": data_cfg.get("fixed_time_range", None),
-            "grid_coverage_rtol": precfg.get("grid_coverage_rtol", 1e-6),
-
             # Preprocessing knobs that change outputs
             "min_value_threshold": precfg.get("min_value_threshold", 1e-30),
-            "time_hist_bins": precfg.get("time_hist_bins", 4096),
 
             # Normalization behavior that changes normalization.json
-            "default_norm_method": norm_cfg.get("default_method", "standard"),
-            "norm_methods": norm_methods_items,            # <-- include overrides
-            "time_method": time_method_used,               # <-- include actual time method
-            "epsilon": norm_cfg.get("epsilon", 1e-30),
-            "min_std": norm_cfg.get("min_std", 1e-10),
+            "default_norm_method": norm_cfg.get("default_method", "log-standard"),
+            "norm_methods": norm_methods_items,           
+            "time_method": time_method_used,   
+                      
+            #"epsilon": norm_cfg.get("epsilon", 1e-30),
+            #"min_std": norm_cfg.get("min_std", 1e-10),
 
             # Split policy (affects which traj lands in which split deterministically)
             "use_fraction": train_cfg.get("use_fraction", 1.0),
@@ -205,14 +187,14 @@ class ChemicalKineticsPipeline:
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }, hash_file)
             
-            self.logger.info(f"Data preprocessing complete. Files saved to: {self.processed_dir}")
+            self.logger.info("Data preprocessing complete. Files saved to: %s", self.processed_dir)
     
     def _log_memory_status(self):
         """Log current memory status."""
         mem = psutil.virtual_memory()
         self.logger.info(
-            f"System memory: {mem.total/1024**3:.1f}GB total, "
-            f"{mem.available/1024**3:.1f}GB available ({mem.percent:.1f}% used)"
+            "System memory: %.1fGB total, %.1fGB available (%.1f%% used)",
+            mem.total/1024**3, mem.available/1024**3, mem.percent
         )
         
         if self.device.type == "cuda":
@@ -220,16 +202,12 @@ class ChemicalKineticsPipeline:
             free_mem, total_mem = torch.cuda.mem_get_info(idx)
             used_mem = total_mem - free_mem
             self.logger.info(
-                f"GPU memory: {total_mem/1024**3:.1f}GB total, "
-                f"{free_mem/1024**3:.1f}GB free, "
-                f"{used_mem/1024**3:.1f}GB used"
+                "GPU memory: %.1fGB total, %.1fGB free, %.1fGB used",
+                total_mem/1024**3, free_mem/1024**3, used_mem/1024**3
             )
     
     def train_model(self):
-        """Train the neural network model."""
-        mode_str = "sequence" if self.config["data"].get("sequence_mode", False) else "row-wise"
-        self.logger.info(f"Starting model training in {mode_str} mode...")
-        
+        """Train the neural network model."""        
         # Ensure data is preprocessed
         self.preprocess_data()
         
@@ -241,7 +219,7 @@ class ChemicalKineticsPipeline:
         
         # Log model info
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        self.logger.info(f"Model: {self.config['model']['type']} - Parameters: {total_params:,}")
+        self.logger.info("Model: %s - Parameters: %d", self.config['model']['type'], total_params)
         
         # Load normalization stats
         norm_file = self.processed_dir / "normalization.json"
@@ -258,76 +236,111 @@ class ChemicalKineticsPipeline:
         # Log memory status
         self._log_memory_status()
         
-        # Create datasets
+        # Create datasets with proper cleanup
         self.logger.info("Loading datasets...")
-        train_dataset = SequenceDataset(
-            self.processed_dir, "train", self.config, self.device, norm_stats
-        )
-        
+        train_dataset = None
         val_dataset = None
-        if self.config.get("training", {}).get("val_fraction", 0.0) > 0:
-            val_dataset = SequenceDataset(
-                self.processed_dir, "validation", self.config, self.device, norm_stats
-            )
-        
         test_dataset = None
-        if self.config.get("training", {}).get("test_fraction", 0.0) > 0:
-            test_dataset = SequenceDataset(
-                self.processed_dir, "test", self.config, self.device, norm_stats
+        trainer = None
+        
+        try:
+            # Determine if we need to disable cache for multi-worker loading
+            num_workers = self.config.get("training", {}).get("num_workers", 0)
+            disable_cache = num_workers > 0
+            
+            train_dataset = SequenceDataset(
+                self.processed_dir, "train", self.config, self.device, 
+                norm_stats, disable_cache=disable_cache
             )
-        
-        self.logger.info(f"Train samples: {len(train_dataset)}")
-        if val_dataset:
-            self.logger.info(f"Validation samples: {len(val_dataset)}")
-        if test_dataset:
-            self.logger.info(f"Test samples: {len(test_dataset)}")
-        
-        # Initialize trainer
-        trainer = Trainer(
-            model=model,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            test_dataset=test_dataset,
-            config=self.config,
-            save_dir=self.run_save_dir,
-            device=self.device,
-            norm_helper=norm_helper
-        )
-        
-        # Train model
-        best_val_loss = trainer.train()
-        
-        # Evaluate on test set
-        test_loss = float("inf")
-        if test_dataset:
-            test_loss = trainer.evaluate_test()
-        
-        self.logger.info(f"Training complete! Best validation loss: {best_val_loss:.6f}")
-        if test_loss != float("inf"):
-            self.logger.info(f"Test loss: {test_loss:.6f}")
-        
-        # Save results
-        results = {
-            "best_val_loss": best_val_loss,
-            "test_loss": test_loss,
-            "model_path": str(self.run_save_dir / "best_model.pt"),
-            "training_time": trainer.total_training_time,
-            "best_epoch": trainer.best_epoch,
-        }
-        
-        save_json(results, self.run_save_dir / "results.json")
-        
-        return results
+            
+            if self.config.get("training", {}).get("val_fraction", 0.0) > 0:
+                val_dataset = SequenceDataset(
+                    self.processed_dir, "validation", self.config, self.device, 
+                    norm_stats, disable_cache=disable_cache
+                )
+            
+            if self.config.get("training", {}).get("test_fraction", 0.0) > 0:
+                test_dataset = SequenceDataset(
+                    self.processed_dir, "test", self.config, self.device, 
+                    norm_stats, disable_cache=disable_cache
+                )
+            
+            self.logger.info("Train samples: %d", len(train_dataset))
+            if val_dataset:
+                self.logger.info("Validation samples: %d", len(val_dataset))
+            if test_dataset:
+                self.logger.info("Test samples: %d", len(test_dataset))
+            
+            # Initialize trainer
+            trainer = Trainer(
+                model=model,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                test_dataset=test_dataset,
+                config=self.config,
+                save_dir=self.run_save_dir,
+                device=self.device,
+                norm_helper=norm_helper
+            )
+            
+            # Train model
+            best_val_loss = trainer.train()
+            
+            # Evaluate on test set
+            test_loss = float("inf")
+            if test_dataset:
+                test_loss = trainer.evaluate_test()
+            
+            self.logger.info("Training complete! Best validation loss: %.6f", best_val_loss)
+            if test_loss != float("inf"):
+                self.logger.info("Test loss: %.6f", test_loss)
+            
+            # Save results
+            results = {
+                "best_val_loss": best_val_loss,
+                "test_loss": test_loss,
+                "model_path": str(self.run_save_dir / "best_model.pt"),
+                "training_time": trainer.total_training_time,
+                "best_epoch": trainer.best_epoch,
+            }
+            
+            save_json(results, self.run_save_dir / "results.json")
+            
+            return results
+            
+        finally:
+            # Ensure datasets are properly cleaned up
+            for dataset in [train_dataset, val_dataset, test_dataset]:
+                if dataset is not None:
+                    try:
+                        dataset.close()
+                    except Exception as e:
+                        self.logger.debug("Error closing dataset: %s", e)
+            
+            # Clean up trainer
+            if trainer is not None:
+                del trainer
+            
+            # Clean up model
+            if 'model' in locals():
+                del model
+            
+            # Force GPU memory cleanup
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
     
     def run(self):
         """Execute the full training pipeline."""
         try:
             results = self.train_model()
             self.logger.info("Pipeline completed successfully!")
-            self.logger.info(f"Results saved in: {self.run_save_dir}")
+            self.logger.info("Results saved in: %s", self.run_save_dir)
             return results
+        except KeyboardInterrupt:
+            self.logger.info("Pipeline interrupted by user")
+            raise
         except Exception as e:
-            self.logger.error(f"Pipeline failed: {e}", exc_info=True)
+            self.logger.error("Pipeline failed: %s", e, exc_info=True)
             raise
 
 
@@ -390,8 +403,17 @@ def main():
 
     if args.train:
         # Regular training
-        pipeline = ChemicalKineticsPipeline(args.config)
-        pipeline.run()
+        pipeline = None
+        try:
+            pipeline = ChemicalKineticsPipeline(args.config)
+            pipeline.run()
+        finally:
+            # Cleanup
+            if pipeline is not None:
+                del pipeline
+            # Force final GPU cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     elif args.tune:
         # HPO run
@@ -411,14 +433,19 @@ def main():
             except Exception:
                 pass
 
-        study = optimize_hyperparameters(
-            config_path=args.config,
-            n_trials=args.n_trials,
-            n_jobs=args.n_jobs,
-            study_name=args.study_name,
-            use_hyperband=not args.no_hyperband,
-        )
-        print(f"\nOptimization complete. Study saved as: {study.study_name}")
+        try:
+            study = optimize_hyperparameters(
+                config_path=args.config,
+                n_trials=args.n_trials,
+                n_jobs=args.n_jobs,
+                study_name=args.study_name,
+                use_hyperband=not args.no_hyperband,
+            )
+            print(f"\nOptimization complete. Study saved as: {study.study_name}")
+        finally:
+            # Force GPU cleanup after HPO
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     else:
         parser.print_help()

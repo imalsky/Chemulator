@@ -9,6 +9,7 @@ and training parameters. Designed to be called through main.py --tune.
 import json
 import logging
 import shutil
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -36,12 +37,11 @@ from utils.hardware import setup_device, optimize_hardware
 
 # Model Architecture Search Space
 MODEL_SEARCH_SPACE = {
-    "variant": ["full"],
-    "latent_dim": {"low": 16, "high": 128, "step": 16},
+    "latent_dim": {"low": 16, "high": 256, "step": 16},
     "encoder_layers": {
         "min_layers": 2,
-        "max_layers": 5,
-        "layer_size_min": 64,
+        "max_layers": 7,
+        "layer_size_min": 32,
         "layer_size_max": 1024,
         "layer_size_step": 64
     },
@@ -54,47 +54,35 @@ MODEL_SEARCH_SPACE = {
     },
     "activation": ["tanh", "gelu", "relu", "silu"],
     "dropout": {"low": 0.0, "high": 0.2, "step": 0.05},
-    "use_mixture": [True, False],
-    "mixture_K": {"low": 1, "high": 4},
-    "diversity_mode": ["per_sample", "batch_mean"],
-    "use_time_warp": [True, False],
-    "warp_J_terms": {"low": 2, "high": 8},
-    "warp_hidden": {"low": 32, "high": 128, "step": 32},
 }
 
 # Training Hyperparameter Search Space  
 TRAINING_SEARCH_SPACE = {
-    "optimizer": ["AdamW", "Lion"],
+    "optimizer": ["AdamW"],
     "learning_rate": {"low": 1e-5, "high": 1e-3, "log": True},
     "weight_decay": {"low": 1e-6, "high": 1e-3, "log": True},
     "beta1": {"low": 0.85, "high": 0.95},
     "beta2": {"low": 0.95, "high": 0.999},
     "batch_power": {"low": 8, "high": 12},
     "gradient_accumulation": {"low": 1, "high": 8},
-    "gradient_clip": {"low": 0.0, "high": 10.0, "step": 0.5},
-    "scheduler": ["cosine", "none"],
-    "cosine_T0": {"low": 25, "high": 50},
-    "cosine_Tmult": {"low": 1, "high": 4},
-    "lambda_entropy": {"low": 0.0, "high": 0.1, "step": 0.01},
-    "lambda_diversity": {"low": 0.0, "high": 0.1, "step": 0.01},
-    "temp_start": {"low": 0.5, "high": 2.0},
-    "temp_end": {"low": 0.1, "high": 0.5},
-    "temp_anneal_frac": {"low": 0.3, "high": 0.8},
     "use_amp": [True, False],
-    "amp_dtype": ["float16", "bfloat16"],
-    "use_fraction": {"low": 0.5, "high": 1.0, "step": 0.1},
+    "gradient_clip": {"low": 0.5, "high": 5.0, "step": 0.5},
+    "scheduler": ["cosine", "plateau", "none"],
+    "cosine_T0": {"low": 10, "high": 100, "step": 10},
+    "cosine_Tmult": {"low": 1, "high": 2},
+    "use_fraction": {"low": 0.8, "high": 1.0, "step": 0.1},
+    "amp_dtype": ["bfloat16"]
 }
 
 # Fixed Training Parameters for HPO
 HPO_TRAINING_CONFIG = {
-    "epochs": 50,
-    "early_stopping_patience": 10,
+    "epochs": 100,
+    "early_stopping_patience": 20,
     "min_delta": 1e-6,
 }
 
 # Default/Baseline Configuration
 DEFAULT_TRIAL = {
-    "model_variant": "full",
     "latent_dim": 32,
     "n_encoder_layers": 4,
     "encoder_layer_0": 256,
@@ -108,11 +96,6 @@ DEFAULT_TRIAL = {
     "decoder_layer_3": 256,
     "activation": "tanh",
     "dropout": 0.0,
-    "use_mixture": False,
-    "use_time_warp": True,
-    "warp_J_terms": 5,
-    "warp_hidden": 64,
-    "warp_use_features": True,
     "optimizer": "AdamW",
     "learning_rate": 1e-4,
     "weight_decay": 1e-5,
@@ -124,11 +107,6 @@ DEFAULT_TRIAL = {
     "scheduler": "cosine",
     "cosine_T0": 50,
     "cosine_Tmult": 2,
-    "lambda_entropy": 0.0,
-    "lambda_diversity": 0.0,
-    "temp_start": 1.0,
-    "temp_end": 0.3,
-    "temp_anneal_frac": 0.6,
     "use_amp": False,
     "use_fraction": 1.0,
 }
@@ -184,20 +162,22 @@ class ProgressCallback:
         if trial.state == optuna.trial.TrialState.COMPLETE:
             self.logger.info(f"Validation loss: {trial.value:.6f}")
             
-            # Show current best if available
-            complete_trials = [t for t in study.trials 
-                             if t.state == optuna.trial.TrialState.COMPLETE]
-            if complete_trials:
-                self.logger.info(f"Current best: Trial {study.best_trial.number} "
-                               f"(loss: {study.best_value:.6f})")
-                if trial.value < study.best_value * 1.001:  # Within 0.1% is improvement
-                    improvement = (study.best_value - trial.value) / abs(study.best_value) * 100
-                    self.logger.info(f"IMPROVEMENT: {improvement:.2f}% better")
+            try:
+                if hasattr(study, 'best_trial') and study.best_trial is not None:
+                    self.logger.info(f"Current best: Trial {study.best_trial.number} "
+                                f"(loss: {study.best_value:.6f})")
+                    if trial.value <= study.best_value * 1.001:
+                        improvement = (study.best_value - trial.value) / abs(study.best_value) * 100
+                        self.logger.info(f"IMPROVEMENT: {improvement:.2f}% better")
+            except Exception as e:
+                self.logger.debug(f"Could not compare with best trial: {e}")
         
         elif trial.state == optuna.trial.TrialState.PRUNED:
             self.logger.info("Trial PRUNED (early stopped)")
         elif trial.state == optuna.trial.TrialState.FAIL:
             self.logger.info("Trial FAILED")
+        else:
+            self.logger.info(f"Trial ended with state: {trial.state}")
         
         self.logger.info("-"*80 + "\n")
 
@@ -222,9 +202,6 @@ class HyperparameterTuner:
         self.study_name = study_name
         self.logger = logging.getLogger(__name__)
         
-        # Setup console logging
-        self._setup_logging()
-        
         self.logger.info("="*80)
         self.logger.info("INITIALIZING HYPERPARAMETER OPTIMIZATION")
         self.logger.info("="*80)
@@ -234,9 +211,19 @@ class HyperparameterTuner:
         optimize_hardware(base_config.get("system", {}), self.device)
         self._log_device_info()
         
-        # Setup directories
+        # Setup directories at same level as model_save_dir
         self.study_dir = output_dir / "optuna_studies" / study_name
-        self.study_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Check if study already exists
+        if self.study_dir.exists():
+            self.logger.error(f"Study directory already exists: {self.study_dir}")
+            self.logger.error("Please use a different study name or remove the existing directory.")
+            raise FileExistsError(
+                f"Study directory already exists: {self.study_dir}\n"
+                f"Use --study-name to specify a different name or remove the existing directory."
+            )
+        
+        self.study_dir.mkdir(parents=True, exist_ok=False)
         self.logger.info(f"Study directory: {self.study_dir}")
         
         # Load normalization stats
@@ -251,19 +238,6 @@ class HyperparameterTuner:
         self.progress_callback = ProgressCallback(self.logger)
         
         self.logger.info("Initialization complete\n")
-    
-    def _setup_logging(self):
-        """Configure console logging."""
-        if not any(isinstance(h, logging.StreamHandler) for h in self.logger.handlers):
-            console = logging.StreamHandler()
-            console.setLevel(logging.INFO)
-            formatter = logging.Formatter(
-                '%(asctime)s | HPO | %(levelname)s | %(message)s',
-                datefmt='%H:%M:%S'
-            )
-            console.setFormatter(formatter)
-            self.logger.addHandler(console)
-            self.logger.setLevel(logging.INFO)
     
     def _log_device_info(self):
         """Log device information."""
@@ -308,7 +282,6 @@ class HyperparameterTuner:
         cfg = {}
         search = MODEL_SEARCH_SPACE
         
-        cfg["variant"] = trial.suggest_categorical("model_variant", search["variant"])
         cfg["latent_dim"] = trial.suggest_int(
             "latent_dim",
             search["latent_dim"]["low"],
@@ -348,31 +321,6 @@ class HyperparameterTuner:
             step=search["dropout"]["step"]
         )
         
-        # Mixture of experts
-        use_mixture = trial.suggest_categorical("use_mixture", search["use_mixture"])
-        if use_mixture:
-            cfg["mixture"] = {
-                "K": trial.suggest_int("mixture_K", search["mixture_K"]["low"], search["mixture_K"]["high"]),
-                "temperature": 1.0,
-                "diversity_mode": trial.suggest_categorical("diversity_mode", search["diversity_mode"]),
-                "use_encoder_features": trial.suggest_categorical("gate_use_features", [True, False])
-            }
-        else:
-            cfg["mixture"] = {"K": 1}
-        
-        # Time warp
-        cfg["time_warp"] = {
-            "enabled": trial.suggest_categorical("use_time_warp", search["use_time_warp"]),
-            "J_terms": trial.suggest_int("warp_J_terms", search["warp_J_terms"]["low"], search["warp_J_terms"]["high"]),
-            "hidden_dim": trial.suggest_int(
-                "warp_hidden",
-                search["warp_hidden"]["low"],
-                search["warp_hidden"]["high"],
-                step=search["warp_hidden"]["step"]
-            ),
-            "use_encoder_features": trial.suggest_categorical("warp_use_features", [True, False])
-        }
-        
         return cfg
     
     def suggest_training_params(self, trial: Trial) -> Dict[str, Any]:
@@ -394,8 +342,14 @@ class HyperparameterTuner:
             log=search["weight_decay"]["log"]
         )
         
+        # Sample the betas
         beta1 = trial.suggest_float("beta1", search["beta1"]["low"], search["beta1"]["high"])
         beta2 = trial.suggest_float("beta2", search["beta2"]["low"], search["beta2"]["high"])
+        
+        # Ensure beta2 > beta1 for optimizer stability
+        if beta2 <= beta1:
+            beta2 = min(0.999, beta1 + 0.01)
+        
         cfg["betas"] = [beta1, beta2]
         
         batch_power = trial.suggest_int("batch_power", search["batch_power"]["low"], search["batch_power"]["high"])
@@ -421,27 +375,6 @@ class HyperparameterTuner:
                 "eta_min": 1e-8
             }
         
-        cfg["regularization"] = {
-            "lambda_entropy": trial.suggest_float(
-                "lambda_entropy",
-                search["lambda_entropy"]["low"],
-                search["lambda_entropy"]["high"],
-                step=search["lambda_entropy"]["step"]
-            ),
-            "lambda_diversity": trial.suggest_float(
-                "lambda_diversity",
-                search["lambda_diversity"]["low"],
-                search["lambda_diversity"]["high"],
-                step=search["lambda_diversity"]["step"]
-            )
-        }
-        
-        cfg["mixture_temperature_schedule"] = {
-            "start": trial.suggest_float("temp_start", search["temp_start"]["low"], search["temp_start"]["high"]),
-            "end": trial.suggest_float("temp_end", search["temp_end"]["low"], search["temp_end"]["high"]),
-            "anneal_frac": trial.suggest_float("temp_anneal_frac", search["temp_anneal_frac"]["low"], search["temp_anneal_frac"]["high"])
-        }
-        
         cfg["use_amp"] = trial.suggest_categorical("use_amp", search["use_amp"])
         if cfg["use_amp"]:
             cfg["amp_dtype"] = trial.suggest_categorical("amp_dtype", search["amp_dtype"])
@@ -458,7 +391,11 @@ class HyperparameterTuner:
     
     def objective(self, trial: Trial) -> float:
         """Objective function for optimization."""
-        self.progress_callback.on_trial_start(trial.study, trial)
+        # Try to call progress callback start
+        try:
+            self.progress_callback.on_trial_start(trial.study, trial)
+        except Exception as e:
+            self.logger.debug(f"Progress callback start failed: {e}")
         
         # Set seed
         seed = self.base_config.get("system", {}).get("seed", 42)
@@ -484,7 +421,6 @@ class HyperparameterTuner:
         
         try:
             # Create and train model
-            self.logger.info("\nBuilding model...")
             model = create_model(config, self.device)
             n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             self.logger.info(f"Model created: {n_params:,} parameters")
@@ -516,22 +452,33 @@ class HyperparameterTuner:
                 trial.set_user_attr("model_params", n_params)
                 trial.set_user_attr("training_time", train_time)
             
-            self.progress_callback.on_trial_end(trial.study, trial)
+            # Try to call progress callback end
+            try:
+                self.progress_callback.on_trial_end(trial.study, trial)
+            except Exception as e:
+                self.logger.debug(f"Progress callback end failed: {e}")
+            
             return best_val_loss
             
         except optuna.TrialPruned:
             self.logger.info("Trial pruned")
-            self.progress_callback.on_trial_end(trial.study, trial)
+            try:
+                self.progress_callback.on_trial_end(trial.study, trial)
+            except Exception as e:
+                self.logger.debug(f"Progress callback end failed: {e}")
             raise
             
         except Exception as e:
             self.logger.error(f"Trial {trial.number} failed: {str(e)}")
             self.logger.debug(traceback.format_exc())
-            self.progress_callback.on_trial_end(trial.study, trial)
+            try:
+                self.progress_callback.on_trial_end(trial.study, trial)
+            except Exception as e2:
+                self.logger.debug(f"Progress callback end failed: {e2}")
             return float('inf')
             
         finally:
-            # Cleanup
+            # Cleanup to free memory
             if 'model' in locals():
                 del model
             if 'trainer' in locals():
@@ -540,10 +487,8 @@ class HyperparameterTuner:
     
     def _log_trial_params(self, model_params: Dict, train_params: Dict):
         """Log key trial parameters."""
-        self.logger.info("\nTrial configuration:")
         self.logger.info(f"  Model: latent_dim={model_params['latent_dim']}, "
-                        f"activation={model_params['activation']}, "
-                        f"time_warp={model_params['time_warp']['enabled']}")
+                         f"activation={model_params['activation']}")
         self.logger.info(f"  Training: optimizer={train_params['optimizer']}, "
                         f"lr={train_params['learning_rate']:.2e}, "
                         f"batch={train_params['batch_size']}")
@@ -562,9 +507,14 @@ class HyperparameterTuner:
         self.logger.info("="*80)
         
         if study_name and study_name != self.study_name:
+            new_study_dir = self.study_dir.parent / study_name
+            if new_study_dir.exists():
+                raise FileExistsError(
+                    f"Cannot change to study '{study_name}' - directory already exists: {new_study_dir}"
+                )
             self.study_name = study_name
-            self.study_dir = self.study_dir.parent / self.study_name
-            self.study_dir.mkdir(parents=True, exist_ok=True)
+            self.study_dir = new_study_dir
+            self.study_dir.mkdir(parents=True, exist_ok=False)
         
         self.logger.info(f"Configuration:")
         self.logger.info(f"  Trials: {n_trials}")
@@ -628,7 +578,6 @@ class HyperparameterTuner:
     def _materialize_model_from_params(self, p: Dict[str, Any]) -> Dict[str, Any]:
         """Convert trial params to model config."""
         cfg = {
-            "variant": p["model_variant"],
             "latent_dim": p["latent_dim"],
             "activation": p["activation"],
             "dropout": p["dropout"],
@@ -640,22 +589,6 @@ class HyperparameterTuner:
         n_dec = p["n_decoder_layers"]
         cfg["decoder_layers"] = [p[f"decoder_layer_{i}"] for i in range(n_dec)]
         
-        if p["use_mixture"]:
-            cfg["mixture"] = {
-                "K": p["mixture_K"],
-                "temperature": 1.0,
-                "diversity_mode": p["diversity_mode"],
-                "use_encoder_features": p.get("gate_use_features", False),
-            }
-        else:
-            cfg["mixture"] = {"K": 1}
-        
-        cfg["time_warp"] = {
-            "enabled": p["use_time_warp"],
-            "J_terms": p["warp_J_terms"],
-            "hidden_dim": p["warp_hidden"],
-            "use_encoder_features": p.get("warp_use_features", False),
-        }
         return cfg
     
     def _materialize_training_from_params(self, p: Dict[str, Any]) -> Dict[str, Any]:
@@ -679,20 +612,9 @@ class HyperparameterTuner:
                 "eta_min": 1e-8,
             }
         
-        cfg["regularization"] = {
-            "lambda_entropy": p["lambda_entropy"],
-            "lambda_diversity": p["lambda_diversity"],
-        }
-        
-        cfg["mixture_temperature_schedule"] = {
-            "start": p["temp_start"],
-            "end": p["temp_end"],
-            "anneal_frac": p["temp_anneal_frac"],
-        }
-        
         cfg["use_amp"] = p["use_amp"]
         if cfg["use_amp"]:
-            cfg["amp_dtype"] = p.get("amp_dtype", "float16")
+            cfg["amp_dtype"] = p.get("amp_dtype", "bfloat16")
         
         cfg.update(HPO_TRAINING_CONFIG)
         return cfg
@@ -787,9 +709,9 @@ def optimize_hyperparameters(
     cfg = load_json_config(Path(config_path))
     
     # Setup data directory
-    seq_tag = "seq" if cfg["data"].get("sequence_mode", False) else "row"
-    data_dir = Path(cfg["paths"]["processed_data_dir"]) / f"{seq_tag}_mode"
-    out_root = Path(cfg["paths"]["model_save_dir"])
+    data_dir = Path(cfg["paths"]["processed_data_dir"])
+    model_save_dir = Path(cfg["paths"]["model_save_dir"])
+    out_root = model_save_dir.parent  # Gets parent of "data/models" -> "data"
     out_root.mkdir(parents=True, exist_ok=True)
     
     # Preprocess if needed
@@ -803,12 +725,16 @@ def optimize_hyperparameters(
         dp.process_to_npy_shards()
     
     # Run optimization
-    tuner = HyperparameterTuner(
-        base_config=cfg,
-        data_dir=data_dir,
-        output_dir=out_root,
-        study_name=study_name or "lilan_hpo",
-    )
+    try:
+        tuner = HyperparameterTuner(
+            base_config=cfg,
+            data_dir=data_dir,
+            output_dir=out_root,
+            study_name=study_name or "lilan_hpo",
+        )
+    except FileExistsError as e:
+        print(f"\nError: {e}")
+        sys.exit(1)
     
     return tuner.run(
         n_trials=n_trials,

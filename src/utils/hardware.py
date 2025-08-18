@@ -38,7 +38,6 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
     """Apply hardware-specific optimizations with safe feature detection."""
     logger = logging.getLogger(__name__)
 
-    # -------- Matmul precision / TF32 --------
     tf32_enabled = bool(config.get("tf32", True))
     try:
         # Only meaningful on CUDA for float32; harmless elsewhere, but be explicit.
@@ -62,7 +61,6 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
     except Exception:
         pass
 
-    # -------- cuDNN autotune --------
     if device.type == "cuda":
         try:
             if bool(config.get("cudnn_benchmark", True)) and hasattr(torch.backends, "cudnn"):
@@ -71,7 +69,6 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
         except Exception:
             pass
 
-        # IMPORTANT: Only set memory fraction if explicitly requested (<1.0)
         mem_frac = config.get("cuda_memory_fraction", None)
         if mem_frac is not None:
             try:
@@ -85,7 +82,6 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
             except Exception as e:
                 logger.warning(f"Could not set CUDA memory fraction: {e}")
 
-    # -------- CPU threading --------
     if "OMP_NUM_THREADS" not in os.environ:
         try:
             n = min(32, os.cpu_count() or 1)
@@ -98,7 +94,6 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
     else:
         logger.info(f"Using {os.environ['OMP_NUM_THREADS']} CPU threads (OMP_NUM_THREADS).")
 
-    # Determinism (optional)
     if bool(config.get("deterministic", False)):
         try:
             torch.use_deterministic_algorithms(True)

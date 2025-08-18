@@ -3,13 +3,22 @@
 #SBATCH -o ChemulatorJob.o%j            # Standard output file
 #SBATCH -e ChemulatorJob.e%j            # Standard error file
 #SBATCH -p gpu                          # Specify the GPU partition
-#SBATCH --clusters=edge                 # Target the edge nodes
-#SBATCH -N 1                            # Request a single node
-#SBATCH -n 1                            # Run a single task
-#SBATCH --gpus=1                        # Request one full GPU
-#SBATCH --cpus-per-task=32              # Request 32 CPU cores
-#SBATCH --mem=150G                      # Request 100 GB of CPU RAM
-#SBATCH -t 72:00:00                     # Set a 24-hour runtime limit
+
+
+####SBATCH --clusters=edge                 # Target the edge nodes
+###SBATCH -N 1                            # Request a single node
+####SBATCH -n 1                            # Run a single task
+####SBATCH --gpus=1                        # Request one full GPU
+####SBATCH --cpus-per-task=16              # Request 32 CPU cores
+#####SBATCH --mem=40G                      # Request 100 GB of CPU RAM
+#SBATCH -A exoweather
+
+
+#SBATCH -p gpu-mig
+#SBATCH --gres=gpu:2g.20gb:1
+
+
+#SBATCH -t 1:00:00                     # Set a 24-hour runtime limit
 
 cd "$SLURM_SUBMIT_DIR"
 
@@ -35,5 +44,5 @@ echo "------------------------------------------------"
 
 # --- Run the Application ---
 echo "Starting Python application..."
-python src/main.py --tune
+python src/main.py --train
 echo "Job completed successfully."
