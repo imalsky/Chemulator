@@ -6,11 +6,11 @@
       "data/raw/run9003-result.h5",
       "data/raw/run9004-result.h5",
       "data/raw/run9005-result.h5",
-      //"data/raw/run9006-result.h5",
-      //"data/raw/run9007-result.h5",
-      //"data/raw/run9008-result.h5",
-      //"data/raw/run9009-result.h5",
-      //"data/raw/run9010-result.h5"
+      "data/raw/run9006-result.h5",
+      "data/raw/run9007-result.h5",
+      "data/raw/run9008-result.h5",
+      "data/raw/run9009-result.h5",
+      "data/raw/run9010-result.h5"
     ],
     "processed_data_dir": "data/processed",
     "model_save_dir": "data/models",
@@ -29,21 +29,15 @@
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
     "global_variables": ["P", "T"],
-    "time_variable": "t_time",
-
-    "sequence_mode": true,
-    "M_per_sample": 500,
-    "fixed_time_range": { "min": 1e-3, "max": 1e8 } 
+    "time_variable": "t_time"
   },
 
   "preprocessing": {
-    "min_value_threshold": 1e-28,
+    "min_value_threshold": 1e-25,
     "num_workers": 8,
     "hdf5_chunk_size": 16384,
-    "target_shard_bytes": 10000000,
-    "npz_compressed": false,
-    "time_hist_bins": 512,
-    "grid_coverage_rtol": 1e-6
+    "trajectories_per_shard": 100,
+    "npz_compressed": false
   },
 
   "normalization": {
@@ -51,25 +45,26 @@
     "methods": {
       "T": "standard",
       "P": "log-standard",
-      "t_time": "log-min-max" // THIS IS SPECIAL. DON"T CHANGE THIS!!!
+      "t_time": "log-min-max"
     },
     "epsilon": 1e-30,
     "min_std": 1e-10,
     "clamp_value": 999.0
   },
-
   "model": {
     "type": "linear_latent",
-    "variant": "full",  // Choose "full" or "independent"
-    "latent_dim": 32,
-    "encoder_layers": [1024, 1024, 1024, 1024],
-    "decoder_layers": [256, 1024, 1024, 1024],
+    "latent_dim": 128,
 
-    "mixture": { "K": 1 },
-    "time_warp": { "enabled": true, "J_terms": 5, "hidden_dim": 64 },
+    "encoder_layers": [512, 1024, 1024, 1024],
+    "decoder_layers": [256, 1024, 1024, 256],
+    "tau_layers": [128, 128, 128, 128],
 
-    "activation": "tanh",
-    "dropout": 0.0
+    "activation": "gelu",
+    "dropout": 0.0,
+    "use_layernorm": true,
+    "max_tau": 50,
+
+    "final_layer_scale": 1.0
   },
 
   "training": {
@@ -78,44 +73,34 @@
     "test_fraction": 0.15,
     "use_fraction": 1.0,
 
-    "mixture_temperature_schedule": { "start": 1.0, "end": 0.3, "anneal_frac": 0.6 },
-
-    "epochs": 100,
-    "batch_size": 1024,
+    "epochs": 200,
+    "batch_size": 256,
     "gradient_accumulation_steps": 4,
-
-    "gpu_cache_dataset": "auto",
 
     "optimizer": "AdamW",
     "learning_rate": 1e-4,
-    "weight_decay": 1e-5,
-    "betas": [0.9, 0.999],
+    "weight_decay": 5e-4,
+    "betas": [0.85, 0.95],
     "eps": 1e-8,
     "gradient_clip": 2.0,
 
     "scheduler": "cosine",
-    "scheduler_params": { "T_0": 100, "T_mult": 2, "eta_min": 1e-8 },
+    "scheduler_params": { "T_0": 200, "T_mult": 2, "eta_min": 1e-8 },
 
     "use_amp": false,
-    //"amp_dtype": "bfloat16",
     "amp_dtype": "float32",
 
-    "early_stopping_patience": 5000,
-    "min_delta": 1e-8,
-
-    "regularization": {
-      "lambda_entropy": 0.0,
-      "lambda_diversity": 0.0
-    }
+    "early_stopping_patience": 30,
+    "min_delta": 1e-8
   },
+
   "system": {
     "seed": 42,
+    "use_torch_export": true,
     "use_torch_compile": true,
     "compile_mode": "default",
-    "use_torch_export": true,
     "cudnn_benchmark": false,
     "tf32": false,
-    "dtype": "float32",
-    "cuda_memory_fraction": 0.95
+    "dtype": "float32"
   }
 }
