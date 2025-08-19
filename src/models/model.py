@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Linear Latent Network (LiLaN) model implementation with monotone time-warp.
-
+Linear Latent Network (LiLaN) model implementation with configurable time-warp.
 
 Formulation:
     y(t) = E(x0, p) + τ(t, x0, p) * C(x0, p)   # Linear latent dynamics
     x(t) = D(y(t))                             # Decode to physical space
+
+Two τ modes:
+    - "integral": Monotone τ via cumulative integral of positive speed
+    - "direct": Direct MLP prediction with τ(t0) = 0 constraint
 """
 
 from __future__ import annotations
@@ -47,14 +50,14 @@ def _get_xavier_gain(activation_name: str) -> float:
 
 
 def _build_mlp(
-    input_dim: int,
-    output_dim: int,
-    hidden_layers: List[int],
-    activation_factory,
-    activation_name: str,
-    dropout_p: float = 0.0,
-    use_layernorm: bool = True,
-    final_layer_scale: float = 1.0,
+        input_dim: int,
+        output_dim: int,
+        hidden_layers: List[int],
+        activation_factory,
+        activation_name: str,
+        dropout_p: float = 0.0,
+        use_layernorm: bool = True,
+        final_layer_scale: float = 1.0,
 ) -> nn.Sequential:
     """
     Build an MLP with blocks: Linear -> (LayerNorm) -> Activation -> (Dropout) for hidden layers.
@@ -97,8 +100,11 @@ def _build_mlp(
 
 class LinearLatentNetwork(nn.Module):
     """
-    Linear Latent Network (LiLaN) with a monotone time-warp implemented
-    as the cumulative integral of a strictly positive speed.
+    Linear Latent Network (LiLaN) with configurable time-warp implementation.
+
+    Supports two τ modes:
+    - "integral": Monotone τ via cumulative integral of strictly positive speed
+    - "direct": Direct MLP prediction with τ(t0) = 0 enforcement
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -123,7 +129,12 @@ class LinearLatentNetwork(nn.Module):
         self.dropout_p = float(model_cfg.get("dropout", 0.0))
         use_layernorm = bool(model_cfg.get("use_layernorm", True))
         final_scale = float(model_cfg.get("final_layer_scale", 0.5))
-        
+
+        # Time transform mode
+        self.tau_mode = str(model_cfg.get("tau_mode", "integral")).lower()
+        if self.tau_mode not in ["integral", "direct"]:
+            raise ValueError(f"Invalid tau_mode: {self.tau_mode}. Must be 'integral' or 'direct'")
+
         # Store max_tau as instance variable from config
         self.max_tau = float(model_cfg.get("max_tau", 50.0))
 
@@ -132,8 +143,8 @@ class LinearLatentNetwork(nn.Module):
         decoder_layers = list(model_cfg.get("decoder_layers", [128, 256, 256]))
 
         # Input dims
-        encoder_input_dim = self.num_species + self.num_globals           # for E and C
-        tau_input_dim = 1 + self.num_species + self.num_globals           # for speed net: [t, x0, p]
+        encoder_input_dim = self.num_species + self.num_globals  # for E and C
+        tau_input_dim = 1 + self.num_species + self.num_globals  # for tau: [t, x0, p]
         decoder_input_dim = self.latent_dim
 
         # Networks
@@ -151,12 +162,21 @@ class LinearLatentNetwork(nn.Module):
             self.dropout_p, use_layernorm, final_scale
         )
 
-        # Speed net for τ': (t, x0, p) -> speed >= 0 (enforced in forward via softplus)
-        self.tau_speed_net = _build_mlp(
-            tau_input_dim, self.latent_dim, tau_layers,
-            self.activation_factory, self.activation_name,
-            self.dropout_p, use_layernorm, final_scale
-        )
+        # Time transform network - configuration depends on tau_mode
+        if self.tau_mode == "integral":
+            # Speed net for τ': (t, x0, p) -> speed >= 0 (enforced via softplus)
+            self.tau_net = _build_mlp(
+                tau_input_dim, self.latent_dim, tau_layers,
+                self.activation_factory, self.activation_name,
+                self.dropout_p, use_layernorm, final_scale
+            )
+        else:  # direct
+            # Direct τ net: (t, x0, p) -> τ(t)
+            self.tau_net = _build_mlp(
+                tau_input_dim, self.latent_dim, tau_layers,
+                self.activation_factory, self.activation_name,
+                self.dropout_p, use_layernorm, final_scale
+            )
 
         # Decoder: y -> targets
         self.decoder_D = _build_mlp(
@@ -166,8 +186,8 @@ class LinearLatentNetwork(nn.Module):
         )
 
         self.logger.info(
-            "Created LiLaN model: latent_dim=%d, activation=%s, dropout=%.3f, max_tau=%.1f, n_params=%s",
-            self.latent_dim, activation_name, self.dropout_p, self.max_tau,
+            "Created LiLaN model: latent_dim=%d, activation=%s, dropout=%.3f, tau_mode=%s, max_tau=%.1f, n_params=%s",
+            self.latent_dim, activation_name, self.dropout_p, self.tau_mode, self.max_tau,
             f"{sum(p.numel() for p in self.parameters() if p.requires_grad):,}",
         )
 
@@ -186,41 +206,93 @@ class LinearLatentNetwork(nn.Module):
         B, M = self._validate_inputs(inputs)
 
         # Parse inputs
-        x0 = inputs[:, :self.num_species]                                  # [B, S]
-        p = inputs[:, self.num_species:self.num_species + self.num_globals]# [B, G]
-        t = inputs[:, self.num_species + self.num_globals:]                # [B, M]
+        x0 = inputs[:, :self.num_species]  # [B, S]
+        p = inputs[:, self.num_species:self.num_species + self.num_globals]  # [B, G]
+        t = inputs[:, self.num_species + self.num_globals:]  # [B, M]
 
         # Encoders
         # h := [x0, p]
-        h = torch.cat([x0, p], dim=1)                                      # [B, S+G]
-        y0 = self.encoder_E(h)                                             # [B, m]
-        c  = self.encoder_C(h)                                             # [B, m]
+        h = torch.cat([x0, p], dim=1)  # [B, S+G]
+        y0 = self.encoder_E(h)  # [B, m]
+        c = self.encoder_C(h)  # [B, m]
 
-        # Monotone time-warp τ via cumulative integral of positive speed
+        # Compute time transform τ based on mode
+        if self.tau_mode == "integral":
+            tau = self._compute_tau_integral(t, h, B, M)
+        else:  # direct
+            tau = self._compute_tau_direct(t, h, B, M)
+
+        # Latent trajectory and decoding
+        y = y0.unsqueeze(1) + tau * c.unsqueeze(1)  # [B, M, m]
+        x = self.decoder_D(y.reshape(B * M, self.latent_dim))  # [B*M, T]
+        predictions = x.view(B, M, self.num_targets)  # [B, M, T]
+
+        return predictions, {}
+
+    def _compute_tau_integral(self, t: torch.Tensor, h: torch.Tensor, B: int, M: int) -> torch.Tensor:
+        """
+        Compute τ via cumulative integral of positive speed (monotone by construction).
+
+        Args:
+            t: Time points [B, M]
+            h: Concatenated [x0, p] features [B, S+G]
+            B: Batch size
+            M: Number of time points
+
+        Returns:
+            tau: Time transform values [B, M, m]
+        """
         # Prepare features for the speed network at each time point
-        t_flat = t.reshape(B * M, 1)                                       # [B*M, 1]
-        h_exp = h.unsqueeze(1).expand(B, M, -1).reshape(B * M, -1)         # [B*M, S+G]
-        speed_in = torch.cat([t_flat, h_exp], dim=1)                       # [B*M, 1+S+G]
+        t_flat = t.reshape(B * M, 1)  # [B*M, 1]
+        h_exp = h.unsqueeze(1).expand(B, M, -1).reshape(B * M, -1)  # [B*M, S+G]
+        speed_in = torch.cat([t_flat, h_exp], dim=1)  # [B*M, 1+S+G]
 
-        raw_speed = self.tau_speed_net(speed_in).view(B, M, self.latent_dim)  # [B, M, m]
-        speed = torch.nn.functional.softplus(raw_speed) + 1e-8             # strictly positive
+        raw_speed = self.tau_net(speed_in).view(B, M, self.latent_dim)  # [B, M, m]
+        speed = torch.nn.functional.softplus(raw_speed) + 1e-8  # strictly positive
 
         # Trapezoidal integration along time axis; anchor τ(t0) = 0
-        dt = t[:, 1:] - t[:, :-1]                                          # [B, M-1]
+        dt = t[:, 1:] - t[:, :-1]  # [B, M-1]
         incr = 0.5 * (speed[:, 1:, :] + speed[:, :-1, :]) * dt.unsqueeze(-1)  # [B, M-1, m]
         tau = torch.zeros(B, 1, self.latent_dim, device=speed.device, dtype=speed.dtype)
         cumsum_tau = torch.cumsum(incr, dim=1)
-        
+
         # Clamp tau to prevent numerical overflow using configured max_tau
         cumsum_tau = torch.clamp(cumsum_tau, max=self.max_tau)
-        tau = torch.cat([tau, cumsum_tau], dim=1)                          # [B, M, m]
+        tau = torch.cat([tau, cumsum_tau], dim=1)  # [B, M, m]
 
-        # Latent trajectory and decoding
-        y = y0.unsqueeze(1) + tau * c.unsqueeze(1)                         # [B, M, m]
-        x = self.decoder_D(y.reshape(B * M, self.latent_dim))              # [B*M, T]
-        predictions = x.view(B, M, self.num_targets)                       # [B, M, T]
+        return tau
 
-        return predictions, {}
+    def _compute_tau_direct(self, t: torch.Tensor, h: torch.Tensor, B: int, M: int) -> torch.Tensor:
+        """
+        Compute τ via direct MLP prediction with τ(t0) = 0 constraint.
+
+        Args:
+            t: Time points [B, M]
+            h: Concatenated [x0, p] features [B, S+G]
+            B: Batch size
+            M: Number of time points
+
+        Returns:
+            tau: Time transform values [B, M, m]
+        """
+        # Prepare features for tau network at each time point
+        t_flat = t.reshape(B * M, 1)  # [B*M, 1]
+        h_exp = h.unsqueeze(1).expand(B, M, -1).reshape(B * M, -1)  # [B*M, S+G]
+        tau_in = torch.cat([t_flat, h_exp], dim=1)  # [B*M, 1+S+G]
+
+        # Predict raw tau values
+        tau_raw = self.tau_net(tau_in).view(B, M, self.latent_dim)  # [B, M, m]
+
+        # Enforce τ(t0) = 0 by subtracting the first time point's value
+        tau_t0 = tau_raw[:, 0:1, :]  # [B, 1, m]
+        tau = tau_raw - tau_t0  # [B, M, m]
+
+        # Optional: Apply soft clamping to prevent extreme values
+        # Using tanh to softly bound tau to [-max_tau, max_tau]
+        if self.max_tau > 0:
+            tau = self.max_tau * torch.tanh(tau / self.max_tau)
+
+        return tau
 
     def _validate_inputs(self, inputs: torch.Tensor) -> Tuple[int, int]:
         if inputs.dim() != 2:
