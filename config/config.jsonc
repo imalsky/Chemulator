@@ -36,7 +36,7 @@
     "min_value_threshold": 1e-25,
     "num_workers": 8,
     "hdf5_chunk_size": 16384,
-    "trajectories_per_shard": 100,
+    "trajectories_per_shard": 100000,
     "npz_compressed": false
   },
 
@@ -55,16 +55,17 @@
     "type": "linear_latent",
     "latent_dim": 128,
 
-    "encoder_layers": [512, 1024, 1024, 1024],
-    "decoder_layers": [256, 1024, 1024, 256],
+    "encoder_layers": [512, 512, 512, 512],
+    "decoder_layers": [192, 256, 256, 256],
     "tau_layers": [128, 128, 128, 128],
 
-    "activation": "gelu",
+    "activation": "silu",
     "dropout": 0.0,
     "use_layernorm": true,
     "max_tau": 50,
 
-    "final_layer_scale": 1.0
+    "final_layer_scale": 1.0,
+    "tau_mode": "integral"  // Options: "integral" (monotone) or "direct" (unconstrained MLP)
   },
 
   "training": {
@@ -73,13 +74,12 @@
     "test_fraction": 0.15,
     "use_fraction": 1.0,
 
-    "epochs": 200,
+    "epochs": 100,
     "batch_size": 256,
-    "gradient_accumulation_steps": 4,
 
     "optimizer": "AdamW",
     "learning_rate": 1e-4,
-    "weight_decay": 5e-4,
+    "weight_decay": 5e-5,
     "betas": [0.85, 0.95],
     "eps": 1e-8,
     "gradient_clip": 2.0,
@@ -87,8 +87,8 @@
     "scheduler": "cosine",
     "scheduler_params": { "T_0": 200, "T_mult": 2, "eta_min": 1e-8 },
 
-    "use_amp": false,
-    "amp_dtype": "float32",
+    "use_amp": true,
+    "amp_dtype": "bfloat16",
 
     "early_stopping_patience": 30,
     "min_delta": 1e-8

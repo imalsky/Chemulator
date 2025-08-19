@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-High-performance dataset implementation for chemical kinetics models.
+Dataset implementation for chemical kinetics models.
 
-Provides efficient data loading with:
-- Config-driven normalization for inputs and targets
-- GPU caching for small datasets
-- Chunked loading for large datasets
-- Support for multiple data types (float32/float64)
+Provides efficient data loading with GPU caching and normalization.
+Loads raw data from preprocessed shards and applies transformations via NormalizationHelper.
 """
 
-import json
 import logging
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
@@ -21,24 +17,24 @@ from torch.utils.data import Dataset, DataLoader
 from data.normalizer import NormalizationHelper
 
 
-# Constants to avoid magic numbers
+# Memory management constants
 GPU_MEMORY_RESERVE_BYTES = 3_000_000_000  # 3GB
-GPU_MEMORY_OVERHEAD_FACTOR = 1.15  # 15% overhead
+GPU_MEMORY_OVERHEAD_FACTOR = 1.15
 DEFAULT_GPU_CACHE_FRACTION = 0.5
 BYTES_PER_FLOAT = {
     torch.float64: 8,
     torch.float32: 4,
     torch.float16: 2,
-    torch.bfloat16: 2,
+    torch.bfloat16: 2
 }
 
 
 class SequenceDataset(Dataset):
     """
-    Dataset for sequence-mode (trajectory-based) data with normalization.
+    Dataset for sequence-mode trajectory data with normalization.
     
-    Efficiently loads preprocessed trajectory data and applies
-    config-driven normalization to both inputs and targets.
+    Efficiently loads preprocessed data and applies normalization
+    transformations based on configuration.
     """
     
     def __init__(
@@ -51,15 +47,15 @@ class SequenceDataset(Dataset):
         disable_cache: bool = False
     ):
         """
-        Initialize the sequence dataset.
+        Initialize dataset.
         
         Args:
             shard_dir: Directory containing preprocessed shards
             split_name: Split name ('train', 'validation', 'test')
-            config: Configuration with data and normalization settings
+            config: Configuration dictionary
             device: Target device for tensors
-            norm_stats: Optional normalization statistics
-            disable_cache: Explicitly disable shard caching (for multi-worker safety)
+            norm_stats: Normalization statistics
+            disable_cache: Disable shard caching for multi-worker loading
         """
         super().__init__()
         self.shard_dir = Path(shard_dir)
@@ -69,103 +65,102 @@ class SequenceDataset(Dataset):
         self.device = device
         self.logger = logging.getLogger(__name__)
         self.norm_stats = norm_stats or {}
-        self._in_worker_process = disable_cache
+        self._disable_cache = disable_cache
         self._closed = False
-
-        # Configure data types
-        self._setup_dtypes()
         
-        # Load and validate metadata
+        # Setup data type
+        self._setup_dtype()
+        
+        # Load metadata
         self._load_metadata()
         
-        # Extract configuration parameters
+        # Setup dimensions
         self._setup_dimensions()
         
-        # Build shard lookup table
+        # Build shard lookup
         self._build_shard_lookup()
-
-        # Auto-load normalization stats if not provided
+        
+        # Load normalization stats if not provided
         if not self.norm_stats or not self.norm_stats.get("per_key_stats"):
             norm_path = self.shard_dir / "normalization.json"
             if norm_path.exists():
-                with open(norm_path, 'r', encoding='utf-8') as f:
-                    self.norm_stats = json.load(f)
+                from utils.utils import load_json
+                self.norm_stats = load_json(norm_path)
             else:
-                raise ValueError(f"Normalization stats required but not found.")
-    
+                raise ValueError(f"Normalization statistics required but not found at {norm_path}")
+        
         # Initialize normalization helper
-        self._setup_normalization()
+        self.norm_helper = NormalizationHelper(self.norm_stats, self.device, self.config)
         
         # Initialize caching
         self.gpu_cache = None
         self._shard_cache = {"name": None, "data": None}
         
-        # Try to cache entire dataset on GPU if possible
+        # Try GPU caching if possible
         self._try_gpu_cache()
-
-    def _setup_dtypes(self) -> None:
-        """Configure data types from config."""
+    
+    def _setup_dtype(self) -> None:
+        """Configure data types."""
         dtype_str = self.config["system"].get("dtype", "float32")
         try:
             self.dtype = getattr(torch, dtype_str)
         except AttributeError:
-            self.logger.warning("Unknown dtype '%s', using float32", dtype_str)
+            self.logger.warning(f"Unknown dtype '{dtype_str}', using float32")
             self.dtype = torch.float32
         self.np_dtype = np.float64 if dtype_str == "float64" else np.float32
-
+    
     def _load_metadata(self) -> None:
         """Load and validate shard metadata."""
+        from utils.utils import load_json
+        
         shard_index_path = self.shard_dir / "shard_index.json"
         if not shard_index_path.exists():
             raise FileNotFoundError(f"Shard index not found: {shard_index_path}")
-            
-        with open(shard_index_path, 'r', encoding='utf-8') as f:
-            self.shard_index = json.load(f)
-            
-        if not self.shard_index.get("sequence_mode", False):
-            raise ValueError("Expected sequence mode data for SequenceDataset")
         
-        # Check for variable-length sequences and error if found
+        self.shard_index = load_json(shard_index_path)
+        
+        if not self.shard_index.get("sequence_mode", False):
+            raise ValueError("Expected sequence mode data")
+        
         if self.shard_index.get("variable_length", False):
-            raise ValueError("Variable-length sequences detected.")
+            raise ValueError("Variable-length sequences not supported")
         
         self.split_info = self.shard_index["splits"][self.split_name]
         self.M = int(self.shard_index.get("M_per_sample", 0))
         
         if self.M <= 0:
             raise ValueError(f"Invalid M_per_sample: {self.M}")
-
+    
     def _setup_dimensions(self) -> None:
-        """Extract dimensions and variable lists from config."""
-        data_config = self.config["data"]
+        """Extract dimensions from configuration."""
+        data_cfg = self.config["data"]
         
-        self.species_vars = data_config["species_variables"]
-        self.target_vars = data_config.get("target_species_variables", self.species_vars)
-        self.global_vars = data_config["global_variables"]
-        self.time_var = data_config["time_variable"]
-
-        # Compute counts
+        self.species_vars = data_cfg["species_variables"]
+        self.target_vars = data_cfg.get("target_species_variables", self.species_vars)
+        self.global_vars = data_cfg["global_variables"]
+        self.time_var = data_cfg["time_variable"]
+        
         self.n_species = len(self.species_vars)
         self.n_targets = len(self.target_vars)
         self.n_globals = len(self.global_vars)
         
-        # Verify counts against metadata
+        # Verify against metadata
         si = self.shard_index
-        if (self.n_species != int(si["n_input_species"]) or
-            self.n_targets != int(si["n_target_species"]) or
-            self.n_globals != int(si["n_globals"])):
-            raise ValueError(f"Variable count mismatch with shard_index.json: ")
-
+        if (self.n_species != si["n_input_species"] or
+            self.n_targets != si["n_target_species"] or
+            self.n_globals != si["n_globals"]):
+            raise ValueError("Variable count mismatch with shard_index.json")
+    
     def _build_shard_lookup(self) -> None:
-        """Build efficient lookup arrays for shard access."""
+        """Build lookup arrays for efficient shard access."""
         self.shards = self.split_info.get("shards", [])
         self.n_total_samples = self.split_info.get("n_trajectories", 0)
         
         if self.n_total_samples == 0:
-            self.logger.warning("No samples found in '%s' split", self.split_name)
+            self.logger.warning(f"No samples found in '{self.split_name}' split")
             return
         
-        # Build cumulative sum for fast shard indexing
+        # Build cumulative sum for indexing
         cumsum = 0
         self.shard_starts = []
         
@@ -177,42 +172,13 @@ class SequenceDataset(Dataset):
         
         self.shard_starts = np.array(self.shard_starts, dtype=np.int64)
         self.n_total_samples = cumsum
-
-    def _setup_normalization(self) -> None:
-        """Initialize normalization helper with statistics."""
-        if self.norm_stats and self.norm_stats.get("per_key_stats"):
-            self.norm_helper = NormalizationHelper(
-                self.norm_stats, 
-                self.device,
-                self.config
-            )
-            self.logger.info("Normalization enabled for '%s' dataset", self.split_name)
-        else:
-            raise RuntimeError(f"Cannot initialize normalization helper for '{self.split_name}' dataset.")
-
-    def _normalize_time_tensor(self, t_np: np.ndarray) -> torch.Tensor:
-        """
-        Normalize time values and return as tensor on the correct device.
-        """
-        if not self.norm_helper:
-            raise RuntimeError(
-                f"Cannot normalize time values: normalization helper not initialized. "
-                f"Ensure normalization.json exists at {self.shard_dir / 'normalization.json'} "
-                f"or provide norm_stats when creating the dataset."
-            )
-        
-        # Convert to tensor (initially on CPU)
-        t_tensor = torch.from_numpy(t_np.astype(self.np_dtype, copy=False))
-        
-        # Normalize (this moves to self.device internally and returns on self.device)
-        return self.norm_helper.normalize_time(t_tensor)
-
+    
     def _try_gpu_cache(self) -> None:
-        """Attempt to cache entire dataset on GPU if memory permits."""
+        """Attempt to cache entire dataset on GPU."""
         if self.n_total_samples == 0:
             return
         
-        # Check GPU cache configuration
+        # Check configuration
         gpu_cache_setting = self.config.get("training", {}).get("gpu_cache_dataset", "auto")
         if gpu_cache_setting is False or self.device.type != "cuda":
             return
@@ -228,7 +194,7 @@ class SequenceDataset(Dataset):
             )
             return
         
-        # Load and normalize all data
+        # Load all data
         self.logger.info(
             "Loading '%s' data for GPU cache (%.1f GB)...",
             self.split_name, bytes_needed/1e9
@@ -237,39 +203,35 @@ class SequenceDataset(Dataset):
         try:
             all_inputs, all_targets = self._load_all_data()
             
-            # Transfer to GPU with correct dtype
+            # Transfer to GPU
             self.gpu_cache = {
                 "inputs": all_inputs.to(device=self.device, dtype=self.dtype, non_blocking=True),
-                "targets": all_targets.to(device=self.device, dtype=self.dtype, non_blocking=True),
+                "targets": all_targets.to(device=self.device, dtype=self.dtype, non_blocking=True)
             }
             self.logger.info("GPU cache created for '%s'", self.split_name)
+            
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-            self.logger.warning("Failed to create GPU cache for '%s': %s", self.split_name, e)
+            self.logger.warning("Failed to create GPU cache: %s", e)
             self.gpu_cache = None
-            # Clear any partial allocations
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
-
+    
     def _estimate_memory_requirement(self) -> int:
-        """Calculate bytes needed for GPU cache including intermediate buffers."""
+        """Calculate bytes needed for GPU cache."""
         bytes_per_float = BYTES_PER_FLOAT.get(self.dtype, 4)
         
-        # Total elements: inputs + targets
+        # Total elements
         total_elements = self.n_total_samples * (
             self.n_species + self.n_globals + self.M + self.n_targets * self.M
         )
         
-        # Base memory for final tensors
+        # Base memory plus overhead
         base_memory = int(total_elements * bytes_per_float)
-        
-        # Account for intermediate tensors during normalization
         intermediate_memory = int(self.n_total_samples * self.M * bytes_per_float)
-        
-        # Add buffer for concatenation and other operations (50% overhead)
         overhead = int(base_memory * 0.5)
         
         return base_memory + intermediate_memory + overhead
-
+    
     def _calculate_memory_budget(self) -> int:
         """Calculate available GPU memory budget."""
         try:
@@ -278,132 +240,124 @@ class SequenceDataset(Dataset):
             else:
                 idx = self.device.index
             
-            # Get actual free memory
-            free_mem, total_mem = torch.cuda.mem_get_info(idx)
+            free_mem, _ = torch.cuda.mem_get_info(idx)
             
             tcfg = self.config.get("training", {})
             max_frac = float(tcfg.get("gpu_cache_max_fraction", DEFAULT_GPU_CACHE_FRACTION))
-            reserve_bytes = int(tcfg.get("gpu_cache_reserved_bytes", GPU_MEMORY_RESERVE_BYTES))
+            reserve = int(tcfg.get("gpu_cache_reserved_bytes", GPU_MEMORY_RESERVE_BYTES))
             overhead = float(tcfg.get("gpu_cache_overhead_factor", GPU_MEMORY_OVERHEAD_FACTOR))
             
-            # Calculate budget from free memory
-            budget = max(0, int(free_mem * max_frac) - reserve_bytes)
+            budget = max(0, int(free_mem * max_frac) - reserve)
             return int(budget / overhead)
             
         except Exception as e:
             self.logger.warning("Could not assess GPU memory: %s", e)
             return 0
-
+    
     def _load_all_data(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Load and normalize all data for GPU caching."""
-        if not self.norm_helper:
-            raise RuntimeError("Cannot load data without normalization helper")
-            
-        all_x0_norm, all_g_norm, all_t_norm, all_y_norm = [], [], [], []
+        all_inputs = []
+        all_targets = []
         
         for shard in self.shards:
             shard_path = self.split_dir / shard["filename"]
             
             if not shard_path.exists():
-                raise FileNotFoundError(f"Shard file not found: {shard_path}")
-                
+                raise FileNotFoundError(f"Shard not found: {shard_path}")
+            
             with np.load(shard_path, allow_pickle=False) as data:
-                # Load raw data (already log-transformed for species)
-                x0_log = torch.from_numpy(data["x0_log"].astype(self.np_dtype))
+                # Load raw data
+                x0 = torch.from_numpy(data["x0"].astype(self.np_dtype))
                 g_vec = torch.from_numpy(data["globals"].astype(self.np_dtype))
-                t_vec_np = data["t_vec"]
-                y_log = torch.from_numpy(data["y_mat"].astype(self.np_dtype))
+                t_vec = torch.from_numpy(data["t_vec"].astype(self.np_dtype))
+                y_mat = torch.from_numpy(data["y_mat"].astype(self.np_dtype))
                 
-                # Normalize time directly to tensor (avoiding numpy round-trip)
-                t_norm = self._normalize_time_tensor(t_vec_np)
+                # Apply normalization
+                x0_norm = self.norm_helper.normalize(x0, self.species_vars)
+                g_norm = self.norm_helper.normalize(g_vec, self.global_vars)
                 
-                # Apply normalization (these return tensors on self.device)
-                x0_n = self.norm_helper.normalize(x0_log, self.species_vars)
-                g_n = self.norm_helper.normalize(g_vec, self.global_vars)
-                y_n = self.norm_helper.normalize(y_log, self.target_vars)
+                # Normalize time (handle batched data)
+                batch_size = t_vec.shape[0]
+                t_flat = t_vec.reshape(-1, 1)
+                t_norm_flat = self.norm_helper.normalize(t_flat, [self.time_var])
+                t_norm = t_norm_flat.reshape(batch_size, self.M)
                 
-                all_x0_norm.append(x0_n)
-                all_g_norm.append(g_n)
-                all_t_norm.append(t_norm)
-                all_y_norm.append(y_n)
+                # Normalize targets (handle batched data)
+                y_mat_flat = y_mat.reshape(-1, self.n_targets)
+                y_norm_flat = self.norm_helper.normalize(y_mat_flat, self.target_vars)
+                y_norm = y_norm_flat.reshape(batch_size, self.M, self.n_targets)
+                
+                # Combine inputs: [x0, globals, times]
+                inputs = torch.cat([x0_norm, g_norm, t_norm], dim=1)
+                
+                all_inputs.append(inputs)
+                all_targets.append(y_norm)
         
-        # Concatenate all data (all tensors are on the same device now)
-        x0_full = torch.cat(all_x0_norm, dim=0).to(self.dtype)
-        g_full = torch.cat(all_g_norm, dim=0).to(self.dtype)
-        t_full = torch.cat(all_t_norm, dim=0).to(self.dtype)
-        y_full = torch.cat(all_y_norm, dim=0).to(self.dtype)
-        
-        # Combine inputs: [x0, globals, times]
-        inputs_full = torch.cat([x0_full, g_full, t_full], dim=1)
-        
-        return inputs_full, y_full
-
+        # Concatenate all data
+        return torch.cat(all_inputs, dim=0), torch.cat(all_targets, dim=0)
+    
     def _load_from_disk(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load a single trajectory from disk with normalization."""
+        """Load single trajectory from disk with normalization."""
         if self._closed:
             raise RuntimeError("Cannot load data from closed dataset")
-            
+        
         # Find shard containing this index
         shard_idx = np.searchsorted(self.shard_starts, idx, side='right') - 1
         local_idx = idx - self.shard_starts[shard_idx]
         shard_info = self.shards[shard_idx]
         
-        # Disable caching when using multiple workers
-        use_cache = not self._in_worker_process
+        # Check cache
+        use_cache = not self._disable_cache
         
         if use_cache and self._shard_cache["name"] == shard_info["filename"]:
             raw = self._shard_cache["data"]
         else:
-            # Load data from disk
+            # Load from disk
             shard_path = self.split_dir / shard_info["filename"]
             if not shard_path.exists():
-                raise FileNotFoundError(f"Shard file not found: {shard_path}")
-                
+                raise FileNotFoundError(f"Shard not found: {shard_path}")
+            
             with np.load(shard_path, allow_pickle=False) as data:
                 raw = dict(data)
                 
-                # Cache if safe to do so
                 if use_cache:
-                    # Clear old cache before loading new
+                    # Update cache
                     if self._shard_cache["data"] is not None:
                         del self._shard_cache["data"]
-                        
+                    
                     self._shard_cache = {
                         "name": shard_info["filename"],
                         "data": raw
                     }
         
-        # Extract trajectory data
-        x0_log_np = raw["x0_log"][local_idx].astype(self.np_dtype, copy=False)
-        g_np = raw["globals"][local_idx].astype(self.np_dtype, copy=False)
-        t_np = raw["t_vec"][local_idx].astype(self.np_dtype, copy=False)
-        y_log_np = raw["y_mat"][local_idx].astype(self.np_dtype, copy=False)
+        # Extract trajectory (raw data)
+        x0 = torch.from_numpy(raw["x0"][local_idx].astype(self.np_dtype))
+        g_vec = torch.from_numpy(raw["globals"][local_idx].astype(self.np_dtype))
+        t_vec = torch.from_numpy(raw["t_vec"][local_idx].astype(self.np_dtype))
+        y_mat = torch.from_numpy(raw["y_mat"][local_idx].astype(self.np_dtype))
         
-        # Convert to tensors
-        x0_log = torch.from_numpy(x0_log_np)
-        g_vec = torch.from_numpy(g_np)
-        y_log = torch.from_numpy(y_log_np)
+        # Apply normalization (includes log10 transformation where needed)
+        x0_norm = self.norm_helper.normalize(x0.unsqueeze(0), self.species_vars).squeeze(0)
+        g_norm = self.norm_helper.normalize(g_vec.unsqueeze(0), self.global_vars).squeeze(0)
         
-        # Normalize time directly to tensor
-        t_norm = self._normalize_time_tensor(t_np)
+        # Normalize time
+        t_norm = self.norm_helper.normalize(t_vec.unsqueeze(1), [self.time_var]).squeeze(1)
         
-        # Apply normalization (returns tensors on self.device)
-        x0_n = self.norm_helper.normalize(x0_log.unsqueeze(0), self.species_vars).squeeze(0)
-        g_n = self.norm_helper.normalize(g_vec.unsqueeze(0), self.global_vars).squeeze(0)
-        y_n = self.norm_helper.normalize(y_log, self.target_vars)
+        # Normalize targets
+        y_norm = self.norm_helper.normalize(y_mat, self.target_vars)
         
-        # Combine inputs (all tensors are on self.device now)
-        inputs_tensor = torch.cat([x0_n, g_n, t_norm], dim=0).to(self.dtype)
-        targets_tensor = y_n.to(self.dtype)
+        # Combine inputs: [x0, globals, times]
+        inputs_tensor = torch.cat([x0_norm, g_norm, t_norm], dim=0).to(self.dtype)
+        targets_tensor = y_norm.to(self.dtype)
         
         return inputs_tensor, targets_tensor
-
+    
     def __len__(self) -> int:
-        """Return the total number of samples in the dataset."""
+        """Return number of samples."""
         return self.n_total_samples
-
+    
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get a single trajectory by index."""
+        """Get single trajectory by index."""
         if not 0 <= idx < self.n_total_samples:
             raise IndexError(f"Index {idx} out of range [0, {self.n_total_samples})")
         
@@ -411,6 +365,15 @@ class SequenceDataset(Dataset):
             return self.gpu_cache["inputs"][idx], self.gpu_cache["targets"][idx]
         else:
             return self._load_from_disk(idx)
+    
+    def close(self) -> None:
+        """Clean up resources."""
+        self._closed = True
+        self._shard_cache = {"name": None, "data": None}
+        self.gpu_cache = None
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
 
 def create_dataloader(
     dataset: Dataset,
@@ -421,16 +384,13 @@ def create_dataloader(
     **kwargs
 ) -> Optional[DataLoader]:
     """
-    Create optimized DataLoader for sequence dataset.
-    
-    Automatically configures based on GPU caching status to minimize
-    data transfer overhead and maximize throughput.
+    Create optimized DataLoader.
     
     Args:
-        dataset: The dataset to load from
-        config: Configuration dictionary containing training parameters
-        shuffle: Whether to shuffle data each epoch
-        device: Target device for pin_memory optimization
+        dataset: Dataset to load from
+        config: Configuration dictionary
+        shuffle: Whether to shuffle data
+        device: Target device for pin_memory
         drop_last: Whether to drop incomplete last batch
         **kwargs: Additional DataLoader arguments
         
@@ -451,7 +411,7 @@ def create_dataloader(
         dataset.split_name, batch_size, len(dataset)
     )
     
-    # GPU-cached data: simple batching without workers
+    # GPU-cached data: no workers needed
     if hasattr(dataset, 'gpu_cache') and dataset.gpu_cache is not None:
         if kwargs.get("num_workers", 0) != 0:
             raise ValueError("GPU-cached dataset must use num_workers=0")
@@ -465,15 +425,15 @@ def create_dataloader(
             **kwargs
         )
     
-    # CPU loading: use workers for parallel data loading
+    # CPU loading: use workers
     num_workers = tcfg.get("num_workers", 0)
     
     # Mark dataset for worker process handling
-    if hasattr(dataset, '_in_worker_process') and num_workers > 0:
-        dataset._in_worker_process = True
+    if hasattr(dataset, '_disable_cache') and num_workers > 0:
+        dataset._disable_cache = True
         log.info("Shard caching disabled for multi-worker DataLoader")
     
-    # Configure DataLoader parameters
+    # Configure DataLoader
     loader_kwargs = dict(
         dataset=dataset,
         batch_size=batch_size,

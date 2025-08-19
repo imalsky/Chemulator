@@ -35,7 +35,6 @@ class Trainer:
     Unified trainer for LiLaN chemical kinetics models.
     
     Handles training, validation, and testing of models with support for:
-    - Gradient accumulation for large effective batch sizes
     - Mixed precision training (fp16/bf16)
     - Multiple optimizer types (AdamW, Lion)
     - Learning rate scheduling
@@ -44,71 +43,74 @@ class Trainer:
     """
     
     def __init__(
-        self,
-        model: nn.Module,
-        train_dataset: Dataset,
-        val_dataset: Optional[Dataset],
-        test_dataset: Optional[Dataset],
-        config: Dict[str, Any],
-        save_dir: Path,
-        device: torch.device,
-        norm_helper: Optional[NormalizationHelper] = None
-    ):
-        """
-        Initialize the trainer
-        
-        Args:
-            model: The neural network model to train
-            train_dataset: Training dataset
-            val_dataset: Validation dataset (optional)
-            test_dataset: Test dataset (optional)
-            config: Configuration dictionary containing all training parameters
-            save_dir: Directory to save checkpoints and logs
-            device: Device to run training on (cpu/cuda/mps)
-            norm_helper: Helper for data normalization/denormalization
-        """
-        self.logger = logging.getLogger(__name__)
-        
-        # Core components
-        self.model = model
-        self.config = config
-        self.save_dir = save_dir
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.device = device
-        self.norm_helper = norm_helper
-        self.autocast_device_type = "cuda" if self.device.type == "cuda" else "cpu"
+            self,
+            model: nn.Module,
+            train_dataset: Dataset,
+            val_dataset: Optional[Dataset],
+            test_dataset: Optional[Dataset],
+            config: Dict[str, Any],
+            save_dir: Path,
+            device: torch.device,
+            norm_helper: Optional[NormalizationHelper] = None,
+            processed_dir: Optional[Path] = None
+        ):
+            """
+            Initialize the trainer
+            
+            Args:
+                model: The neural network model to train
+                train_dataset: Training dataset
+                val_dataset: Validation dataset (optional)
+                test_dataset: Test dataset (optional)
+                config: Configuration dictionary containing all training parameters
+                save_dir: Directory to save checkpoints and logs
+                device: Device to run training on (cpu/cuda/mps)
+                norm_helper: Helper for data normalization/denormalization
+                processed_dir: Path to the preprocessed data directory
+            """
+            self.logger = logging.getLogger(__name__)
+            
+            # Core components
+            self.model = model
+            self.config = config
+            self.save_dir = save_dir
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            self.device = device
+            self.norm_helper = norm_helper
+            self.processed_dir = processed_dir
+            self.autocast_device_type = "cuda" if self.device.type == "cuda" else "cpu"
 
-        # Extract config sections for easier access
-        self.train_config = config["training"]
-        self.system_config = config["system"]
-        self.data_config = config["data"]
+            # Extract config sections for easier access
+            self.train_config = config["training"]
+            self.system_config = config["system"]
+            self.data_config = config["data"]
 
-        # Detect if we're in hyperparameter optimization mode
-        self.is_hpo = self._detect_hpo_mode()
-        
-        # Set up data type
-        self.dtype = self._setup_dtype()
-        
-        # Dataset validation
-        self.has_validation = self._has_valid_dataset(val_dataset)
-        
-        # Create data loaders
-        self._setup_dataloaders(train_dataset, val_dataset, test_dataset)
-        
-        # Initialize training state
-        self._init_training_state()
-        
-        # Training configuration
-        self._load_training_config()
-        
-        # Setup training components
-        self._setup_optimizer()
-        self._setup_scheduler()
-        self._setup_loss()
-        self._setup_amp()        
-        
-        # Initialize metrics logging
-        self._init_csv_logger()
+            # Detect if we're in hyperparameter optimization mode
+            self.is_hpo = self._detect_hpo_mode()
+            
+            # Set up data type
+            self.dtype = self._setup_dtype()
+            
+            # Dataset validation
+            self.has_validation = self._has_valid_dataset(val_dataset)
+            
+            # Create data loaders
+            self._setup_dataloaders(train_dataset, val_dataset, test_dataset)
+            
+            # Initialize training state
+            self._init_training_state()
+            
+            # Training configuration
+            self._load_training_config()
+            
+            # Setup training components
+            self._setup_optimizer()
+            self._setup_scheduler()
+            self._setup_loss()
+            self._setup_amp()        
+            
+            # Initialize metrics logging
+            self._init_csv_logger()
     
     def _detect_hpo_mode(self) -> bool:
         """Check if running in hyperparameter optimization mode."""
@@ -146,7 +148,6 @@ class Trainer:
         """Load training configuration parameters."""
         self.early_stopping_patience = self.train_config["early_stopping_patience"]
         self.min_delta = self.train_config["min_delta"]
-        self.gradient_accumulation_steps = self.train_config["gradient_accumulation_steps"]
     
     def _init_csv_logger(self):
         """Initialize CSV file for logging training metrics."""
@@ -266,7 +267,7 @@ class Trainer:
             return
         
         # Calculate steps per epoch for batch-level schedulers
-        steps_per_epoch = max(1, (len(self.train_loader) + self.gradient_accumulation_steps - 1) // self.gradient_accumulation_steps)
+        steps_per_epoch = len(self.train_loader)
         
         params = self.train_config.get("scheduler_params", {})
         
@@ -507,35 +508,34 @@ class Trainer:
             return train_loss < (best_train_loss - self.min_delta)
     
     def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
-        """Train for one epoch with proper gradient accumulation."""
+        """
+        Train for one epoch.
+        """
         self.model.train()
         total_loss = 0.0
         total_samples = 0
         
-        # Use standard, simple gradient accumulation approach
         for batch_idx, (inputs, targets) in enumerate(self.train_loader):
             inputs, targets = self._prepare_batch(inputs, targets)
             
             with autocast(device_type=self.autocast_device_type, enabled=self.use_amp, dtype=self.amp_dtype):
                 predictions, _ = self.model(inputs)
                 loss = self._compute_loss(predictions, targets)
-                # ALWAYS scale by the total number of accumulation steps
-                # This is the standard approach - simple and mathematically correct
-                scaled_loss = loss / self.gradient_accumulation_steps
             
             # Backward pass
             if self.scaler.is_enabled():
-                self.scaler.scale(scaled_loss).backward()
+                self.scaler.scale(loss).backward()
             else:
-                scaled_loss.backward()
+                loss.backward()
             
-            # Step optimizer when accumulation window is complete OR last batch
-            if ((batch_idx + 1) % self.gradient_accumulation_steps == 0) or \
-            ((batch_idx + 1) == len(self.train_loader)):
-                self._optimizer_step()
-                if self.scheduler and self.scheduler_step_on_batch:
-                    self.scheduler.step()
-                self.global_step += 1
+            # Step optimizer on every batch
+            self._optimizer_step()
+            self.global_step += 1
+            
+            # Step batch-level scheduler on every batch
+            # This is now correct as the optimizer also steps on every batch
+            if self.scheduler and self.scheduler_step_on_batch:
+                self.scheduler.step()
             
             # Track metrics using unscaled loss
             batch_size = inputs.size(0)
@@ -544,13 +544,8 @@ class Trainer:
         
         avg_loss = total_loss / max(total_samples, 1)
         return avg_loss, {}
-
-    def _should_step_optimizer(self, batch_idx: int) -> bool:
-        """Check if optimizer should step after this batch."""
-        is_last_batch = (batch_idx + 1) == len(self.train_loader)
-        window_complete = ((batch_idx + 1) % self.gradient_accumulation_steps == 0)
-        return window_complete or is_last_batch
     
+
     def _optimizer_step(self):
         """Perform optimizer step with gradient clipping."""
         # Unscale gradients if using fp16
@@ -569,7 +564,6 @@ class Trainer:
         else:
             self.optimizer.step()
         
-        # Clear gradients for next accumulation
         self.optimizer.zero_grad(set_to_none=True)
     
     @torch.inference_mode()
@@ -752,32 +746,76 @@ class Trainer:
         return unwrapped
     
     def _create_example_input(self, model: nn.Module) -> torch.Tensor:
-        """Create example input tensor for model export."""
-        # Try to infer input dim D from an actual batch (val preferred; else train)
-        D = None
+        """
+        Create a structured example input tensor for model export.
+        
+        The LinearLatentNetwork model expects input with structure:
+        - First n_species entries: species initial conditions
+        - Next n_globals entries: global parameters  
+        - Final M entries: monotonically increasing time points
+        
+        This function creates a valid input that respects these constraints,
+        particularly ensuring the time vector is monotonically increasing
+        to avoid errors during the model's internal time integration.
+        """
+        data_cfg = self.config["data"]
+        n_species = len(data_cfg["species_variables"])
+        n_globals = len(data_cfg["global_variables"])
+        
+        # Infer sequence length M from a data loader
+        M = None
         try:
             loader = self.val_loader or self.train_loader
             if loader is not None:
                 sample_inputs, _ = next(iter(loader))
-                D = int(sample_inputs.shape[1])
-        except Exception:
-            D = None
-
-        if D is None:
-            raise ValueError(f"Problems creating example input")
-
-        # Match model param dtype/device
+                # M is the remaining dimensions after species and globals
+                M = sample_inputs.shape[1] - n_species - n_globals
+        except Exception as e:
+            self.logger.warning(f"Could not infer M from data loader: {e}")
+        
+        # Fall back to shard metadata if needed
+        if not M or M <= 1:
+            try:
+                from utils.utils import load_json
+                shard_index = load_json(self.processed_dir / "shard_index.json")
+                M = int(shard_index.get("M_per_sample", 0))
+            except Exception:
+                pass
+        
+        if not M or M <= 1:
+            raise ValueError(
+                f"Could not determine a valid sequence length M for model export. "
+                f"Got M={M}, need M>1 for time series data."
+            )
+        
+        # Get dtype and device from model parameters
         param = next((p for p in model.parameters() if p.requires_grad), None)
         dtype = param.dtype if param is not None else torch.float32
         device = param.device if param is not None else torch.device("cpu")
-        return torch.randn(1, D, dtype=dtype, device=device)
+        
+        # Create structured input components
+        # 1. Random initial conditions for species (positive values typical for concentrations)
+        x0 = torch.abs(torch.randn(1, n_species, dtype=dtype, device=device)) * 0.1 + 0.01
+        
+        # 2. Random global parameters (reasonable range)
+        globals_vec = torch.randn(1, n_globals, dtype=dtype, device=device)
+        
+        # 3. Monotonically increasing time vector (CRITICAL for model correctness)
+        # Use linspace to guarantee monotonic increase
+        time_vec = torch.linspace(0.0, 10.0, steps=M, dtype=dtype, device=device).unsqueeze(0)
+        
+        # Concatenate to form the final structured input
+        # Shape: [1, n_species + n_globals + M]
+        example_input = torch.cat([x0, globals_vec, time_vec], dim=1)
+        
+        self.logger.debug(
+            f"Created example input: shape={example_input.shape}, "
+            f"n_species={n_species}, n_globals={n_globals}, M={M}"
+        )
+        
+        return example_input
     
     def _perform_export(self, model: nn.Module, example_input: torch.Tensor):
         """Perform the actual model export."""
-        try:
-            # Try positional argument export first
-            return torch.export.export(model, (example_input,))
-        except Exception as e:
-            # Fallback to keyword argument export
-            self.logger.debug(f"Positional export failed: {e}, trying kwargs")
-            return torch.export.export(model, (), kwargs={"inputs": example_input})
+        # Export with the single positional argument the model expects
+        return torch.export.export(model, (example_input,))

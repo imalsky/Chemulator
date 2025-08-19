@@ -58,60 +58,64 @@ class ChemicalKineticsPipeline:
         optimize_hardware(self.config["system"], self.device)
     
     def setup_paths(self):
-        """Create directory structure."""
-        import uuid
-        paths = self.config["paths"]
-        
-        # Create run directory with unique identifier
-        model_type = self.config["model"].get("type", "LiLaN")
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        unique_id = str(uuid.uuid4())[:8]
-        self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{timestamp}_{unique_id}"
-        
-        # Convert paths
-        self.raw_data_files = [Path(f) for f in paths["raw_data_files"]]
-        
-        # Processed data directory
-        base_processed_dir = Path(paths["processed_data_dir"])
-        self.processed_dir = base_processed_dir
-        
-        self.log_dir = Path(paths["log_dir"])
-        
-        # Create directories
-        ensure_directories(self.processed_dir, self.run_save_dir, self.log_dir)
+            """Create directory structure."""
+            import uuid
+            paths = self.config["paths"]
+            
+            # Create run directory with unique identifier
+            model_type = self.config["model"].get("type", "LiLaN")
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{timestamp}_{unique_id}"
+            
+            # Convert paths
+            self.raw_data_files = [Path(f) for f in paths["raw_data_files"]]
+            
+            # Processed data directory
+            base_processed_dir = Path(paths["processed_data_dir"])
+            self.processed_dir = base_processed_dir
+            
+            self.log_dir = Path(paths["log_dir"])
+            
+            # Create directories for models and logs, but NOT for processed data yet.
+            ensure_directories(self.run_save_dir, self.log_dir)
         
     def _compute_data_hash(self) -> str:
         """
         Compute a hash of data-critical parameters that affect shard content or normalization.
+        
+        This hash must include ALL parameters that affect:
+        1. Which trajectories go into which split
+        2. The normalization statistics computed
+        3. The data values saved to disk
         """
         import hashlib
         import json
 
         norm_cfg = self.config.get("normalization", {})
-        precfg  = self.config.get("preprocessing", {})
+        precfg = self.config.get("preprocessing", {})
         train_cfg = self.config.get("training", {})
-        data_cfg  = self.config.get("data", {})
-        sys_cfg   = self.config.get("system", {})
+        data_cfg = self.config.get("data", {})
+        sys_cfg = self.config.get("system", {})
 
-        time_var = data_cfg.get("time_variable")
+        time_var = data_cfg.get("time_variable", "t_time")
 
         # Normalization methods (make deterministic: lowercased, sorted)
         norm_methods = norm_cfg.get("methods", {}) or {}
         norm_methods_norm = {k: (None if v is None else str(v).lower()) for k, v in norm_methods.items()}
         norm_methods_items = sorted(norm_methods_norm.items())
 
-        # Time method as actually used by the code (fallback matches CorePreprocessor/Normalizer)
+        # Time method as actually used by the code
         default_method = norm_cfg.get("default_method", "log-standard")
         time_method_used = norm_methods_norm.get(time_var, default_method.lower())
 
-        # If you change preprocessing math (e.g., tau0 logic), bump this string:
-        preprocessor_version = "fixed"
-
+        # Build the hash payload
         data_params = {
             # Inputs & schema
             "raw_files": sorted([str(f) for f in self.raw_data_files]),
             "species_variables": data_cfg.get("species_variables", []),
-            "target_species_variables": data_cfg.get("target_species_variables", data_cfg.get("species_variables", [])),
+            "target_species_variables": data_cfg.get("target_species_variables", 
+                                                    data_cfg.get("species_variables", [])),
             "global_variables": data_cfg.get("global_variables", []),
             "time_variable": time_var,
 
@@ -119,12 +123,13 @@ class ChemicalKineticsPipeline:
             "min_value_threshold": precfg.get("min_value_threshold", 1e-30),
 
             # Normalization behavior that changes normalization.json
-            "default_norm_method": norm_cfg.get("default_method", "log-standard"),
-            "norm_methods": norm_methods_items,           
-            "time_method": time_method_used,   
-                      
-            #"epsilon": norm_cfg.get("epsilon", 1e-30),
-            #"min_std": norm_cfg.get("min_std", 1e-10),
+            "default_norm_method": default_method,
+            "norm_methods": norm_methods_items,
+            "time_method": time_method_used,
+            
+            # CRITICAL: These affect normalization statistics computation
+            "epsilon": norm_cfg.get("epsilon", 1e-30),
+            "min_std": norm_cfg.get("min_std", 1e-10),
 
             # Split policy (affects which traj lands in which split deterministically)
             "use_fraction": train_cfg.get("use_fraction", 1.0),
@@ -137,57 +142,93 @@ class ChemicalKineticsPipeline:
             # Dtype baked into saved arrays
             "system_dtype": sys_cfg.get("dtype", "float32"),
 
-            # Preprocessor logic version
-            "preprocessor_version": preprocessor_version,
+            # Preprocessor logic version (bump when fixing bugs in preprocessing logic)
+            "preprocessor_version": "v2_fixed_hash",
         }
-
-        # NOTE: If you do NOT want shard regrouping or compression tweaks to force a regen,
-        # keep 'trajectories_per_shard' and 'npz_compressed' out of the hash.
-        # If you *do* want that to trigger regen, add them here.
+        
+        # CRITICAL: Add tau0 if time-norm method is used
+        # tau0 affects the normalization statistics for time
+        if time_method_used == "time-norm":
+            data_params["tau0"] = norm_cfg.get("tau0", 1.0)
+        
+        # Optional: Include these if you want shard regrouping to trigger regeneration
+        # Currently excluded by design to allow reorganizing shards without recomputing
+        # "trajectories_per_shard": precfg.get("trajectories_per_shard", 100),
+        # "npz_compressed": precfg.get("npz_compressed", True),
 
         payload = json.dumps(data_params, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-
     
     def preprocess_data(self):
-        """Preprocess data if needed."""
-        self.logger.info("Checking data preprocessing...")
-        
-        # Check if data already exists with matching hash
-        current_hash = self._compute_data_hash()
-        hash_file = self.processed_dir / "data_hash.json"
-        
-        regenerate = True
-        if hash_file.exists():
-            saved_hash_data = load_json(hash_file)
-            if saved_hash_data.get("hash") == current_hash:
-                self.logger.info("Data already preprocessed with matching hash. Skipping regeneration.")
-                regenerate = False
+            """Preprocess data if needed."""
+            self.logger.info("Checking data preprocessing...")
+            
+            # Check if data already exists with matching hash
+            current_hash = self._compute_data_hash()
+            hash_file = self.processed_dir / "data_hash.json"
+            
+            regenerate = True
+            force_regen_reason = None
+            
+            if hash_file.exists():
+                saved_hash_data = load_json(hash_file)
+                saved_hash = saved_hash_data.get("hash")
+                saved_version = saved_hash_data.get("preprocessor_version", "unknown")
+                
+                # Force regeneration if old version detected
+                if saved_version in ["unknown", "fixed", "v1"]:
+                    force_regen_reason = f"Old preprocessor version detected: {saved_version}"
+                elif saved_hash == current_hash:
+                    self.logger.info("Data already preprocessed with matching hash. Skipping regeneration.")
+                    regenerate = False
+                else:
+                    force_regen_reason = "Data hash mismatch"
             else:
-                self.logger.info("Data hash mismatch. Regenerating data...")
-        
-        if regenerate:
-            preprocessor = DataPreprocessor(
-                raw_files=self.raw_data_files,
-                output_dir=self.processed_dir,
-                config=self.config
-            )
+                force_regen_reason = "No existing preprocessed data found"
             
-            # Check for missing files
-            missing = [p for p in self.raw_data_files if not p.exists()]
-            if missing:
-                raise FileNotFoundError(f"Missing raw data files: {missing}")
-            
-            # Process to shards
-            preprocessor.process_to_npy_shards()
-            
-            # Save the hash
-            save_json({
-                "hash": current_hash,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-            }, hash_file)
-            
-            self.logger.info("Data preprocessing complete. Files saved to: %s", self.processed_dir)
+            if regenerate:
+                if force_regen_reason:
+                    self.logger.info(f"Regenerating data: {force_regen_reason}")
+
+                if self.processed_dir.exists():
+                    error_msg = (
+                        f"Processed data directory '{self.processed_dir}' already exists, but "
+                        f"data regeneration is required. Reason: {force_regen_reason}. "
+                        "Please remove this directory and run again."
+                    )
+                    self.logger.error(error_msg)
+                    import sys
+                    sys.exit(1)
+
+                # Create the directory now that we know it's needed and doesn't exist.
+                self.processed_dir.mkdir(parents=True, exist_ok=True)
+                
+                preprocessor = DataPreprocessor(
+                    raw_files=self.raw_data_files,
+                    output_dir=self.processed_dir,
+                    config=self.config
+                )
+                
+                # Check for missing files
+                missing = [p for p in self.raw_data_files if not p.exists()]
+                if missing:
+                    raise FileNotFoundError(f"Missing raw data files: {missing}")
+                
+                # Process to shards
+                preprocessor.process_to_npy_shards()
+                
+                # Save the hash with version info
+                save_json({
+                    "hash": current_hash,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "preprocessor_version": "v2_fixed_hash",  # Match the version in _compute_data_hash
+                    "config_snapshot": {
+                        "normalization": self.config.get("normalization", {}),
+                        "preprocessing": self.config.get("preprocessing", {}),
+                    }
+                }, hash_file)
+                
+                self.logger.info("Data preprocessing complete. Files saved to: %s", self.processed_dir)
     
     def _log_memory_status(self):
         """Log current memory status."""
@@ -205,129 +246,134 @@ class ChemicalKineticsPipeline:
                 "GPU memory: %.1fGB total, %.1fGB free, %.1fGB used",
                 total_mem/1024**3, free_mem/1024**3, used_mem/1024**3
             )
-    
+        
     def train_model(self):
-        """Train the neural network model."""        
-        # Ensure data is preprocessed
-        self.preprocess_data()
-        
-        # Save config for this run
-        save_json(self.config, self.run_save_dir / "config.json")
-        
-        # Create model
-        model = create_model(self.config, self.device)
-        
-        # Log model info
-        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        self.logger.info("Model: %s - Parameters: %d", self.config['model']['type'], total_params)
-        
-        # Load normalization stats
-        norm_file = self.processed_dir / "normalization.json"
-        if not norm_file.exists():
-            raise FileNotFoundError(f"Normalization file missing: {norm_file}")
-        norm_stats = load_json(norm_file)
-        
-        norm_helper = NormalizationHelper(
-            stats=norm_stats,
-            device=self.device,
-            config=self.config
-        )
-        
-        # Log memory status
-        self._log_memory_status()
-        
-        # Create datasets with proper cleanup
-        self.logger.info("Loading datasets...")
-        train_dataset = None
-        val_dataset = None
-        test_dataset = None
-        trainer = None
-        
-        try:
-            # Determine if we need to disable cache for multi-worker loading
-            num_workers = self.config.get("training", {}).get("num_workers", 0)
-            disable_cache = num_workers > 0
+            """Train the neural network model."""        
+            # Ensure data is preprocessed
+            self.preprocess_data()
             
-            train_dataset = SequenceDataset(
-                self.processed_dir, "train", self.config, self.device, 
-                norm_stats, disable_cache=disable_cache
-            )
+            # Save config for this run
+            save_json(self.config, self.run_save_dir / "config.json")
             
-            if self.config.get("training", {}).get("val_fraction", 0.0) > 0:
-                val_dataset = SequenceDataset(
-                    self.processed_dir, "validation", self.config, self.device, 
-                    norm_stats, disable_cache=disable_cache
-                )
+            # Create model
+            model = create_model(self.config, self.device)
             
-            if self.config.get("training", {}).get("test_fraction", 0.0) > 0:
-                test_dataset = SequenceDataset(
-                    self.processed_dir, "test", self.config, self.device, 
-                    norm_stats, disable_cache=disable_cache
-                )
+            # Log model info
+            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            self.logger.info("Model: %s - Parameters: %d", self.config['model']['type'], total_params)
             
-            self.logger.info("Train samples: %d", len(train_dataset))
-            if val_dataset:
-                self.logger.info("Validation samples: %d", len(val_dataset))
-            if test_dataset:
-                self.logger.info("Test samples: %d", len(test_dataset))
+            # Load normalization stats
+            norm_file = self.processed_dir / "normalization.json"
+            if not norm_file.exists():
+                raise FileNotFoundError(f"Normalization file missing: {norm_file}")
+            norm_stats = load_json(norm_file)
             
-            # Initialize trainer
-            trainer = Trainer(
-                model=model,
-                train_dataset=train_dataset,
-                val_dataset=val_dataset,
-                test_dataset=test_dataset,
-                config=self.config,
-                save_dir=self.run_save_dir,
+            norm_helper = NormalizationHelper(
+                stats=norm_stats,
                 device=self.device,
-                norm_helper=norm_helper
+                config=self.config
             )
             
-            # Train model
-            best_val_loss = trainer.train()
+            # Log memory status
+            self._log_memory_status()
             
-            # Evaluate on test set
-            test_loss = float("inf")
-            if test_dataset:
-                test_loss = trainer.evaluate_test()
+            # Create datasets with proper cleanup
+            self.logger.info("Loading datasets...")
+            train_dataset = None
+            val_dataset = None
+            test_dataset = None
+            trainer = None
             
-            self.logger.info("Training complete! Best validation loss: %.6f", best_val_loss)
-            if test_loss != float("inf"):
-                self.logger.info("Test loss: %.6f", test_loss)
-            
-            # Save results
-            results = {
-                "best_val_loss": best_val_loss,
-                "test_loss": test_loss,
-                "model_path": str(self.run_save_dir / "best_model.pt"),
-                "training_time": trainer.total_training_time,
-                "best_epoch": trainer.best_epoch,
-            }
-            
-            save_json(results, self.run_save_dir / "results.json")
-            
-            return results
-            
-        finally:
-            # Ensure datasets are properly cleaned up
-            for dataset in [train_dataset, val_dataset, test_dataset]:
-                if dataset is not None:
-                    try:
-                        dataset.close()
-                    except Exception as e:
-                        self.logger.debug("Error closing dataset: %s", e)
-            
-            # Clean up trainer
-            if trainer is not None:
-                del trainer
-            
-            # Clean up model
-            if 'model' in locals():
-                del model
-            
-            # Force GPU memory cleanup
-            if self.device.type == "cuda":
-                torch.cuda.empty_cache()
+            try:
+                # Determine if we need to disable cache for multi-worker loading
+                # Fallback to preprocessing config for num_workers for convenience
+                train_cfg = self.config.get("training", {})
+                prep_cfg = self.config.get("preprocessing", {})
+                num_workers = train_cfg.get("num_workers", prep_cfg.get("num_workers", 0))
+
+                disable_cache = num_workers > 0
+                
+                train_dataset = SequenceDataset(
+                    self.processed_dir, "train", self.config, self.device, 
+                    norm_stats, disable_cache=disable_cache
+                )
+                
+                if self.config.get("training", {}).get("val_fraction", 0.0) > 0:
+                    val_dataset = SequenceDataset(
+                        self.processed_dir, "validation", self.config, self.device, 
+                        norm_stats, disable_cache=disable_cache
+                    )
+                
+                if self.config.get("training", {}).get("test_fraction", 0.0) > 0:
+                    test_dataset = SequenceDataset(
+                        self.processed_dir, "test", self.config, self.device, 
+                        norm_stats, disable_cache=disable_cache
+                    )
+                
+                self.logger.info("Train samples: %d", len(train_dataset))
+                if val_dataset:
+                    self.logger.info("Validation samples: %d", len(val_dataset))
+                if test_dataset:
+                    self.logger.info("Test samples: %d", len(test_dataset))
+                
+                # Initialize trainer
+                trainer = Trainer(
+                    model=model,
+                    train_dataset=train_dataset,
+                    val_dataset=val_dataset,
+                    test_dataset=test_dataset,
+                    config=self.config,
+                    save_dir=self.run_save_dir,
+                    device=self.device,
+                    norm_helper=norm_helper,
+                    processed_dir=self.processed_dir
+                )
+                    
+                # Train model
+                best_val_loss = trainer.train()
+                
+                # Evaluate on test set
+                test_loss = float("inf")
+                if test_dataset:
+                    test_loss = trainer.evaluate_test()
+                
+                self.logger.info("Training complete! Best validation loss: %.6f", best_val_loss)
+                if test_loss != float("inf"):
+                    self.logger.info("Test loss: %.6f", test_loss)
+                
+                # Save results
+                results = {
+                    "best_val_loss": best_val_loss,
+                    "test_loss": test_loss,
+                    "model_path": str(self.run_save_dir / "best_model.pt"),
+                    "training_time": trainer.total_training_time,
+                    "best_epoch": trainer.best_epoch,
+                }
+                
+                save_json(results, self.run_save_dir / "results.json")
+                
+                return results
+                
+            finally:
+                # Ensure datasets are properly cleaned up
+                for dataset in [train_dataset, val_dataset, test_dataset]:
+                    if dataset is not None:
+                        try:
+                            dataset.close()
+                        except Exception as e:
+                            self.logger.debug("Error closing dataset: %s", e)
+                
+                # Clean up trainer
+                if trainer is not None:
+                    del trainer
+                
+                # Clean up model
+                if 'model' in locals():
+                    del model
+                
+                # Force GPU memory cleanup
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
     
     def run(self):
         """Execute the full training pipeline."""
