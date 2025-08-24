@@ -1,0 +1,150 @@
+{
+  "best_val_loss": 0.04380432652585484,
+  "model_path": "models/ae_deeponet_20250824_134956/stage3_deeponet/best_model.pt",
+  "config": {
+    "paths": {
+      "raw_data_files": [
+        "data/raw/run9001-result.h5"
+      ],
+      "processed_data_dir": "data/processed-1-log-standard",
+      "model_save_dir": "models",
+      "log_dir": "logs"
+    },
+    "data": {
+      "species_variables": [
+        "C2H2_evolution",
+        "CH4_evolution",
+        "CO2_evolution",
+        "CO_evolution",
+        "H2O_evolution",
+        "H2_evolution",
+        "HCN_evolution",
+        "H_evolution",
+        "N2_evolution",
+        "NH3_evolution",
+        "OH_evolution",
+        "O_evolution"
+      ],
+      "target_species_variables": [
+        "C2H2_evolution",
+        "CH4_evolution",
+        "CO2_evolution",
+        "CO_evolution",
+        "H2O_evolution",
+        "H2_evolution",
+        "HCN_evolution",
+        "H_evolution",
+        "N2_evolution",
+        "NH3_evolution",
+        "OH_evolution",
+        "O_evolution"
+      ],
+      "global_variables": [
+        "P",
+        "T"
+      ],
+      "expected_globals": [
+        "P",
+        "T"
+      ],
+      "time_variable": "t_time"
+    },
+    "preprocessing": {
+      "min_value_threshold": 1e-25,
+      "num_workers": 8,
+      "hdf5_chunk_size": 16384,
+      "trajectories_per_shard": 10000,
+      "npz_compressed": true
+    },
+    "normalization": {
+      "default_method": "log-standard",
+      "methods": {
+        "t_time": "log-min-max",
+        "P": "log-standard",
+        "T": "standard"
+      },
+      "epsilon": 1e-30,
+      "min_std": 1e-10,
+      "clamp_value": 50.0
+    },
+    "model": {
+      "type": "AE_DeepONet",
+      "latent_dim": 6,
+      "p": 10,
+      "trunk_times": [
+        0.25,
+        0.5,
+        0.75,
+        1.0
+      ],
+      "use_pou": false,
+      "ae_encoder_layers": [
+        128,
+        128,
+        128
+      ],
+      "ae_decoder_layers": [
+        128,
+        128,
+        128
+      ],
+      "branch_layers": [
+        128,
+        128,
+        128
+      ],
+      "trunk_layers": [
+        128,
+        128,
+        128
+      ],
+      "activation": "leaky_relu",
+      "dropout": 0.0,
+      "use_layernorm": false
+    },
+    "training": {
+      "loss": "mse",
+      "ae_pretrain_epochs": 100,
+      "ae_pretrain_lr": 0.001,
+      "freeze_ae_after_pretrain": true,
+      "epochs": 200,
+      "batch_size": 256,
+      "val_fraction": 0.15,
+      "test_fraction": 0.15,
+      "use_fraction": 1.0,
+      "optimizer": "AdamW",
+      "learning_rate": 0.001,
+      "weight_decay": 0.0001,
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "eps": 1e-08,
+      "gradient_clip": 1.0,
+      "scheduler": "cosine",
+      "scheduler_params": {
+        "warmup_epochs": 10,
+        "eta_min": 1e-08
+      },
+      "use_amp": true,
+      "amp_dtype": "bfloat16",
+      "early_stopping_patience": 30,
+      "min_delta": 1e-08,
+      "gpu_cache_dataset": "auto",
+      "num_workers": 0,
+      "prefetch_factor": 2,
+      "pou_weight": 0.01,
+      "use_relative_time": false,
+      "window_size": 100
+    },
+    "system": {
+      "seed": 42,
+      "use_torch_export": false,
+      "use_torch_compile": false,
+      "compile_mode": "default",
+      "cudnn_benchmark": true,
+      "tf32": true,
+      "dtype": "float32"
+    }
+  }
+}
