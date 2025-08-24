@@ -1,501 +1,372 @@
 #!/usr/bin/env python3
 """
-Main entry point for chemical kinetics neural network training and hyperparameter tuning.
+Main entry point for AE-DeepONet training following Goswami et al. (2023).
+GPU-only implementation with strict validation.
 """
-
-import os
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import logging
 import sys
 import time
 from pathlib import Path
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import torch
-from typing import Dict, Union
-import psutil
-import torch.multiprocessing
-try:
-    torch.multiprocessing.set_sharing_strategy('file_system')
-except RuntimeError:
-    pass
-
-from utils.hardware import setup_device, optimize_hardware
-from utils.utils import setup_logging, seed_everything, ensure_directories, load_json_config, save_json, load_json
-from data.preprocessor import DataPreprocessor
-from data.dataset import SequenceDataset
-from models.model import create_model
-from training.trainer import Trainer
-from data.normalizer import NormalizationHelper
 
 
-class ChemicalKineticsPipeline:
-    """Training pipeline for chemical kinetics models."""
-    
-    def __init__(self, config_or_path: Union[Path, Dict]):
-        """Initialize the pipeline."""
-        if isinstance(config_or_path, (Path, str)):
-            self.config = load_json_config(Path(config_or_path))
-        elif isinstance(config_or_path, dict):
-            self.config = config_or_path
-        else:
-            raise TypeError("config_or_path must be a Path, str, or dict")
-        
-        # Create directory tree
+from utils import setup_logging, seed_everything, load_json_config, save_json, load_json
+from hardware import setup_device, optimize_hardware
+from preprocessor import DataPreprocessor
+from dataset import GPUSequenceDataset, GPULatentDataset, create_gpu_dataloader
+from model import create_model
+from trainer import Trainer
+from generate_latent_dataset import generate_latent_dataset
+
+
+
+class AEDeepONetPipeline:
+    """Three-stage training pipeline following the paper."""
+
+    def __init__(self, config_path: Path):
+        self.config = load_json_config(config_path)
+        self.config_path = config_path
+
+        # Setup paths
         self.setup_paths()
-        
-        # Setup logging with file handler
+
+        # Setup logging
         log_file = self.log_dir / f"pipeline_{time.strftime('%Y%m%d_%H%M%S')}.log"
         setup_logging(log_file=log_file)
-        
         self.logger = logging.getLogger(__name__)
-        self.logger.info("Chemical Kinetics Pipeline initialized")
-        
+
         # Set seed
         seed_everything(self.config.get("system", {}).get("seed", 42))
-        
-        # Setup hardware
+
+        # Setup hardware - MUST be GPU
         self.device = setup_device()
-        optimize_hardware(self.config["system"], self.device)
-    
-    def setup_paths(self):
-            """Create directory structure."""
-            import uuid
-            paths = self.config["paths"]
-            
-            # Create run directory with unique identifier
-            model_type = self.config["model"].get("type", "LiLaN")
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            unique_id = str(uuid.uuid4())[:8]
-            self.run_save_dir = Path(paths["model_save_dir"]) / f"{model_type}_{timestamp}_{unique_id}"
-            
-            # Convert paths
-            self.raw_data_files = [Path(f) for f in paths["raw_data_files"]]
-            
-            # Processed data directory
-            base_processed_dir = Path(paths["processed_data_dir"])
-            self.processed_dir = base_processed_dir
-            
-            self.log_dir = Path(paths["log_dir"])
-            
-            # Create directories for models and logs, but NOT for processed data yet.
-            ensure_directories(self.run_save_dir, self.log_dir)
-        
-    def _compute_data_hash(self) -> str:
-        """
-        Compute a hash of data-critical parameters that affect shard content or normalization.
-        
-        This hash must include ALL parameters that affect:
-        1. Which trajectories go into which split
-        2. The normalization statistics computed
-        3. The data values saved to disk
-        """
-        import hashlib
-        import json
 
-        norm_cfg = self.config.get("normalization", {})
-        precfg = self.config.get("preprocessing", {})
-        train_cfg = self.config.get("training", {})
-        data_cfg = self.config.get("data", {})
-        sys_cfg = self.config.get("system", {})
+        if self.device.type != "cuda":
+            self.logger.error("AE-DeepONet requires CUDA GPU. CPU not supported.")
+            raise RuntimeError("CUDA GPU required. Please run on a system with NVIDIA GPU.")
 
-        time_var = data_cfg.get("time_variable", "t_time")
+        # Check GPU memory
+        _, total_mem = torch.cuda.mem_get_info(self.device.index or 0)
+        total_gb = total_mem / 1e9
 
-        # Normalization methods (make deterministic: lowercased, sorted)
-        norm_methods = norm_cfg.get("methods", {}) or {}
-        norm_methods_norm = {k: (None if v is None else str(v).lower()) for k, v in norm_methods.items()}
-        norm_methods_items = sorted(norm_methods_norm.items())
-
-        # Time method as actually used by the code
-        default_method = norm_cfg.get("default_method", "log-standard")
-        time_method_used = norm_methods_norm.get(time_var, default_method.lower())
-
-        # Build the hash payload
-        data_params = {
-            # Inputs & schema
-            "raw_files": sorted([str(f) for f in self.raw_data_files]),
-            "species_variables": data_cfg.get("species_variables", []),
-            "target_species_variables": data_cfg.get("target_species_variables", 
-                                                    data_cfg.get("species_variables", [])),
-            "global_variables": data_cfg.get("global_variables", []),
-            "time_variable": time_var,
-
-            # Preprocessing knobs that change outputs
-            "min_value_threshold": precfg.get("min_value_threshold", 1e-30),
-
-            # Normalization behavior that changes normalization.json
-            "default_norm_method": default_method,
-            "norm_methods": norm_methods_items,
-            "time_method": time_method_used,
-            
-            # CRITICAL: These affect normalization statistics computation
-            "epsilon": norm_cfg.get("epsilon", 1e-30),
-            "min_std": norm_cfg.get("min_std", 1e-10),
-
-            # Split policy (affects which traj lands in which split deterministically)
-            "use_fraction": train_cfg.get("use_fraction", 1.0),
-            "val_fraction": train_cfg.get("val_fraction", 0.0),
-            "test_fraction": train_cfg.get("test_fraction", 0.0),
-
-            # Seed controlling deterministic split hashing
-            "seed": sys_cfg.get("seed", 42),
-
-            # Dtype baked into saved arrays
-            "system_dtype": sys_cfg.get("dtype", "float32"),
-
-            # Preprocessor logic version (bump when fixing bugs in preprocessing logic)
-            "preprocessor_version": "v2_fixed_hash",
-        }
-        
-        # CRITICAL: Add tau0 if time-norm method is used
-        # tau0 affects the normalization statistics for time
-        if time_method_used == "time-norm":
-            data_params["tau0"] = norm_cfg.get("tau0", 1.0)
-        
-        # Optional: Include these if you want shard regrouping to trigger regeneration
-        # Currently excluded by design to allow reorganizing shards without recomputing
-        # "trajectories_per_shard": precfg.get("trajectories_per_shard", 100),
-        # "npz_compressed": precfg.get("npz_compressed", True),
-
-        payload = json.dumps(data_params, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-    
-    def preprocess_data(self):
-            """Preprocess data if needed."""
-            self.logger.info("Checking data preprocessing...")
-            
-            # Check if data already exists with matching hash
-            current_hash = self._compute_data_hash()
-            hash_file = self.processed_dir / "data_hash.json"
-            
-            regenerate = True
-            force_regen_reason = None
-            
-            if hash_file.exists():
-                saved_hash_data = load_json(hash_file)
-                saved_hash = saved_hash_data.get("hash")
-                saved_version = saved_hash_data.get("preprocessor_version", "unknown")
-                
-                # Force regeneration if old version detected
-                if saved_version in ["unknown", "fixed", "v1"]:
-                    force_regen_reason = f"Old preprocessor version detected: {saved_version}"
-                elif saved_hash == current_hash:
-                    self.logger.info("Data already preprocessed with matching hash. Skipping regeneration.")
-                    regenerate = False
-                else:
-                    force_regen_reason = "Data hash mismatch"
-            else:
-                force_regen_reason = "No existing preprocessed data found"
-            
-            if regenerate:
-                if force_regen_reason:
-                    self.logger.info(f"Regenerating data: {force_regen_reason}")
-
-                if self.processed_dir.exists():
-                    error_msg = (
-                        f"Processed data directory '{self.processed_dir}' already exists, but "
-                        f"data regeneration is required. Reason: {force_regen_reason}. "
-                        "Please remove this directory and run again."
-                    )
-                    self.logger.error(error_msg)
-                    import sys
-                    sys.exit(1)
-
-                # Create the directory now that we know it's needed and doesn't exist.
-                self.processed_dir.mkdir(parents=True, exist_ok=True)
-                
-                preprocessor = DataPreprocessor(
-                    raw_files=self.raw_data_files,
-                    output_dir=self.processed_dir,
-                    config=self.config
-                )
-                
-                # Check for missing files
-                missing = [p for p in self.raw_data_files if not p.exists()]
-                if missing:
-                    raise FileNotFoundError(f"Missing raw data files: {missing}")
-                
-                # Process to shards
-                preprocessor.process_to_npy_shards()
-                
-                # Save the hash with version info
-                save_json({
-                    "hash": current_hash,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "preprocessor_version": "v2_fixed_hash",  # Match the version in _compute_data_hash
-                    "config_snapshot": {
-                        "normalization": self.config.get("normalization", {}),
-                        "preprocessing": self.config.get("preprocessing", {}),
-                    }
-                }, hash_file)
-                
-                self.logger.info("Data preprocessing complete. Files saved to: %s", self.processed_dir)
-    
-    def _log_memory_status(self):
-        """Log current memory status."""
-        mem = psutil.virtual_memory()
-        self.logger.info(
-            "System memory: %.1fGB total, %.1fGB available (%.1f%% used)",
-            mem.total/1024**3, mem.available/1024**3, mem.percent
-        )
-        
-        if self.device.type == "cuda":
-            idx = 0 if self.device.index is None else self.device.index
-            free_mem, total_mem = torch.cuda.mem_get_info(idx)
-            used_mem = total_mem - free_mem
-            self.logger.info(
-                "GPU memory: %.1fGB total, %.1fGB free, %.1fGB used",
-                total_mem/1024**3, free_mem/1024**3, used_mem/1024**3
+        if total_gb < 8:
+            self.logger.warning(
+                f"GPU has only {total_gb:.1f}GB memory. "
+                "Recommended minimum is 8GB. May encounter out-of-memory errors."
             )
-        
-    def train_model(self):
-            """Train the neural network model."""        
-            # Ensure data is preprocessed
-            self.preprocess_data()
-            
-            # Save config for this run
-            save_json(self.config, self.run_save_dir / "config.json")
-            
-            # Create model
-            model = create_model(self.config, self.device)
-            
-            # Log model info
-            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            self.logger.info("Model: %s - Parameters: %d", self.config['model']['type'], total_params)
-            
-            # Load normalization stats
-            norm_file = self.processed_dir / "normalization.json"
-            if not norm_file.exists():
-                raise FileNotFoundError(f"Normalization file missing: {norm_file}")
-            norm_stats = load_json(norm_file)
-            
-            norm_helper = NormalizationHelper(
-                stats=norm_stats,
-                device=self.device,
+
+        optimize_hardware(self.config["system"], self.device)
+
+        # Log GPU info
+        props = torch.cuda.get_device_properties(self.device.index or 0)
+        self.logger.info(
+            f"Using GPU: {props.name} ({props.total_memory / 1e9:.1f}GB, "
+            f"Compute Capability {props.major}.{props.minor})"
+        )
+
+        self.logger.info("AE-DeepONet pipeline initialized (GPU mode)")
+
+    def setup_paths(self):
+        """Create directory structure."""
+        paths = self.config["paths"]
+
+        # Run directory
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.run_dir = Path(paths["model_save_dir"]) / f"ae_deeponet_{timestamp}"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        # Data paths
+        self.raw_data_files = [Path(f) for f in paths["raw_data_files"]]
+        self.processed_dir = Path(paths["processed_data_dir"])
+        self.latent_dir = self.processed_dir.parent / "latent_data"
+        self.log_dir = Path(paths["log_dir"])
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    def preprocess_data(self):
+        """Preprocess raw data if needed with strict validation."""
+        if not self.processed_dir.exists() or not (self.processed_dir / "normalization.json").exists():
+            self.logger.info("Preprocessing data...")
+
+            # STRICT validation of global variables
+            global_vars = self.config["data"]["global_variables"]
+            expected_globals = self.config["data"].get("expected_globals", ["P", "T"])
+
+            if global_vars != expected_globals:
+                raise ValueError(
+                    f"Global variables mismatch: got {global_vars}, expected {expected_globals}. "
+                    f"The AE-DeepONet branch network requires exactly {expected_globals}. "
+                    f"Please update your config to match your data format."
+                )
+
+            if len(global_vars) != 2:
+                raise ValueError(
+                    f"Expected exactly 2 global variables, got {len(global_vars)}: {global_vars}"
+                )
+
+            self.logger.info(f"Global variables validated: {global_vars} (P=pressure, T=temperature)")
+
+            # Validate time normalization method
+            time_var = self.config["data"]["time_variable"]
+            time_norm_method = self.config["normalization"]["methods"].get(time_var,
+                                                                           self.config["normalization"][
+                                                                               "default_method"])
+
+            if time_norm_method != "log-min-max":
+                self.logger.warning(
+                    f"Time variable '{time_var}' using '{time_norm_method}' normalization. "
+                    f"Recommended: 'log-min-max' for log-spaced time grids."
+                )
+
+            preprocessor = DataPreprocessor(
+                raw_files=self.raw_data_files,
+                output_dir=self.processed_dir,
                 config=self.config
             )
-            
-            # Log memory status
-            self._log_memory_status()
-            
-            # Create datasets with proper cleanup
-            self.logger.info("Loading datasets...")
-            train_dataset = None
-            val_dataset = None
-            test_dataset = None
-            trainer = None
-            
-            try:
-                # Determine if we need to disable cache for multi-worker loading
-                # Fallback to preprocessing config for num_workers for convenience
-                train_cfg = self.config.get("training", {})
-                prep_cfg = self.config.get("preprocessing", {})
-                num_workers = train_cfg.get("num_workers", prep_cfg.get("num_workers", 0))
+            preprocessor.process_to_npy_shards()
 
-                disable_cache = num_workers > 0
-                
-                train_dataset = SequenceDataset(
-                    self.processed_dir, "train", self.config, self.device, 
-                    norm_stats, disable_cache=disable_cache
+            self.logger.info("Data preprocessing complete")
+        else:
+            self.logger.info("Using existing preprocessed data")
+
+            # Still validate the existing data matches expectations
+            norm_stats = load_json(self.processed_dir / "normalization.json")
+
+            # Check time normalization
+            time_var = self.config["data"]["time_variable"]
+            time_method = norm_stats.get("normalization_methods", {}).get(time_var)
+
+            if time_method != "log-min-max":
+                self.logger.warning(
+                    f"Existing data has time normalized with '{time_method}'. "
+                    f"Config specifies 'log-min-max'. This may cause issues."
                 )
-                
-                if self.config.get("training", {}).get("val_fraction", 0.0) > 0:
-                    val_dataset = SequenceDataset(
-                        self.processed_dir, "validation", self.config, self.device, 
-                        norm_stats, disable_cache=disable_cache
-                    )
-                
-                if self.config.get("training", {}).get("test_fraction", 0.0) > 0:
-                    test_dataset = SequenceDataset(
-                        self.processed_dir, "test", self.config, self.device, 
-                        norm_stats, disable_cache=disable_cache
-                    )
-                
-                self.logger.info("Train samples: %d", len(train_dataset))
-                if val_dataset:
-                    self.logger.info("Validation samples: %d", len(val_dataset))
-                if test_dataset:
-                    self.logger.info("Test samples: %d", len(test_dataset))
-                
-                # Initialize trainer
-                trainer = Trainer(
-                    model=model,
-                    train_dataset=train_dataset,
-                    val_dataset=val_dataset,
-                    test_dataset=test_dataset,
-                    config=self.config,
-                    save_dir=self.run_save_dir,
-                    device=self.device,
-                    norm_helper=norm_helper,
-                    processed_dir=self.processed_dir
-                )
-                    
-                # Train model
-                best_val_loss = trainer.train()
-                
-                # Evaluate on test set
-                test_loss = float("inf")
-                if test_dataset:
-                    test_loss = trainer.evaluate_test()
-                
-                self.logger.info("Training complete! Best validation loss: %.6f", best_val_loss)
-                if test_loss != float("inf"):
-                    self.logger.info("Test loss: %.6f", test_loss)
-                
-                # Save results
-                results = {
-                    "best_val_loss": best_val_loss,
-                    "test_loss": test_loss,
-                    "model_path": str(self.run_save_dir / "best_model.pt"),
-                    "training_time": trainer.total_training_time,
-                    "best_epoch": trainer.best_epoch,
-                }
-                
-                save_json(results, self.run_save_dir / "results.json")
-                
-                return results
-                
-            finally:
-                # Ensure datasets are properly cleaned up
-                for dataset in [train_dataset, val_dataset, test_dataset]:
-                    if dataset is not None:
-                        try:
-                            dataset.close()
-                        except Exception as e:
-                            self.logger.debug("Error closing dataset: %s", e)
-                
-                # Clean up trainer
-                if trainer is not None:
-                    del trainer
-                
-                # Clean up model
-                if 'model' in locals():
-                    del model
-                
-                # Force GPU memory cleanup
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
-    
-    def run(self):
-        """Execute the full training pipeline."""
+
+    def stage1_train_autoencoder(self):
+        """Stage 1: Train autoencoder for dimensionality reduction."""
+        self.logger.info("=" * 60)
+        self.logger.info("Stage 1: Autoencoder Training")
+        self.logger.info("=" * 60)
+
+        # Check if already trained
+        ae_checkpoint = self.run_dir / "ae_pretrained.pt"
+        if ae_checkpoint.exists():
+            self.logger.info("Autoencoder already trained, skipping...")
+            return
+
+        # Load data to GPU
+        norm_stats = load_json(self.processed_dir / "normalization.json")
+
         try:
-            results = self.train_model()
+            train_dataset = GPUSequenceDataset(
+                self.processed_dir, "train", self.config, self.device, norm_stats
+            )
+
+            val_dataset = None
+            if self.config["training"].get("val_fraction", 0) > 0:
+                val_dataset = GPUSequenceDataset(
+                    self.processed_dir, "validation", self.config, self.device, norm_stats
+                )
+        except RuntimeError as e:
+            self.logger.error(f"Failed to load datasets to GPU: {e}")
+            self.logger.error("Consider reducing batch size or data size")
+            raise
+
+        # Create dataloaders (no workers needed for GPU datasets)
+        train_loader = create_gpu_dataloader(train_dataset, self.config, shuffle=True)
+        val_loader = create_gpu_dataloader(val_dataset, self.config, shuffle=False) if val_dataset else None
+
+        # Create model
+        model = create_model(self.config, self.device)
+
+        # Create trainer and train
+        trainer = Trainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=self.config,
+            save_dir=self.run_dir / "stage1_ae",
+            device=self.device,
+            is_latent_stage=False
+        )
+
+        # Train autoencoder
+        ae_epochs = self.config["training"].get("ae_pretrain_epochs", 100)
+        trainer.train_ae_pretrain(ae_epochs)
+
+        self.logger.info("Autoencoder training complete")
+
+        # Clean up GPU memory
+        del train_dataset, val_dataset, trainer, model
+        torch.cuda.empty_cache()
+
+    def stage2_generate_latent_data(self):
+        """Stage 2: Generate latent dataset."""
+        self.logger.info("=" * 60)
+        self.logger.info("Stage 2: Generating Latent Dataset")
+        self.logger.info("=" * 60)
+
+        # Check if already generated
+        if self.latent_dir.exists() and (self.latent_dir / "latent_shard_index.json").exists():
+            self.logger.info("Latent dataset already exists, skipping...")
+            return
+
+        # Load pretrained autoencoder
+        model = create_model(self.config, self.device)
+        checkpoint = torch.load(self.run_dir / "stage1_ae" / "ae_pretrained.pt", map_location=self.device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Generate latent dataset
+        try:
+            generate_latent_dataset(
+                model=model,
+                input_dir=self.processed_dir,
+                output_dir=self.latent_dir,
+                config=self.config,
+                device=self.device
+            )
+        except RuntimeError as e:
+            self.logger.error(f"Failed to generate latent dataset: {e}")
+            raise
+
+        self.logger.info("Latent dataset generation complete")
+
+        # Verify the generated data
+        latent_index = load_json(self.latent_dir / "latent_shard_index.json")
+        self.logger.info(f"Generated latent data with dimension {latent_index['latent_dim']}")
+        self.logger.info(f"Trunk times: {latent_index['trunk_times']}")
+
+        # Clean up
+        del model
+        torch.cuda.empty_cache()
+
+    def stage3_train_deeponet(self):
+        """Stage 3: Train DeepONet on latent space."""
+        self.logger.info("=" * 60)
+        self.logger.info("Stage 3: DeepONet Training on Latent Space")
+        self.logger.info("=" * 60)
+
+        # Load latent datasets to GPU
+        try:
+            train_dataset = GPULatentDataset(self.latent_dir, "train", self.config, self.device)
+
+            val_dataset = None
+            if self.config["training"].get("val_fraction", 0) > 0:
+                val_dataset = GPULatentDataset(self.latent_dir, "validation", self.config, self.device)
+        except RuntimeError as e:
+            self.logger.error(f"Failed to load latent datasets to GPU: {e}")
+            self.logger.error("Consider reducing batch size")
+            raise
+
+        # Create dataloaders
+        train_loader = create_gpu_dataloader(train_dataset, self.config, shuffle=True)
+        val_loader = create_gpu_dataloader(val_dataset, self.config, shuffle=False) if val_dataset else None
+
+        # Create model and load pretrained autoencoder
+        model = create_model(self.config, self.device)
+        ae_checkpoint = torch.load(self.run_dir / "stage1_ae" / "ae_pretrained.pt", map_location=self.device)
+
+        # Load only autoencoder weights
+        ae_state = {k: v for k, v in ae_checkpoint["model_state_dict"].items()
+                    if 'autoencoder' in k}
+        model.load_state_dict(ae_state, strict=False)
+
+        # Freeze autoencoder if specified
+        if self.config["training"].get("freeze_ae_after_pretrain", True):
+            for param in model.autoencoder.parameters():
+                param.requires_grad = False
+            self.logger.info("Froze autoencoder parameters")
+
+        # Create trainer
+        trainer = Trainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=self.config,
+            save_dir=self.run_dir / "stage3_deeponet",
+            device=self.device,
+            is_latent_stage=True
+        )
+
+        # Train DeepONet
+        best_loss = trainer.train_deeponet()
+
+        self.logger.info(f"DeepONet training complete. Best loss: {best_loss:.6e}")
+
+        # Save results
+        results = {
+            "best_val_loss": best_loss,
+            "model_path": str(self.run_dir / "stage3_deeponet" / "best_model.pt"),
+            "config": self.config
+        }
+        save_json(results, self.run_dir / "results.json")
+
+        # Clean up
+        del train_dataset, val_dataset, trainer, model
+        torch.cuda.empty_cache()
+
+    def run(self):
+        """Execute the complete 3-stage pipeline."""
+        try:
+            # Log GPU memory at start
+            free_mem, total_mem = torch.cuda.mem_get_info(self.device.index or 0)
+            self.logger.info(
+                f"Starting pipeline with {free_mem / 1e9:.1f}GB/{total_mem / 1e9:.1f}GB GPU memory free"
+            )
+
+            # Preprocess data if needed
+            self.preprocess_data()
+
+            # Stage 1: Train autoencoder
+            self.stage1_train_autoencoder()
+
+            # Stage 2: Generate latent dataset
+            self.stage2_generate_latent_data()
+
+            # Stage 3: Train DeepONet
+            self.stage3_train_deeponet()
+
+            self.logger.info("=" * 60)
             self.logger.info("Pipeline completed successfully!")
-            self.logger.info("Results saved in: %s", self.run_save_dir)
-            return results
-        except KeyboardInterrupt:
-            self.logger.info("Pipeline interrupted by user")
-            raise
+            self.logger.info(f"Results saved in: {self.run_dir}")
+
         except Exception as e:
-            self.logger.error("Pipeline failed: %s", e, exc_info=True)
+            self.logger.error(f"Pipeline failed: {e}", exc_info=True)
             raise
+        finally:
+            # Final GPU cleanup
+            torch.cuda.empty_cache()
 
 
 def main():
     """Main entry point."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Chemical Kinetics Neural Network")
+    parser = argparse.ArgumentParser(description="AE-DeepONet for Chemical Kinetics (GPU-only)")
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("config/config.jsonc"),
-        help="Path to configuration file",
-    )
-
-    # Add mutually exclusive group for train/tune
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--train",
-        action="store_true",
-        help="Train a model using the configuration",
-    )
-    group.add_argument(
-        "--tune",
-        action="store_true",
-        help="Run hyperparameter optimization",
-    )
-
-    # Hyperparameter tuning specific arguments
-    parser.add_argument(
-        "--n-trials",
-        type=int,
-        default=50,
-        help="Number of trials for hyperparameter optimization",
-    )
-    parser.add_argument(
-        "--n-jobs",
-        type=int,
-        default=1,
-        help="Number of parallel jobs for optimization",
-    )
-    parser.add_argument(
-        "--study-name",
-        type=str,
-        default=None,
-        help="Name for the Optuna study",
-    )
-    parser.add_argument(
-        "--no-hyperband",
-        action="store_true",
-        help="Disable Hyperband pruning",
+        required=True,
+        help="Path to configuration file"
     )
 
     args = parser.parse_args()
 
-    # Validate config path
     if not args.config.exists():
-        print(f"Error: Configuration file not found: {args.config}", file=sys.stderr)
+        print(f"Error: Configuration file not found: {args.config}")
         sys.exit(1)
 
-    if args.train:
-        # Regular training
-        pipeline = None
-        try:
-            pipeline = ChemicalKineticsPipeline(args.config)
-            pipeline.run()
-        finally:
-            # Cleanup
-            if pipeline is not None:
-                del pipeline
-            # Force final GPU cleanup
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    elif args.tune:
-        # HPO run
-        from hyperparameter_tuning import optimize_hyperparameters
-
-        # Set up logging for HPO so Optuna & our tuner logs are captured
-        cfg = load_json_config(args.config)
-        log_dir = Path(cfg["paths"]["log_dir"])
-        log_dir.mkdir(parents=True, exist_ok=True)
-        setup_logging(log_file=log_dir / f"hpo_{time.strftime('%Y%m%d_%H%M%S')}.log")
-        logging.getLogger().setLevel(logging.INFO)
-
-        # Optional: enable TF32 matmul on A100s for speed (and silence warning)
-        if torch.cuda.is_available():
-            try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
-
-        try:
-            study = optimize_hyperparameters(
-                config_path=args.config,
-                n_trials=args.n_trials,
-                n_jobs=args.n_jobs,
-                study_name=args.study_name,
-                use_hyperband=not args.no_hyperband,
-            )
-            print(f"\nOptimization complete. Study saved as: {study.study_name}")
-        finally:
-            # Force GPU cleanup after HPO
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    else:
-        parser.print_help()
+    # Check for CUDA availability
+    if not torch.cuda.is_available():
+        print("Error: CUDA GPU required. No GPU detected.")
+        print("This implementation requires an NVIDIA GPU with CUDA support.")
         sys.exit(1)
+
+    pipeline = AEDeepONetPipeline(args.config)
+    pipeline.run()
 
 
 if __name__ == "__main__":

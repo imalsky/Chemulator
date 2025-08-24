@@ -1,106 +1,143 @@
 {
+  // Path configurations for data, models, and logs.
   "paths": {
     "raw_data_files": [
       "data/raw/run9001-result.h5",
-      "data/raw/run9002-result.h5",
-      "data/raw/run9003-result.h5",
-      "data/raw/run9004-result.h5",
-      "data/raw/run9005-result.h5",
-      "data/raw/run9006-result.h5",
-      "data/raw/run9007-result.h5",
-      "data/raw/run9008-result.h5",
-      "data/raw/run9009-result.h5",
-      "data/raw/run9010-result.h5"
+      "data/raw/run9002-result.h5"
     ],
-    "processed_data_dir": "data/processed",
-    "model_save_dir": "data/models",
+    "processed_data_dir": "data/processed-ae-don",
+    "model_save_dir": "models",
     "log_dir": "logs"
   },
 
+  // Data-related specifications.
   "data": {
+    // List of species variables from the dataset (input to the autoencoder).
     "species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
+
+    // Target variables for the autoencoder (typically the same as species_variables).
     "target_species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
+
+    // Global parameters that act as conditions for the DeepONet branch network.
     "global_variables": ["P", "T"],
+
+    // Expected global variable names for validation.
+    "expected_globals": ["P", "T"],
+
+    // Name of the time variable in the dataset.
     "time_variable": "t_time"
   },
 
+  // Preprocessing settings for handling the raw data.
   "preprocessing": {
     "min_value_threshold": 1e-25,
     "num_workers": 8,
     "hdf5_chunk_size": 16384,
-    "trajectories_per_shard": 100000,
-    "npz_compressed": false
+    "trajectories_per_shard": 10000,
+    "npz_compressed": true
   },
 
+  // Normalization settings for all variables.
   "normalization": {
     "default_method": "log-standard",
     "methods": {
-      "T": "standard",
+      "t_time": "log-min-max",
       "P": "log-standard",
-      "t_time": "log-min-max"
+      "T": "standard"
     },
     "epsilon": 1e-30,
     "min_std": 1e-10,
-    "clamp_value": 999.0
+    "clamp_value": 50.0
   },
+
+  // Model-specific hyperparameters and architecture.
   "model": {
-    "type": "linear_latent",
-    "latent_dim": 128,
+    "type": "AE_DeepONet",
 
-    "encoder_layers": [512, 512, 512, 512],
-    "decoder_layers": [192, 256, 256, 256],
-    "tau_layers": [128, 128, 128, 128],
+    // The dimension of the compressed latent space.
+    "latent_dim": 6,
 
-    "activation": "silu",
+    // Number of basis functions per latent dimension in the DeepONet.
+    "p": 10,
+
+    // Normalized time points [0,1] at which the trunk network is evaluated.
+    "trunk_times": [0.25, 0.5, 0.75, 1.0],
+
+    // If true, applies Partition of Unity regularization to the trunk network.
+    "use_pou": false,
+
+    // --- CONFIGURABLE ARCHITECTURE ---
+    // Defines the hidden layers of the Autoencoder's encoder.
+    // Example: [128, 128, 128] creates three hidden layers of 128 units each.
+    // The model automatically handles the input (num_species) and output (latent_dim) layers.
+    "ae_encoder_layers": [128, 128, 128],
+
+    // Defines the hidden layers of the Autoencoder's decoder.
+    // The model automatically handles the input (latent_dim) and output (num_species) layers.
+    "ae_decoder_layers": [128, 128, 128],
+
+    // Defines the hidden layers of the DeepONet's branch network.
+    // The model automatically handles the input (latent_dim + num_globals) and output (latent_dim * p) layers.
+    "branch_layers": [128, 128, 128],
+
+    // Defines the hidden layers of the DeepONet's trunk network.
+    // The model automatically handles the input (1 for time) and output (latent_dim * p) layers.
+    "trunk_layers": [128, 128, 128],
+
+    // Activation function to use in hidden layers.
+    "activation": "leaky_relu",
     "dropout": 0.0,
-    "use_layernorm": true,
-    "max_tau": 50,
-
-    "final_layer_scale": 1.0,
-    "tau_mode": "integral"  // Options: "integral" (monotone) or "direct" (unconstrained MLP)
+    "use_layernorm": false
   },
 
+  // Training process settings.
   "training": {
     "loss": "mse",
+    "ae_pretrain_epochs": 100,
+    "ae_pretrain_lr": 1e-3,
+    "freeze_ae_after_pretrain": true,
+    "epochs": 200,
+    "batch_size": 256,
     "val_fraction": 0.15,
     "test_fraction": 0.15,
     "use_fraction": 1.0,
-
-    "epochs": 100,
-    "batch_size": 256,
-
     "optimizer": "AdamW",
-    "learning_rate": 1e-4,
-    "weight_decay": 5e-5,
-    "betas": [0.85, 0.95],
+    "learning_rate": 1e-3,
+    "weight_decay": 1e-4,
+    "betas": [0.9, 0.999],
     "eps": 1e-8,
-    "gradient_clip": 2.0,
-
+    "gradient_clip": 1.0,
     "scheduler": "cosine",
-    "scheduler_params": { "T_0": 200, "T_mult": 2, "eta_min": 1e-8 },
-
+    "scheduler_params": {
+      "warmup_epochs": 10,
+      "eta_min": 1e-8
+    },
     "use_amp": true,
     "amp_dtype": "bfloat16",
-
     "early_stopping_patience": 30,
-    "min_delta": 1e-8
+    "min_delta": 1e-8,
+    "gpu_cache_dataset": "auto",
+    "num_workers": 0,
+    "prefetch_factor": 2,
+    "pou_weight": 0.01
   },
 
+  // System-level and performance settings.
   "system": {
     "seed": 42,
-    "use_torch_export": true,
-    "use_torch_compile": true,
+    "use_torch_export": false,
+    "use_torch_compile": false,
     "compile_mode": "default",
-    "cudnn_benchmark": false,
-    "tf32": false,
+    "cudnn_benchmark": true,
+    "tf32": true,
     "dtype": "float32"
   }
 }

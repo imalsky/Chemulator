@@ -20,7 +20,7 @@ import h5py
 import numpy as np
 from tqdm.auto import tqdm
 
-from utils.utils import save_json
+from utils import save_json
 
 
 # Configuration constants
