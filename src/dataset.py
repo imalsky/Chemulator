@@ -2,6 +2,7 @@
 """
 GPU-optimized dataset implementations for AE-DeepONet training.
 UPDATED: Support for flexible time point sampling during training.
+UPDATED: Fixed drop_last for validation; clarified shared time grid requirement.
 """
 
 import logging
@@ -242,6 +243,11 @@ class GPUSequenceDataset(Dataset):
 class GPULatentDataset(Dataset):
     """
     GPU-resident dataset for DeepONet training on latent space.
+
+    IMPORTANT: This dataset assumes all trajectories share an identical time grid.
+    The latent generation stage enforces this requirement. If you have per-sample
+    time grids, the latent generation will fail with an error.
+
     Supports fixed/random time point sampling over ALL available times saved in the latent set.
     """
 
@@ -271,8 +277,12 @@ class GPULatentDataset(Dataset):
         trunk_times_list = latent_index.get("trunk_times")
         if not trunk_times_list:
             raise KeyError(f"'trunk_times' missing or empty in {latent_index_path}")
+
+        # IMPORTANT: This is the shared time grid for ALL trajectories
         self.trunk_times = torch.tensor(trunk_times_list, dtype=torch.float32, device=self.device)  # [M_total]
         self.total_time_points = int(self.trunk_times.numel())
+
+        self.logger.info(f"Loaded shared time grid with {self.total_time_points} points")
 
         # Shards for this split
         split_info = latent_index["splits"][split_name]
@@ -284,16 +294,19 @@ class GPULatentDataset(Dataset):
             raise RuntimeError(f"No shards found for split '{split_name}' in latent dataset.")
         first_shard = self.split_dir / self.shards[0]["filename"]
         with np.load(first_shard, allow_pickle=False) as probe:
-            li_shape = probe["latent_inputs"].shape   # [N_probe, L+G]
+            li_shape = probe["latent_inputs"].shape  # [N_probe, L+G]
             lt_shape = probe["latent_targets"].shape  # [N_probe, M_total, L]
         _, in_dim = li_shape
         _, M_total_probe, L_probe = lt_shape
         if M_total_probe != self.total_time_points:
-            raise ValueError("Probe M_total disagrees with trunk_times length; re-generate latent set.")
+            raise ValueError(
+                f"Latent targets time dimension ({M_total_probe}) doesn't match trunk_times length "
+                f"({self.total_time_points}). Regenerate latent dataset."
+            )
 
         N_total = int(split_info["n_trajectories"])
         bytes_per_float = 4
-        floats_inputs  = N_total * in_dim
+        floats_inputs = N_total * in_dim
         floats_targets = N_total * self.total_time_points * L_probe
         est_gb = (floats_inputs + floats_targets) * bytes_per_float * 1.2 / 1e9  # 20% overhead
 
@@ -308,31 +321,34 @@ class GPULatentDataset(Dataset):
         for shard in self.shards:
             shard_path = self.split_dir / shard["filename"]
             with np.load(shard_path, allow_pickle=False) as data:
-                li = torch.from_numpy(data["latent_inputs"].astype(np.float32))   # [N, L+G]
+                li = torch.from_numpy(data["latent_inputs"].astype(np.float32))  # [N, L+G]
                 lt = torch.from_numpy(data["latent_targets"].astype(np.float32))  # [N, M_total, L]
                 all_inputs.append(li)
                 all_targets.append(lt)
 
-        self.inputs  = torch.cat(all_inputs,  dim=0).to(self.device, non_blocking=True)  # [N_tot, L+G]
+        self.inputs = torch.cat(all_inputs, dim=0).to(self.device, non_blocking=True)  # [N_tot, L+G]
         self.targets = torch.cat(all_targets, dim=0).to(self.device, non_blocking=True)  # [N_tot, M,   L]
 
         # Sanity: M must match trunk_times
         if int(self.targets.shape[1]) != self.total_time_points:
-            raise ValueError("Latent targets time dimension != trunk_times length. Re-generate latent set.")
+            raise ValueError(
+                f"Latent targets time dimension ({self.targets.shape[1]}) != trunk_times length "
+                f"({self.total_time_points}). Regenerate latent dataset."
+            )
 
         torch.cuda.synchronize(self.device)
         allocated_gb = torch.cuda.memory_allocated(self.device) / 1e9
         self.logger.info(
             f"Loaded {len(self.inputs)} latent trajectories to GPU. "
             f"Memory allocated: {allocated_gb:.2f} GB. "
-            f"Time points per trajectory (M): {self.total_time_points}"
+            f"Shared time grid: {self.total_time_points} points"
         )
 
         # ---------- Time sampling configuration ----------
         train_cfg = self.config["training"]
         if time_sampling_mode is None:
             self.time_sampling_mode = train_cfg.get("train_time_sampling", "random") if split_name == "train" \
-                                      else train_cfg.get("val_time_sampling", "fixed")
+                else train_cfg.get("val_time_sampling", "fixed")
         else:
             self.time_sampling_mode = time_sampling_mode
 
@@ -351,7 +367,7 @@ class GPULatentDataset(Dataset):
             if fixed_times is not None:
                 req = torch.tensor([float(t) for t in fixed_times], dtype=torch.float32, device=self.device)  # [K]
                 diffs = (self.trunk_times.unsqueeze(0) - req.unsqueeze(1)).abs()  # [K, M_total]
-                idx = diffs.argmin(dim=1)                                         # [K]
+                idx = diffs.argmin(dim=1)  # [K]
                 self.fixed_indices = idx.sort().values
             else:
                 # Evenly spaced subset by count
@@ -363,6 +379,7 @@ class GPULatentDataset(Dataset):
                     step = (self.total_time_points - 1) / float(n_points - 1)
                     self.fixed_indices = torch.round(torch.arange(n_points, device=self.device) * step).long()
         else:
+            # Random time sampling configuration
             if split_name == "train":
                 self.min_time_points = int(train_cfg.get("train_min_time_points", 8))
                 self.max_time_points = int(train_cfg.get("train_max_time_points", 32))
@@ -381,7 +398,7 @@ class GPULatentDataset(Dataset):
         Returns:
             inputs  : [L+G]
             targets : [M_i, L]    (selected latent targets)
-            times   : [M_i]       (the actual normalized trunk times)
+            times   : [M_i]       (the actual normalized trunk times from shared grid)
         """
         if self.randomize_time_points:
             if self.min_time_points == self.max_time_points:
@@ -396,10 +413,9 @@ class GPULatentDataset(Dataset):
             indices = self.fixed_indices
             n_points = int(indices.numel())
 
-        selected_targets = self.targets[idx, indices]    # [M_i, L]
-        time_values     = self.trunk_times[indices]      # [M_i]
+        selected_targets = self.targets[idx, indices]  # [M_i, L]
+        time_values = self.trunk_times[indices]  # [M_i] from shared grid
         return self.inputs[idx], selected_targets, time_values
-
 
 def create_gpu_dataloader(
         dataset: Dataset,
@@ -407,7 +423,10 @@ def create_gpu_dataloader(
         shuffle: bool = True,
         **kwargs
 ) -> DataLoader:
-    """Create DataLoader for GPU-resident datasets."""
+    """Create DataLoader for GPU-resident datasets.
+
+    UPDATED: Fixed drop_last behavior - only drop for training, not validation.
+    """
     batch_size = config["training"]["batch_size"]
 
     # Custom collate function for variable-length time sequences
@@ -442,12 +461,16 @@ def create_gpu_dataloader(
         num_workers = config["training"].get("num_workers", 0)
         pin_memory = True
 
+    # FIXED: Only drop_last for training, not validation
+    # Determine if this is validation based on shuffle=False (validation never shuffles)
+    is_validation = not shuffle
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=True,
+        drop_last=(not is_validation),  # Only drop for training
         **kwargs
     )

@@ -1,9 +1,10 @@
 {
   // AE-DeepONet Configuration File
   // Three-stage training pipeline for chemical kinetics modeling
-  // UPDATED: Latent generation can use ALL available time points.
+  // OPTIMIZED: For 10 fixed time points with paper-like settings
 
   "paths": {
+    // Input HDF5 files (produced by your simulator/export)
     "raw_data_files": [
       "data/raw/run9001-result.h5",
       "data/raw/run9002-result.h5",
@@ -16,126 +17,159 @@
       "data/raw/run9009-result.h5",
       "data/raw/run9010-result.h5"
     ],
+    // Directory containing preprocessed NPZ shards
     "processed_data_dir": "data/processed-10-log-standard",
+    // Root folder for checkpoints
     "model_save_dir": "models",
+    // Root folder for logs
     "log_dir": "logs"
   },
 
   "data": {
+    // Species variables in the dataset
     "species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
+    // Target species (same as input for this case)
     "target_species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
-    // We intentionally use [P,T] (not [φ0,T0])
+    // Global variables: [P, T] instead of paper's [φ₀, T₀]
     "global_variables": ["P", "T"],
+    // Hard validation - must match
     "expected_globals": ["P", "T"],
+    // Time variable name
     "time_variable": "t_time"
   },
 
   "preprocessing": {
+    // Minimum value threshold for species concentrations
     "min_value_threshold": 1e-25,
+    // Parallel workers for preprocessing
     "num_workers": 8,
+    // HDF5 chunk size for reading
     "hdf5_chunk_size": 16384,
+    // Trajectories per NPZ shard
     "trajectories_per_shard": 10000,
+    // Use compression for NPZ files
     "npz_compressed": false
   },
 
   "normalization": {
+    // Default normalization method for species
     "default_method": "log-standard",
     "methods": {
+      // Time MUST be log-min-max for proper [0,1] scaling
       "t_time": "log-min-max",
+      // Pressure uses log-standard (covers wide range)
       "P": "log-standard",
+      // Temperature uses standard normalization
       "T": "standard"
     },
+    // Epsilon for log transforms
     "epsilon": 1e-30,
+    // Minimum std for numerical stability
     "min_std": 1e-10,
+    // Clamp normalized values
     "clamp_value": 50.0
   },
 
   "model": {
     "type": "AE_DeepONet",
+    // Latent dimension for autoencoder
     "latent_dim": 32,
-    "p": 32,
-
-    // Inference fallback ONLY (not used for data generation if mode="all")
+    // DeepONet basis functions (paper uses 10)
+    "p": 10,
+    // Default trunk times for inference (10 points)
     "trunk_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-
-    "use_pou": false,
+    // Trunk basis type: "linear" or "softmax"
+    "trunk_basis": "linear",
+    // Enable PoU regularization for linear basis
+    "use_pou": true,
+    // Architecture: 3 hidden layers for each network
     "ae_encoder_layers": [256, 256, 128],
     "ae_decoder_layers": [128, 256, 256],
     "branch_layers": [256, 256, 128],
     "trunk_layers": [256, 256, 128],
+    // Decoder output mode
     "decoder_output_mode": "linear",
+    // No clamping in normalized space
     "output_clamp": null
   },
 
-  // NEW: Controls how the latent dataset’s time axis is produced.
   "latent_generation": {
-    // "all"  : use ALL available source times from the preprocessed shards (recommended)
-    // "fixed": use the exact times in "fixed_times" (nearest neighbor to source grid)
-    //          If "fixed_times" is omitted, we fall back to model.trunk_times.
-    "mode": "all"
-    // "fixed_times": [0.02, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
+    // Use "fixed" mode for 10 specific time points
+    // This uses nearest-neighbor selection from the source grid
+    "mode": "fixed",
+    // Exactly 10 normalized time points for latent generation
+    "fixed_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
   },
 
   "training": {
-    // Stage 1
+    // Stage 1: Autoencoder pretraining
     "ae_pretrain_epochs": 100,
     "ae_warmup_epochs": 5,
     "freeze_ae_after_pretrain": true,
 
-    // Stage 3
+    // Stage 3: DeepONet training
     "epochs": 200,
-    "batch_size": 256,
+    // Moderate batch size for stability
+    "batch_size": 128,
 
-    // Flexible time sampling during training
-    "train_time_sampling": "random",  // "random" | "fixed"
-    "train_min_time_points": 8,
-    "train_max_time_points": 64,
+    // Training time sampling - use all 10 points
+    "train_time_sampling": "fixed",
+    "train_time_points": 10,
+    "train_fixed_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
 
-    "val_time_sampling": "fixed",     // "random" | "fixed"
-    "val_time_points": 50,            // used if no explicit list is given
+    // Validation time sampling - also use all 10 points
+    "val_time_sampling": "fixed",
+    "val_time_points": 10,
+    "val_fixed_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
 
-    // OPTIONAL explicit lists when using "fixed"
-    // If provided, these override the counts above and are mapped by nearest neighbor.
-    // "train_fixed_times": [0.1, 0.3, 0.5, 0.7, 0.9],
-    // "val_fixed_times":   [0.02, 0.04, 0.06, ..., 1.0],
-
+    // Learning rate schedule
     "learning_rate": 1e-3,
     "min_lr": 1e-6,
     "warmup_epochs": 10,
 
+    // Data splits
     "val_fraction": 0.15,
     "test_fraction": 0.15,
     "use_fraction": 1.0,
 
+    // AdamW optimizer settings
     "weight_decay": 1e-4,
     "betas": [0.9, 0.999],
 
+    // Training stability
     "gradient_clip": 1.0,
     "use_amp": true,
 
-    "pou_weight": 0.001,
+    // PoU regularization weight (small value)
+    "pou_weight": 0.01,
 
-    // Dataloader workers for GPU-resident datasets
+    // Dataloader workers (forced to 0 for GPU datasets)
     "num_workers": 0
   },
 
   "system": {
+    // Random seed for reproducibility
     "seed": 42,
+    // Export model for deployment
     "use_torch_export": true,
+    // Use torch.compile for potential speedup
     "use_torch_compile": true,
     "compile_mode": "default",
+    // CUDA optimizations
     "cudnn_benchmark": true,
     "tf32": true,
     "cuda_memory_fraction": 0.95,
+    // Non-deterministic for speed
     "deterministic": false,
+    // Default precision
     "dtype": "float32"
   }
 }

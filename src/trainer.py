@@ -8,6 +8,7 @@ Features:
 - Partition-of-Unity (PoU) regularization properly integrated
 - Clear logging with normalized space metrics
 - Support for flexible time point sampling during training
+- UPDATED: Clarified loss accumulation (not gradient accumulation)
 """
 
 import logging
@@ -129,7 +130,8 @@ class Trainer:
             config: Dict[str, Any],
             save_dir: Path,
             device: torch.device,
-            is_latent_stage: bool = False
+            is_latent_stage: bool = False,
+            epochs: int = None
     ):
         """
         Initialize the trainer.
@@ -155,6 +157,9 @@ class Trainer:
         self.pou_weight = float(train_cfg.get("pou_weight", 0.0))
         self.warmup_epochs = int(train_cfg.get("warmup_epochs", 10))
         self.min_lr = float(train_cfg.get("min_lr", 1e-6))
+
+        # Set epochs for DeepONet training
+        self.epochs = epochs if epochs is not None else int(train_cfg.get("epochs", 200))
 
         # Choose parameter set by stage:
         # - AE pretrain: only autoencoder parameters
@@ -200,6 +205,8 @@ class Trainer:
         """
         Stage 1: Pretrain autoencoder with cosine annealing scheduler.
 
+        UPDATED: Handles both [B, S] and [B, M, S] input shapes correctly.
+
         Args:
             epochs: Number of epochs to train
 
@@ -228,18 +235,24 @@ class Trainer:
 
             for inputs, targets in self.train_loader:
                 # Move to device
-                targets = targets.to(self.device)  # [B, M, n_species]
+                targets = targets.to(self.device)  # [B, S] or [B, M, S]
 
-                # Flatten for autoencoder
-                B, M, D = targets.shape
-                targets_flat = targets.reshape(B * M, D)
+                # Handle both [B, S] and [B, M, S] shapes
+                # AE is vector→vector reconstruction
+                if targets.dim() == 2:  # [B, S] - direct vector input
+                    inputs_flat = targets
+                elif targets.dim() == 3:  # [B, M, S] - trajectory input
+                    B, M, D = targets.shape
+                    inputs_flat = targets.reshape(B * M, D)
+                else:
+                    raise RuntimeError(f"Unexpected AE target shape: {tuple(targets.shape)}")
 
                 self.optimizer.zero_grad(set_to_none=True)
 
                 # Forward with AMP
                 with autocast('cuda', enabled=self.use_amp):
-                    recon = self.model.autoencoder(targets_flat)
-                    loss = self.criterion(recon, targets_flat)
+                    recon = self.model.autoencoder(inputs_flat)
+                    loss = self.criterion(recon, inputs_flat)
 
                 # Backward
                 self.scaler.scale(loss).backward()
@@ -368,8 +381,13 @@ class Trainer:
         """
         Train one epoch for DeepONet on latent space.
 
-        Uses gradient accumulation across the whole batch (one optimizer step per batch),
-        while supporting variable-length time selections per sample.
+        CLARIFICATION: This implements loss accumulation across samples in a batch,
+        not gradient accumulation across multiple batches. We compute individual
+        losses for each sample (for variable time lengths), sum them, average,
+        then do a single backward() and optimizer.step() per batch.
+
+        This is mathematically equivalent to standard batched training and is NOT
+        microbatching/gradient accumulation.
         """
         self.model.train()
         total_loss = 0.0
@@ -392,7 +410,10 @@ class Trainer:
 
             inputs = inputs.to(self.device, non_blocking=True)
 
-            # ---- Gradient accumulation across the batch ----
+            # ---- Loss accumulation within batch ----
+            # We compute loss for each sample (which may have different time lengths),
+            # sum them up, then average. This is standard batched training, NOT
+            # gradient accumulation across multiple optimizer steps.
             self.optimizer.zero_grad(set_to_none=True)
             batch_loss_sum = 0.0
 
@@ -411,18 +432,22 @@ class Trainer:
                 total_pou += float(comps.get("pou", 0.0))
                 n_samples += 1
 
-                # Sum up losses for a single backward()
+                # Sum up losses for averaging
                 batch_loss_sum = batch_loss_sum + loss_i
 
-            # Normalize by batch size for steady loss scale
+            # Average loss across batch (standard practice)
             with autocast('cuda', enabled=self.use_amp):
                 loss = batch_loss_sum / float(B)
 
-            # Backward once, clip once, step once
+            # Single backward pass per batch (this is NOT gradient accumulation)
             self.scaler.scale(loss).backward()
+
+            # Gradient clipping if configured
             if self.gradient_clip and self.gradient_clip > 0:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+
+            # Single optimizer step per batch
             self.scaler.step(self.optimizer)
             self.scaler.update()
 

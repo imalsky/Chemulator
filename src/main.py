@@ -14,6 +14,7 @@ Features:
 - Configuration persistence
 - Model export for deployment
 - UPDATED: Flexible time point sampling for training
+- UPDATED: Test set evaluation after training
 """
 
 import logging
@@ -45,6 +46,7 @@ class AEDeepONetPipeline:
     1. Autoencoder pretraining
     2. Latent dataset generation
     3. DeepONet training with flexible time sampling
+    4. Test set evaluation
 
     Args:
         config_path: Path to JSON configuration file
@@ -412,7 +414,7 @@ class AEDeepONetPipeline:
         # Train DeepONet
         best_loss = trainer.train_deeponet()
 
-        self.logger.info(f"DeepONet training complete. Best loss: {best_loss:.3e}")
+        self.logger.info(f"DeepONet training complete. Best val loss: {best_loss:.3e}")
 
         # Save final results
         results = {
@@ -428,6 +430,191 @@ class AEDeepONetPipeline:
 
         # Clean up GPU memory
         del train_dataset, val_dataset, trainer, model
+        torch.cuda.empty_cache()
+
+    def evaluate_test_set(self):
+        """
+        Stage 4: Evaluate on test set after training completion.
+
+        Performs comprehensive evaluation on held-out test data including:
+        - Latent space MSE
+        - Decoded species MAE (normalized and physical space)
+        - Per-species error breakdown
+        - Temporal error evolution
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("Stage 4: Test Set Evaluation")
+        self.logger.info("=" * 60)
+
+        # Check test fraction
+        test_frac = self.config["training"].get("test_fraction", 0.0)
+        if test_frac == 0:
+            self.logger.warning("No test set configured (test_fraction=0). Skipping evaluation.")
+            return
+
+        # Load best model
+        best_model_path = self.run_dir / "best_model.pt"
+        if not best_model_path.exists():
+            self.logger.error("Best model checkpoint not found. Please train model first.")
+            return
+
+        # Create model and load weights
+        model = create_model(self.config, self.device)
+        checkpoint = torch.load(best_model_path, map_location=self.device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+
+        # Load normalization helper for physical space evaluation
+        try:
+            from normalizer import NormalizationHelper
+            norm_stats = load_json(self.processed_dir / "normalization.json")
+            norm_helper = NormalizationHelper(norm_stats, self.device, self.config)
+            species_vars = self.config["data"]["target_species_variables"]
+        except Exception as e:
+            self.logger.warning(f"Could not load normalization helper: {e}")
+            norm_helper = None
+            species_vars = None
+
+        # Load test dataset
+        try:
+            # Use all available time points for comprehensive evaluation
+            test_dataset = GPULatentDataset(
+                self.latent_dir,
+                "test",
+                self.config,
+                self.device,
+                time_sampling_mode="fixed",
+                n_time_points=None  # Use all available points
+            )
+        except RuntimeError as e:
+            self.logger.error(f"Failed to load test dataset: {e}")
+            return
+
+        test_loader = create_gpu_dataloader(test_dataset, self.config, shuffle=False)
+
+        # Evaluation metrics
+        total_mse = 0.0
+        total_mae_norm = 0.0
+        total_mae_phys = 0.0
+        per_species_mae_norm = torch.zeros(len(species_vars), device=self.device)
+        per_species_mae_phys = torch.zeros(len(species_vars), device=self.device)
+        temporal_errors = []
+        n_samples = 0
+        n_time_points = 0
+
+        self.logger.info(f"Evaluating on {len(test_dataset)} test trajectories...")
+
+        with torch.no_grad():
+            for batch_data in test_loader:
+                inputs, targets_list, times_list = batch_data
+                B = inputs.size(0)
+
+                for i in range(B):
+                    input_i = inputs[i:i + 1]
+                    targets_i = targets_list[i].unsqueeze(0)
+                    times_i = times_list[i]
+
+                    # Get predictions
+                    z_pred, _ = model(input_i, decode=False, trunk_times=times_i)
+
+                    # Latent space MSE
+                    mse = torch.nn.functional.mse_loss(z_pred, targets_i)
+                    total_mse += mse.item()
+
+                    # Decode to species space
+                    y_pred, _ = model(input_i, decode=True, trunk_times=times_i)
+                    B1, M, LD = targets_i.shape
+                    y_true = model.decode(targets_i.reshape(B1 * M, LD)).view(B1, M, -1)
+
+                    # Normalized space MAE
+                    mae_norm = (y_pred - y_true).abs()
+                    total_mae_norm += mae_norm.mean().item()
+
+                    # Per-species normalized MAE
+                    per_species_mae_norm += mae_norm.mean(dim=(0, 1))
+
+                    # Physical space evaluation if available
+                    if norm_helper is not None:
+                        y_pred_phys = norm_helper.denormalize(
+                            y_pred.reshape(-1, y_pred.shape[-1]), species_vars
+                        ).view_as(y_pred)
+                        y_true_phys = norm_helper.denormalize(
+                            y_true.reshape(-1, y_true.shape[-1]), species_vars
+                        ).view_as(y_true)
+
+                        mae_phys = (y_pred_phys - y_true_phys).abs()
+                        total_mae_phys += mae_phys.mean().item()
+                        per_species_mae_phys += mae_phys.mean(dim=(0, 1))
+
+                        # Temporal error evolution
+                        temporal_mae = mae_phys.mean(dim=2).squeeze(0)  # [M]
+                        temporal_errors.append((times_i.cpu().numpy(), temporal_mae.cpu().numpy()))
+
+                    n_samples += 1
+                    n_time_points += M
+
+        # Compute averages
+        avg_mse = total_mse / n_samples
+        avg_mae_norm = total_mae_norm / n_samples
+        avg_mae_phys = total_mae_phys / n_samples if norm_helper else 0.0
+        per_species_mae_norm /= n_samples
+        per_species_mae_phys /= n_samples
+
+        # Log results
+        self.logger.info("=" * 60)
+        self.logger.info("TEST SET EVALUATION RESULTS")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Number of test trajectories: {n_samples}")
+        self.logger.info(f"Total time points evaluated: {n_time_points}")
+        self.logger.info(f"Average MSE (latent space): {avg_mse:.3e}")
+        self.logger.info(f"Average MAE (normalized): {avg_mae_norm:.3e}")
+
+        if norm_helper:
+            self.logger.info(f"Average MAE (physical): {avg_mae_phys:.3e}")
+            self.logger.info("\nPer-species MAE (physical space):")
+            for i, species in enumerate(species_vars):
+                self.logger.info(f"  {species:20s}: {per_species_mae_phys[i].item():.3e}")
+
+        # Save test results
+        test_results = {
+            "n_test_samples": n_samples,
+            "n_time_points": n_time_points,
+            "latent_mse": avg_mse,
+            "normalized_mae": avg_mae_norm,
+            "physical_mae": avg_mae_phys if norm_helper else None,
+            "per_species_mae_norm": per_species_mae_norm.cpu().numpy().tolist(),
+            "per_species_mae_phys": per_species_mae_phys.cpu().numpy().tolist() if norm_helper else None,
+            "species_names": species_vars,
+            "evaluation_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        # Add temporal error information if available
+        if temporal_errors:
+            # Average temporal errors across all samples
+            import numpy as np
+            all_times = np.concatenate([t for t, _ in temporal_errors])
+            unique_times = np.unique(all_times)
+            avg_temporal_mae = []
+
+            for t in unique_times:
+                errors_at_t = []
+                for times, errors in temporal_errors:
+                    idx = np.where(np.abs(times - t) < 1e-6)[0]
+                    if len(idx) > 0:
+                        errors_at_t.append(errors[idx[0]])
+                if errors_at_t:
+                    avg_temporal_mae.append(np.mean(errors_at_t))
+
+            test_results["temporal_evolution"] = {
+                "times": unique_times.tolist(),
+                "mae_physical": avg_temporal_mae
+            }
+
+        save_json(test_results, self.run_dir / "test_results.json")
+        self.logger.info(f"\nTest results saved to {self.run_dir / 'test_results.json'}")
+
+        # Clean up
+        del model, test_dataset
         torch.cuda.empty_cache()
 
     def _export_model_for_deployment(self, model: torch.nn.Module):
@@ -476,13 +663,14 @@ class AEDeepONetPipeline:
 
     def run(self):
         """
-        Execute the complete 3-stage training pipeline.
+        Execute the complete 3-stage training pipeline plus test evaluation.
 
-        Runs all three stages sequentially:
+        Runs all stages sequentially:
         1. Data preprocessing (if needed)
         2. Autoencoder pretraining
         3. Latent data generation
         4. DeepONet training with flexible time sampling
+        5. Test set evaluation
         """
         try:
             # Log initial GPU memory status
@@ -502,6 +690,9 @@ class AEDeepONetPipeline:
 
             # Stage 3: Train DeepONet
             self.stage3_train_deeponet()
+
+            # Stage 4: Evaluate on test set
+            self.evaluate_test_set()
 
             self.logger.info("=" * 60)
             self.logger.info("Pipeline completed successfully!")
@@ -532,6 +723,7 @@ The pipeline will:
   2. Train autoencoder for dimensionality reduction
   3. Generate latent dataset (always fresh)
   4. Train DeepONet on latent space with flexible time sampling
+  5. Evaluate on test set
 
 All models and logs are saved in a timestamped directory.
         """
