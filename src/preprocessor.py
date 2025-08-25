@@ -435,7 +435,7 @@ class SingleFileProcessor:
             # Use a tolerance-based check consistent with the model,
             # allowing duplicate time points (diff=0) but rejecting decreasing time.
             time_diffs = np.diff(time_data)
-            if np.any(time_diffs < -1e-9):
+            if np.any(time_diffs < -1e-12):
                 self.stats.dropped_non_finite += 1
                 return None
             
