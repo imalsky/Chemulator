@@ -2,7 +2,7 @@
 """
 Generate latent dataset for DeepONet training (Stage 2 of paper).
 Uses normalized time coordinates matching trunk network expectations.
-UPDATED: Enforces shared time grid requirement explicitly.
+FIXED: Time normalization validation, vectorized encoding for efficiency
 """
 
 import logging
@@ -36,7 +36,7 @@ def generate_latent_dataset(
     if device.type != "cuda":
         raise RuntimeError("Latent dataset generation requires CUDA device.")
 
-    # ---- Early exit if latent dataset already exists ----
+    # Early exit if latent dataset already exists
     if output_dir.exists() and (output_dir / "latent_shard_index.json").exists():
         logger.warning(f"Latent dataset already exists at {output_dir}. Skipping generation.")
         return
@@ -77,8 +77,15 @@ def generate_latent_dataset(
         fixed_times_list = lg_cfg.get("fixed_times") or config["model"].get("trunk_times")
         if not fixed_times_list:
             raise ValueError("latent_generation.mode='fixed' requires 'fixed_times' or model.trunk_times.")
-        if not all(0.0 <= float(t) <= 1.0 for t in fixed_times_list):
+        # Enforce sorted, unique, in-range fixed times
+        fixed_times = sorted(float(t) for t in fixed_times_list)
+        fixed_times_unique = []
+        for t in fixed_times:
+            if not fixed_times_unique or abs(t - fixed_times_unique[-1]) > 1e-12:
+                fixed_times_unique.append(t)
+        if not all(0.0 <= t <= 1.0 for t in fixed_times_unique):
             raise ValueError(f"Fixed times must be in [0,1], got {fixed_times_list}")
+        fixed_times_list = fixed_times_unique
 
     # Build latent shard index
     new_shard_index = {
@@ -134,13 +141,9 @@ def generate_latent_dataset(
                 else:
                     raise ValueError(f"'t_vec' must be [M] or [N,M], got shape {t_np.shape}")
 
-                # Validate normalized time is in [0,1] and monotonic
-                if per_sample_times:
-                    t_min, t_max = t_norm.min().item(), t_norm.max().item()
-                else:
-                    t_min, t_max = t_norm.min().item(), t_norm.max().item()
-
-                if t_min < -1e-6 or t_max > 1.0 + 1e-6:
+                # Validate normalized time is strictly in [0,1]
+                t_min, t_max = t_norm.min().item(), t_norm.max().item()
+                if t_min < -1e-12 or t_max > 1.0 + 1e-12:
                     raise ValueError(
                         f"Normalized times must be in [0,1]. Got range [{t_min:.6f}, {t_max:.6f}]. "
                         f"Check normalization for '{time_var}'."
@@ -149,7 +152,6 @@ def generate_latent_dataset(
                 # Monotonicity checks
                 if per_sample_times:
                     N, M = t_norm.shape
-                    # Check each trajectory is non-decreasing
                     for n in range(N):
                         diffs = torch.diff(t_norm[n])
                         if (diffs < -1e-12).any():
@@ -164,7 +166,6 @@ def generate_latent_dataset(
                 if lg_mode == "all":
                     if per_sample_times:
                         # STRICT requirement: all trajectories must share identical time grid
-                        # Check with tolerance for floating point precision
                         time_diff = (t_norm - t_norm[0].unsqueeze(0)).abs().max().item()
                         if time_diff > time_tolerance:
                             raise RuntimeError(
@@ -172,7 +173,7 @@ def generate_latent_dataset(
                                 f"Found maximum time difference of {time_diff:.2e} (tolerance: {time_tolerance:.2e}). "
                                 f"Consider using mode='fixed' or ensuring consistent time grids in preprocessing."
                             )
-                        times_used = t_norm[0]  # [M] - use first row as canonical
+                        times_used = t_norm[0]  # [M]
                         logger.debug(f"Per-sample times detected, verified identical (diff={time_diff:.2e})")
                     else:
                         times_used = t_norm  # [M]
@@ -201,16 +202,26 @@ def generate_latent_dataset(
                         y_selected = y_norm[:, idx, :]  # [N, K, S]
                         trunk_times_tensor = t_norm[idx]  # ACTUAL NN times
 
-                # Encode to latent space
+                # Vectorized encoding with AMP and chunking to avoid OOM
                 N = x0_norm.shape[0]
                 latent_dim = int(config["model"]["latent_dim"])
-
-                z0 = model.encode(x0_norm)  # [N, L]
-
                 K = int(y_selected.size(1))
-                z_targets = torch.empty((N, K, latent_dim), dtype=torch.float32, device=device)
-                for j in range(K):
-                    z_targets[:, j, :] = model.encode(y_selected[:, j, :])
+
+                # Encode initial conditions
+                from torch.amp import autocast  # local import to avoid changing file-level imports
+                with autocast('cuda', enabled=True):
+                    z0 = model.encode(x0_norm)  # [N, L]
+
+                # Encode all time points in chunks: [N*K, S] -> [N*K, L]
+                y_flat = y_selected.reshape(N * K, -1)
+                chunk = int(lg_cfg.get("encode_chunk_size", 65536))
+                z_chunks = []
+                with autocast('cuda', enabled=True):
+                    for start in range(0, y_flat.size(0), chunk):
+                        end = min(start + chunk, y_flat.size(0))
+                        z_chunks.append(model.encode(y_flat[start:end]))
+                z_flat = torch.cat(z_chunks, dim=0)
+                z_targets = z_flat.reshape(N, K, latent_dim)  # [N, K, L]
 
                 # Move to CPU for saving
                 z0_cpu = z0.to(dtype=torch.float32, device='cpu')
@@ -239,7 +250,6 @@ def generate_latent_dataset(
                     shared_time_vec = times_list
                     logger.info(f"Established shared time grid with {len(times_list)} points")
                 else:
-                    # Verify consistency with tolerance
                     if len(shared_time_vec) != len(times_list):
                         raise RuntimeError(
                             f"Inconsistent time grid lengths: {len(shared_time_vec)} vs {len(times_list)}. "
@@ -262,6 +272,11 @@ def generate_latent_dataset(
     # Finalize index and copy normalization
     if shared_time_vec is None:
         raise RuntimeError("No shards processed; cannot finalize latent index.")
+
+    # Ensure shared grid is non-decreasing
+    if any(shared_time_vec[i] > shared_time_vec[i + 1] for i in range(len(shared_time_vec) - 1)):
+        raise RuntimeError("Shared trunk_times must be non-decreasing.")
+
     new_shard_index["trunk_times"] = shared_time_vec
     save_json(new_shard_index, output_dir / "latent_shard_index.json")
     save_json(norm_stats, output_dir / "normalization.json")
