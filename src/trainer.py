@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Training module for AE-DeepONet with learning rate scheduling and PoU regularization.
+CORRECTED: Fixed masked MSE normalization, proper trunk feature extraction, consistent LR handling
 """
 
 import logging
@@ -18,6 +19,7 @@ from torch.utils.data import DataLoader
 
 class CosineAnnealingWarmupScheduler:
     """Cosine annealing learning rate scheduler with linear warmup."""
+
     def __init__(
             self,
             optimizer: torch.optim.Optimizer,
@@ -48,17 +50,16 @@ class CosineAnnealingWarmupScheduler:
         self.current_epoch = 0
 
     def step(self, epoch: Optional[int] = None):
-        if epoch is None:
-            self.current_epoch += 1
-            epoch = self.current_epoch
-        else:
+        if epoch is not None:
             self.current_epoch = epoch
 
-        if self.warmup_epochs > 0 and epoch <= self.warmup_epochs and self.warmup_scheduler:
-            self.warmup_scheduler.step(epoch)
+        if self.current_epoch < self.warmup_epochs and self.warmup_scheduler:
+            self.warmup_scheduler.step()
         else:
-            cosine_epoch = max(0, epoch - self.warmup_epochs)
+            cosine_epoch = self.current_epoch - self.warmup_epochs
             self.cosine_scheduler.step(cosine_epoch)
+
+        self.current_epoch += 1
 
     def get_last_lr(self):
         return self.optimizer.param_groups[0]['lr']
@@ -84,7 +85,9 @@ class CosineAnnealingWarmupScheduler:
 
 
 class Trainer:
-    """Trainer for AE-DeepONet models with proper PoU regularization integration."""
+    """
+    Trainer for AE-DeepONet models with corrected batch processing.
+    """
 
     def __init__(
             self,
@@ -117,7 +120,11 @@ class Trainer:
         self.min_lr = float(train_cfg.get("min_lr", 1e-6))
         self.epochs = epochs if epochs is not None else int(train_cfg.get("epochs", 200))
 
-        params = self.model.deeponet_parameters() if self.is_latent else self.model.ae_parameters()
+        # Choose parameter set
+        if self.is_latent:
+            params = self.model.deeponet_parameters()
+        else:
+            params = self.model.ae_parameters()
 
         self.optimizer = AdamW(
             params,
@@ -143,8 +150,12 @@ class Trainer:
         if self.use_amp:
             self.logger.info("Automatic Mixed Precision (AMP) enabled")
 
+    def _ensure_time_2d(self, t: torch.Tensor) -> torch.Tensor:
+        """Ensure time tensor is 2D [M, 1]."""
+        return t if t.dim() == 2 else t.unsqueeze(-1)
+
     def train_ae_pretrain(self, epochs: int) -> float:
-        """Stage 1: Pretrain autoencoder with cosine annealing scheduler."""
+        """Stage 1: Pretrain autoencoder with corrected scheduler handling."""
         self.logger.info("Starting autoencoder pretraining...")
 
         ae_warmup = self.config["training"].get("ae_warmup_epochs", 5)
@@ -158,15 +169,15 @@ class Trainer:
 
         for epoch in range(1, epochs + 1):
             epoch_start_time = time.time()
+            self.current_epoch = epoch
             self.model.train()
             train_loss = 0.0
             n_batches = 0
 
-            current_lr = self.scheduler.get_last_lr()
-
             for inputs, targets in self.train_loader:
                 targets = targets.to(self.device)
 
+                # Handle both [B, S] and [B, M, S] shapes
                 if targets.dim() == 2:
                     inputs_flat = targets
                 elif targets.dim() == 3:
@@ -185,8 +196,9 @@ class Trainer:
 
                 if self.gradient_clip > 0:
                     self.scaler.unscale_(self.optimizer)
+                    # Clip only optimizer params
                     torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
+                        self.optimizer.param_groups[0]['params'],
                         self.gradient_clip
                     )
 
@@ -199,7 +211,9 @@ class Trainer:
             avg_loss = train_loss / n_batches
             epoch_time = time.time() - epoch_start_time
 
-            self.scheduler.step(epoch)
+            # Step scheduler after computing metrics
+            self.scheduler.step()
+            current_lr = self.scheduler.get_last_lr()
 
             self.logger.info(
                 f"[AE Pretrain] Epoch {epoch:3d}/{epochs} | "
@@ -214,6 +228,7 @@ class Trainer:
             if epoch % 10 == 0 or epoch == epochs:
                 self._save_checkpoint(epoch, avg_loss, prefix="ae_checkpoint")
 
+        # Save final pretrained autoencoder
         final_checkpoint = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -227,7 +242,7 @@ class Trainer:
         return avg_loss
 
     def train_deeponet(self) -> float:
-        """Stage 3: Train DeepONet on latent space with PoU regularization."""
+        """Stage 3: Train DeepONet with corrected batch processing."""
         self.logger.info("Starting DeepONet training on latent space...")
 
         self.scheduler = CosineAnnealingWarmupScheduler(
@@ -241,14 +256,15 @@ class Trainer:
         for epoch in range(1, self.epochs + 1):
             epoch_start_time = time.time()
             self.current_epoch = epoch
-            current_lr = self.scheduler.get_last_lr()
 
-            train_loss, train_metrics = self._train_epoch()
-            val_loss, val_metrics = self._validate()
+            train_loss, train_metrics = self._train_epoch_corrected()
+            val_loss, val_metrics = self._validate_corrected()
 
             epoch_time = time.time() - epoch_start_time
 
-            self.scheduler.step(epoch)
+            # Step scheduler after metrics
+            self.scheduler.step()
+            current_lr = self.scheduler.get_last_lr()
 
             self.logger.info(
                 f"Epoch {epoch:3d}/{self.epochs} | "
@@ -278,8 +294,8 @@ class Trainer:
         self._save_history()
         return self.best_val_loss
 
-    def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
-        """Train one epoch for DeepONet on latent space with vectorized computation."""
+    def _train_epoch_corrected(self) -> Tuple[float, Dict[str, float]]:
+        """Training epoch with corrected masked loss and vectorized branch computation."""
         self.model.train()
         total_loss = 0.0
         total_mse = 0.0
@@ -290,87 +306,117 @@ class Trainer:
             if len(batch_data) != 3:
                 raise RuntimeError("This _train_epoch handles only the latent DeepONet stage.")
 
-            inputs, targets_list, times_list = batch_data
+            inputs, targets_data, times_data = batch_data
             B = inputs.size(0)
-
             inputs = inputs.to(self.device, non_blocking=True)
-
-            # robust equality for float times
-            t0 = times_list[0].to(dtype=torch.float32, device='cpu')
-            times_are_identical = all(
-                torch.allclose(t0, times_list[i].to(dtype=torch.float32, device='cpu'), rtol=0.0, atol=1e-8)
-                for i in range(1, B)
-            )
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            if times_are_identical:
-                shared_times = times_list[0].to(self.device, non_blocking=True)
-                targets = torch.stack([
-                    t.squeeze(0) if t.dim() > 2 else t
-                    for t in targets_list
-                ]).to(self.device, non_blocking=True)
+            # Fast path: uniform time grid
+            if torch.is_tensor(targets_data):
+                targets = targets_data.to(self.device, non_blocking=True)
+                times = self._ensure_time_2d(times_data.to(self.device, non_blocking=True))
 
                 with autocast('cuda', enabled=self.use_amp):
-                    loss, comps = self.model.compute_deeponet_loss_vectorized(
-                        inputs, targets, shared_times, pou_weight=self.pou_weight
+                    loss, comps = self.model.compute_deeponet_loss(
+                        inputs, targets, trunk_times=times, pou_weight=self.pou_weight
                     )
 
-                total_mse += float(comps.get("mse", 0.0)) * B
-                total_pou += float(comps.get("pou", 0.0)) * B
-                n_samples += B
+                batch_loss = loss
+                batch_mse = comps.get("mse", 0.0)
+                batch_pou = comps.get("pou", 0.0)
 
             else:
-                # Build union of times and align targets on union grid
-                times_cpu = [t.flatten().to(dtype=torch.float32, device='cpu') for t in times_list]
-                all_times = torch.cat(times_cpu)
+                # Variable-time path with corrected masked loss
+                targets_list = targets_data
+                times_list = times_data
+
+                # Find max length and create padded tensors
+                max_len = max(t.size(0) for t in targets_list)
+                L = targets_list[0].size(-1)  # latent dimension
+
+                padded_targets = torch.zeros(B, max_len, L, device=self.device, dtype=inputs.dtype)
+                mask = torch.zeros(B, max_len, device=self.device, dtype=torch.bool)
+
+                # Fill padded tensors
+                for i in range(B):
+                    M_i = targets_list[i].size(0)
+                    padded_targets[i, :M_i] = targets_list[i].to(self.device, non_blocking=True)
+                    mask[i, :M_i] = True
+
+                # Collect unique times
+                all_times = torch.cat([t.to(self.device) for t in times_list])
                 unique_times, inverse = torch.unique(all_times, sorted=True, return_inverse=True)
-                U = unique_times.numel()
-
-                lengths = [t.numel() for t in times_cpu]
-                if len(lengths) > 1:
-                    cum = torch.tensor(lengths[:-1]).cumsum(0)
-                    offsets = torch.cat([torch.zeros(1, dtype=torch.long), cum])
-                else:
-                    offsets = torch.zeros(1, dtype=torch.long)
-                idx_per_sample = [inverse[offsets[i]:offsets[i] + lengths[i]] for i in range(B)]
-
-                unique_times = unique_times.to(self.device, non_blocking=True)
-
-                # Prepare padded targets/mask on union grid [B, U, L]
-                t0_ex = targets_list[0].squeeze(0) if targets_list[0].dim() > 2 else targets_list[0]
-                Ldim = t0_ex.shape[-1]
-                padded_targets = torch.zeros(B, U, Ldim, device=self.device, dtype=t0_ex.dtype)
-                mask = torch.zeros(B, U, dtype=torch.bool, device=self.device)
-
-                for i, idx in enumerate(idx_per_sample):
-                    t_i = targets_list[i].squeeze(0) if targets_list[i].dim() > 2 else targets_list[i]
-                    t_i = t_i.to(self.device, non_blocking=True)  # (M_i, L)
-                    j = idx.to(self.device, non_blocking=True)  # (M_i,)
-                    padded_targets[i, j] = t_i
-                    mask[i, j] = True
 
                 with autocast('cuda', enabled=self.use_amp):
-                    # keep existing signature to avoid touching model
-                    loss, comps = self.model.compute_deeponet_loss_padded(
-                        inputs, padded_targets, unique_times, times_list, mask,
-                        pou_weight=self.pou_weight
-                    )
+                    # Compute branch for entire batch once
+                    branch_all = self.model.deeponet.forward_branch(inputs)
+                    branch_all = branch_all.view(B, self.model.latent_dim, self.model.p)
 
-                total_mse += float(comps.get("mse", 0.0)) * B
-                total_pou += float(comps.get("pou", 0.0)) * B
-                n_samples += B
+                    # Compute trunk for unique times once
+                    unique_times_2d = self._ensure_time_2d(unique_times)
+                    trunk_all = self.model.deeponet.forward_trunk(unique_times_2d)
+                    trunk_all = trunk_all.view(-1, self.model.latent_dim, self.model.p)
 
-            self.scaler.scale(loss).backward()
+                    # Apply basis transformation if needed
+                    if self.model.deeponet.trunk_basis == "softmax":
+                        trunk_all = torch.nn.functional.softmax(trunk_all, dim=-1)
+
+                    # Compute predictions for each sample
+                    z_pred_list = []
+                    start_idx = 0
+                    for i in range(B):
+                        M_i = times_list[i].size(0)
+                        sample_inverse = inverse[start_idx:start_idx + M_i]
+
+                        # Get relevant trunk outputs
+                        trunk_i = trunk_all[sample_inverse]  # [M_i, latent_dim, p]
+                        branch_i = branch_all[i]  # [latent_dim, p]
+
+                        # Compute prediction
+                        z_i = torch.einsum('lp,mlp->ml', branch_i, trunk_i)  # [M_i, latent_dim]
+
+                        # Pad if necessary
+                        if M_i < max_len:
+                            padding = torch.zeros(max_len - M_i, L, device=self.device, dtype=z_i.dtype)
+                            z_i = torch.cat([z_i, padding], dim=0)
+
+                        z_pred_list.append(z_i)
+                        start_idx += M_i
+
+                    z_pred = torch.stack(z_pred_list)  # [B, max_len, latent_dim]
+
+                    # CORRECTED: Proper masked loss normalization
+                    valid = mask.unsqueeze(-1)  # [B, max_len, 1]
+                    squared_error = (z_pred - padded_targets).pow(2) * valid  # [B, max_len, L]
+                    total_valid_elements = (valid.sum() * z_pred.size(-1)).clamp_min(1)  # Total valid elements
+                    mse_loss = squared_error.sum() / total_valid_elements
+
+                    # PoU regularization on trunk outputs
+                    pou_loss = self.model.pou_regularization(trunk_all) if self.model.use_pou else torch.zeros_like(
+                        mse_loss)
+
+                    batch_loss = mse_loss + self.pou_weight * pou_loss
+                    batch_mse = mse_loss
+                    batch_pou = pou_loss
+
+            self.scaler.scale(batch_loss).backward()
 
             if self.gradient_clip and self.gradient_clip > 0:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+                # Clip only optimizer params
+                torch.nn.utils.clip_grad_norm_(
+                    self.optimizer.param_groups[0]['params'],
+                    self.gradient_clip
+                )
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            total_loss += loss.item() * B  # sample-weighted
+            total_loss += float(batch_loss.item())
+            total_mse += float(batch_mse.item())
+            total_pou += float(batch_pou.item())
+            n_samples += 1
 
         avg_loss = total_loss / max(1, n_samples)
         avg_mse = total_mse / max(1, n_samples)
@@ -379,12 +425,12 @@ class Trainer:
         return float(avg_loss), {"mse": float(avg_mse), "pou": float(avg_pou)}
 
     @torch.no_grad()
-    def _validate(self) -> Tuple[float, Dict[str, float]]:
-        """FIXED: Vectorized validation for efficiency."""
+    def _validate_corrected(self) -> Tuple[float, Dict[str, float]]:
+        """Validation with corrected time handling."""
         if self.val_loader is None:
             return float("inf"), {}
 
-        # Lazy-load normalization helper once
+        # Lazy-load normalization helper
         if not hasattr(self, "_norm_helper"):
             try:
                 from utils import load_json
@@ -410,34 +456,25 @@ class Trainer:
             if len(batch_data) != 3:
                 raise RuntimeError("Validation expects latent dataset batches.")
 
-            inputs, targets_list, times_list = batch_data
+            inputs, targets_data, times_data = batch_data
             B = inputs.size(0)
 
-            inputs = inputs.to(self.device, non_blocking=True)
-
-            # robust equality for float times
-            t0 = times_list[0].to(dtype=torch.float32, device='cpu')
-            times_are_identical = all(
-                torch.allclose(t0, times_list[i].to(dtype=torch.float32, device='cpu'), rtol=0.0, atol=1e-8)
-                for i in range(1, B)
-            )
-
-            if times_are_identical:
-                shared_times = times_list[0].to(self.device, non_blocking=True)
-                targets = torch.stack([
-                    t.squeeze(0) if t.dim() > 2 else t
-                    for t in targets_list
-                ]).to(self.device, non_blocking=True)
+            # Fast path: uniform time grid
+            if torch.is_tensor(targets_data):
+                targets = targets_data
+                times = self._ensure_time_2d(times_data)
 
                 with autocast('cuda', enabled=self.use_amp):
-                    z_pred, _ = self.model(inputs, decode=False, trunk_times=shared_times)
+                    z_pred, _ = self.model(inputs, decode=False, trunk_times=times)
                     loss = self.criterion(z_pred, targets)
 
+                    # Decode for MAE
                     B1, M1, LD = targets.shape
                     y_pred = self.model.decode(z_pred.reshape(B1 * M1, LD)).view(B1, M1, -1)
                     y_true = self.model.decode(targets.reshape(B1 * M1, LD)).view(B1, M1, -1)
                     mae_n = (y_pred - y_true).abs().mean()
 
+                # Physical space MAE if available
                 if have_phys:
                     y_pred_phys = self._norm_helper.denormalize(
                         y_pred.reshape(-1, y_pred.shape[-1]), self._species_vars
@@ -456,10 +493,14 @@ class Trainer:
                 n_samples += B
 
             else:
+                # Variable-time path
+                targets_list = targets_data
+                times_list = times_data
+
                 for i in range(B):
                     input_i = inputs[i:i + 1]
                     targets_i = targets_list[i].unsqueeze(0)
-                    times_i = times_list[i]
+                    times_i = self._ensure_time_2d(times_list[i])
 
                     with autocast('cuda', enabled=self.use_amp):
                         z_pred, _ = self.model(input_i, decode=False, trunk_times=times_i)
@@ -487,6 +528,7 @@ class Trainer:
                     total_mae_phys += float(mae_p)
                     n_samples += 1
 
+        # Compute averages
         avg_loss = total_loss / max(1, n_samples)
         avg_mse = total_mse / max(1, n_samples)
         avg_mae_n = total_mae_norm / max(1, n_samples)
@@ -503,6 +545,7 @@ class Trainer:
         return avg_loss, metrics
 
     def _save_checkpoint(self, epoch: int, loss: float, prefix: str = "checkpoint", is_best: bool = False):
+        """Save model checkpoint."""
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
@@ -527,6 +570,7 @@ class Trainer:
             self.logger.info(f"Saved best model at epoch {epoch} with loss {loss:.3e}")
 
     def _save_history(self):
+        """Save training history."""
         import json
 
         history = {
