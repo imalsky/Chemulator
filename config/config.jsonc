@@ -1,10 +1,5 @@
 {
-  // AE-DeepONet Configuration File
-  // Three-stage training pipeline for chemical kinetics modeling
-  // OPTIMIZED: For 10 fixed time points with paper-like settings
-
   "paths": {
-    // Input HDF5 files (produced by your simulator/export)
     "raw_data_files": [
       "data/raw/run9001-result.h5",
       "data/raw/run9002-result.h5",
@@ -17,159 +12,139 @@
       "data/raw/run9009-result.h5",
       "data/raw/run9010-result.h5"
     ],
-    // Directory containing preprocessed NPZ shards
     "processed_data_dir": "data/processed-10-log-standard",
-    // Root folder for checkpoints
     "model_save_dir": "models",
-    // Root folder for logs
     "log_dir": "logs"
   },
 
   "data": {
-    // Species variables in the dataset
+    // Variables in HDF5 files - used during preprocessing
     "species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
-    // Target species (same as input for this case)
+    // Target species for output - usually same as species_variables
     "target_species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
-    // Global variables: [P, T] instead of paper's [φ₀, T₀]
+    // Global conditioning variables: [P, T] not paper's [φ₀, T₀]
     "global_variables": ["P", "T"],
-    // Hard validation - must match
-    "expected_globals": ["P", "T"],
-    // Time variable name
-    "time_variable": "t_time"
+    "expected_globals": ["P", "T"],  // Validation check
+    "time_variable": "t_time"  // Name of time array in HDF5
   },
 
   "preprocessing": {
-    // Minimum value threshold for species concentrations
-    "min_value_threshold": 1e-25,
-    // Parallel workers for preprocessing
-    "num_workers": 8,
-    // HDF5 chunk size for reading
-    "hdf5_chunk_size": 16384,
-    // Trajectories per NPZ shard
-    "trajectories_per_shard": 10000,
-    // Use compression for NPZ files
-    "npz_compressed": false
+    "min_value_threshold": 1e-25,  // Drop trajectories below this
+    "num_workers": 8,  // Parallel processing
+    "trajectories_per_shard": 10000,  // NPZ file size control
+    "npz_compressed": false  // Faster I/O without compression
   },
 
   "normalization": {
-    // Default normalization method for species
-    "default_method": "log-standard",
+    // Applied during preprocessing and data loading
+    "default_method": "log-standard",  // For species
     "methods": {
-      // Time MUST be log-min-max for proper [0,1] scaling
-      "t_time": "log-min-max",
-      // Pressure uses log-standard (covers wide range)
-      "P": "log-standard",
-      // Temperature uses standard normalization
-      "T": "standard"
+      "t_time": "log-min-max",  // Maps time to [0,1] - REQUIRED
+      "P": "log-standard",      // Pressure normalization
+      "T": "standard"            // Temperature normalization
     },
-    // Epsilon for log transforms
-    "epsilon": 1e-30,
-    // Minimum std for numerical stability
-    "min_std": 1e-10,
-    // Clamp normalized values
-    "clamp_value": 50.0
+    "epsilon": 1e-30,  // Floor for log transform
+    "min_std": 1e-10   // Numerical stability
   },
 
   "model": {
     "type": "AE_DeepONet",
-    // Latent dimension for autoencoder
-    "latent_dim": 32,
-    // DeepONet basis functions (paper uses 10)
-    "p": 10,
-    // Default trunk times for inference (10 points)
-    "trunk_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-    // Trunk basis type: "linear" or "softmax"
-    "trunk_basis": "linear",
-    // Enable PoU regularization for linear basis
-    "use_pou": true,
-    // Architecture: 3 hidden layers for each network
+
+    // Autoencoder settings (Stage 1)
+    "latent_dim": 16,  // Compression dimension
     "ae_encoder_layers": [256, 256, 128],
     "ae_decoder_layers": [128, 256, 256],
+
+    // DeepONet settings (Stage 3)
+    "p": 10,  // Number of basis functions
     "branch_layers": [256, 256, 128],
     "trunk_layers": [256, 256, 128],
-    // Decoder output mode
+
+    // THE ONLY TIME SPECIFICATION NEEDED
+    // Used for: 1) Default inference times
+    //           2) Fallback for latent generation if not specified
+    //           3) Fallback for training if not specified
+    "trunk_times": [0.25, 0.50, 0.75, 1.0],
+
+    // Basis and regularization
+    "trunk_basis": "linear",  // or "softmax"
+    "use_pou": true,  // Partition of Unity regularization
+
+    // Output configuration
     "decoder_output_mode": "linear",
-    // No clamping in normalized space
-    "output_clamp": null
+    "output_clamp": null  // No clamping in normalized space
   },
 
   "latent_generation": {
-    // Use "fixed" mode for 10 specific time points
-    // This uses nearest-neighbor selection from the source grid
-    "mode": "fixed",
-    // Exactly 10 normalized time points for latent generation
-    "fixed_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    // Stage 2: Generate latent dataset
+    // "fixed" mode uses nearest-neighbor from source grid
+    // "all" mode uses all available time points (requires identical grids)
+    // No fixed_times specified - uses model.trunk_times
+    "mode": "fixed"
   },
 
   "training": {
     // Stage 1: Autoencoder pretraining
-    "ae_pretrain_epochs": 100,
-    "ae_warmup_epochs": 5,
+    "ae_pretrain_epochs": 50,
+    "ae_warmup_epochs": 0,
     "freeze_ae_after_pretrain": true,
 
     // Stage 3: DeepONet training
     "epochs": 200,
-    // Moderate batch size for stability
-    "batch_size": 128,
+    "batch_size": 512,
 
-    // Training time sampling - use all 10 points
+    // Time sampling strategy
+    // "fixed": All samples use same time points (vectorized, fast)
+    // "random": Each sample picks random subset (requires padding, slower)
     "train_time_sampling": "fixed",
-    "train_time_points": 10,
-    "train_fixed_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-
-    // Validation time sampling - also use all 10 points
     "val_time_sampling": "fixed",
-    "val_time_points": 10,
-    "val_fixed_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+
+    // Optional: Specify subset of available times
+    // If not specified, uses all available latent times
+    // "train_time_points": 5,  // Would use first 5 of trunk_times
+    // "val_time_points": 10,   // Would use all 10
 
     // Learning rate schedule
     "learning_rate": 1e-3,
     "min_lr": 1e-6,
     "warmup_epochs": 10,
 
-    // Data splits
+    // Data splits - applied deterministically during preprocessing
     "val_fraction": 0.15,
     "test_fraction": 0.15,
-    "use_fraction": 1.0,
+    "use_fraction": 1.0,  // Subsample data if < 1.0
 
-    // AdamW optimizer settings
+    // Optimizer (AdamW)
     "weight_decay": 1e-4,
     "betas": [0.9, 0.999],
 
     // Training stability
     "gradient_clip": 1.0,
-    "use_amp": true,
+    "use_amp": true,  // Mixed precision for speed/memory
 
-    // PoU regularization weight (small value)
+    // PoU regularization weight
     "pou_weight": 0.01,
 
-    // Dataloader workers (forced to 0 for GPU datasets)
-    "num_workers": 0
+    // DataLoader settings
+    "num_workers": 0  // Must be 0 for GPU-resident datasets
   },
 
   "system": {
-    // Random seed for reproducibility
-    "seed": 42,
-    // Export model for deployment
-    "use_torch_export": true,
-    // Use torch.compile for potential speedup
-    "use_torch_compile": true,
-    "compile_mode": "default",
-    // CUDA optimizations
-    "cudnn_benchmark": true,
-    "tf32": true,
-    "cuda_memory_fraction": 0.95,
-    // Non-deterministic for speed
-    "deterministic": false,
-    // Default precision
-    "dtype": "float32"
+    "seed": 42,  // Reproducibility
+    "use_torch_export": true,  // Export for deployment
+    "use_torch_compile": false,  // Often fails with dynamic shapes
+    "cudnn_benchmark": true,  // Auto-tune convolutions
+    "tf32": true,  // Use TensorFloat32 for speed
+    "cuda_memory_fraction": 0.95,  // Reserve GPU memory
+    "deterministic": false,  // Trade reproducibility for speed
+    "dtype": "float32"  // Model precision
   }
 }

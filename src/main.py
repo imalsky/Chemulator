@@ -13,8 +13,8 @@ Features:
 - Unified model directory structure
 - Configuration persistence
 - Model export for deployment
-- UPDATED: Flexible time point sampling for training
-- UPDATED: Test set evaluation after training
+- Flexible time point sampling for training (not in Goswami et al. 2023)
+- Test set evaluation after training
 """
 
 import logging
@@ -151,16 +151,10 @@ class AEDeepONetPipeline:
             expected_globals = self.config["data"].get("expected_globals", ["P", "T"])
 
             if global_vars != expected_globals:
-                raise ValueError(
-                    f"Global variables mismatch: got {global_vars}, expected {expected_globals}. "
-                    f"The AE-DeepONet branch network requires exactly {expected_globals}. "
-                    f"Please update your config to match your data format."
-                )
+                raise ValueError(f"Global variables mismatch: got {global_vars}, expected {expected_globals}.")
 
             if len(global_vars) != 2:
-                raise ValueError(
-                    f"Expected exactly 2 global variables, got {len(global_vars)}: {global_vars}"
-                )
+                raise ValueError(f"Expected exactly 2 global variables, got {len(global_vars)}: {global_vars}")
 
             self.logger.info(f"Global variables validated: {global_vars} (P=pressure, T=temperature)")
 
@@ -252,7 +246,7 @@ class AEDeepONetPipeline:
             train_loader=train_loader,
             val_loader=val_loader,
             config=self.config,
-            save_dir=self.run_dir,  # Single unified directory
+            save_dir=self.run_dir,
             device=self.device,
             is_latent_stage=False
         )
@@ -287,10 +281,7 @@ class AEDeepONetPipeline:
         checkpoint_path = self.run_dir / "ae_pretrained.pt"
 
         if not checkpoint_path.exists():
-            raise FileNotFoundError(
-                f"Autoencoder checkpoint not found at {checkpoint_path}. "
-                "Please run Stage 1 first."
-            )
+            raise FileNotFoundError(f"Autoencoder checkpoint not found at {checkpoint_path}.")
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
