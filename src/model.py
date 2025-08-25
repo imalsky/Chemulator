@@ -9,7 +9,7 @@ Key implementation notes:
 - Clamping is ONLY performed in normalized space. Physical space clamping has been
   removed to avoid confusion and ensure consistency.
 - PoU regularization is properly integrated into the loss function.
-- BatchNorm is handled flexibly to support batch_size=1.
+- BatchNorm replaced with LayerNorm to handle batch_size=1 correctly.
 - UPDATED: Support for flexible trunk times (randomized training, dense inference)
 """
 
@@ -95,24 +95,6 @@ class Autoencoder(nn.Module):
 # DeepONet
 # =====================================================================================
 
-class FlexibleBatchNorm1d(nn.Module):
-    """
-    BatchNorm1d wrapper that handles batch_size=1 gracefully.
-    Falls back to identity when batch_size=1 during training.
-    """
-
-    def __init__(self, num_features):
-        super().__init__()
-        self.bn = nn.BatchNorm1d(num_features)
-
-    def forward(self, x):
-        if x.size(0) == 1 and self.training:
-            # Skip batch norm for single sample during training
-            return x
-        else:
-            return self.bn(x)
-
-
 class DeepONet(nn.Module):
     """
     DeepONet with dynamically built branch and trunk networks.
@@ -120,31 +102,34 @@ class DeepONet(nn.Module):
     - Trunk input: normalized time t in [0, 1], dimension 1
     - Output: latent trajectory z(t) with shape [B, M, latent_dim]
 
-    Matches paper implementation with BatchNorm in branch network.
+    Matches paper implementation with normalization in branch network.
+    UPDATED: Uses LayerNorm instead of BatchNorm for batch_size=1 compatibility.
     """
 
     def __init__(self, latent_dim: int, num_globals: int, p: int,
-                 branch_hidden_layers: List[int], trunk_hidden_layers: List[int]):
+                 branch_hidden_layers: List[int], trunk_hidden_layers: List[int],
+                 trunk_basis: str = "linear"):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_globals = num_globals
         self.p = p
+        self.trunk_basis = trunk_basis  # "linear" or "softmax"
 
-        # Branch network with BatchNorm (as per paper)
+        # Branch network with LayerNorm (batch-size invariant)
         self.branch_layers = nn.ModuleList()
         in_features = latent_dim + num_globals
 
-        # Following paper's architecture exactly
+        # Following paper's architecture but with LayerNorm
         for hidden_units in branch_hidden_layers:
             self.branch_layers.append(nn.Linear(in_features, hidden_units))
-            self.branch_layers.append(FlexibleBatchNorm1d(hidden_units))  # Use flexible BN
+            self.branch_layers.append(nn.LayerNorm(hidden_units))  # Replaced BatchNorm
             self.branch_layers.append(nn.LeakyReLU(0.01))
             in_features = hidden_units
 
         # Final layer without activation
         self.branch_layers.append(nn.Linear(in_features, latent_dim * p))
 
-        # Trunk network (no BatchNorm as per paper)
+        # Trunk network (no normalization as per paper)
         self.trunk_layers = nn.ModuleList()
         in_features = 1
         for hidden_units in trunk_hidden_layers:
@@ -184,7 +169,14 @@ class DeepONet(nn.Module):
         M = trunk_input.size(0)
 
         branch_out = self.forward_branch(branch_input).view(B, self.latent_dim, self.p)  # [B, L, p]
-        trunk_out = self.forward_trunk(trunk_input).view(M, self.latent_dim, self.p)  # [M, L, p]
+        trunk_raw = self.forward_trunk(trunk_input).view(M, self.latent_dim, self.p)  # [M, L, p]
+
+        # Apply basis transformation if specified
+        if self.trunk_basis == "softmax":
+            # Apply softmax over basis dimension for non-negative, normalized basis
+            trunk_out = F.softmax(trunk_raw, dim=-1)
+        else:
+            trunk_out = trunk_raw
 
         # Tensor contraction over basis p
         z_pred = torch.einsum('blp,mlp->bml', branch_out, trunk_out)  # [B, M, L]
@@ -206,6 +198,7 @@ class AEDeepONet(nn.Module):
     - Clamping is ONLY in normalized space. Physical space clamping removed.
     - PoU regularization is integrated into the loss function.
     - UPDATED: Support for flexible trunk times during training and inference
+    - UPDATED: LayerNorm instead of BatchNorm for batch_size=1 compatibility
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -219,9 +212,12 @@ class AEDeepONet(nn.Module):
         self.num_species = len(data_cfg["species_variables"])
         self.num_globals = len(data_cfg["global_variables"])
         self.latent_dim = model_cfg["latent_dim"]
-        self.p = model_cfg.get("p", 10)
+        self.p = model_cfg.get("p", 10)  # Default to paper's value
         self.use_pou = model_cfg.get("use_pou", False)
         self.pou_weight = config["training"].get("pou_weight", 0.01)
+
+        # Trunk basis configuration
+        self.trunk_basis = model_cfg.get("trunk_basis", "linear")  # "linear" or "softmax"
 
         # Decoder output control (normalized space only)
         self.decoder_output_mode: str = str(model_cfg.get("decoder_output_mode", "linear")).lower()
@@ -257,7 +253,11 @@ class AEDeepONet(nn.Module):
             p=self.p,
             branch_hidden_layers=branch_layers,
             trunk_hidden_layers=trunk_layers,
+            trunk_basis=self.trunk_basis,
         )
+
+        # Cache device for efficiency
+        self.register_buffer('_device_tensor', torch.zeros(1))
 
         # Initialize optional normalized-space clamping tensors
         self.clamp_min = torch.tensor([], dtype=torch.float32)
@@ -292,6 +292,11 @@ class AEDeepONet(nn.Module):
         self.index_list = []
         self.train_loss_list = []
         self.val_loss_list = []
+
+    @property
+    def device(self):
+        """Get the device of the model."""
+        return self._device_tensor.device
 
     def compute_deeponet_loss(
             self,
@@ -329,12 +334,12 @@ class AEDeepONet(nn.Module):
         # Core losses
         mse_loss = F.mse_loss(z_pred, targets)
         trunk_outputs = aux.get("trunk_outputs", None)
-        pou_loss = self.pou_regularization(trunk_outputs) if trunk_outputs is not None else torch.zeros((),
-                                                                                                        device=z_pred.device)
+        pou_loss = self.pou_regularization(trunk_outputs) if trunk_outputs is not None else torch.zeros(
+            (), device=self.device, dtype=z_pred.dtype
+        )
 
         total = mse_loss + float(pou_weight) * pou_loss
         return total, {"mse": mse_loss, "pou": pou_loss}
-
 
     def _init_normalized_clamp(self):
         """Initialize clamping bounds in NORMALIZED space only."""
@@ -416,6 +421,9 @@ class AEDeepONet(nn.Module):
         Encourages sum of basis functions to equal 1 for better interpretability
         and stability of the DeepONet decomposition.
 
+        NOTE: If trunk_basis="softmax", the basis already sums to 1, so PoU penalty
+        will be near zero. Keep it for monitoring or set use_pou=False.
+
         Args:
             trunk_outputs: Trunk network outputs [M, L, p] or None
 
@@ -424,9 +432,7 @@ class AEDeepONet(nn.Module):
         """
         # Handle cases where PoU is disabled or trunk outputs not provided
         if not self.use_pou or trunk_outputs is None:
-            # Get device from model parameters to ensure consistency
-            device = next(self.parameters()).device
-            return torch.tensor(0.0, device=device)
+            return torch.tensor(0.0, device=self.device, dtype=torch.float32)
 
         # Sum over basis functions (last dimension)
         trunk_sum = trunk_outputs.sum(dim=-1)  # [M, L]
