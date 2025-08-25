@@ -1,14 +1,9 @@
 {
   // AE-DeepONet Configuration File
   // Three-stage training pipeline for chemical kinetics modeling
+  // UPDATED: Latent generation can use ALL available time points.
 
-  // IMPORTANT NOTE: We use [P, T] (pressure, temperature) as global variables
-  // instead of [φ₀, T₀] (equivalence ratio, initial temperature) from the paper.
-  // This is intentional for our specific application.
-
-  // Path configurations for data, models, and logs
   "paths": {
-    // Input HDF5 files containing chemical kinetics simulation data
     "raw_data_files": [
       "data/raw/run9001-result.h5",
       "data/raw/run9002-result.h5",
@@ -21,165 +16,126 @@
       "data/raw/run9009-result.h5",
       "data/raw/run9010-result.h5"
     ],
-
-    // Directory for preprocessed NPZ shards
     "processed_data_dir": "data/processed-10-log-standard",
-
-    // Root directory for saved models (timestamped subdirectories created)
     "model_save_dir": "models",
-
-    // Directory for training logs
     "log_dir": "logs"
   },
 
-  // Data specifications and variable definitions
   "data": {
-    // Chemical species variables (autoencoder inputs/outputs)
     "species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
-
-    // Target variables for reconstruction (typically same as species_variables)
     "target_species_variables": [
       "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
-
-    // Global parameters - We use [P, T] instead of [φ₀, T₀] from the paper
-    // P = pressure, T = temperature (NOT equivalence ratio)
+    // We intentionally use [P,T] (not [φ0,T0])
     "global_variables": ["P", "T"],
-
-    // Expected global variables for validation (strictly enforced)
     "expected_globals": ["P", "T"],
-
-    // Time variable name in the dataset
     "time_variable": "t_time"
   },
 
-  // Preprocessing settings for raw data transformation
   "preprocessing": {
-    // Minimum value threshold for species concentrations
     "min_value_threshold": 1e-25,
-
-    // Number of parallel workers for data processing
     "num_workers": 8,
-
-    // HDF5 reading chunk size
     "hdf5_chunk_size": 16384,
-
-    // Number of trajectories per NPZ shard file
     "trajectories_per_shard": 10000,
-
-    // Use compression for NPZ files
     "npz_compressed": false
   },
 
-  // Normalization settings for all variables
   "normalization": {
-    // Default normalization method for species
-    "default_method": "log-standard",  // log10 then z-score
-
-    // Per-variable normalization overrides
+    "default_method": "log-standard",
     "methods": {
-      "t_time": "log-min-max",  // Normalize time to [0,1] in log space
-      "P": "log-standard",       // Pressure: log10 then z-score
-      "T": "standard"            // Temperature: z-score only
+      "t_time": "log-min-max",
+      "P": "log-standard",
+      "T": "standard"
     },
-
-    // Small value added before log10 to avoid log(0)
     "epsilon": 1e-30,
-
-    // Minimum standard deviation to avoid division by zero
     "min_std": 1e-10,
-
-    // Maximum absolute value after normalization (outlier clipping)
     "clamp_value": 50.0
   },
 
-  // Model architecture and hyperparameters
   "model": {
-    // Model type identifier
     "type": "AE_DeepONet",
+    "latent_dim": 32,
+    "p": 32,
 
-    // Latent space dimension and DeepONet basis count
-    "latent_dim": 64,
-    "p": 64,
-
-    // Normalized time points [0,1] for trunk network evaluation
+    // Inference fallback ONLY (not used for data generation if mode="all")
     "trunk_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
 
-    // Partition-of-Unity regularization flag
-    "use_pou": true,  // Set to true to enable PoU regularization
-
-    // Autoencoder architecture (layer sizes)
-    "ae_encoder_layers": [512, 512, 512],
-    "ae_decoder_layers": [512, 512, 512],
-
-    // DeepONet branch/trunk architectures
-    "branch_layers": [512, 512, 512],
-    "trunk_layers": [512, 512, 512],
-
-    // Decoder output configuration
-    "decoder_output_mode": "linear",  // "linear" or "sigmoid01"
-
-    // Output clamping in NORMALIZED space only
-    // Can be null, [min, max], or {"min": ..., "max": ...}
-    "output_clamp": null  // Set to e.g. [-5, 5] to clamp normalized values
+    "use_pou": false,
+    "ae_encoder_layers": [256, 256, 128],
+    "ae_decoder_layers": [128, 256, 256],
+    "branch_layers": [256, 256, 128],
+    "trunk_layers": [256, 256, 128],
+    "decoder_output_mode": "linear",
+    "output_clamp": null
   },
 
-  // Training process settings
+  // NEW: Controls how the latent dataset’s time axis is produced.
+  "latent_generation": {
+    // "all"  : use ALL available source times from the preprocessed shards (recommended)
+    // "fixed": use the exact times in "fixed_times" (nearest neighbor to source grid)
+    //          If "fixed_times" is omitted, we fall back to model.trunk_times.
+    "mode": "all"
+    // "fixed_times": [0.02, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0]
+  },
+
   "training": {
-    // Stage 1: Autoencoder pretraining
+    // Stage 1
     "ae_pretrain_epochs": 100,
-    "ae_warmup_epochs": 5,           // Warmup epochs for AE training
+    "ae_warmup_epochs": 5,
     "freeze_ae_after_pretrain": true,
 
-    // Stage 3: DeepONet training
+    // Stage 3
     "epochs": 200,
     "batch_size": 256,
 
-    // Learning rate schedule parameters
-    "learning_rate": 1e-3,            // Maximum learning rate
-    "min_lr": 1e-6,                   // Minimum learning rate for cosine annealing
-    "warmup_epochs": 10,              // Warmup epochs for DeepONet training
+    // Flexible time sampling during training
+    "train_time_sampling": "random",  // "random" | "fixed"
+    "train_min_time_points": 8,
+    "train_max_time_points": 64,
 
-    // Dataset splits (fractions)
+    "val_time_sampling": "fixed",     // "random" | "fixed"
+    "val_time_points": 50,            // used if no explicit list is given
+
+    // OPTIONAL explicit lists when using "fixed"
+    // If provided, these override the counts above and are mapped by nearest neighbor.
+    // "train_fixed_times": [0.1, 0.3, 0.5, 0.7, 0.9],
+    // "val_fixed_times":   [0.02, 0.04, 0.06, ..., 1.0],
+
+    "learning_rate": 1e-3,
+    "min_lr": 1e-6,
+    "warmup_epochs": 10,
+
     "val_fraction": 0.15,
     "test_fraction": 0.15,
-    "use_fraction": 1.0,              // Fraction of data to use (for debugging)
+    "use_fraction": 1.0,
 
-    // Optimizer settings (AdamW)
     "weight_decay": 1e-4,
     "betas": [0.9, 0.999],
 
-    // Training stability
-    "gradient_clip": 1.0,             // Gradient clipping value
-    "use_amp": true,                  // Automatic Mixed Precision
+    "gradient_clip": 1.0,
+    "use_amp": true,
 
-    // Regularization
-    "pou_weight": 0.01                // Weight for PoU regularization (if enabled)
+    "pou_weight": 0.001,
+
+    // Dataloader workers for GPU-resident datasets
+    "num_workers": 0
   },
 
-  // System-level and performance settings
   "system": {
-    // Random seed for reproducibility
     "seed": 42,
-
-    // Model export settings
-    "use_torch_export": true,         // Export model for deployment
-    "use_torch_compile": false,       // Use torch.compile optimization
-    "compile_mode": "default",        // Compilation mode if enabled
-
-    // CUDA optimizations
-    "cudnn_benchmark": true,          // Enable cuDNN autotuner
-    "tf32": true,                     // Enable TensorFloat-32 on Ampere GPUs
-    "cuda_memory_fraction": 0.95,     // GPU memory allocation fraction
-    "deterministic": false,           // Deterministic operations (slower)
-
-    // Numeric precision
-    "dtype": "float32"                // "float32" or "float64"
+    "use_torch_export": true,
+    "use_torch_compile": true,
+    "compile_mode": "default",
+    "cudnn_benchmark": true,
+    "tf32": true,
+    "cuda_memory_fraction": 0.95,
+    "deterministic": false,
+    "dtype": "float32"
   }
 }

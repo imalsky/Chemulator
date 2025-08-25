@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 GPU-optimized dataset implementations for AE-DeepONet training.
+UPDATED: Support for flexible time point sampling during training.
 """
 
 import logging
@@ -113,108 +114,121 @@ class GPUSequenceDataset(Dataset):
         return total_gb
 
     def _preload_to_gpu(self):
-        """Preload all data to GPU memory."""
-        self.logger.info(f"Preloading {self.split_name} dataset to GPU...")
+        """Preload sequence (AE-pretrain) data to GPU and build samples (all NORMALIZED)."""
+        self.logger.info(f"Preloading {self.split_name} sequence dataset to GPU...")
 
-        # Estimate memory requirement
         required_gb = self._estimate_memory_gb()
-
         if not check_gpu_memory_available(required_gb, self.device):
             raise RuntimeError(
-                f"Insufficient GPU memory. Need ~{required_gb:.1f}GB for {self.split_name} dataset. "
-                "Consider reducing batch size or using smaller data splits."
+                f"Insufficient GPU memory. Need ~{required_gb:.1f}GB for sequence dataset. "
+                "Reduce batch size or use smaller splits."
             )
 
         self.trajectories = []
 
-        # Load and process all shards
+        # Load each shard of the split
         for shard_info in self.shards:
             shard_path = self.split_dir / shard_info["filename"]
-
             with np.load(shard_path, allow_pickle=False) as data:
-                # Load raw data
-                x0 = torch.from_numpy(data["x0"].astype(np.float32))
-                globals_vec = torch.from_numpy(data["globals"].astype(np.float32))
-                t_vec = torch.from_numpy(data["t_vec"].astype(np.float32))
-                y_mat = torch.from_numpy(data["y_mat"].astype(np.float32))
+                # Expected keys from preprocessor: "x0", "globals", "t_vec", "y_mat"
+                x0_np = data["x0"].astype(np.float32)  # [N, S]
+                g_np = data["globals"].astype(np.float32)  # [N, G]
+                t_np = data["t_vec"].astype(np.float32)  # [M] or [N, M]
+                y_np = data["y_mat"].astype(np.float32)  # [N, M, S]
 
-                # Apply normalization
-                x0_norm = self.norm_helper.normalize(x0, self.species_vars)
-                globals_norm = self.norm_helper.normalize(globals_vec, self.global_vars)
+                N = x0_np.shape[0]
+                if y_np.shape[0] != N:
+                    raise ValueError(f"'y_mat' first dim must equal N; got {y_np.shape[0]} vs {N}")
 
-                # Fix time normalization shape
-                if t_vec.dim() == 1:
-                    # Shared time grid
-                    t_norm = self.norm_helper.normalize(
-                        t_vec.unsqueeze(-1), [self.time_var]
-                    ).squeeze(-1)
-                    t_norm = t_norm.unsqueeze(0).expand(x0.shape[0], -1)
+                # Detect time layout
+                if t_np.ndim == 1:
+                    M = t_np.shape[0]
+                    per_sample_times = False
+                elif t_np.ndim == 2:
+                    N2, M = t_np.shape
+                    if N2 != N:
+                        raise ValueError(f"'t_vec' 2D must be [N, M]; got {t_np.shape}, expected {(N, M)}")
+                    per_sample_times = True
                 else:
-                    # Per-trajectory times
-                    t_norm = self.norm_helper.normalize(
-                        t_vec.unsqueeze(-1), [self.time_var]
-                    ).squeeze(-1)
+                    raise ValueError(f"'t_vec' must be 1D [M] or 2D [N, M]; got shape {t_np.shape}")
 
-                y_norm = self.norm_helper.normalize(y_mat, self.species_vars)
+                # ---- Normalize everything on the configured device ----
+                # Species: x0 and trajectory y(t)
+                x0_t = torch.from_numpy(x0_np)
+                y_t = torch.from_numpy(y_np)  # [N, M, S]
+                x0_norm = self.norm_helper.normalize(x0_t, self.species_vars)  # [N, S]
+                y_norm = self.norm_helper.normalize(y_t, self.species_vars)  # [N, M, S]
 
-                # Store complete trajectories
-                for i in range(x0.shape[0]):
-                    traj = {
-                        'x0': x0_norm[i].to(self.device),
-                        'globals': globals_norm[i].to(self.device),
-                        'times': t_norm[i].to(self.device),
-                        'y': y_norm[i].to(self.device)
-                    }
-                    self.trajectories.append(traj)
+                # Globals: [P, T]
+                g_t = torch.from_numpy(g_np)
+                g_norm = self.norm_helper.normalize(g_t, self.global_vars)  # [N, G]
 
-        # Create sample indices for relative time sampling
+                # Time: normalize with method configured for time_variable
+                if not per_sample_times:
+                    t_shared = torch.from_numpy(t_np)  # [M]
+                    t_shared_norm = self.norm_helper.normalize(
+                        t_shared.unsqueeze(-1), [self.time_var]
+                    ).squeeze(-1)  # [M] in [0,1]
+                    for n in range(N):
+                        self.trajectories.append({
+                            "x0": x0_norm[n].to(self.device, non_blocking=True),  # [S]
+                            "globals": g_norm[n].to(self.device, non_blocking=True),  # [G]
+                            "times": t_shared_norm.to(self.device, non_blocking=True),  # [M]
+                            "y": y_norm[n].to(self.device, non_blocking=True),  # [M, S]
+                        })
+                else:
+                    t_all = torch.from_numpy(t_np)  # [N, M]
+                    t_all_norm = self.norm_helper.normalize(
+                        t_all.unsqueeze(-1), [self.time_var]
+                    ).squeeze(-1)  # [N, M] in [0,1]
+                    for n in range(N):
+                        self.trajectories.append({
+                            "x0": x0_norm[n].to(self.device, non_blocking=True),
+                            "globals": g_norm[n].to(self.device, non_blocking=True),
+                            "times": t_all_norm[n].to(self.device, non_blocking=True),
+                            "y": y_norm[n].to(self.device, non_blocking=True),
+                        })
+
+        # Build samples
         if self.use_relative_time:
             self._create_relative_samples()
         else:
             self._create_standard_samples()
 
-        # Force synchronization
-        torch.cuda.synchronize(self.device)
-
-        # Log memory usage
-        allocated_gb = torch.cuda.memory_allocated(self.device) / 1e9
-        self.logger.info(
-            f"Loaded {len(self.trajectories)} trajectories to GPU. "
-            f"Memory allocated: {allocated_gb:.2f}GB. "
-            f"Created {len(self.samples)} training samples."
-        )
-
     def _create_standard_samples(self):
-        """Create standard samples (full trajectories from t=0)."""
+        """Create AE-pretrain samples: reconstruct species vectors y(t) from themselves (normalized)."""
         self.samples = []
         for traj in self.trajectories:
-            # Standard: predict full trajectory from initial condition
-            self.samples.append({
-                'inputs': torch.cat([traj['x0'], traj['globals'], traj['times']]),
-                'targets': traj['y']
-            })
+            y_mat = traj['y']  # [M, S], already normalized
+            M = y_mat.shape[0]
+            # One sample per timepoint: (y(t), y(t))
+            for m in range(M):
+                y_vec = y_mat[m]  # [S]
+                self.samples.append({
+                    'inputs': y_vec,  # AE input: species vector
+                    'targets': y_vec  # AE target: same vector
+                })
 
     def _create_relative_samples(self):
-        """Create relative time samples (sliding windows)."""
+        """Create AE-pretrain samples from windows but still as vector→vector reconstruction."""
         self.samples = []
         for traj in self.trajectories:
-            M = traj['times'].shape[0]
+            y_mat = traj['y']  # [M, S], normalized
+            M = y_mat.shape[0]
+            if M <= 0:
+                continue
 
-            # Create multiple samples per trajectory with different starting points
-            n_windows = max(1, (M - self.window_size) // 10)  # Sample every 10 timesteps
-
-            for start_idx in range(0, M - self.window_size, max(1, (M - self.window_size) // n_windows)):
-                end_idx = min(start_idx + self.window_size, M)
-
-                # Extract window
-                x_start = traj['y'][start_idx]  # Use state at start_idx as initial condition
-                times_window = traj['times'][start_idx:end_idx] - traj['times'][start_idx]  # Relative times
-                y_window = traj['y'][start_idx:end_idx]
-
-                self.samples.append({
-                    'inputs': torch.cat([x_start, traj['globals'], times_window]),
-                    'targets': y_window
-                })
+            # Choose a step so we don't explode the count; sample roughly every 10 steps.
+            step = max(1, min(10, M // max(1, M // 10)))
+            # Use sliding windows to *subsample* time indices; still vector→vector
+            for start_idx in range(0, max(1, M - self.window_size + 1), step):
+                end_idx = min(M, start_idx + self.window_size)
+                for m in range(start_idx, end_idx):
+                    y_vec = y_mat[m]  # [S]
+                    self.samples.append({
+                        'inputs': y_vec,
+                        'targets': y_vec
+                    })
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -228,6 +242,7 @@ class GPUSequenceDataset(Dataset):
 class GPULatentDataset(Dataset):
     """
     GPU-resident dataset for DeepONet training on latent space.
+    Supports fixed/random time point sampling over ALL available times saved in the latent set.
     """
 
     def __init__(
@@ -235,97 +250,155 @@ class GPULatentDataset(Dataset):
             latent_dir: Path,
             split_name: str,
             config: Dict[str, Any],
-            device: torch.device
+            device: torch.device,
+            time_sampling_mode: Optional[str] = None,
+            n_time_points: Optional[int] = None
     ):
         super().__init__()
         self.logger = logging.getLogger(__name__)
 
-        # Force GPU usage
         if device.type != "cuda":
-            raise RuntimeError(
-                "GPULatentDataset requires CUDA device. "
-                "CPU training not supported for performance reasons."
-            )
-
+            raise RuntimeError("GPULatentDataset requires CUDA device.")
         self.device = device
-        self.config = config
+
         self.latent_dir = Path(latent_dir)
-        self.split_dir = self.latent_dir / split_name
         self.split_name = split_name
+        self.config = config
 
-        # Load latent shard index
-        shard_index = load_json(self.latent_dir / "latent_shard_index.json")
-        self.shards = shard_index["splits"][split_name]["shards"]
-        self.latent_dim = shard_index.get("latent_dim", config["model"]["latent_dim"])
+        # Load latent index and trunk_times (the ACTUAL normalized time grid used)
+        latent_index_path = self.latent_dir / "latent_shard_index.json"
+        latent_index = load_json(latent_index_path)
+        trunk_times_list = latent_index.get("trunk_times")
+        if not trunk_times_list:
+            raise KeyError(f"'trunk_times' missing or empty in {latent_index_path}")
+        self.trunk_times = torch.tensor(trunk_times_list, dtype=torch.float32, device=self.device)  # [M_total]
+        self.total_time_points = int(self.trunk_times.numel())
 
-        # Preload to GPU
-        self._preload_to_gpu()
+        # Shards for this split
+        split_info = latent_index["splits"][split_name]
+        self.shards = split_info["shards"]
+        self.split_dir = self.latent_dir / split_name
 
-    def _estimate_memory_gb(self) -> float:
-        """Estimate memory required for latent data."""
-        # Count total samples
-        n_total = sum(shard["n_trajectories"] for shard in self.shards)
+        # ---------- Memory estimate (based on latent shapes) ----------
+        if not self.shards:
+            raise RuntimeError(f"No shards found for split '{split_name}' in latent dataset.")
+        first_shard = self.split_dir / self.shards[0]["filename"]
+        with np.load(first_shard, allow_pickle=False) as probe:
+            li_shape = probe["latent_inputs"].shape   # [N_probe, L+G]
+            lt_shape = probe["latent_targets"].shape  # [N_probe, M_total, L]
+        _, in_dim = li_shape
+        _, M_total_probe, L_probe = lt_shape
+        if M_total_probe != self.total_time_points:
+            raise ValueError("Probe M_total disagrees with trunk_times length; re-generate latent set.")
 
-        # Use actual latent dimension from index
-        M = len(self.config["model"].get("trunk_times", [0.25, 0.5, 0.75, 1.0]))
-        n_globals = len(self.config["data"]["global_variables"])
-
+        N_total = int(split_info["n_trajectories"])
         bytes_per_float = 4
-        floats_per_sample = (
-                self.latent_dim + n_globals +  # inputs
-                M * self.latent_dim  # targets
-        )
+        floats_inputs  = N_total * in_dim
+        floats_targets = N_total * self.total_time_points * L_probe
+        est_gb = (floats_inputs + floats_targets) * bytes_per_float * 1.2 / 1e9  # 20% overhead
 
-        total_gb = (n_total * floats_per_sample * bytes_per_float * 1.2) / 1e9
-        return total_gb
-
-    def _preload_to_gpu(self):
-        """Preload all latent data to GPU."""
-        self.logger.info(f"Preloading {self.split_name} latent dataset to GPU...")
-
-        # Check memory
-        required_gb = self._estimate_memory_gb()
-
-        if not check_gpu_memory_available(required_gb, self.device):
+        if not check_gpu_memory_available(est_gb, self.device):
             raise RuntimeError(
-                f"Insufficient GPU memory. Need ~{required_gb:.1f}GB for latent dataset. "
-                "Consider reducing batch size or using smaller splits."
+                f"Insufficient GPU memory. Need ~{est_gb:.1f}GB for latent dataset. "
+                f"Reduce batch size or regenerate with fewer time points."
             )
 
-        all_inputs = []
-        all_targets = []
-
-        # Load all shards
+        # ---------- Load all shards to GPU ----------
+        all_inputs, all_targets = [], []
         for shard in self.shards:
             shard_path = self.split_dir / shard["filename"]
-
             with np.load(shard_path, allow_pickle=False) as data:
-                inputs = torch.from_numpy(data["latent_inputs"].astype(np.float32))
-                targets = torch.from_numpy(data["latent_targets"].astype(np.float32))
+                li = torch.from_numpy(data["latent_inputs"].astype(np.float32))   # [N, L+G]
+                lt = torch.from_numpy(data["latent_targets"].astype(np.float32))  # [N, M_total, L]
+                all_inputs.append(li)
+                all_targets.append(lt)
 
-                all_inputs.append(inputs)
-                all_targets.append(targets)
+        self.inputs  = torch.cat(all_inputs,  dim=0).to(self.device, non_blocking=True)  # [N_tot, L+G]
+        self.targets = torch.cat(all_targets, dim=0).to(self.device, non_blocking=True)  # [N_tot, M,   L]
 
-        # Concatenate and move to GPU
-        self.inputs = torch.cat(all_inputs, dim=0).to(self.device, non_blocking=True)
-        self.targets = torch.cat(all_targets, dim=0).to(self.device, non_blocking=True)
+        # Sanity: M must match trunk_times
+        if int(self.targets.shape[1]) != self.total_time_points:
+            raise ValueError("Latent targets time dimension != trunk_times length. Re-generate latent set.")
 
-        # Force synchronization
         torch.cuda.synchronize(self.device)
-
-        # Log memory usage
         allocated_gb = torch.cuda.memory_allocated(self.device) / 1e9
         self.logger.info(
             f"Loaded {len(self.inputs)} latent trajectories to GPU. "
-            f"Memory allocated: {allocated_gb:.2f}GB"
+            f"Memory allocated: {allocated_gb:.2f} GB. "
+            f"Time points per trajectory (M): {self.total_time_points}"
         )
+
+        # ---------- Time sampling configuration ----------
+        train_cfg = self.config["training"]
+        if time_sampling_mode is None:
+            self.time_sampling_mode = train_cfg.get("train_time_sampling", "random") if split_name == "train" \
+                                      else train_cfg.get("val_time_sampling", "fixed")
+        else:
+            self.time_sampling_mode = time_sampling_mode
+
+        self.randomize_time_points = (self.time_sampling_mode == "random")
+        self.fixed_indices = None
+
+        if not self.randomize_time_points:
+            # Prefer explicit fixed time lists
+            if split_name == "train":
+                fixed_times = train_cfg.get("train_fixed_times", None)
+                default_count = int(train_cfg.get("train_time_points", 10))
+            else:
+                fixed_times = train_cfg.get("val_fixed_times", None)
+                default_count = int(train_cfg.get("val_time_points", 50))
+
+            if fixed_times is not None:
+                req = torch.tensor([float(t) for t in fixed_times], dtype=torch.float32, device=self.device)  # [K]
+                diffs = (self.trunk_times.unsqueeze(0) - req.unsqueeze(1)).abs()  # [K, M_total]
+                idx = diffs.argmin(dim=1)                                         # [K]
+                self.fixed_indices = idx.sort().values
+            else:
+                # Evenly spaced subset by count
+                n_points = int(n_time_points) if n_time_points is not None else default_count
+                n_points = max(1, min(n_points, self.total_time_points))
+                if n_points == self.total_time_points:
+                    self.fixed_indices = torch.arange(self.total_time_points, device=self.device)
+                else:
+                    step = (self.total_time_points - 1) / float(n_points - 1)
+                    self.fixed_indices = torch.round(torch.arange(n_points, device=self.device) * step).long()
+        else:
+            if split_name == "train":
+                self.min_time_points = int(train_cfg.get("train_min_time_points", 8))
+                self.max_time_points = int(train_cfg.get("train_max_time_points", 32))
+            else:
+                self.min_time_points = int(train_cfg.get("val_min_time_points", 8))
+                self.max_time_points = int(train_cfg.get("val_max_time_points", 32))
+            # Clamp to availability
+            self.max_time_points = max(1, min(self.max_time_points, self.total_time_points))
+            self.min_time_points = max(1, min(self.min_time_points, self.max_time_points))
 
     def __len__(self) -> int:
         return len(self.inputs)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns latent data directly from GPU memory."""
-        return self.inputs[idx], self.targets[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            inputs  : [L+G]
+            targets : [M_i, L]    (selected latent targets)
+            times   : [M_i]       (the actual normalized trunk times)
+        """
+        if self.randomize_time_points:
+            if self.min_time_points == self.max_time_points:
+                n_points = self.min_time_points
+            else:
+                n_points = int(torch.randint(self.min_time_points,
+                                             self.max_time_points + 1,
+                                             (1,), device=self.device).item())
+            # Unique, sorted random indices across ALL available M
+            indices = torch.randperm(self.total_time_points, device=self.device)[:n_points].sort().values
+        else:
+            indices = self.fixed_indices
+            n_points = int(indices.numel())
+
+        selected_targets = self.targets[idx, indices]    # [M_i, L]
+        time_values     = self.trunk_times[indices]      # [M_i]
+        return self.inputs[idx], selected_targets, time_values
 
 
 def create_gpu_dataloader(
@@ -337,12 +410,34 @@ def create_gpu_dataloader(
     """Create DataLoader for GPU-resident datasets."""
     batch_size = config["training"]["batch_size"]
 
+    # Custom collate function for variable-length time sequences
+    def collate_fn(batch):
+        if len(batch[0]) == 3:  # Latent dataset with time values
+            inputs, targets, times = zip(*batch)
+
+            # Stack inputs (all same size)
+            inputs_tensor = torch.stack(inputs)
+
+            # For variable length targets/times, we need to handle differently
+            # Option 1: Pad to max length in batch (not ideal for DeepONet)
+            # Option 2: Keep them separate and handle in training loop
+            # We'll go with option 2 - return lists
+
+            return inputs_tensor, targets, times
+        else:
+            # Standard dataset
+            return torch.utils.data.dataloader.default_collate(batch)
+
     # Force num_workers=0 for GPU datasets
     if hasattr(dataset, 'device') and dataset.device.type == 'cuda':
         if 'num_workers' in kwargs:
             kwargs.pop('num_workers')
         num_workers = 0
         pin_memory = False
+
+        # Use custom collate for latent dataset
+        if hasattr(dataset, 'randomize_time_points'):
+            kwargs['collate_fn'] = collate_fn
     else:
         num_workers = config["training"].get("num_workers", 0)
         pin_memory = True

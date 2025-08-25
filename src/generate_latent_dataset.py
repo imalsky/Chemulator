@@ -24,80 +24,81 @@ def generate_latent_dataset(
         config: Dict[str, Any],
         device: torch.device
 ) -> None:
-    """Generate latent dataset after autoencoder pretraining."""
-    logger = logging.getLogger(__name__)
+    """Generate latent dataset after autoencoder pretraining.
 
-    # Force GPU
+    If config['latent_generation']['mode'] == 'all', we encode ALL available
+    time points from the preprocessed shards (no interpolation). Otherwise, we
+    select fixed times (nearest neighbor to source grid).
+    """
+    logger = logging.getLogger(__name__)
     if device.type != "cuda":
         raise RuntimeError("Latent dataset generation requires CUDA device.")
 
-    logger.info("Generating latent dataset...")
+    # ---- Early exit if latent dataset already exists ----
+    if output_dir.exists() and (output_dir / "latent_shard_index.json").exists():
+        logger.warning(f"Latent dataset already exists at {output_dir}. Skipping generation.")
+        return
 
-    # Create output directory
+    logger.info("Generating latent dataset...")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load shard index and normalization stats
+    # Load input metadata and normalization
     shard_index = load_json(input_dir / "shard_index.json")
-    norm_stats = load_json(input_dir / "normalization.json")
+    norm_stats  = load_json(input_dir / "normalization.json")
 
-    # ---- CRITICAL FIX 2: Enforce log-min-max at stats level ----
     data_cfg = config["data"]
     time_var = data_cfg["time_variable"]
+
+    # Enforce log-min-max for time
     nm = norm_stats.get("normalization_methods", {})
     tm = norm_stats.get("time_normalization", {})
-
-    if nm.get(time_var, None) != "log-min-max" or tm.get("time_transform", None) != "log-min-max":
+    if nm.get(time_var) != "log-min-max" or tm.get("time_transform") != "log-min-max":
         raise ValueError(
-            f"Preprocessed stats do not use log-min-max for '{time_var}'. "
-            f"Found normalization_methods[{time_var}]={nm.get(time_var)} "
-            f"and time_normalization.time_transform={tm.get('time_transform')}. "
-            f"Both must be 'log-min-max'. Please reprocess your data with log-min-max time normalization."
+            f"Time variable '{time_var}' must use log-min-max normalization; "
+            f"found nm[{time_var}]={nm.get(time_var)}, tm.time_transform={tm.get('time_transform')}."
         )
-
     logger.info(f"Verified time variable '{time_var}' uses log-min-max normalization")
 
-    # Initialize normalization helper
-    norm_helper = NormalizationHelper(norm_stats, device, config)
-
-    # Setup variables
+    # Setup helpers and variables
+    norm_helper  = NormalizationHelper(norm_stats, device, config)
     species_vars = data_cfg["species_variables"]
-    global_vars = data_cfg["global_variables"]
-
-    # Strictly validate globals are [P, T]
-    expected_globals = data_cfg.get("expected_globals", ["P", "T"])
-    if global_vars != expected_globals:
-        raise ValueError(
-            f"Global variables mismatch: got {global_vars}, expected {expected_globals}. "
-            f"DeepONet branch network requires exactly {expected_globals}."
-        )
-
+    global_vars  = data_cfg["global_variables"]
+    expected     = data_cfg.get("expected_globals", ["P", "T"])
+    if global_vars != expected:
+        raise ValueError(f"Global variables mismatch: got {global_vars}, expected {expected}.")
     logger.info(f"Using global variables: {global_vars} (P=pressure, T=temperature)")
 
-    # Get trunk times from config (must be in [0, 1])
-    trunk_times_list = config["model"].get("trunk_times", [0.25, 0.5, 0.75, 1.0])
+    # Determine latent time mode
+    lg_cfg = config.get("latent_generation", {})
+    lg_mode = (lg_cfg.get("mode") or "all").lower()
+    if lg_mode not in ("all", "fixed"):
+        raise ValueError(f"latent_generation.mode must be 'all' or 'fixed', got '{lg_mode}'")
 
-    # Validate trunk times
-    if not all(0.0 <= float(t) <= 1.0 for t in trunk_times_list):
-        raise ValueError(f"trunk_times must be in [0,1], got {trunk_times_list}")
+    # If fixed, pick list; else will fill from source
+    fixed_times_list = None
+    if lg_mode == "fixed":
+        fixed_times_list = lg_cfg.get("fixed_times") or config["model"].get("trunk_times")
+        if not fixed_times_list:
+            raise ValueError("latent_generation.mode='fixed' requires 'fixed_times' or model.trunk_times.")
+        if not all(0.0 <= float(t) <= 1.0 for t in fixed_times_list):
+            raise ValueError(f"Fixed times must be in [0,1], got {fixed_times_list}")
 
-    trunk_times = torch.tensor(trunk_times_list, dtype=torch.float32, device=device)
-
-    # Process each split
+    # Build latent shard index
     new_shard_index = {
         "latent_mode": True,
-        "latent_dim": config["model"]["latent_dim"],
-        "trunk_times": trunk_times_list,
+        "latent_dim": int(config["model"]["latent_dim"]),
+        "trunk_times": None,   # set later
         "splits": {}
     }
 
     model.eval()
-
     with torch.no_grad():
+        shared_time_vec = None
+
         for split_name in ["train", "validation", "test"]:
             logger.info(f"Processing {split_name} split...")
-
-            split_dir = input_dir / split_name
-            output_split_dir = output_dir / split_name
+            split_dir         = input_dir / split_name
+            output_split_dir  = output_dir / split_name
             output_split_dir.mkdir(parents=True, exist_ok=True)
 
             split_info = shard_index["splits"][split_name]
@@ -106,169 +107,129 @@ def generate_latent_dataset(
             for shard_info in tqdm(split_info["shards"], desc=split_name):
                 shard_path = split_dir / shard_info["filename"]
 
-                # Check GPU memory
-                free_mem, _ = torch.cuda.mem_get_info(device.index or 0)
-                if free_mem < 2e9:  # Less than 2GB free
-                    torch.cuda.empty_cache()
-
+                # Load raw tensors (CPU), cast to float32
                 with np.load(shard_path, allow_pickle=False) as data:
-                    # Load raw data
-                    x0 = torch.from_numpy(data["x0"].astype(np.float32))
-                    globals_vec = torch.from_numpy(data["globals"].astype(np.float32))
-                    t_vec = torch.from_numpy(data["t_vec"].astype(np.float32))
-                    y_mat = torch.from_numpy(data["y_mat"].astype(np.float32))
+                    x0_np  = data["x0"].astype(np.float32)       # [N, S]
+                    y_np   = data["y_mat"].astype(np.float32)    # [N, M, S]
+                    g_np   = data["globals"].astype(np.float32)  # [N, G]
+                    t_np   = data["t_vec"].astype(np.float32)    # [M] or [N, M]
 
-                    # Validate globals shape (should be [N, 2] for [P, T])
-                    if globals_vec.shape[1] != 2:
-                        raise ValueError(
-                            f"Expected 2 global variables [P, T], got shape {globals_vec.shape}"
-                        )
+                # Convert to tensors (CPU first)
+                x0      = torch.from_numpy(x0_np)
+                y_mat   = torch.from_numpy(y_np)                # [N, M, S]
+                globals_vec = torch.from_numpy(g_np)            # [N, G]
 
-                    # ---- DEFENSIVE CHECK C: Assert globals are constant per trajectory ----
-                    if globals_vec.dim() == 2 and globals_vec.shape[0] > 1:
-                        # Check if globals vary across the batch (they shouldn't within a trajectory)
-                        # This assumes globals_vec has one row per trajectory
-                        pass  # Each trajectory has its own constant P,T, which is correct
+                # Normalize
+                x0_norm      = norm_helper.normalize(x0, species_vars).to(device)        # [N, S]
+                y_norm       = norm_helper.normalize(y_mat, species_vars).to(device)     # [N, M, S]
+                globals_norm = norm_helper.normalize(globals_vec, global_vars)           # [N, G]
 
-                    # Apply normalization
-                    x0_norm = norm_helper.normalize(x0, species_vars).to(device)
-                    globals_norm = norm_helper.normalize(globals_vec, global_vars)  # This returns GPU tensor
-                    y_norm = norm_helper.normalize(y_mat, species_vars).to(device)
+                # Normalize time to [0,1]
+                if t_np.ndim == 1:
+                    t_vec  = torch.from_numpy(t_np)                                     # [M]
+                    t_norm = norm_helper.normalize(t_vec.unsqueeze(-1), [time_var]).squeeze(-1).to(device)  # [M]
+                    per_sample_times = False
+                elif t_np.ndim == 2:
+                    t_vec  = torch.from_numpy(t_np)                                     # [N, M]
+                    t_norm = norm_helper.normalize(t_vec.unsqueeze(-1), [time_var]).squeeze(-1).to(device)  # [N, M]
+                    per_sample_times = True
+                else:
+                    raise ValueError(f"'t_vec' must be [M] or [N,M], got shape {t_np.shape}")
 
-                    # Encode initial species to latent
-                    z0 = model.encode(x0_norm)  # [N, latent_dim] on GPU
+                # Monotonicity checks
+                if per_sample_times:
+                    N, M = t_norm.shape
+                    if (t_norm[:, 0] > t_norm[:, -1]).any():
+                        raise ValueError("Each trajectory must have non-decreasing normalized time.")
+                else:
+                    M = int(t_norm.shape[0])
+                    if not (float(t_norm[0]) <= float(t_norm[-1])):
+                        raise ValueError("Shared time grid must be non-decreasing.")
 
-                    # ---- Normalize time using NormalizationHelper (log-min-max) ----
-                    if t_vec.dim() == 1:
-                        # Shared time grid across all trajectories
-                        t_norm = norm_helper.normalize(
-                            t_vec.unsqueeze(-1), [time_var]
-                        ).squeeze(-1).to(device)  # [M] in [0,1]
-
-                        # ---- DEFENSIVE CHECK A: Assert normalized time spans [0,1] ----
-                        if not (t_norm[0] <= t_norm[-1]):
-                            raise ValueError("Normalized time grid must be monotonically increasing.")
-                        if abs(float(t_norm[0])) > 1e-6 or abs(float(t_norm[-1] - 1.0)) > 1e-6:
-                            logger.warning(
-                                f"Normalized time grid spans [{float(t_norm[0]):.6f}, {float(t_norm[-1]):.6f}], "
-                                f"expected ~[0, 1]. This may indicate incorrect normalization."
+                # Select times and targets
+                if lg_mode == "all":
+                    if per_sample_times:
+                        # require shared grid: every row equal to the first row
+                        if (t_norm - t_norm[0].unsqueeze(0)).abs().max().item() > 1e-7:
+                            raise RuntimeError(
+                                "latent_generation.mode='all' requires a shared time grid across trajectories."
                             )
-
-                        # Find indices corresponding to trunk times
-                        M = t_norm.numel()
-                        indices = []
-                        for trunk_t in trunk_times:
-                            # Find nearest normalized time
-                            diffs = (t_norm - trunk_t).abs()
-                            idx = diffs.argmin().item()
-                            indices.append(idx)
-
-                        # Log selected times for verification
-                        selected_times = [float(t_norm[idx]) for idx in indices]
-                        logger.debug(f"Selected normalized times: {selected_times} (target: {trunk_times_list})")
-
-                        # Extract species at selected times
-                        y_selected = y_norm[:, indices]  # [N, len(trunk_times), n_species]
-
+                        times_used = t_norm[0]  # [M]
                     else:
-                        # Per-trajectory time grids
-                        t_norm = norm_helper.normalize(
-                            t_vec.unsqueeze(-1), [time_var]
-                        ).squeeze(-1).to(device)  # [N, M] in [0,1]
+                        times_used = t_norm      # [M]
+                    y_selected = y_norm                                            # [N, M, S]
+                    trunk_times_tensor = times_used.to(device)                     # [M]
+                else:
+                    # Fixed: nearest-neighbor to requested normalized times
+                    req = torch.tensor([float(t) for t in fixed_times_list], dtype=torch.float32, device=device)  # [K]
+                    if per_sample_times:
+                        if (t_norm - t_norm[0].unsqueeze(0)).abs().max().item() > 1e-7:
+                            raise RuntimeError("latent_generation.mode='fixed' expects a shared time grid.")
+                        diffs = (t_norm[0].unsqueeze(0) - req.unsqueeze(1)).abs()  # [K, M]
+                        idx = diffs.argmin(dim=1)                                  # [K]
+                        y_selected = y_norm[:, idx, :]                             # [N, K, S]
+                    else:
+                        diffs = (t_norm.unsqueeze(0) - req.unsqueeze(1)).abs()     # [K, M]
+                        idx = diffs.argmin(dim=1)                                  # [K]
+                        y_selected = y_norm[:, idx, :]                             # [N, K, S]
+                    trunk_times_tensor = req                                       # [K]
 
-                        # Check each trajectory's time span
-                        for i in range(t_norm.shape[0]):
-                            if not (t_norm[i, 0] <= t_norm[i, -1]):
-                                raise ValueError(f"Trajectory {i}: time grid must be monotonically increasing.")
-                            if abs(float(t_norm[i, 0])) > 1e-6 or abs(float(t_norm[i, -1] - 1.0)) > 1e-6:
-                                logger.warning(
-                                    f"Trajectory {i}: normalized time spans [{float(t_norm[i, 0]):.6f}, "
-                                    f"{float(t_norm[i, -1]):.6f}], expected ~[0, 1]."
-                                )
+                # Encode to latent space
+                N = x0_norm.shape[0]
+                latent_dim = int(config["model"]["latent_dim"])
 
-                        N, M = t_norm.shape
-                        indices = []
-                        for trunk_t in trunk_times:
-                            # Find nearest normalized time for each trajectory
-                            diffs = (t_norm - trunk_t.unsqueeze(0)).abs()  # [N, M]
-                            idx = diffs.argmin(dim=1)  # [N]
-                            indices.append(idx)
+                z0 = model.encode(x0_norm)                                         # [N, L]
 
-                        indices = torch.stack(indices, dim=1)  # [N, len(trunk_times)]
+                K = int(y_selected.size(1))
+                z_targets = torch.empty((N, K, latent_dim), dtype=torch.float32, device=device)
+                for j in range(K):
+                    z_targets[:, j, :] = model.encode(y_selected[:, j, :])
 
-                        # Extract species at selected times for each trajectory
-                        batch_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, len(trunk_times))
-                        y_selected = y_norm[batch_idx, indices]  # [N, len(trunk_times), n_species]
+                # Move to CPU for saving
+                z0_cpu        = z0.to(dtype=torch.float32, device='cpu')
+                globals_cpu   = globals_norm.to(dtype=torch.float32, device='cpu')
+                z_targets_cpu = z_targets.to(dtype=torch.float32, device='cpu')
+                latent_inputs = torch.cat([z0_cpu, globals_cpu], dim=1)            # [N, L+2]
 
-                    # Encode selected timepoints to latent space
-                    latent_targets = []
-                    for j in range(y_selected.size(1)):
-                        z_at_t = model.encode(y_selected[:, j])  # [N, latent_dim] on GPU
-                        latent_targets.append(z_at_t)
+                # Save compressed latent shard
+                output_filename = f"latent_{shard_info['filename']}"
+                output_path     = output_split_dir / output_filename
+                np.savez_compressed(
+                    output_path,
+                    latent_inputs=latent_inputs.numpy(),     # [N, L+2]
+                    latent_targets=z_targets_cpu.numpy()      # [N, K, L]
+                )
 
-                    z_targets = torch.stack(latent_targets, dim=1)  # [N, len(trunk_times), latent_dim] on GPU
+                # Record shard
+                new_shards.append({
+                    "filename": output_filename,
+                    "n_trajectories": shard_info["n_trajectories"]
+                })
 
-                    # Verify shape
-                    if z_targets.shape[1] != len(trunk_times_list):
-                        raise RuntimeError(
-                            f"Shape mismatch: z_targets has {z_targets.shape[1]} timepoints, "
-                            f"expected {len(trunk_times_list)}"
-                        )
+                # Enforce consistent time vector across shards
+                times_list = trunk_times_tensor.to('cpu', dtype=torch.float32).numpy().tolist()
+                if shared_time_vec is None:
+                    shared_time_vec = times_list
+                else:
+                    if len(shared_time_vec) != len(times_list) or any(
+                        abs(a - b) > 1e-7 for a, b in zip(shared_time_vec, times_list)
+                    ):
+                        raise RuntimeError("Inconsistent trunk_times across shards; verify preprocessing.")
 
-                    # ---- CRITICAL FIX 1: Move everything to CPU with consistent dtype ----
-                    # Convert to float32 CPU tensors for saving
-                    z0_cpu = z0.to(dtype=torch.float32, device='cpu')
-                    globals_cpu = globals_norm.to(dtype=torch.float32, device='cpu')
-                    z_targets_cpu = z_targets.to(dtype=torch.float32, device='cpu')
-
-                    # Create latent inputs: [z0, P, T]
-                    latent_inputs = torch.cat([z0_cpu, globals_cpu], dim=1)  # [N, latent_dim + 2] on CPU
-
-                    # ---- DEFENSIVE CHECK B: Ensure correct dtype ----
-                    assert latent_inputs.dtype == torch.float32, f"Expected float32, got {latent_inputs.dtype}"
-                    assert z_targets_cpu.dtype == torch.float32, f"Expected float32, got {z_targets_cpu.dtype}"
-
-                    # Save latent shard
-                    output_filename = f"latent_{shard_info['filename']}"
-                    output_path = output_split_dir / output_filename
-
-                    np.savez_compressed(
-                        output_path,
-                        latent_inputs=latent_inputs.numpy(),  # Now safely on CPU
-                        latent_targets=z_targets_cpu.numpy()  # Now safely on CPU
-                    )
-
-                    new_shards.append({
-                        "filename": output_filename,
-                        "n_trajectories": shard_info["n_trajectories"]
-                    })
-
-                    # Clear GPU memory periodically
-                    if len(new_shards) % 10 == 0:
-                        torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
 
             new_shard_index["splits"][split_name] = {
                 "shards": new_shards,
                 "n_trajectories": split_info["n_trajectories"]
             }
 
-    # Save latent shard index
+    # Finalize index and copy normalization
+    if shared_time_vec is None:
+        raise RuntimeError("No shards processed; cannot finalize latent index.")
+    new_shard_index["trunk_times"] = shared_time_vec
     save_json(new_shard_index, output_dir / "latent_shard_index.json")
-
-    # Copy normalization stats
     save_json(norm_stats, output_dir / "normalization.json")
-
     logger.info(f"Latent dataset saved to {output_dir}")
-
-    # Final sanity check: log a sample to verify
-    logger.info("Sanity check - Sample latent data shapes:")
-    logger.info(f"  latent_inputs: [N, {config['model']['latent_dim'] + 2}] = [z0, P, T]")
-    logger.info(f"  latent_targets: [N, {len(trunk_times_list)}, {config['model']['latent_dim']}]")
-
-    # Optional: Compute and save latent statistics for potential standardization
-    if new_shard_index["splits"]["train"]["n_trajectories"] > 0:
-        logger.info("Computing latent space statistics for optional standardization...")
-        _compute_latent_statistics(output_dir, new_shard_index, config)
 
 
 def _compute_latent_statistics(output_dir: Path, shard_index: Dict, config: Dict) -> None:
