@@ -13,6 +13,7 @@ Features:
 - Unified model directory structure
 - Configuration persistence
 - Model export for deployment
+- UPDATED: Flexible time point sampling for training
 """
 
 import logging
@@ -43,7 +44,7 @@ class AEDeepONetPipeline:
     Manages the three-stage training process:
     1. Autoencoder pretraining
     2. Latent dataset generation
-    3. DeepONet training
+    3. DeepONet training with flexible time sampling
 
     Args:
         config_path: Path to JSON configuration file
@@ -318,7 +319,7 @@ class AEDeepONetPipeline:
 
     def stage3_train_deeponet(self):
         """
-        Stage 3: Train DeepONet on latent space.
+        Stage 3: Train DeepONet on latent space with flexible time sampling.
 
         Trains the DeepONet component to predict latent trajectories
         from initial conditions and global parameters.
@@ -327,16 +328,47 @@ class AEDeepONetPipeline:
         self.logger.info("Stage 3: DeepONet Training on Latent Space")
         self.logger.info("=" * 60)
 
+        # Get time sampling configuration
+        train_cfg = self.config["training"]
+        train_mode = train_cfg.get("train_time_sampling", "random")
+        val_mode = train_cfg.get("val_time_sampling", "fixed")
+
+        self.logger.info(f"Training time sampling mode: {train_mode}")
+        if train_mode == "random":
+            min_pts = train_cfg.get("train_min_time_points", 8)
+            max_pts = train_cfg.get("train_max_time_points", 32)
+            self.logger.info(f"  Random time points range: [{min_pts}, {max_pts}]")
+        else:
+            pts = train_cfg.get("train_time_points", 10)
+            self.logger.info(f"  Fixed time points: {pts}")
+
+        self.logger.info(f"Validation time sampling mode: {val_mode}")
+        if val_mode == "random":
+            min_pts = train_cfg.get("val_min_time_points", 8)
+            max_pts = train_cfg.get("val_max_time_points", 32)
+            self.logger.info(f"  Random time points range: [{min_pts}, {max_pts}]")
+        else:
+            pts = train_cfg.get("val_time_points", 50)
+            self.logger.info(f"  Fixed time points: {pts}")
+
         # Load latent datasets to GPU
         try:
             train_dataset = GPULatentDataset(
-                self.latent_dir, "train", self.config, self.device
+                self.latent_dir,
+                "train",
+                self.config,
+                self.device,
+                time_sampling_mode=train_mode
             )
 
             val_dataset = None
             if self.config["training"].get("val_fraction", 0) > 0:
                 val_dataset = GPULatentDataset(
-                    self.latent_dir, "validation", self.config, self.device
+                    self.latent_dir,
+                    "validation",
+                    self.config,
+                    self.device,
+                    time_sampling_mode=val_mode
                 )
         except RuntimeError as e:
             self.logger.error(f"Failed to load latent datasets to GPU: {e}")
@@ -450,7 +482,7 @@ class AEDeepONetPipeline:
         1. Data preprocessing (if needed)
         2. Autoencoder pretraining
         3. Latent data generation
-        4. DeepONet training
+        4. DeepONet training with flexible time sampling
         """
         try:
             # Log initial GPU memory status
@@ -499,7 +531,7 @@ The pipeline will:
   1. Preprocess raw HDF5 data (if needed)
   2. Train autoencoder for dimensionality reduction
   3. Generate latent dataset (always fresh)
-  4. Train DeepONet on latent space
+  4. Train DeepONet on latent space with flexible time sampling
 
 All models and logs are saved in a timestamped directory.
         """

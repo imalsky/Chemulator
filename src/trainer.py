@@ -7,6 +7,7 @@ Features:
 - Automatic mixed precision (AMP) support
 - Partition-of-Unity (PoU) regularization properly integrated
 - Clear logging with normalized space metrics
+- Support for flexible time point sampling during training
 """
 
 import logging
@@ -25,6 +26,9 @@ from torch.utils.data import DataLoader
 class CosineAnnealingWarmupScheduler:
     """
     Cosine annealing learning rate scheduler with linear warmup.
+
+    Combines linear warmup phase with cosine annealing decay for smooth
+    learning rate transitions and improved training stability.
     """
 
     def __init__(
@@ -35,6 +39,16 @@ class CosineAnnealingWarmupScheduler:
             min_lr: float = 1e-6,
             base_lr: Optional[float] = None
     ):
+        """
+        Initialize the scheduler.
+
+        Args:
+            optimizer: PyTorch optimizer to schedule
+            warmup_epochs: Number of epochs for linear warmup
+            total_epochs: Total number of training epochs
+            min_lr: Minimum learning rate after cosine decay
+            base_lr: Base learning rate (uses optimizer's lr if None)
+        """
         self.optimizer = optimizer
         self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
@@ -102,6 +116,9 @@ class CosineAnnealingWarmupScheduler:
 class Trainer:
     """
     Trainer for AE-DeepONet models with proper PoU regularization integration.
+
+    Handles both autoencoder pretraining and DeepONet training stages with
+    flexible time point sampling support.
     """
 
     def __init__(
@@ -114,56 +131,64 @@ class Trainer:
             device: torch.device,
             is_latent_stage: bool = False
     ):
+        """
+        Initialize the trainer.
+        """
         self.logger = logging.getLogger(__name__)
+
+        # Core state
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
         self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
-        self.is_latent_stage = is_latent_stage
+        self.is_latent = bool(is_latent_stage)
 
-        # Extract training configuration
-        train_cfg = config["training"]
-        self.epochs = train_cfg["epochs"]
-        self.lr = train_cfg["learning_rate"]
-        self.weight_decay = train_cfg.get("weight_decay", 1e-4)
-        self.gradient_clip = train_cfg.get("gradient_clip", 1.0)
-        self.use_amp = train_cfg.get("use_amp", True) and device.type == "cuda"
-        self.pou_weight = train_cfg.get("pou_weight", 0.01)
+        # Training config
+        train_cfg = self.config.get("training", {})
+        self.lr = float(train_cfg.get("learning_rate", 1e-3))
+        self.weight_decay = float(train_cfg.get("weight_decay", 1e-4))
+        betas_cfg = train_cfg.get("betas", (0.9, 0.999))
+        self.gradient_clip = float(train_cfg.get("gradient_clip", 0.0))
+        self.use_amp = bool(train_cfg.get("use_amp", True))
+        self.pou_weight = float(train_cfg.get("pou_weight", 0.0))
+        self.warmup_epochs = int(train_cfg.get("warmup_epochs", 10))
+        self.min_lr = float(train_cfg.get("min_lr", 1e-6))
 
-        # Learning rate scheduler configuration
-        self.warmup_epochs = train_cfg.get("warmup_epochs", 10)
-        self.min_lr = train_cfg.get("min_lr", 1e-6)
+        # Choose parameter set by stage:
+        # - AE pretrain: only autoencoder parameters
+        # - Latent/DeepONet: only DeepONet parameters
+        if self.is_latent:
+            params = self.model.deeponet_parameters()
+        else:
+            params = self.model.ae_parameters()
 
-        # Setup optimizer (AdamW for weight decay)
+        # Optimizer (AdamW)
         self.optimizer = AdamW(
-            model.parameters(),
+            params,
             lr=self.lr,
             weight_decay=self.weight_decay,
-            betas=train_cfg.get("betas", (0.9, 0.999))
+            betas=betas_cfg
         )
 
-        # Setup learning rate scheduler
-        self.scheduler = None  # Will be initialized for each training stage
+        # LR scheduler placeholder; created in each training stage method
+        self.scheduler = None
 
-        # Setup AMP scaler
+        # AMP scaler
         self.scaler = GradScaler('cuda' if self.use_amp else 'cpu', enabled=self.use_amp)
 
-        # Loss function (MSE as per paper)
+        # Criterion
         self.criterion = nn.MSELoss()
 
-        # Training state
+        # Tracking
         self.current_epoch = 0
         self.best_val_loss = float("inf")
         self.best_epoch = -1
-
-        # Metrics tracking
         self.train_history = []
         self.val_history = []
 
-        # Ensure model has history lists
+        # Ensure model has tracking lists
         for name in ("index_list", "train_loss_list", "val_loss_list"):
             if not hasattr(self.model, name):
                 setattr(self.model, name, [])
@@ -174,6 +199,12 @@ class Trainer:
     def train_ae_pretrain(self, epochs: int) -> float:
         """
         Stage 1: Pretrain autoencoder with cosine annealing scheduler.
+
+        Args:
+            epochs: Number of epochs to train
+
+        Returns:
+            Final training loss
         """
         self.logger.info("Starting autoencoder pretraining...")
 
@@ -266,6 +297,11 @@ class Trainer:
     def train_deeponet(self) -> float:
         """
         Stage 3: Train DeepONet on latent space with PoU regularization.
+
+        Supports flexible time point sampling during training.
+
+        Returns:
+            Best validation loss achieved
         """
         self.logger.info("Starting DeepONet training on latent space...")
 
@@ -330,123 +366,166 @@ class Trainer:
 
     def _train_epoch(self) -> Tuple[float, Dict[str, float]]:
         """
-        Train one epoch with PoU regularization properly integrated.
+        Train one epoch for DeepONet on latent space.
+
+        Uses gradient accumulation across the whole batch (one optimizer step per batch),
+        while supporting variable-length time selections per sample.
         """
         self.model.train()
         total_loss = 0.0
         total_mse = 0.0
         total_pou = 0.0
-        n_batches = 0
+        n_samples = 0
 
-        for inputs, targets in self.train_loader:
-            inputs = inputs.to(self.device)
-            targets = targets.to(self.device)
-
-            self.optimizer.zero_grad(set_to_none=True)
-
-            with autocast('cuda', enabled=self.use_amp):
-                if self.is_latent_stage:
-                    # DeepONet training: predict latent trajectory with trunk outputs for PoU
-                    z_pred, aux = self.model(inputs, decode=False, return_trunk_outputs=True)
-                    mse_loss = self.criterion(z_pred, targets)
-
-                    # PoU regularization (active only if use_pou=True and pou_weight>0)
-                    pou_loss = self.model.pou_regularization(aux.get("trunk_outputs"))
-
-                    # Combined loss
-                    loss = mse_loss + self.pou_weight * pou_loss
-                else:
-                    # Regular training (autoencoder)
-                    y_pred, _ = self.model(inputs, decode=True)
-                    mse_loss = self.criterion(y_pred, targets)
-                    pou_loss = torch.tensor(0.0)
-                    loss = mse_loss
-
-            # Backward
-            self.scaler.scale(loss).backward()
-
-            # Gradient clipping
-            if self.gradient_clip > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.gradient_clip
+        for batch_data in self.train_loader:
+            # Expect latent dataset: (inputs, targets_list, times_list)
+            if len(batch_data) != 3:
+                raise RuntimeError(
+                    "This _train_epoch handles only the latent DeepONet stage. "
+                    "Use train_ae_pretrain() for autoencoder pretraining."
                 )
 
-            # Optimizer step
+            inputs, targets_list, times_list = batch_data
+            B = inputs.size(0)
+            if not isinstance(targets_list, list) or not isinstance(times_list, list) or len(targets_list) != B:
+                raise RuntimeError("Latent dataloader must return lists of length B for targets and times.")
+
+            inputs = inputs.to(self.device, non_blocking=True)
+
+            # ---- Gradient accumulation across the batch ----
+            self.optimizer.zero_grad(set_to_none=True)
+            batch_loss_sum = 0.0
+
+            for i in range(B):
+                input_i = inputs[i:i + 1]  # [1, L+G]
+                targets_i = targets_list[i].unsqueeze(0).to(self.device, non_blocking=True)  # [1, M_i, L]
+                times_i = times_list[i].to(self.device, non_blocking=True)  # [M_i] in [0,1]
+
+                with autocast('cuda', enabled=self.use_amp):
+                    loss_i, comps = self.model.compute_deeponet_loss(
+                        input_i, targets_i, trunk_times=times_i, pou_weight=self.pou_weight
+                    )
+
+                # Accumulate scalar metrics
+                total_mse += float(comps.get("mse", 0.0))
+                total_pou += float(comps.get("pou", 0.0))
+                n_samples += 1
+
+                # Sum up losses for a single backward()
+                batch_loss_sum = batch_loss_sum + loss_i
+
+            # Normalize by batch size for steady loss scale
+            with autocast('cuda', enabled=self.use_amp):
+                loss = batch_loss_sum / float(B)
+
+            # Backward once, clip once, step once
+            self.scaler.scale(loss).backward()
+            if self.gradient_clip and self.gradient_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            total_loss += loss.item()
-            total_mse += mse_loss.item()
-            total_pou += pou_loss.item() if isinstance(pou_loss, torch.Tensor) else pou_loss
-            n_batches += 1
+            total_loss += float(loss.detach())
 
-        metrics = {
-            "loss": total_loss / n_batches,
-            "mse": total_mse / n_batches,
-            "pou": total_pou / n_batches
-        }
+        # Averages over individual samples
+        avg_loss = total_loss / max(1, len(self.train_loader))
+        avg_mse = total_mse / max(1, n_samples)
+        avg_pou = total_pou / max(1, n_samples)
 
-        return metrics["loss"], metrics
+        return float(avg_loss), {"mse": float(avg_mse), "pou": float(avg_pou)}
 
     @torch.no_grad()
     def _validate(self) -> Tuple[float, Dict[str, float]]:
         """
-        Validate with metrics in NORMALIZED space.
+        Validate model performance on validation set.
 
-        IMPORTANT: The 'decoded_mae' metric is computed in NORMALIZED space,
-        not physical units. This represents the MAE between normalized species
-        concentrations (after log10 and z-score transformations), NOT actual
-        physical concentrations.
+        Computes metrics in both normalized and physical space when possible.
+
+        Returns:
+            Average loss and metrics dictionary
         """
         if self.val_loader is None:
             return float("inf"), {}
 
+        # Lazy-load normalization helper once (if available)
+        if not hasattr(self, "_norm_helper"):
+            try:
+                from utils import load_json
+                from normalizer import NormalizationHelper
+                stats_path = Path(self.config["paths"]["processed_data_dir"]) / "normalization.json"
+                stats = load_json(stats_path)
+                self._norm_helper = NormalizationHelper(stats, self.device, self.config)
+                self._species_vars = list(self.config["data"]["target_species_variables"])
+            except Exception:
+                self._norm_helper = None
+                self._species_vars = None
+
+        have_phys = self._norm_helper is not None and self._species_vars is not None
+
         self.model.eval()
         total_loss = 0.0
         total_mse = 0.0
-        total_decoded_mae = 0.0
-        n_batches = 0
+        total_mae_norm = 0.0
+        total_mae_phys = 0.0
+        n_samples = 0
 
-        for inputs, targets in self.val_loader:
-            inputs = inputs.to(self.device)
-            targets = targets.to(self.device)
+        for batch_data in self.val_loader:
+            if len(batch_data) != 3:
+                raise RuntimeError("Validation expects latent dataset batches: (inputs, targets_list, times_list).")
 
-            with autocast('cuda', enabled=self.use_amp):
-                if self.is_latent_stage:
-                    # Compute latent MSE
-                    z_pred, _ = self.model(inputs, decode=False)
-                    loss = self.criterion(z_pred, targets)
+            inputs, targets_list, times_list = batch_data
+            B = inputs.size(0)
 
-                    # Also compute decoded MAE in NORMALIZED space for interpretability
-                    y_pred, _ = self.model(inputs, decode=True)
+            for i in range(B):
+                input_i = inputs[i:i + 1]
+                targets_i = targets_list[i].unsqueeze(0)
+                times_i = times_list[i]
 
-                    # Decode targets for comparison
-                    B, M, LD = targets.shape
-                    targets_flat = targets.reshape(B * M, LD)
-                    y_true_flat = self.model.decode(targets_flat)
-                    y_true = y_true_flat.view(B, M, -1)
+                with autocast('cuda', enabled=self.use_amp):
+                    # Latent-space MSE
+                    z_pred, _ = self.model(input_i, decode=False, trunk_times=times_i)
+                    loss = self.criterion(z_pred, targets_i)
 
-                    # MAE in normalized space (log10 + z-score transformed)
-                    decoded_mae = (y_pred - y_true).abs().mean()
+                    # Decode both pred and target to species (normalized) for MAE
+                    y_pred, _ = self.model(input_i, decode=True, trunk_times=times_i)
+                    B1, M1, LD = targets_i.shape
+                    y_true = self.model.decode(targets_i.reshape(B1 * M1, LD)).view(B1, M1, -1)
+                    mae_n = (y_pred - y_true).abs().mean()
+
+                # Compute physical space MAE if possible
+                if have_phys:
+                    y_pred_phys = self._norm_helper.denormalize(
+                        y_pred.reshape(-1, y_pred.shape[-1]), self._species_vars
+                    ).view_as(y_pred)
+                    y_true_phys = self._norm_helper.denormalize(
+                        y_true.reshape(-1, y_true.shape[-1]), self._species_vars
+                    ).view_as(y_true)
+                    mae_p = (y_pred_phys - y_true_phys).abs().mean().item()
                 else:
-                    y_pred, _ = self.model(inputs, decode=True)
-                    loss = self.criterion(y_pred, targets)
-                    decoded_mae = torch.tensor(0.0)
+                    mae_p = 0.0
 
-            total_loss += loss.item()
-            total_mse += loss.item()
-            total_decoded_mae += decoded_mae.item()
-            n_batches += 1
+                total_loss += float(loss.item())
+                total_mse += float(loss.item())
+                total_mae_norm += float(mae_n.item())
+                total_mae_phys += float(mae_p)
+                n_samples += 1
+
+        # Compute averages
+        avg_loss = total_loss / max(1, n_samples)
+        avg_mse = total_mse / max(1, n_samples)
+        avg_mae_n = total_mae_norm / max(1, n_samples)
+        avg_mae_p = total_mae_phys / max(1, n_samples)
 
         metrics = {
-            "loss": total_loss / n_batches,
-            "mse": total_mse / n_batches,
-            "decoded_mae": total_decoded_mae / n_batches  # Normalized space MAE
+            "loss": avg_loss,
+            "mse": avg_mse,
+            "decoded_mae": avg_mae_n,
         }
+        if have_phys:
+            metrics["decoded_mae_phys"] = avg_mae_p
 
-        return metrics["loss"], metrics
+        return avg_loss, metrics
 
     def _save_checkpoint(self, epoch: int, loss: float, prefix: str = "checkpoint", is_best: bool = False):
         """Save model checkpoint with all training state."""

@@ -41,7 +41,7 @@ def optimize_hardware(config: Dict[str, Any], device: torch.device) -> None:
     tf32_enabled = bool(config.get("tf32", True))
     try:
         # Only meaningful on CUDA for float32; harmless elsewhere, but be explicit.
-        if device.type == "cuda" and tf32_enabled and torch.get_default_dtype() == torch.float32:
+        if device.type == "cuda" and tf32_enabled:
             torch.set_float32_matmul_precision("high")  # enables TF32 paths
             # Redundant but explicit toggles:
             if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):

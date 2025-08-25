@@ -10,6 +10,7 @@ Key implementation notes:
   removed to avoid confusion and ensure consistency.
 - PoU regularization is properly integrated into the loss function.
 - BatchNorm is handled flexibly to support batch_size=1.
+- UPDATED: Support for flexible trunk times (randomized training, dense inference)
 """
 
 import logging
@@ -204,6 +205,7 @@ class AEDeepONet(nn.Module):
       This is intentional for our specific application.
     - Clamping is ONLY in normalized space. Physical space clamping removed.
     - PoU regularization is integrated into the loss function.
+    - UPDATED: Support for flexible trunk times during training and inference
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -221,11 +223,20 @@ class AEDeepONet(nn.Module):
         self.use_pou = model_cfg.get("use_pou", False)
         self.pou_weight = config["training"].get("pou_weight", 0.01)
 
-        # Output-range controls (decoder space) - NORMALIZED SPACE ONLY
+        # Decoder output control (normalized space only)
         self.decoder_output_mode: str = str(model_cfg.get("decoder_output_mode", "linear")).lower()
-
-        # Simplified clamping - ALWAYS in normalized space
         self.output_clamp = model_cfg.get("output_clamp", None)
+
+        # ---- Guard: sigmoid01 only valid when species are [0,1]-normalized ----
+        norm_cfg = config.get("normalization", {})
+        default_species_method = str(norm_cfg.get("default_method", "")).lower()
+        valid_01 = default_species_method in {"min-max", "log-min-max"}
+        if self.decoder_output_mode == "sigmoid01" and not valid_01:
+            self.logger.warning(
+                "decoder_output_mode='sigmoid01' requires species to be min-max or log-min-max normalized; "
+                f"found default_method='{default_species_method}'. Forcing 'linear'."
+            )
+            self.decoder_output_mode = "linear"
 
         # ---- Build submodules ----
         ae_encoder_layers = model_cfg["ae_encoder_layers"]
@@ -237,52 +248,93 @@ class AEDeepONet(nn.Module):
             num_species=self.num_species,
             latent_dim=self.latent_dim,
             encoder_hidden_layers=ae_encoder_layers,
-            decoder_hidden_layers=ae_decoder_layers
+            decoder_hidden_layers=ae_decoder_layers,
         )
+
         self.deeponet = DeepONet(
             latent_dim=self.latent_dim,
             num_globals=self.num_globals,
             p=self.p,
             branch_hidden_layers=branch_layers,
-            trunk_hidden_layers=trunk_layers
+            trunk_hidden_layers=trunk_layers,
         )
 
-        # ---- Validation ----
+        # Initialize optional normalized-space clamping tensors
+        self.clamp_min = torch.tensor([], dtype=torch.float32)
+        self.clamp_max = torch.tensor([], dtype=torch.float32)
+        self._init_normalized_clamp()
+
+        # ---- Validation warnings / choices ----
         if self.num_species != 12:
             self.logger.warning(
                 f"Paper uses 12 species for syngas, but found {self.num_species}. "
                 f"Species: {data_cfg['species_variables']}"
             )
 
-        # NOTE: We intentionally use [P, T] instead of [φ₀, T₀] from the paper
         expected_globals = data_cfg.get("expected_globals", ["P", "T"])
         if data_cfg["global_variables"] != expected_globals:
             raise ValueError(
-                f"Global variables mismatch: got {data_cfg['global_variables']}, "
-                f"expected {expected_globals}. "
-                f"Note: We use [P, T] (pressure, temperature) instead of "
-                f"[φ₀, T₀] (equivalence ratio, initial temp) from the paper."
+                f"Global variables mismatch: got {data_cfg['global_variables']}, expected {expected_globals}. "
+                "Note: this implementation intentionally uses [P, T] instead of [φ₀, T₀]."
             )
 
-        # ---- Trunk evaluation times (normalized) ----
+        # Default trunk times used only if forward() is called without trunk_times
         trunk_times = model_cfg.get("trunk_times", [0.25, 0.5, 0.75, 1.0])
         if not all(0.0 <= float(t) <= 1.0 for t in trunk_times):
             raise ValueError(f"trunk_times must be in [0,1], got {trunk_times}")
-        self.register_buffer("trunk_times", torch.tensor(trunk_times, dtype=torch.float32).view(-1, 1))
-
-        # ---- Optional clamp buffers (NORMALIZED SPACE ONLY) ----
-        self.register_buffer("clamp_min", torch.empty(0), persistent=False)
-        self.register_buffer("clamp_max", torch.empty(0), persistent=False)
-        self._init_normalized_clamp()
-
-        # ---- Log summary ----
-        n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        self.logger.info(
-            f"AE-DeepONet initialized with {n_params:,} params | "
-            f"latent_dim={self.latent_dim}, p={self.p}, use_pou={self.use_pou} | "
-            f"decoder_output_mode={self.decoder_output_mode} | "
-            f"clamp_active={self.clamp_min.numel() > 0} (normalized space only)"
+        self.register_buffer(
+            "default_trunk_times",
+            torch.tensor(trunk_times, dtype=torch.float32).view(-1, 1),
+            persistent=False
         )
+
+        # Bookkeeping lists used by your history save path
+        self.index_list = []
+        self.train_loss_list = []
+        self.val_loss_list = []
+
+    def compute_deeponet_loss(
+            self,
+            inputs: torch.Tensor,
+            targets: torch.Tensor,
+            trunk_times: Optional[torch.Tensor] = None,
+            pou_weight: float = 0.0,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute the full DeepONet loss inside the model:
+          total = MSE(z_pred, targets) + pou_weight * PoU(trunk_outputs)
+
+        Args:
+            inputs: [B, latent_dim + num_globals] = [z0, P, T]
+            targets: [B, M_i, latent_dim] latent targets at the provided trunk_times
+            trunk_times: [M_i] or [M_i, 1] normalized times in [0, 1]
+            pou_weight: scalar weighting for PoU regularization
+
+        Returns:
+            total_loss, {"mse": mse_loss, "pou": pou_loss}
+        """
+        # Forward in latent space while returning trunk basis for PoU
+        z_pred, aux = self(
+            inputs,
+            decode=False,
+            return_trunk_outputs=True,
+            trunk_times=trunk_times
+        )
+        # Shape checks
+        if z_pred.shape != targets.shape:
+            raise ValueError(
+                f"MSE shape mismatch: pred {tuple(z_pred.shape)} vs target {tuple(targets.shape)}"
+            )
+
+        # Core losses
+        mse_loss = F.mse_loss(z_pred, targets)
+        trunk_outputs = aux.get("trunk_outputs", None)
+        pou_loss = self.pou_regularization(trunk_outputs) if trunk_outputs is not None else torch.zeros((),
+                                                                                                        device=z_pred.device)
+
+        total = mse_loss + float(pou_weight) * pou_loss
+        return total, {"mse": mse_loss, "pou": pou_loss}
+
 
     def _init_normalized_clamp(self):
         """Initialize clamping bounds in NORMALIZED space only."""
@@ -357,13 +409,24 @@ class AEDeepONet(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         return self.autoencoder.decode(z)
 
-    def pou_regularization(self, trunk_outputs: torch.Tensor) -> torch.Tensor:
+    def pou_regularization(self, trunk_outputs: Optional[torch.Tensor]) -> torch.Tensor:
         """
         Partition-of-Unity (PoU) regularization.
-        Encourages sum of basis functions to equal 1.
+
+        Encourages sum of basis functions to equal 1 for better interpretability
+        and stability of the DeepONet decomposition.
+
+        Args:
+            trunk_outputs: Trunk network outputs [M, L, p] or None
+
+        Returns:
+            PoU regularization loss (scalar tensor)
         """
-        if not self.use_pou:
-            return torch.tensor(0.0, device=trunk_outputs.device)
+        # Handle cases where PoU is disabled or trunk outputs not provided
+        if not self.use_pou or trunk_outputs is None:
+            # Get device from model parameters to ensure consistency
+            device = next(self.parameters()).device
+            return torch.tensor(0.0, device=device)
 
         # Sum over basis functions (last dimension)
         trunk_sum = trunk_outputs.sum(dim=-1)  # [M, L]
@@ -380,7 +443,8 @@ class AEDeepONet(nn.Module):
             self,
             inputs: torch.Tensor,
             decode: bool = True,
-            return_trunk_outputs: bool = False
+            return_trunk_outputs: bool = False,
+            trunk_times: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Forward pass through AE-DeepONet.
@@ -390,6 +454,7 @@ class AEDeepONet(nn.Module):
                    NOTE: We use [P, T] not [φ₀, T₀] as in the paper
             decode: if True, decode latent z(t) to species space
             return_trunk_outputs: if True, include trunk basis in aux (for PoU)
+            trunk_times: Optional custom trunk times [M, 1] or [M]. If None, uses default.
 
         Returns:
             predictions, aux_dict
@@ -403,8 +468,14 @@ class AEDeepONet(nn.Module):
                 f"Expected input dimension {expected_dim} ([z0, P, T]), got {inputs.size(1)}"
             )
 
-        # Trunk times (normalized) as registered buffer
-        trunk_in = self.trunk_times.to(inputs.device, inputs.dtype)  # [M, 1]
+        # Use provided trunk times or fall back to default
+        if trunk_times is None:
+            trunk_in = self.default_trunk_times.to(inputs.device, inputs.dtype)  # [M, 1]
+        else:
+            # Ensure correct shape [M, 1]
+            if trunk_times.dim() == 1:
+                trunk_times = trunk_times.unsqueeze(-1)
+            trunk_in = trunk_times.to(inputs.device, inputs.dtype)
 
         # Single forward pass through DeepONet (avoids double computation)
         z_pred, trunk_out = self.deeponet(inputs, trunk_in)  # z_pred: [B, M, L], trunk_out: [M, L, p]
@@ -438,7 +509,7 @@ class AEDeepONet(nn.Module):
     # Loss
     # -------------------------
     def loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Mean Squared Error loss (PoU is handled in trainer)."""
+        """Plain MSE (used for AE pretraining). DeepONet uses compute_deeponet_loss()."""
         return F.mse_loss(y_pred, y_true)
 
     # -------------------------
@@ -484,33 +555,5 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
         except Exception as e:
             logging.getLogger(__name__).warning(f"torch.compile failed: {e}. Proceeding without compilation.")
 
-    # Optional export - use model's dtype
-    if config.get("system", {}).get("use_torch_export", False):
-        try:
-            model.eval()
-
-            # Use model's actual dtype
-            example_dtype = next(model.parameters()).dtype
-            example_input = torch.randn(
-                1,
-                model.latent_dim + model.num_globals,
-                device=device,
-                dtype=example_dtype
-            )
-
-            exported_program = torch.export.export(
-                model, args=(example_input,), kwargs={"decode": True, "return_trunk_outputs": False}
-            )
-
-            export_dir = Path(config["paths"].get("model_save_dir", "models"))
-            export_dir.mkdir(parents=True, exist_ok=True)
-            export_path = export_dir / "ae_deeponet_exported.pt2"
-            torch.export.save(exported_program, str(export_path))
-            logging.getLogger(__name__).info(f"Model exported for deployment to {export_path}")
-
-            model.train()
-
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Model export failed: {e}")
-
+    # NOTE: Model export/save is handled centrally in main.py. Do not export here.
     return model
