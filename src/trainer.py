@@ -134,7 +134,13 @@ class Trainer:
         )
 
         self.scheduler = None
-        self.scaler = GradScaler('cuda' if self.use_amp else 'cpu', enabled=self.use_amp)
+        amp_dtype = torch.float16
+
+        if any(p.dtype == torch.bfloat16 for p in self.model.parameters()):
+            amp_dtype = torch.bfloat16
+        self.autocast_kwargs = dict(device_type='cuda', enabled=self.use_amp, dtype=amp_dtype)
+        self.scaler = GradScaler(enabled=self.use_amp and amp_dtype == torch.float16)
+
         self.criterion = nn.MSELoss()
 
         self.current_epoch = 0
@@ -188,7 +194,7 @@ class Trainer:
 
                 self.optimizer.zero_grad(set_to_none=True)
 
-                with autocast('cuda', enabled=self.use_amp):
+                with autocast(**self.autocast_kwargs):
                     recon = self.model.autoencoder(inputs_flat)
                     loss = self.criterion(recon, inputs_flat)
 
@@ -317,7 +323,7 @@ class Trainer:
                 targets = targets_data.to(self.device, non_blocking=True)
                 times = self._ensure_time_2d(times_data.to(self.device, non_blocking=True))
 
-                with autocast('cuda', enabled=self.use_amp):
+                with autocast(**self.autocast_kwargs):
                     loss, comps = self.model.compute_deeponet_loss(
                         inputs, targets, trunk_times=times, pou_weight=self.pou_weight
                     )
@@ -348,7 +354,7 @@ class Trainer:
                 all_times = torch.cat([t.to(self.device) for t in times_list])
                 unique_times, inverse = torch.unique(all_times, sorted=True, return_inverse=True)
 
-                with autocast('cuda', enabled=self.use_amp):
+                with autocast(**self.autocast_kwargs):
                     # Compute branch for entire batch once
                     branch_all = self.model.deeponet.forward_branch(inputs)
                     branch_all = branch_all.view(B, self.model.latent_dim, self.model.p)
@@ -464,7 +470,7 @@ class Trainer:
                 targets = targets_data
                 times = self._ensure_time_2d(times_data)
 
-                with autocast('cuda', enabled=self.use_amp):
+                with autocast(**self.autocast_kwargs):
                     z_pred, _ = self.model(inputs, decode=False, trunk_times=times)
                     loss = self.criterion(z_pred, targets)
 
@@ -502,7 +508,7 @@ class Trainer:
                     targets_i = targets_list[i].unsqueeze(0)
                     times_i = self._ensure_time_2d(times_list[i])
 
-                    with autocast('cuda', enabled=self.use_amp):
+                    with autocast(**self.autocast_kwargs):
                         z_pred, _ = self.model(input_i, decode=False, trunk_times=times_i)
                         loss = self.criterion(z_pred, targets_i)
 
