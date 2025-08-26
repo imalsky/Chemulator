@@ -1,21 +1,12 @@
 {
   // AE-DeepONet Configuration File
-  // Three-stage training pipeline for chemical kinetics modeling
-  // OPTIMIZED: For 10 fixed time points with paper-like settings
+  // Configured to use ALL available time points throughout the pipeline
 
   "paths": {
     // Input HDF5 files (produced by your simulator/export)
     "raw_data_files": [
-      "data/raw/run9001-result.h5",
-      //"data/raw/run9002-result.h5",
-      //"data/raw/run9003-result.h5",
-      //"data/raw/run9004-result.h5",
-      //"data/raw/run9005-result.h5",
-      //"data/raw/run9006-result.h5",
-      //"data/raw/run9007-result.h5",
-      //"data/raw/run9008-result.h5",
-      //"data/raw/run9009-result.h5",
-      //"data/raw/run9010-result.h5"
+      "data/raw/run9001-result.h5"
+      // Add more files as needed
     ],
     // Directory containing preprocessed NPZ shards
     "processed_data_dir": "data/processed-1-log-standard",
@@ -38,7 +29,7 @@
       "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
       "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
     ],
-    // Global variables: [P, T] instead of paper's [φ₀, T₀]
+    // Global variables: [P, T]
     "global_variables": ["P", "T"],
     // Hard validation - must match
     "expected_globals": ["P", "T"],
@@ -82,53 +73,86 @@
     "type": "AE_DeepONet",
     // Latent dimension for autoencoder
     "latent_dim": 32,
-    // DeepONet basis functions (paper uses 10)
+    // DeepONet basis functions
     "p": 10,
-    // Default trunk times for inference (10 points)
-    "trunk_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
     // Trunk basis type: "linear" or "softmax"
     "trunk_basis": "linear",
     // Enable PoU regularization for linear basis
     "use_pou": true,
     // Architecture: 3 hidden layers for each network
-    "ae_encoder_layers": [256, 256, 128],
-    "ae_decoder_layers": [128, 256, 256],
-    "branch_layers": [256, 256, 128],
-    "trunk_layers": [256, 256, 128],
+    "ae_encoder_layers": [256, 128, 64],
+    "ae_decoder_layers": [64, 128, 256],
+    "branch_layers": [256, 128, 64],
+    "trunk_layers": [256, 128, 64],
     // Decoder output mode
     "decoder_output_mode": "linear",
     // No clamping in normalized space
     "output_clamp": null
   },
 
+  // ============================================================================
+  // LATENT DATASET GENERATION
+  // ============================================================================
+
   "latent_generation": {
-    // Use "fixed" mode for 10 specific time points
-    // This uses nearest-neighbor selection from the source grid
-    "mode": "fixed",
-    // Exactly 10 normalized time points for latent generation
-    "fixed_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    // AVAILABLE OPTIONS: "fixed" | "all"
+    // Using "all" - encode every time point from source data
+    "mode": "all"
+
+    // When mode="all":
+    // - Uses entire source time grid (no selection/subsampling)
+    // - All trajectories MUST have identical time grids
+    // - Significantly increases memory usage
+    // - No additional parameters needed
+
+    // Alternative mode="fixed" would require:
+    // "fixed_times": [0.1, 0.2, ...] // specific normalized times to extract
   },
+
+  // ============================================================================
+  // TRAINING CONFIGURATION
+  // ============================================================================
 
   "training": {
     // Stage 1: Autoencoder pretraining
+    "ae_per_trajectory": true,
     "ae_pretrain_epochs": 100,
     "ae_warmup_epochs": 5,
     "freeze_ae_after_pretrain": true,
 
     // Stage 3: DeepONet training
     "epochs": 200,
-    // Moderate batch size for stability
-    "batch_size": 128,
+    "batch_size": 1024,
 
-    // Training time sampling - use all 10 points
+    // ===== TRAINING TIME SAMPLING =====
+    // AVAILABLE OPTIONS: "fixed" | "random"
+    // Using "fixed" with "all" to use every available time point
     "train_time_sampling": "fixed",
-    "train_time_points": 10,
-    "train_fixed_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
 
-    // Validation time sampling - also use all 10 points
+    // For "fixed" sampling, options are:
+    // - List of specific times: [0.1, 0.2, ...]
+    // - String "all": use every point in latent dataset
+    // - Not specified: use train_time_points count
+    "train_fixed_times": "all",  // USE ALL AVAILABLE POINTS
+
+    // Alternative configurations:
+    // "train_fixed_times": [0.1, 0.5, 1.0],  // specific times only
+    // "train_time_points": 50,  // evenly spaced count (if train_fixed_times not set)
+
+    // Alternative "random" sampling would use:
+    // "train_time_sampling": "random",
+    // "train_min_time_points": 8,
+    // "train_max_time_points": 32,
+
+    // ===== VALIDATION TIME SAMPLING =====
+    // AVAILABLE OPTIONS: "fixed" | "random"
+    // Using "fixed" with "all" for comprehensive validation
     "val_time_sampling": "fixed",
-    "val_time_points": 10,
-    "val_fixed_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+    "val_fixed_times": "all",  // USE ALL AVAILABLE POINTS
+
+    // Alternative configurations:
+    // "val_fixed_times": [0.1, 0.5, 1.0],  // specific times only
+    // "val_time_points": 50,  // evenly spaced count (if val_fixed_times not set)
 
     // Learning rate schedule
     "learning_rate": 1e-3,
@@ -148,7 +172,7 @@
     "gradient_clip": 1.0,
     "use_amp": true,
 
-    // PoU regularization weight (small value)
+    // PoU regularization weight
     "pou_weight": 0.01,
 
     // Dataloader workers (forced to 0 for GPU datasets)

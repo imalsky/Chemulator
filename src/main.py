@@ -339,8 +339,17 @@ class AEDeepONetPipeline:
             max_pts = train_cfg.get("train_max_time_points", 32)
             self.logger.info(f"  Random time points range: [{min_pts}, {max_pts}]")
         else:
-            pts = train_cfg.get("train_time_points", 10)
-            self.logger.info(f"  Fixed time points: {pts}")
+            # Check what's actually configured for fixed sampling
+            train_fixed_times = train_cfg.get("train_fixed_times", None)
+            if train_fixed_times == "all":
+                self.logger.info(f"  Using ALL available time points")
+            elif isinstance(train_fixed_times, list):
+                self.logger.info(f"  Fixed time points: {len(train_fixed_times)} specified points")
+                self.logger.debug(f"  Points: {train_fixed_times}")
+            else:
+                # Fallback to count
+                pts = train_cfg.get("train_time_points", 10)
+                self.logger.info(f"  Fixed time points: {pts} evenly-spaced points")
 
         self.logger.info(f"Validation time sampling mode: {val_mode}")
         if val_mode == "random":
@@ -348,8 +357,17 @@ class AEDeepONetPipeline:
             max_pts = train_cfg.get("val_max_time_points", 32)
             self.logger.info(f"  Random time points range: [{min_pts}, {max_pts}]")
         else:
-            pts = train_cfg.get("val_time_points", 50)
-            self.logger.info(f"  Fixed time points: {pts}")
+            # Check what's actually configured for fixed sampling
+            val_fixed_times = train_cfg.get("val_fixed_times", None)
+            if val_fixed_times == "all":
+                self.logger.info(f"  Using ALL available time points")
+            elif isinstance(val_fixed_times, list):
+                self.logger.info(f"  Fixed time points: {len(val_fixed_times)} specified points")
+                self.logger.debug(f"  Points: {val_fixed_times}")
+            else:
+                # Fallback to count
+                pts = train_cfg.get("val_time_points", 50)
+                self.logger.info(f"  Fixed time points: {pts} evenly-spaced points")
 
         # Load latent datasets to GPU
         try:
@@ -370,6 +388,13 @@ class AEDeepONetPipeline:
                     self.device,
                     time_sampling_mode=val_mode
                 )
+
+            # Log actual number of time points being used
+            if hasattr(train_dataset, 'fixed_indices') and train_dataset.fixed_indices is not None:
+                self.logger.info(f"Training dataset will use {len(train_dataset.fixed_indices)} time points")
+            if val_dataset and hasattr(val_dataset, 'fixed_indices') and val_dataset.fixed_indices is not None:
+                self.logger.info(f"Validation dataset will use {len(val_dataset.fixed_indices)} time points")
+
         except RuntimeError as e:
             self.logger.error(f"Failed to load latent datasets to GPU: {e}")
             self.logger.error("Consider reducing batch size")

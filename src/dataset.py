@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 GPU-optimized dataset implementations for AE-DeepONet training.
-CORRECTED: Removed memory inefficiencies, proper pinned memory usage, on-the-fly index generation
+ENHANCED: Added per-trajectory batching option for AE training
 """
 
 import logging
@@ -33,7 +33,7 @@ def check_gpu_memory_available(required_gb: float, device: torch.device) -> bool
 class GPUSequenceDataset(Dataset):
     """
     GPU-resident dataset for autoencoder pretraining.
-    CORRECTED: Single contiguous tensor storage, shared time grid, pinned memory
+    Enhanced with optional per-trajectory batching for better efficiency.
     """
 
     def __init__(
@@ -88,6 +88,9 @@ class GPUSequenceDataset(Dataset):
                 f"Global variables mismatch! Config has {self.global_vars}, "
                 f"expected {expected_globals}. Check your data."
             )
+
+        # Check if we should use per-trajectory batching
+        self.ae_per_trajectory = bool(config.get("training", {}).get("ae_per_trajectory", False))
 
         # Preload all data to GPU efficiently
         self._preload_to_gpu_optimized()
@@ -162,7 +165,8 @@ class GPUSequenceDataset(Dataset):
 
         # Collect all y matrices for flattened storage
         all_y_list = []
-        trajectory_offsets = [0]  # Track where each trajectory starts in flat array
+        trajectory_info = []
+        current_idx = 0
 
         # For metadata storage (minimal)
         all_x0_list = []
@@ -220,11 +224,13 @@ class GPUSequenceDataset(Dataset):
                     all_x0_list.append(x0_norm[n])
                     all_globals_list.append(g_norm[n])
                     all_y_list.append(y_norm[n])  # [M, S]
-                    trajectory_offsets.append(trajectory_offsets[-1] + y_norm[n].shape[0])
+                    M = y_norm[n].shape[0]
+                    trajectory_info.append((current_idx, M))
+                    current_idx += M
 
         # Create single contiguous tensor for all AE samples
         self.ae_flat = torch.cat(all_y_list, dim=0).contiguous()  # [total_timepoints, S]
-        self.trajectory_offsets = torch.tensor(trajectory_offsets[:-1], dtype=torch.long, device=self.device)
+        self.trajectory_info = torch.tensor(trajectory_info, dtype=torch.long, device=self.device)
 
         # Store metadata (much smaller)
         self.all_x0 = torch.stack(all_x0_list)
@@ -235,23 +241,37 @@ class GPUSequenceDataset(Dataset):
         allocated_gb = torch.cuda.memory_allocated(self.device) / 1e9
         self.logger.info(
             f"Loaded {len(all_x0_list)} trajectories ({self.ae_flat.shape[0]} samples) to GPU. "
-            f"Memory allocated: {allocated_gb:.2f} GB"
+            f"Memory allocated: {allocated_gb:.2f} GB. "
+            f"Per-trajectory mode: {self.ae_per_trajectory}"
         )
 
     def __len__(self) -> int:
-        """Return total number of flattened samples."""
-        return self.ae_flat.shape[0]
+        """Return dataset size based on AE training mode."""
+        if self.ae_per_trajectory:
+            # Return number of trajectories for per-trajectory batching
+            return int(self.trajectory_info.size(0))
+        else:
+            # Return total number of flattened samples for per-timepoint batching
+            return self.ae_flat.shape[0]
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return single AE sample from flattened storage."""
-        vec = self.ae_flat[idx]  # [S]
-        return vec, vec  # AE input and target are the same
+        """Return data based on AE training mode."""
+        if self.ae_per_trajectory:
+            # Per-trajectory mode: return entire trajectory
+            start, length = self.trajectory_info[idx].tolist()
+            if length <= 0:
+                raise RuntimeError(f"Trajectory {idx} has non-positive length {length}")
+            y_mat = self.ae_flat[start:start + length].contiguous()  # [M, S]
+            return y_mat, y_mat
+        else:
+            # Per-timepoint mode: return single sample
+            vec = self.ae_flat[idx]  # [S]
+            return vec, vec
 
 
 class GPULatentDataset(Dataset):
     """
     GPU-resident dataset for DeepONet training on latent space.
-    CORRECTED: On-the-fly index generation, proper memory estimation
     """
 
     def __init__(
@@ -388,8 +408,12 @@ class GPULatentDataset(Dataset):
                 fixed_times = train_cfg.get("val_fixed_times", None)
                 default_count = int(train_cfg.get("val_time_points", 50))
 
-            if fixed_times is not None:
-                # Find nearest neighbor indices
+            # CHANGED: Handle "all" as a special value
+            if fixed_times == "all":
+                # Use all available time points
+                self.fixed_indices = torch.arange(self.total_time_points, device=self.device)
+            elif fixed_times is not None and fixed_times != "all":
+                # Find nearest neighbor indices for specified times
                 req = torch.tensor([float(t) for t in fixed_times], dtype=torch.float32, device=self.device)
                 diffs = (self.trunk_times.unsqueeze(0) - req.unsqueeze(1)).abs()
                 idx = diffs.argmin(dim=1)
@@ -474,8 +498,26 @@ def create_gpu_dataloader(
     """Create DataLoader for GPU-resident datasets with optimized settings."""
     batch_size = config["training"]["batch_size"]
 
-    # Custom collate function for variable-length time sequences
-    def collate_fn(batch):
+    # Custom collate function for AE per-trajectory batching
+    def ae_collate_fn(batch):
+        """Collate for per-trajectory AE training requiring shared M."""
+        # batch is list of (y_mat, y_mat) where y_mat is [M, S]
+        inputs = [item[0] for item in batch]
+
+        # Verify all have same M dimension
+        Ms = [y.shape[0] for y in inputs]
+        if len(set(Ms)) != 1:
+            raise RuntimeError(
+                f"Per-trajectory AE training requires all trajectories in batch to have same time dimension. "
+                f"Got M values: {sorted(set(Ms))}. Ensure preprocessing generates consistent time grids."
+            )
+
+        # Stack into [B, M, S]
+        inputs_tensor = torch.stack(inputs)
+        return inputs_tensor, inputs_tensor
+
+    # Custom collate function for variable-length time sequences (latent)
+    def latent_collate_fn(batch):
         if len(batch[0]) == 3:  # Latent dataset with time values
             inputs, targets, times = zip(*batch)
 
@@ -500,9 +542,11 @@ def create_gpu_dataloader(
         num_workers = 0
         pin_memory = False
 
-        # Use custom collate for latent dataset
-        if hasattr(dataset, 'randomize_time_points'):
-            kwargs['collate_fn'] = collate_fn
+        # Use appropriate collate function
+        if isinstance(dataset, GPUSequenceDataset) and dataset.ae_per_trajectory:
+            kwargs['collate_fn'] = ae_collate_fn
+        elif hasattr(dataset, 'randomize_time_points'):
+            kwargs['collate_fn'] = latent_collate_fn
     else:
         num_workers = config["training"].get("num_workers", 0)
         pin_memory = True
