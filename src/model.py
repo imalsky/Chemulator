@@ -2,11 +2,11 @@
 """
 Autoencoder-DeepONet implementation following Goswami et al. (2023).
 Complete implementation with trunk_times required at inference.
+UPDATED: Support for bypassing autoencoder to work directly in species space.
 """
 
 import logging
-from pathlib import Path
-from typing import Dict, Any, Tuple, List, Optional, Union
+from typing import Dict, Any, Tuple, List, Optional
 
 import torch
 import torch.nn as nn
@@ -156,10 +156,10 @@ class AEDeepONet(nn.Module):
     """
     Combined Autoencoder-DeepONet model.
 
-    Three-stage training:
-    1. Autoencoder pretraining for dimensionality reduction
-    2. Latent dataset generation
-    3. DeepONet training in latent space
+    Three-stage training (or direct DeepONet if bypass_autoencoder=True):
+    1. Autoencoder pretraining for dimensionality reduction (skipped if bypassed)
+    2. Latent dataset generation (skipped if bypassed)
+    3. DeepONet training in latent/species space
 
     NOTE: trunk_times must always be provided at inference - no defaults.
     """
@@ -177,6 +177,17 @@ class AEDeepONet(nn.Module):
         self.latent_dim = model_cfg["latent_dim"]
         self.p = model_cfg.get("p", 10)
         self.trunk_basis = model_cfg.get("trunk_basis", "linear")
+
+        # NEW: Check if we're bypassing the autoencoder
+        self.bypass_autoencoder = model_cfg.get("bypass_autoencoder", False)
+
+        # Set working dimension based on bypass mode
+        if self.bypass_autoencoder:
+            self.working_dim = self.num_species
+            self.logger.info(f"Bypassing autoencoder - working directly in {self.working_dim}-D species space")
+        else:
+            self.working_dim = self.latent_dim
+            self.logger.info(f"Using autoencoder with {self.working_dim}-D latent space")
 
         # PoU (Partition of Unity) regularization settings
         # Only makes sense for linear basis (softmax already sums to 1)
@@ -207,15 +218,20 @@ class AEDeepONet(nn.Module):
         branch_layers = model_cfg["branch_layers"]
         trunk_layers = model_cfg["trunk_layers"]
 
-        self.autoencoder = Autoencoder(
-            num_species=self.num_species,
-            latent_dim=self.latent_dim,
-            encoder_hidden_layers=ae_encoder_layers,
-            decoder_hidden_layers=ae_decoder_layers,
-        )
+        # Only create autoencoder if not bypassing
+        if self.bypass_autoencoder:
+            self.autoencoder = None
+        else:
+            self.autoencoder = Autoencoder(
+                num_species=self.num_species,
+                latent_dim=self.latent_dim,
+                encoder_hidden_layers=ae_encoder_layers,
+                decoder_hidden_layers=ae_decoder_layers,
+            )
 
+        # DeepONet works with working_dim (either latent_dim or num_species)
         self.deeponet = DeepONet(
-            latent_dim=self.latent_dim,
+            latent_dim=self.working_dim,
             num_globals=self.num_globals,
             p=self.p,
             branch_hidden_layers=branch_layers,
@@ -260,50 +276,43 @@ class AEDeepONet(nn.Module):
 
     def compute_deeponet_loss(
             self,
-            inputs: torch.Tensor,
-            targets: torch.Tensor,
-            trunk_times: torch.Tensor,
-            pou_weight: float = 0.0,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+            z_pred: torch.Tensor,  # [B, M, working_dim]
+            z_true: torch.Tensor,  # [B, M, working_dim]
+            mask: Optional[torch.Tensor] = None,  # [B, M] booleans or {0,1}
+            trunk_outputs: Optional[torch.Tensor] = None,  # for PoU (e.g., [M, working_dim, P] or [..., P])
+            pou_weight: float = 0.0
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute the full DeepONet loss including PoU regularization.
-
-        Args:
-            inputs: [B, latent_dim + num_globals] branch inputs
-            targets: [B, M, latent_dim] target latent trajectories
-            trunk_times: [M] or [M, 1] time points (required)
-            pou_weight: Weight for PoU regularization
+        Working-space loss (latent if AE enabled; species if bypassing).
+        - Masked MSE over valid (B, M) positions, averaged per-element across the last dim.
+        - Optional PoU penalty if a *linear* trunk basis is used.
 
         Returns:
-            total_loss: Combined MSE + PoU loss
-            loss_components: Dictionary with individual loss components
+            total_loss, {"mse": ..., "pou": ...}
         """
-        # Forward pass in latent space
-        z_pred, aux = self(
-            inputs,
-            decode=False,
-            return_trunk_outputs=True,
-            trunk_times=trunk_times
-        )
+        # ----- MSE (masked if provided) -----
+        if mask is None:
+            mse = F.mse_loss(z_pred, z_true, reduction="mean")
+        else:
+            # Ensure mask lives with predictions and broadcasts to [..., working_dim]
+            m = mask.to(dtype=z_pred.dtype, device=z_pred.device).unsqueeze(-1)  # [B, M, 1]
+            sq = (z_pred - z_true) ** 2
+            sq = sq * m
+            # Denominator = (#valid B,M positions) * working_dim
+            valid = m.sum() * z_pred.shape[-1]
+            valid = valid.clamp_min(1)  # avoid div-by-zero
+            mse = sq.sum() / valid
 
-        # Shape validation
-        if z_pred.shape != targets.shape:
-            raise ValueError(
-                f"MSE shape mismatch: pred {tuple(z_pred.shape)} vs target {tuple(targets.shape)}"
-            )
-
-        # Main reconstruction loss
-        mse_loss = F.mse_loss(z_pred, targets)
-
-        # PoU regularization if enabled
-        trunk_outputs = aux.get("trunk_outputs", None)
-        if self.use_pou and trunk_outputs is not None and pou_weight > 0:
+        # ----- PoU penalty (device-safe, no reliance on self.device) -----
+        if pou_weight > 0.0:
             pou_loss = self.pou_regularization(trunk_outputs)
         else:
-            pou_loss = torch.zeros((), device=self.device, dtype=z_pred.dtype)
+            # create scalar 0 on the same device/dtype as z_pred (no self.device)
+            pou_loss = torch.zeros((), device=z_pred.device, dtype=z_pred.dtype)
 
-        total = mse_loss + float(pou_weight) * pou_loss
-        return total, {"mse": mse_loss, "pou": pou_loss}
+        total = mse + pou_weight * pou_loss
+        stats = {"mse": float(mse.detach().cpu()), "pou": float(pou_loss.detach().cpu())}
+        return total, stats
 
     def _init_normalized_clamp(self):
         """
@@ -371,34 +380,39 @@ class AEDeepONet(nn.Module):
             raise ValueError("Clamp min exceeds max for at least one species")
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode species concentrations to latent space."""
+        """Encode species concentrations to latent space (or identity if bypassed)."""
+        if self.bypass_autoencoder:
+            return x  # Identity mapping
         return self.autoencoder.encode(x)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode latent representations to species concentrations."""
+        """Decode latent representations to species concentrations (or identity if bypassed)."""
+        if self.bypass_autoencoder:
+            return z  # Identity mapping
         return self.autoencoder.decode(z)
 
     def pou_regularization(self, trunk_outputs: Optional[torch.Tensor]) -> torch.Tensor:
         """
-        Partition-of-Unity (PoU) regularization.
-        Encourages trunk basis functions to sum to 1 for better interpretability.
+        Partition-of-Unity (PoU) penalty for a *linear* trunk basis.
 
-        Args:
-            trunk_outputs: [M, L, p] trunk basis functions
+        trunk_outputs: Tensor of trunk basis evaluations. Expected to sum to 1.0 over the
+                       last dimension (basis dimension) at every evaluation coordinate.
+                       Shape may be [..., P] where P = number of trunk basis functions.
 
         Returns:
-            PoU loss scalar
+            Scalar tensor (mean-squared deviation from unity).
+            If trunk_outputs is None, returns 0 on a sensible device without using self.device.
         """
-        if not self.use_pou or trunk_outputs is None:
-            return torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        if trunk_outputs is None:
+            # fall back to model parameter device (no reliance on self.device)
+            dev = next(self.parameters()).device if any(True for _ in self.parameters()) else torch.device("cpu")
+            return torch.tensor(0.0, device=dev, dtype=torch.float32)
 
-        # Sum over basis functions (last dimension)
-        trunk_sum = trunk_outputs.sum(dim=-1)  # [M, L]
-
-        # Penalize deviation from 1
-        pou_loss = ((trunk_sum - 1.0) ** 2).mean()
-
-        return pou_loss
+        # Sum over basis dimension (last dim). Expect each sum ≈ 1 for linear basis.
+        # Works for shapes like [M, L, P] or [B, M, L, P]; only the last dim is special.
+        s = trunk_outputs.sum(dim=-1)
+        penalty = (s - 1.0) ** 2
+        return penalty.mean()
 
     def forward(
             self,
@@ -411,22 +425,22 @@ class AEDeepONet(nn.Module):
         Forward pass through AE-DeepONet.
 
         Args:
-            inputs: [B, latent_dim + num_globals] = [z0, globals]
-            decode: If True, decode latent z(t) to species space
+            inputs: [B, working_dim + num_globals] = [z0/x0, globals]
+            decode: If True, decode latent z(t) to species space (ignored if bypassed)
             return_trunk_outputs: If True, include trunk basis in aux
             trunk_times: REQUIRED - time points [M] or [M, 1] for evaluation
 
         Returns:
-            predictions: [B, M, latent_dim] if decode=False, [B, M, num_species] if decode=True
+            predictions: [B, M, working_dim] if decode=False or bypassed, [B, M, num_species] if decode=True
             aux_dict: Dictionary with auxiliary outputs (z_pred, trunk_outputs)
 
         Raises:
             ValueError: If trunk_times not provided
         """
-        expected_dim = self.latent_dim + self.num_globals
+        expected_dim = self.working_dim + self.num_globals
         if inputs.size(1) != expected_dim:
             raise ValueError(
-                f"Expected input dimension {expected_dim} ([latent, globals]), got {inputs.size(1)}"
+                f"Expected input dimension {expected_dim} ([{'latent' if not self.bypass_autoencoder else 'species'}, globals]), got {inputs.size(1)}"
             )
 
         # CHANGED: trunk_times now always required - no defaults
@@ -442,18 +456,31 @@ class AEDeepONet(nn.Module):
         trunk_in = trunk_times.to(inputs.device, inputs.dtype)
 
         # Single forward pass through DeepONet
-        z_pred, trunk_out = self.deeponet(inputs, trunk_in)  # [B, M, L], [M, L, p]
+        z_pred, trunk_out = self.deeponet(inputs, trunk_in)  # [B, M, working_dim], [M, working_dim, p]
 
         # Store auxiliary outputs
         aux = {"z_pred": z_pred}
         if return_trunk_outputs or self.use_pou:
             aux["trunk_outputs"] = trunk_out
 
+        # If bypassing autoencoder, we're already in species space
+        if self.bypass_autoencoder:
+            # Apply output transformations if configured
+            if self.decoder_output_mode == "sigmoid01":
+                z_pred = torch.sigmoid(z_pred)
+
+            # Apply clamping if configured
+            if self.clamp_min.numel() > 0 and self.clamp_max.numel() > 0:
+                z_pred = torch.max(z_pred, self.clamp_min.to(z_pred.device, z_pred.dtype))
+                z_pred = torch.min(z_pred, self.clamp_max.to(z_pred.device, z_pred.dtype))
+
+            return z_pred, aux
+
         # Return latent predictions if not decoding
         if not decode:
             return z_pred, aux
 
-        # Decode from latent to species space
+        # Decode from latent to species space (only when not bypassed)
         B, M, L = z_pred.shape
         y_flat = self.decode(z_pred.reshape(B * M, L))  # [B*M, S]
 
@@ -479,6 +506,8 @@ class AEDeepONet(nn.Module):
 
     def ae_parameters(self):
         """Return autoencoder parameters for stage 1 training."""
+        if self.bypass_autoencoder:
+            return iter([])  # Empty iterator
         return self.autoencoder.parameters()
 
     def deeponet_parameters(self):
@@ -492,16 +521,22 @@ def create_model(config: Dict[str, Any], device: torch.device) -> nn.Module:
 
     Args:
         config: Configuration dictionary
-        device: Target device (must be CUDA)
+        device: Target device (must be CUDA unless bypassing autoencoder)
 
     Returns:
         Configured AE-DeepONet model
 
     Raises:
-        RuntimeError: If device is not CUDA
+        RuntimeError: If device is not CUDA (unless bypassing autoencoder)
     """
-    if device.type != "cuda":
-        raise RuntimeError("AE-DeepONet requires a CUDA device for efficient training.")
+    bypass_ae = config.get("model", {}).get("bypass_autoencoder", False)
+
+    if not bypass_ae and device.type != "cuda":
+        raise RuntimeError("AE-DeepONet with autoencoder requires a CUDA device for efficient training.")
+    elif bypass_ae and device.type != "cuda":
+        logging.getLogger(__name__).warning(
+            "Running DeepONet without autoencoder on CPU - training may be slow"
+        )
 
     model = AEDeepONet(config)
 
