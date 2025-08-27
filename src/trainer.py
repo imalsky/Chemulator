@@ -2,6 +2,7 @@
 """
 Training module for AE-DeepONet with learning rate scheduling and PoU regularization.
 CORRECTED: Fixed masked MSE normalization, proper trunk feature extraction, consistent LR handling
+UPDATED: Support for bypass_autoencoder mode
 """
 
 import logging
@@ -87,6 +88,7 @@ class CosineAnnealingWarmupScheduler:
 class Trainer:
     """
     Trainer for AE-DeepONet models with corrected batch processing.
+    Supports both latent space and direct species space training.
     """
 
     def __init__(
@@ -98,6 +100,7 @@ class Trainer:
             save_dir: Path,
             device: torch.device,
             is_latent_stage: bool = False,
+            is_species_stage: bool = False,
             epochs: int = None
     ):
         self.logger = logging.getLogger(__name__)
@@ -108,6 +111,7 @@ class Trainer:
         self.save_dir = Path(save_dir)
         self.device = device
         self.is_latent = bool(is_latent_stage)
+        self.is_species = bool(is_species_stage)  # NEW: For bypass mode
 
         train_cfg = self.config.get("training", {})
         self.lr = float(train_cfg.get("learning_rate", 1e-3))
@@ -121,8 +125,17 @@ class Trainer:
         self.epochs = epochs if epochs is not None else int(train_cfg.get("epochs", 200))
 
         # Choose parameter set
-        if self.is_latent:
-            params = self.model.deeponet_parameters()
+        if self.is_latent or self.is_species:
+            # DeepONet training (latent or species space)
+            # If AE is NOT frozen and not bypassed, train it jointly with the DeepONet.
+            freeze_ae = self.config.get("training", {}).get("freeze_ae_after_pretrain", True)
+            bypass_ae = self.config.get("model", {}).get("bypass_autoencoder", False)
+
+            if bypass_ae or freeze_ae:
+                params = self.model.deeponet_parameters()
+            else:
+                from itertools import chain
+                params = chain(self.model.deeponet_parameters(), self.model.ae_parameters())
         else:
             params = self.model.ae_parameters()
 
@@ -249,7 +262,10 @@ class Trainer:
 
     def train_deeponet(self) -> float:
         """Stage 3: Train DeepONet with corrected batch processing."""
-        self.logger.info("Starting DeepONet training on latent space...")
+        if self.is_species:
+            self.logger.info("Starting DeepONet training directly on species space...")
+        else:
+            self.logger.info("Starting DeepONet training on latent space...")
 
         self.scheduler = CosineAnnealingWarmupScheduler(
             self.optimizer,
@@ -310,7 +326,7 @@ class Trainer:
 
         for batch_data in self.train_loader:
             if len(batch_data) != 3:
-                raise RuntimeError("This _train_epoch handles only the latent DeepONet stage.")
+                raise RuntimeError("This _train_epoch handles only the DeepONet stage (latent or species).")
 
             inputs, targets_data, times_data = batch_data
             B = inputs.size(0)
@@ -318,19 +334,28 @@ class Trainer:
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            # Fast path: uniform time grid
+            # Fast path: uniform time grid (all samples share the same time vector)
             if torch.is_tensor(targets_data):
                 targets = targets_data.to(self.device, non_blocking=True)
                 times = self._ensure_time_2d(times_data.to(self.device, non_blocking=True))
 
                 with autocast(**self.autocast_kwargs):
+                    # Forward once to get predictions and (optionally) trunk basis
+                    z_pred, aux = self.model(inputs, decode=False, trunk_times=times)
+                    trunk_outputs = aux.get("trunk_outputs") if getattr(self.model, "use_pou", False) else None
+
+                    # Compute loss in working space (latent or species) + PoU
                     loss, comps = self.model.compute_deeponet_loss(
-                        inputs, targets, trunk_times=times, pou_weight=self.pou_weight
+                        z_pred=z_pred,
+                        z_true=targets,
+                        mask=None,
+                        trunk_outputs=trunk_outputs,
+                        pou_weight=self.pou_weight
                     )
 
                 batch_loss = loss
-                batch_mse = comps.get("mse", 0.0)
-                batch_pou = comps.get("pou", 0.0)
+                batch_mse = torch.as_tensor(comps.get("mse", 0.0), device=self.device, dtype=inputs.dtype)
+                batch_pou = torch.as_tensor(comps.get("pou", 0.0), device=self.device, dtype=inputs.dtype)
 
             else:
                 # Variable-time path with corrected masked loss
@@ -339,9 +364,11 @@ class Trainer:
 
                 # Find max length and create padded tensors
                 max_len = max(t.size(0) for t in targets_list)
-                L = targets_list[0].size(-1)  # latent dimension
 
-                padded_targets = torch.zeros(B, max_len, L, device=self.device, dtype=inputs.dtype)
+                # Use working_dim which is either latent_dim or num_species
+                working_dim = self.model.working_dim
+
+                padded_targets = torch.zeros(B, max_len, working_dim, device=self.device, dtype=inputs.dtype)
                 mask = torch.zeros(B, max_len, device=self.device, dtype=torch.bool)
 
                 # Fill padded tensors
@@ -357,12 +384,12 @@ class Trainer:
                 with autocast(**self.autocast_kwargs):
                     # Compute branch for entire batch once
                     branch_all = self.model.deeponet.forward_branch(inputs)
-                    branch_all = branch_all.view(B, self.model.latent_dim, self.model.p)
+                    branch_all = branch_all.view(B, working_dim, self.model.p)
 
                     # Compute trunk for unique times once
                     unique_times_2d = self._ensure_time_2d(unique_times)
                     trunk_all = self.model.deeponet.forward_trunk(unique_times_2d)
-                    trunk_all = trunk_all.view(-1, self.model.latent_dim, self.model.p)
+                    trunk_all = trunk_all.view(-1, working_dim, self.model.p)
 
                     # Apply basis transformation if needed
                     if self.model.deeponet.trunk_basis == "softmax":
@@ -376,26 +403,26 @@ class Trainer:
                         sample_inverse = inverse[start_idx:start_idx + M_i]
 
                         # Get relevant trunk outputs
-                        trunk_i = trunk_all[sample_inverse]  # [M_i, latent_dim, p]
-                        branch_i = branch_all[i]  # [latent_dim, p]
+                        trunk_i = trunk_all[sample_inverse]  # [M_i, working_dim, p]
+                        branch_i = branch_all[i]  # [working_dim, p]
 
-                        # Compute prediction
-                        z_i = torch.einsum('lp,mlp->ml', branch_i, trunk_i)  # [M_i, latent_dim]
+                        # Prediction
+                        z_i = torch.einsum('lp,mlp->ml', branch_i, trunk_i)  # [M_i, working_dim]
 
                         # Pad if necessary
                         if M_i < max_len:
-                            padding = torch.zeros(max_len - M_i, L, device=self.device, dtype=z_i.dtype)
+                            padding = torch.zeros(max_len - M_i, working_dim, device=self.device, dtype=z_i.dtype)
                             z_i = torch.cat([z_i, padding], dim=0)
 
                         z_pred_list.append(z_i)
                         start_idx += M_i
 
-                    z_pred = torch.stack(z_pred_list)  # [B, max_len, latent_dim]
+                    z_pred = torch.stack(z_pred_list)  # [B, max_len, working_dim]
 
-                    # CORRECTED: Proper masked loss normalization
+                    # Proper masked loss normalization
                     valid = mask.unsqueeze(-1)  # [B, max_len, 1]
-                    squared_error = (z_pred - padded_targets).pow(2) * valid  # [B, max_len, L]
-                    total_valid_elements = (valid.sum() * z_pred.size(-1)).clamp_min(1)  # Total valid elements
+                    squared_error = (z_pred - padded_targets).pow(2) * valid
+                    total_valid_elements = (valid.sum() * z_pred.size(-1)).clamp_min(1)
                     mse_loss = squared_error.sum() / total_valid_elements
 
                     # PoU regularization on trunk outputs
@@ -410,7 +437,6 @@ class Trainer:
 
             if self.gradient_clip and self.gradient_clip > 0:
                 self.scaler.unscale_(self.optimizer)
-                # Clip only optimizer params
                 torch.nn.utils.clip_grad_norm_(
                     self.optimizer.param_groups[0]['params'],
                     self.gradient_clip
@@ -460,7 +486,7 @@ class Trainer:
 
         for batch_data in self.val_loader:
             if len(batch_data) != 3:
-                raise RuntimeError("Validation expects latent dataset batches.")
+                raise RuntimeError("Validation expects DeepONet dataset batches.")
 
             inputs, targets_data, times_data = batch_data
             B = inputs.size(0)
@@ -474,10 +500,16 @@ class Trainer:
                     z_pred, _ = self.model(inputs, decode=False, trunk_times=times)
                     loss = self.criterion(z_pred, targets)
 
-                    # Decode for MAE
-                    B1, M1, LD = targets.shape
-                    y_pred = self.model.decode(z_pred.reshape(B1 * M1, LD)).view(B1, M1, -1)
-                    y_true = self.model.decode(targets.reshape(B1 * M1, LD)).view(B1, M1, -1)
+                    # For bypass mode, we're already in species space
+                    if self.model.bypass_autoencoder:
+                        y_pred = z_pred
+                        y_true = targets
+                    else:
+                        # Decode for MAE
+                        B1, M1, LD = targets.shape
+                        y_pred = self.model.decode(z_pred.reshape(B1 * M1, LD)).view(B1, M1, -1)
+                        y_true = self.model.decode(targets.reshape(B1 * M1, LD)).view(B1, M1, -1)
+
                     mae_n = (y_pred - y_true).abs().mean()
 
                 # Physical space MAE if available
@@ -512,9 +544,15 @@ class Trainer:
                         z_pred, _ = self.model(input_i, decode=False, trunk_times=times_i)
                         loss = self.criterion(z_pred, targets_i)
 
-                        B1, M1, LD = targets_i.shape
-                        y_pred = self.model.decode(z_pred.reshape(B1 * M1, LD)).view(B1, M1, -1)
-                        y_true = self.model.decode(targets_i.reshape(B1 * M1, LD)).view(B1, M1, -1)
+                        # For bypass mode, we're already in species space
+                        if self.model.bypass_autoencoder:
+                            y_pred = z_pred
+                            y_true = targets_i
+                        else:
+                            B1, M1, LD = targets_i.shape
+                            y_pred = self.model.decode(z_pred.reshape(B1 * M1, LD)).view(B1, M1, -1)
+                            y_true = self.model.decode(targets_i.reshape(B1 * M1, LD)).view(B1, M1, -1)
+
                         mae_n = (y_pred - y_true).abs().mean()
 
                     if have_phys:

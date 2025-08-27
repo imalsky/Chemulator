@@ -2,6 +2,7 @@
 """
 GPU-optimized dataset implementations for AE-DeepONet training.
 ENHANCED: Added per-trajectory batching option for AE training
+UPDATED: Added GPUSpeciesDeepONetDataset for bypass mode training
 """
 
 import logging
@@ -269,6 +270,251 @@ class GPUSequenceDataset(Dataset):
             return vec, vec
 
 
+class GPUSpeciesDeepONetDataset(Dataset):
+    """
+    GPU-resident dataset for DeepONet training directly on species space.
+    Used when bypass_autoencoder=True.
+    """
+
+    def __init__(
+            self,
+            shard_dir: Path,
+            split_name: str,
+            config: Dict[str, Any],
+            device: torch.device,
+            norm_stats: Optional[Dict[str, Any]] = None,
+            time_sampling_mode: Optional[str] = None,
+            n_time_points: Optional[int] = None
+    ):
+        super().__init__()
+        self.logger = logging.getLogger(__name__)
+
+        if device.type != "cuda":
+            raise RuntimeError("GPUSpeciesDeepONetDataset requires CUDA device.")
+
+        self.device = device
+        self.shard_dir = Path(shard_dir)
+        self.split_dir = self.shard_dir / split_name
+        self.split_name = split_name
+        self.config = config
+
+        # Load normalization helper
+        if norm_stats is None:
+            norm_path = self.shard_dir / "normalization.json"
+            norm_stats = load_json(norm_path)
+
+        self.norm_helper = NormalizationHelper(norm_stats, device, config)
+
+        # Load shard index
+        shard_index = load_json(self.shard_dir / "shard_index.json")
+        self.split_info = shard_index["splits"][split_name]
+        self.shards = self.split_info["shards"]
+
+        # Setup dimensions
+        data_cfg = config["data"]
+        self.species_vars = data_cfg["species_variables"]
+        self.global_vars = data_cfg["global_variables"]
+        self.time_var = data_cfg["time_variable"]
+
+        # Preload all data to GPU efficiently
+        self._preload_to_gpu()
+
+        # Setup time sampling
+        self._setup_time_sampling(time_sampling_mode, n_time_points)
+
+    def _preload_to_gpu(self):
+        """Preload species data to GPU."""
+        self.logger.info(f"Preloading {self.split_name} species dataset to GPU...")
+
+        # Collect all data
+        all_x0 = []
+        all_globals = []
+        all_y_mat = []
+        all_times = []
+        shared_time = None
+
+        for shard_info in self.shards:
+            shard_path = self.split_dir / shard_info["filename"]
+            with np.load(shard_path, allow_pickle=False) as data:
+                # Load and convert to tensors
+                x0 = torch.from_numpy(data["x0"].astype(np.float32))
+                g = torch.from_numpy(data["globals"].astype(np.float32))
+                y = torch.from_numpy(data["y_mat"].astype(np.float32))
+                t = torch.from_numpy(data["t_vec"].astype(np.float32))
+
+                # Move to GPU and normalize
+                x0_gpu = x0.to(self.device)
+                g_gpu = g.to(self.device)
+                y_gpu = y.to(self.device)
+
+                x0_norm = self.norm_helper.normalize(x0_gpu, self.species_vars)
+                g_norm = self.norm_helper.normalize(g_gpu, self.global_vars)
+                y_norm = self.norm_helper.normalize(y_gpu, self.species_vars)
+
+                # Handle time
+                if t.ndim == 1:
+                    # Shared time grid
+                    if shared_time is None:
+                        t_gpu = t.to(self.device)
+                        shared_time = self.norm_helper.normalize(
+                            t_gpu.unsqueeze(-1), [self.time_var]
+                        ).squeeze(-1)
+                    t_to_store = None  # Will use shared_time
+                else:
+                    # Per-sample times
+                    t_gpu = t.to(self.device)
+                    t_norm = self.norm_helper.normalize(
+                        t_gpu.unsqueeze(-1), [self.time_var]
+                    ).squeeze(-1)
+                    t_to_store = t_norm
+
+                N = x0_norm.shape[0]
+                for i in range(N):
+                    all_x0.append(x0_norm[i])
+                    all_globals.append(g_norm[i])
+                    all_y_mat.append(y_norm[i])
+                    if t_to_store is not None:
+                        all_times.append(t_to_store[i])
+
+        # Stack into contiguous tensors
+        self.x0 = torch.stack(all_x0)
+        self.globals = torch.stack(all_globals)
+        self.y_mat = torch.stack(all_y_mat)
+
+        # Combine x0 and globals into inputs
+        self.inputs = torch.cat([self.x0, self.globals], dim=1)
+
+        # Handle time
+        if all_times:
+            self.times = torch.stack(all_times)
+            self.shared_time = None
+        else:
+            self.times = None
+            self.shared_time = shared_time
+
+        self.total_time_points = self.y_mat.shape[1]
+
+        allocated_gb = torch.cuda.memory_allocated(self.device) / 1e9
+        self.logger.info(
+            f"Loaded {len(self.x0)} trajectories to GPU. "
+            f"Memory allocated: {allocated_gb:.2f} GB. "
+            f"Time points per trajectory: {self.total_time_points}"
+        )
+
+    def _setup_time_sampling(self, time_sampling_mode: Optional[str], n_time_points: Optional[int]):
+        """Setup time sampling configuration."""
+        train_cfg = self.config["training"]
+
+        if time_sampling_mode is None:
+            self.time_sampling_mode = train_cfg.get("train_time_sampling", "random") if self.split_name == "train" \
+                else train_cfg.get("val_time_sampling", "fixed")
+        else:
+            self.time_sampling_mode = time_sampling_mode
+
+        self.randomize_time_points = (self.time_sampling_mode == "random")
+        self.fixed_indices = None
+
+        if not self.randomize_time_points:
+            # Fixed time sampling
+            if self.split_name == "train":
+                fixed_times = train_cfg.get("train_fixed_times", None)
+                default_count = int(train_cfg.get("train_time_points", 10))
+            else:
+                fixed_times = train_cfg.get("val_fixed_times", None)
+                default_count = int(train_cfg.get("val_time_points", 50))
+
+            # Get the actual time grid
+            if self.shared_time is not None:
+                time_grid = self.shared_time
+            else:
+                time_grid = self.times[0]  # Use first trajectory's time grid
+
+            # CHANGED: Handle "all" as a special value
+            if fixed_times == "all":
+                # Use all available time points
+                self.fixed_indices = torch.arange(self.total_time_points, device=self.device)
+            elif fixed_times is not None and fixed_times != "all":
+                # Find nearest neighbor indices for specified times
+                req = torch.tensor([float(t) for t in fixed_times], dtype=torch.float32, device=self.device)
+                diffs = (time_grid.unsqueeze(0) - req.unsqueeze(1)).abs()
+                idx = diffs.argmin(dim=1)
+                self.fixed_indices = idx.sort().values
+            else:
+                # Evenly spaced subset without duplicates
+                n_points = int(n_time_points) if n_time_points is not None else default_count
+                n_points = max(1, min(n_points, self.total_time_points))
+
+                if n_points == self.total_time_points:
+                    self.fixed_indices = torch.arange(self.total_time_points, device=self.device)
+                else:
+                    # Use linspace and ensure unique
+                    self.fixed_indices = torch.linspace(
+                        0, self.total_time_points - 1,
+                        steps=n_points,
+                        device=self.device
+                    ).round().long()
+                    # Ensure strictly unique and sorted
+                    self.fixed_indices = torch.unique(self.fixed_indices, sorted=True)
+        else:
+            # Random time sampling configuration
+            if self.split_name == "train":
+                self.min_time_points = int(train_cfg.get("train_min_time_points", 8))
+                self.max_time_points = int(train_cfg.get("train_max_time_points", 32))
+            else:
+                self.min_time_points = int(train_cfg.get("val_min_time_points", 8))
+                self.max_time_points = int(train_cfg.get("val_max_time_points", 32))
+
+            # Clamp to availability
+            self.max_time_points = max(1, min(self.max_time_points, self.total_time_points))
+            self.min_time_points = max(1, min(self.min_time_points, self.max_time_points))
+
+            # Set seed for reproducibility if configured
+            seed = self.config.get("system", {}).get("seed", None)
+            if seed is not None:
+                self.generator = torch.Generator(device=self.device)
+                self.generator.manual_seed(seed + hash(self.split_name))
+            else:
+                self.generator = None
+
+    def __len__(self) -> int:
+        return len(self.inputs)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns data with on-the-fly time sampling."""
+        if self.randomize_time_points:
+            # Generate indices on the fly
+            if self.min_time_points == self.max_time_points:
+                n_points = self.min_time_points
+            else:
+                n_points = int(torch.randint(
+                    self.min_time_points,
+                    self.max_time_points + 1,
+                    (1,),
+                    device=self.device,
+                    generator=self.generator
+                ).item())
+
+            # Generate sorted random indices
+            indices = torch.randperm(
+                self.total_time_points,
+                device=self.device,
+                generator=self.generator
+            )[:n_points].sort().values
+        else:
+            indices = self.fixed_indices
+
+        # Get selected targets
+        selected_targets = self.y_mat[idx, indices]
+
+        # Get time values
+        if self.shared_time is not None:
+            time_values = self.shared_time[indices]
+        else:
+            time_values = self.times[idx][indices]
+
+        return self.inputs[idx], selected_targets, time_values
+
+
 class GPULatentDataset(Dataset):
     """
     GPU-resident dataset for DeepONet training on latent space.
@@ -516,9 +762,9 @@ def create_gpu_dataloader(
         inputs_tensor = torch.stack(inputs)
         return inputs_tensor, inputs_tensor
 
-    # Custom collate function for variable-length time sequences (latent)
-    def latent_collate_fn(batch):
-        if len(batch[0]) == 3:  # Latent dataset with time values
+    # Custom collate function for variable-length time sequences (latent/species)
+    def deeponet_collate_fn(batch):
+        if len(batch[0]) == 3:  # DeepONet dataset with time values
             inputs, targets, times = zip(*batch)
 
             # Stack inputs (all same size)
@@ -546,7 +792,7 @@ def create_gpu_dataloader(
         if isinstance(dataset, GPUSequenceDataset) and dataset.ae_per_trajectory:
             kwargs['collate_fn'] = ae_collate_fn
         elif hasattr(dataset, 'randomize_time_points'):
-            kwargs['collate_fn'] = latent_collate_fn
+            kwargs['collate_fn'] = deeponet_collate_fn
     else:
         num_workers = config["training"].get("num_workers", 0)
         pin_memory = True

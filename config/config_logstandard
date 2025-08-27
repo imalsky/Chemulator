@@ -1,9 +1,5 @@
 {
-  // AE-DeepONet Configuration File
-  // Configured to use 4 equally spaced time points: 0.25, 0.5, 0.75, 1.0
-
   "paths": {
-    // Input HDF5 files (produced by your simulator/export)
     "raw_data_files": [
       "data/raw/run9001-result.h5",
       "data/raw/run9002-result.h5",
@@ -16,68 +12,65 @@
       "data/raw/run9009-result.h5",
       "data/raw/run9010-result.h5"
     ],
-    // Directory containing preprocessed NPZ shards
-    "processed_data_dir": "data/processed-10-log-min-max",
-    // Root folder for checkpoints
+    "processed_data_dir": "data/processed-10-log-standard",
     "model_save_dir": "models",
-    // Root folder for logs
-    "log_dir": "logs",
-    // Directories to search for reusable autoencoders
-    "autoencoder_search_dirs": ["models/"]
+    "log_dir": "logs"
   },
 
   "data": {
-    // Species variables in the dataset
     "species_variables": [
-      "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
-      "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
-      "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
+      "C2H2_evolution",
+      "CH4_evolution",
+      "CO2_evolution",
+      "CO_evolution",
+      "H2O_evolution",
+      "H2_evolution",
+      "HCN_evolution",
+      "H_evolution",
+      "N2_evolution",
+      "NH3_evolution",
+      "OH_evolution",
+      "O_evolution"
     ],
-    // Target species (same as input for this case)
     "target_species_variables": [
-      "C2H2_evolution", "CH4_evolution", "CO2_evolution", "CO_evolution",
-      "H2O_evolution", "H2_evolution", "HCN_evolution", "H_evolution",
-      "N2_evolution", "NH3_evolution", "OH_evolution", "O_evolution"
+      "C2H2_evolution",
+      "CH4_evolution",
+      "CO2_evolution",
+      "CO_evolution",
+      "H2O_evolution",
+      "H2_evolution",
+      "HCN_evolution",
+      "H_evolution",
+      "N2_evolution",
+      "NH3_evolution",
+      "OH_evolution",
+      "O_evolution"
     ],
-    // Global variables: [P, T]
     "global_variables": ["P", "T"],
-    // Hard validation - must match
     "expected_globals": ["P", "T"],
-    // Time variable name
     "time_variable": "t_time"
   },
 
   "preprocessing": {
-    // Minimum value threshold for species concentrations
     "min_value_threshold": 1e-25,
-    // Parallel workers for preprocessing
     "num_workers": 8,
-    // HDF5 chunk size for reading
     "hdf5_chunk_size": 16384,
-    // Trajectories per NPZ shard
     "trajectories_per_shard": 10000,
-    // Use compression for NPZ files
     "npz_compressed": false
   },
 
   "normalization": {
-    // Default normalization method for species
-    "default_method": "log-min-max",
+    "default_method": "log-standard",
     "methods": {
-      // Time MUST be log-min-max for proper [0,1] scaling
       "t_time": "log-min-max",
-      // Pressure uses log-standard (covers wide range)
-      "P": "log-min-max",
-      // Temperature uses standard normalization
-      "T": "log-min-max"
+      "P": "log-standard",
+      "T": "standard"
     },
-    // Epsilon for log transforms
     "epsilon": 1e-30,
-    // Minimum std for numerical stability
     "min_std": 1e-10,
-    // Clamp normalized values
     "clamp_value": 50.0
   },
+
 
   "model": {
     "type": "DeepONet",
@@ -124,66 +117,45 @@
   // ============================================================================
 
   "training": {
-    // Stage 1: Autoencoder pretraining
     "ae_per_trajectory": true,
-    "ae_pretrain_epochs": 300,
-    "ae_warmup_epochs": 5,
-    "freeze_ae_after_pretrain": true,
+    "ae_pretrain_epochs": 200,
+    "ae_warmup_epochs": 10,
+    "freeze_ae_after_pretrain": false,
 
-    // Stage 3: DeepONet training
-    "epochs": 100,
+    "epochs": 200,
     "batch_size": 1024,
 
-    // ===== TRAINING TIME SAMPLING =====
-    // CURRENTLY USING: "fixed" mode with specific time points
-    "train_time_sampling": "fixed",
-    "train_fixed_times": [0.25, 0.5, 0.75, 1.0],
+    "train_time_sampling": "random",
+    "train_min_time_points": 16,
+    "train_max_time_points": 16,
 
-    // ===== VALIDATION TIME SAMPLING =====
-    // CURRENTLY USING: "fixed" mode with specific time points
     "val_time_sampling": "fixed",
-    "val_fixed_times": [0.25, 0.5, 0.75, 1.0],
+    "val_fixed_times": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
 
-    // Learning rate schedule
-    "learning_rate": 2e-4,
-    "min_lr": 1e-8,
+    "learning_rate": 0.001,
+    "min_lr": 1e-08,
     "warmup_epochs": 10,
-
-    // Data splits
     "val_fraction": 0.15,
     "test_fraction": 0.15,
     "use_fraction": 1.0,
-
-    // AdamW optimizer settings
-    "weight_decay": 1e-4,
+    "weight_decay": 0.0001,
     "betas": [0.9, 0.999],
-
-    // Training stability
     "gradient_clip": 1.0,
     "use_amp": true,
 
-    // PoU regularization weight
-    "pou_weight": 0.01,
-
-    // Dataloader workers (forced to 0 for GPU datasets)
+    "pou_weight": 0.02,
     "num_workers": 0
   },
 
   "system": {
-    // Random seed for reproducibility
     "seed": 42,
-    // Export model for deployment
     "use_torch_export": false,
-    // Use torch.compile for potential speedup
     "use_torch_compile": false,
     "compile_mode": "default",
-    // CUDA optimizations
     "cudnn_benchmark": true,
     "tf32": true,
     "cuda_memory_fraction": 0.95,
-    // Non-deterministic for speed
     "deterministic": false,
-    // Default precision
     "dtype": "float32"
   }
 }

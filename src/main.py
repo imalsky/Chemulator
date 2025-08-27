@@ -3,9 +3,9 @@
 Main entry point for AE-DeepONet training pipeline.
 
 Three-stage training following Goswami et al. (2023):
-1. Autoencoder pretraining for dimensionality reduction
-2. Latent dataset generation
-3. DeepONet training on latent space
+1. Autoencoder pretraining for dimensionality reduction (skippable if bypass_autoencoder=True)
+2. Latent dataset generation (skippable if bypass_autoencoder=True)
+3. DeepONet training on latent/species space
 
 Features:
 - GPU-optimized implementation
@@ -14,14 +14,21 @@ Features:
 - Configuration persistence
 - Model export for deployment
 - UPDATED: Flexible time point sampling for training
+- UPDATED: Preprocessing-only mode for CPU systems
+- NEW: Bypass autoencoder option for direct species space training
+- NEW: Reuse existing compatible autoencoders
 """
 
+import hashlib
+import json
 import logging
 import shutil
 import sys
 import time
 from pathlib import Path
 import os
+from typing import Optional
+
 
 # Handle potential library conflicts
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -31,7 +38,7 @@ import torch
 from utils import setup_logging, seed_everything, load_json_config, save_json, load_json
 from hardware import setup_device, optimize_hardware
 from preprocessor import DataPreprocessor
-from dataset import GPUSequenceDataset, GPULatentDataset, create_gpu_dataloader
+from dataset import GPUSequenceDataset, GPULatentDataset, GPUSpeciesDeepONetDataset, create_gpu_dataloader
 from model import create_model
 from trainer import Trainer
 from generate_latent_dataset import generate_latent_dataset
@@ -41,19 +48,25 @@ class AEDeepONetPipeline:
     """
     Complete training pipeline for AE-DeepONet.
 
-    Manages the three-stage training process:
-    1. Autoencoder pretraining
-    2. Latent dataset generation
+    Manages the three-stage training process (or direct DeepONet if bypassed):
+    1. Autoencoder pretraining (skipped if bypassed or reused)
+    2. Latent dataset generation (skipped if bypassed)
     3. DeepONet training with flexible time sampling
 
     Args:
         config_path: Path to JSON configuration file
+        preprocess_only: If True, only run preprocessing then exit (no GPU required)
     """
 
-    def __init__(self, config_path: Path):
+    def __init__(self, config_path: Path, preprocess_only: bool = False):
         """Initialize the training pipeline with configuration."""
         self.config = load_json_config(config_path)
         self.config_path = config_path
+        self.preprocess_only = preprocess_only
+
+        # Check bypass mode
+        self.bypass_autoencoder = self.config.get("model", {}).get("bypass_autoencoder", False)
+        self.reuse_autoencoder = self.config.get("model", {}).get("reuse_autoencoder", False)
 
         # Setup paths
         self.setup_paths()
@@ -67,38 +80,62 @@ class AEDeepONetPipeline:
         seed = self.config.get("system", {}).get("seed", 42)
         seed_everything(seed)
 
-        # Setup hardware - MUST be GPU for performance
+        # Setup hardware - allow CPU for preprocessing
         self.device = setup_device()
 
-        if self.device.type != "cuda":
-            self.logger.error("AE-DeepONet requires CUDA GPU. CPU not supported.")
-            raise RuntimeError("CUDA GPU required. Please run on a system with NVIDIA GPU.")
+        if self.preprocess_only:
+            # For preprocessing only, CPU is fine
+            self.logger.info("Running in preprocessing-only mode (CPU is sufficient)")
+            if self.device.type == "cuda":
+                self.logger.info(f"GPU detected but not required for preprocessing")
+        else:
+            # For training, require CUDA (unless bypassing autoencoder)
+            if not self.bypass_autoencoder and self.device.type != "cuda":
+                self.logger.error("AE-DeepONet training requires CUDA GPU. CPU not supported.")
+                raise RuntimeError(
+                    "CUDA GPU required for training with autoencoder. "
+                    "Use --preprocess-only for preprocessing without GPU, "
+                    "or set bypass_autoencoder=true in config for CPU training."
+                )
+            elif self.bypass_autoencoder and self.device.type != "cuda":
+                self.logger.warning(
+                    "Running DeepONet without autoencoder on CPU - training may be slow"
+                )
 
-        # Check GPU memory availability
-        free_mem, total_mem = torch.cuda.mem_get_info(self.device.index or 0)
-        total_gb = total_mem / 1e9
-        free_gb = free_mem / 1e9
+            if self.device.type == "cuda":
+                # Check GPU memory availability
+                free_mem, total_mem = torch.cuda.mem_get_info(self.device.index or 0)
+                total_gb = total_mem / 1e9
+                free_gb = free_mem / 1e9
 
-        if total_gb < 8:
-            self.logger.warning(
-                f"GPU has only {total_gb:.1f}GB memory. "
-                "Recommended minimum is 8GB. May encounter out-of-memory errors."
-            )
+                if total_gb < 8:
+                    self.logger.warning(
+                        f"GPU has only {total_gb:.1f}GB memory. "
+                        "Recommended minimum is 8GB. May encounter out-of-memory errors."
+                    )
 
-        # Apply hardware optimizations
-        optimize_hardware(self.config["system"], self.device)
+                # Apply hardware optimizations
+                optimize_hardware(self.config["system"], self.device)
 
-        # Log GPU information
-        props = torch.cuda.get_device_properties(self.device.index or 0)
-        self.logger.info(
-            f"Using GPU: {props.name} ({props.total_memory / 1e9:.1f}GB total, "
-            f"{free_gb:.1f}GB free, Compute Capability {props.major}.{props.minor})"
-        )
+                # Log GPU information
+                props = torch.cuda.get_device_properties(self.device.index or 0)
+                self.logger.info(
+                    f"Using GPU: {props.name} ({props.total_memory / 1e9:.1f}GB total, "
+                    f"{free_gb:.1f}GB free, Compute Capability {props.major}.{props.minor})"
+                )
 
         # Save configuration to model directory for reproducibility
         self._save_config()
 
-        self.logger.info("AE-DeepONet pipeline initialized (GPU mode)")
+        # Log configuration modes
+        if self.bypass_autoencoder:
+            self.logger.info("BYPASS MODE: Skipping autoencoder - DeepONet will work directly in species space")
+        if self.reuse_autoencoder:
+            self.logger.info("REUSE MODE: Will search for compatible existing autoencoders")
+
+        self.logger.info(
+            f"AE-DeepONet pipeline initialized ({'preprocessing-only' if self.preprocess_only else 'full training'} mode)"
+        )
 
     def setup_paths(self):
         """Create and organize directory structure."""
@@ -126,6 +163,76 @@ class AEDeepONetPipeline:
         config_copy = self.run_dir / "config.json"
         save_json(self.config, config_copy)
         self.logger.info(f"Configuration saved to {config_copy}")
+
+    def _compute_config_fingerprint(self, config_subset: dict) -> str:
+        """Compute hash fingerprint of configuration subset for comparison."""
+        # Create a canonical JSON representation
+        canonical = json.dumps(config_subset, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _find_compatible_autoencoder(self) -> Optional[Path]:
+        """
+        Search for compatible pre-trained autoencoder in existing model directories.
+
+        Returns:
+            Path to compatible ae_pretrained.pt file, or None if not found
+        """
+        search_dirs = self.config.get("paths", {}).get("autoencoder_search_dirs", ["models/"])
+
+        # Extract critical parameters that must match
+        required_params = {
+            "latent_dim": self.config["model"]["latent_dim"],
+            "ae_encoder_layers": self.config["model"]["ae_encoder_layers"],
+            "ae_decoder_layers": self.config["model"]["ae_decoder_layers"],
+            "num_species": len(self.config["data"]["species_variables"]),
+            "species_variables": self.config["data"]["species_variables"],
+            "normalization": self.config["normalization"]
+        }
+
+        required_fingerprint = self._compute_config_fingerprint(required_params)
+
+        for search_dir in search_dirs:
+            search_path = Path(search_dir)
+            if not search_path.exists():
+                continue
+
+            # Look for ae_deeponet_* directories
+            for model_dir in sorted(search_path.glob("ae_deeponet_*/")):
+                ae_path = model_dir / "ae_pretrained.pt"
+                config_path = model_dir / "config.json"
+
+                if ae_path.exists() and config_path.exists():
+                    # Load and check configuration
+                    try:
+                        saved_config = load_json(config_path)
+
+                        # Extract same parameters from saved config
+                        saved_params = {
+                            "latent_dim": saved_config["model"]["latent_dim"],
+                            "ae_encoder_layers": saved_config["model"]["ae_encoder_layers"],
+                            "ae_decoder_layers": saved_config["model"]["ae_decoder_layers"],
+                            "num_species": len(saved_config["data"]["species_variables"]),
+                            "species_variables": saved_config["data"]["species_variables"],
+                            "normalization": saved_config["normalization"]
+                        }
+
+                        saved_fingerprint = self._compute_config_fingerprint(saved_params)
+
+                        if saved_fingerprint == required_fingerprint:
+                            self.logger.info(f"Found compatible autoencoder at {ae_path}")
+
+                            # Verify checkpoint is actually loadable
+                            try:
+                                checkpoint = torch.load(ae_path, map_location='cpu', weights_only=False)
+                                if "model_state_dict" in checkpoint:
+                                    return ae_path
+                            except Exception as e:
+                                self.logger.warning(f"Could not load checkpoint {ae_path}: {e}")
+
+                    except Exception as e:
+                        self.logger.debug(f"Could not check {model_dir}: {e}")
+
+        return None
 
     def _clean_latent_data(self):
         """Remove existing latent data to ensure fresh generation."""
@@ -204,29 +311,86 @@ class AEDeepONetPipeline:
         """
         Stage 1: Train autoencoder for dimensionality reduction.
 
+        Can be skipped if:
+        - bypass_autoencoder=True
+        - reuse_autoencoder=True and compatible autoencoder found
+
         Trains the autoencoder component to learn a compressed latent
         representation of the chemical species concentrations.
         """
+        # Skip if bypassing autoencoder
+        if self.bypass_autoencoder:
+            self.logger.info("Bypassing autoencoder - skipping Stage 1")
+            return
+
         self.logger.info("=" * 60)
         self.logger.info("Stage 1: Autoencoder Training")
         self.logger.info("=" * 60)
 
-        # Check if already trained
+        # If a checkpoint already exists in this run dir, don't retrain
         ae_checkpoint = self.run_dir / "ae_pretrained.pt"
         if ae_checkpoint.exists():
-            self.logger.info("Autoencoder checkpoint found, skipping training...")
+            self.logger.info("Autoencoder checkpoint found in run directory; skipping training")
             return
 
-        # Load normalization statistics
+        # Try to reuse an existing AE if enabled
+        if self.reuse_autoencoder:
+            existing_ae_path = self._find_compatible_autoencoder()
+            if existing_ae_path:
+                self.logger.info(f"Reusing compatible autoencoder from {existing_ae_path}")
+
+                # Copy the AE checkpoint into the current run directory
+                ae_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(existing_ae_path, ae_checkpoint)
+
+                # Copy the exact normalization.json used by that AE
+                # Prefer embedded config in the checkpoint; fall back to config.json in the same dir
+                saved_cfg = None
+                try:
+                    ckpt = torch.load(existing_ae_path, map_location="cpu", weights_only=False)
+                    saved_cfg = ckpt.get("config", None)
+                except Exception as e:
+                    self.logger.warning(
+                        f"Could not load checkpoint to extract config ({e}); falling back to config.json")
+
+                if saved_cfg is None:
+                    cfg_json = existing_ae_path.parent / "config.json"
+                    if cfg_json.exists():
+                        try:
+                            saved_cfg = load_json(cfg_json)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to read {cfg_json}: {e}")
+
+                if saved_cfg is not None:
+                    src_norm = Path(saved_cfg["paths"]["processed_data_dir"]) / "normalization.json"
+                    dst_norm = self.processed_dir / "normalization.json"
+                    try:
+                        if src_norm.exists():
+                            dst_norm.parent.mkdir(parents=True, exist_ok=True)
+                            # Overwrite to guarantee consistency with reused AE
+                            shutil.copy2(src_norm, dst_norm)
+                            self.logger.info(f"Copied normalization stats from {src_norm} → {dst_norm}")
+                        else:
+                            self.logger.warning(f"No normalization.json at {src_norm}; ensure normalization matches.")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to copy normalization.json: {e}")
+                else:
+                    self.logger.warning(
+                        "No saved config available from reused AE; cannot verify/copy normalization.json")
+
+                # Done — we reused and synced normalization; skip training
+                return
+            else:
+                self.logger.info("No compatible autoencoder found — training a new one")
+
+        # Load normalization statistics (must exist after preprocessing)
         norm_stats = load_json(self.processed_dir / "normalization.json")
 
+        # Build GPU datasets
         try:
-            # Load training dataset to GPU
             train_dataset = GPUSequenceDataset(
                 self.processed_dir, "train", self.config, self.device, norm_stats
             )
-
-            # Load validation dataset if specified
             val_dataset = None
             if self.config["training"].get("val_fraction", 0) > 0:
                 val_dataset = GPUSequenceDataset(
@@ -237,42 +401,47 @@ class AEDeepONetPipeline:
             self.logger.error("Consider reducing batch size or data size")
             raise
 
-        # Create dataloaders (no workers needed for GPU datasets)
+        # Dataloaders
         train_loader = create_gpu_dataloader(train_dataset, self.config, shuffle=True)
         val_loader = create_gpu_dataloader(val_dataset, self.config, shuffle=False) if val_dataset else None
 
-        # Create model
+        # Model & trainer
         model = create_model(self.config, self.device)
-
-        # Create trainer and train (unified directory)
         trainer = Trainer(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
             config=self.config,
-            save_dir=self.run_dir,  # Single unified directory
+            save_dir=self.run_dir,
             device=self.device,
             is_latent_stage=False
         )
 
-        # Train autoencoder
+        # Train AE
         ae_epochs = self.config["training"].get("ae_pretrain_epochs", 100)
         trainer.train_ae_pretrain(ae_epochs)
-
         self.logger.info("Autoencoder training complete")
 
-        # Clean up GPU memory
+        # Cleanup
         del train_dataset, val_dataset, trainer, model
-        torch.cuda.empty_cache()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def stage2_generate_latent_data(self):
         """
         Stage 2: Generate latent dataset.
 
+        Skipped if bypass_autoencoder=True.
+
         Uses the trained autoencoder to transform the full dataset into
         latent space representations for DeepONet training.
         Always regenerates to ensure consistency.
         """
+        # Skip if bypassing autoencoder
+        if self.bypass_autoencoder:
+            self.logger.info("Bypassing autoencoder - skipping Stage 2")
+            return
+
         self.logger.info("=" * 60)
         self.logger.info("Stage 2: Generating Latent Dataset")
         self.logger.info("=" * 60)
@@ -319,13 +488,20 @@ class AEDeepONetPipeline:
 
     def stage3_train_deeponet(self):
         """
-        Stage 3: Train DeepONet on latent space with flexible time sampling.
+        Stage 3: Train DeepONet on latent/species space with flexible time sampling.
 
-        Trains the DeepONet component to predict latent trajectories
+        Works in:
+        - Latent space if autoencoder is used
+        - Species space if bypass_autoencoder=True
+
+        Trains the DeepONet component to predict trajectories
         from initial conditions and global parameters.
         """
         self.logger.info("=" * 60)
-        self.logger.info("Stage 3: DeepONet Training on Latent Space")
+        if self.bypass_autoencoder:
+            self.logger.info("Stage 3: DeepONet Training on Species Space (Bypass Mode)")
+        else:
+            self.logger.info("Stage 3: DeepONet Training on Latent Space")
         self.logger.info("=" * 60)
 
         # Get time sampling configuration
@@ -369,25 +545,50 @@ class AEDeepONetPipeline:
                 pts = train_cfg.get("val_time_points", 50)
                 self.logger.info(f"  Fixed time points: {pts} evenly-spaced points")
 
-        # Load latent datasets to GPU
+        # Load datasets - either latent or species space
         try:
-            train_dataset = GPULatentDataset(
-                self.latent_dir,
-                "train",
-                self.config,
-                self.device,
-                time_sampling_mode=train_mode
-            )
+            if self.bypass_autoencoder:
+                # Load species space datasets
+                norm_stats = load_json(self.processed_dir / "normalization.json")
 
-            val_dataset = None
-            if self.config["training"].get("val_fraction", 0) > 0:
-                val_dataset = GPULatentDataset(
-                    self.latent_dir,
-                    "validation",
+                train_dataset = GPUSpeciesDeepONetDataset(
+                    self.processed_dir,
+                    "train",
                     self.config,
                     self.device,
-                    time_sampling_mode=val_mode
+                    norm_stats=norm_stats,
+                    time_sampling_mode=train_mode
                 )
+
+                val_dataset = None
+                if self.config["training"].get("val_fraction", 0) > 0:
+                    val_dataset = GPUSpeciesDeepONetDataset(
+                        self.processed_dir,
+                        "validation",
+                        self.config,
+                        self.device,
+                        norm_stats=norm_stats,
+                        time_sampling_mode=val_mode
+                    )
+            else:
+                # Load latent datasets
+                train_dataset = GPULatentDataset(
+                    self.latent_dir,
+                    "train",
+                    self.config,
+                    self.device,
+                    time_sampling_mode=train_mode
+                )
+
+                val_dataset = None
+                if self.config["training"].get("val_fraction", 0) > 0:
+                    val_dataset = GPULatentDataset(
+                        self.latent_dir,
+                        "validation",
+                        self.config,
+                        self.device,
+                        time_sampling_mode=val_mode
+                    )
 
             # Log actual number of time points being used
             if hasattr(train_dataset, 'fixed_indices') and train_dataset.fixed_indices is not None:
@@ -396,7 +597,7 @@ class AEDeepONetPipeline:
                 self.logger.info(f"Validation dataset will use {len(val_dataset.fixed_indices)} time points")
 
         except RuntimeError as e:
-            self.logger.error(f"Failed to load latent datasets to GPU: {e}")
+            self.logger.error(f"Failed to load datasets to GPU: {e}")
             self.logger.error("Consider reducing batch size")
             raise
 
@@ -404,24 +605,27 @@ class AEDeepONetPipeline:
         train_loader = create_gpu_dataloader(train_dataset, self.config, shuffle=True)
         val_loader = create_gpu_dataloader(val_dataset, self.config, shuffle=False) if val_dataset else None
 
-        # Create model and load pretrained autoencoder
+        # Create model
         model = create_model(self.config, self.device)
-        ae_checkpoint = torch.load(
-            self.run_dir / "ae_pretrained.pt",
-            map_location=self.device,
-            weights_only=False  # Need False for optimizer states and custom objects
-        )
 
-        # Load only autoencoder weights
-        ae_state = {k: v for k, v in ae_checkpoint["model_state_dict"].items()
-                    if 'autoencoder' in k}
-        model.load_state_dict(ae_state, strict=False)
+        # Load pretrained autoencoder if not bypassing
+        if not self.bypass_autoencoder:
+            ae_checkpoint = torch.load(
+                self.run_dir / "ae_pretrained.pt",
+                map_location=self.device,
+                weights_only=False  # Need False for optimizer states and custom objects
+            )
 
-        # Freeze autoencoder if specified
-        if self.config["training"].get("freeze_ae_after_pretrain", True):
-            for param in model.autoencoder.parameters():
-                param.requires_grad = False
-            self.logger.info("Froze autoencoder parameters")
+            # Load only autoencoder weights
+            ae_state = {k: v for k, v in ae_checkpoint["model_state_dict"].items()
+                        if 'autoencoder' in k}
+            model.load_state_dict(ae_state, strict=False)
+
+            # Freeze autoencoder if specified
+            if self.config["training"].get("freeze_ae_after_pretrain", True):
+                for param in model.autoencoder.parameters():
+                    param.requires_grad = False
+                self.logger.info("Froze autoencoder parameters")
 
         # Create trainer (unified directory)
         trainer = Trainer(
@@ -431,7 +635,8 @@ class AEDeepONetPipeline:
             config=self.config,
             save_dir=self.run_dir,  # Single unified directory
             device=self.device,
-            is_latent_stage=True
+            is_latent_stage=not self.bypass_autoencoder,
+            is_species_stage=self.bypass_autoencoder
         )
 
         # Train DeepONet
@@ -444,6 +649,8 @@ class AEDeepONetPipeline:
             "best_val_loss": best_loss,
             "model_path": str(self.run_dir / "best_model.pt"),
             "config": self.config,
+            "bypass_autoencoder": self.bypass_autoencoder,
+            "reused_autoencoder": self.reuse_autoencoder and not self.bypass_autoencoder,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
         save_json(results, self.run_dir / "results.json")
@@ -458,41 +665,44 @@ class AEDeepONetPipeline:
     def _export_model_for_deployment(self, model: torch.nn.Module):
         """
         Export the trained model for easy deployment.
-
-        Args:
-            model: Trained AE-DeepONet model
         """
         if self.config.get("system", {}).get("use_torch_export", False):
             try:
                 self.logger.info("Exporting model for deployment...")
 
-                # Create example input
+                # Create example inputs consistent with model dtype/device
                 batch_size = 1
+                if self.bypass_autoencoder:
+                    input_dim = model.num_species + model.num_globals
+                else:
+                    input_dim = model.latent_dim + model.num_globals
+
+                model_dtype = next(model.parameters()).dtype
+
                 example_input = torch.randn(
-                    batch_size,
-                    model.latent_dim + model.num_globals,
+                    batch_size, input_dim,
                     device=self.device,
-                    dtype=torch.float32
+                    dtype=model_dtype
                 )
 
-                # Export the model
+                # Provide example trunk times [M,1]
+                t_example = torch.linspace(0, 1, steps=100, device=self.device, dtype=model_dtype).unsqueeze(-1)
+
+                # Export the model (forward requires trunk_times)
                 exported_program = torch.export.export(
                     model,
                     args=(example_input,),
-                    kwargs={"decode": True, "return_trunk_outputs": False}
+                    kwargs={"decode": True, "return_trunk_outputs": False, "trunk_times": t_example},
                 )
 
-                # Save in the model directory for easy access
                 export_path = self.run_dir / "ae_deeponet_exported.pt2"
                 torch.export.save(exported_program, str(export_path))
-
                 self.logger.info(f"Model exported for deployment to {export_path}")
 
-                # Also save a scripted version for broader compatibility
+                # Optional scripted backup
                 scripted_model = torch.jit.script(model)
                 script_path = self.run_dir / "ae_deeponet_scripted.pt"
                 torch.jit.save(scripted_model, str(script_path))
-
                 self.logger.info(f"Scripted model saved to {script_path}")
 
             except Exception as e:
@@ -501,28 +711,48 @@ class AEDeepONetPipeline:
 
     def run(self):
         """
-        Execute the complete 3-stage training pipeline.
+        Execute the pipeline - preprocessing only or full training.
 
-        Runs all three stages sequentially:
-        1. Data preprocessing (if needed)
-        2. Autoencoder pretraining
-        3. Latent data generation
-        4. DeepONet training with flexible time sampling
+        Runs preprocessing and optionally the training stages:
+        1. Data preprocessing (always)
+        2. Autoencoder pretraining (if not preprocess_only and not bypass_autoencoder)
+        3. Latent data generation (if not preprocess_only and not bypass_autoencoder)
+        4. DeepONet training (if not preprocess_only)
         """
         try:
+            if self.preprocess_only:
+                # Only run preprocessing
+                self.logger.info("=" * 60)
+                self.logger.info("Running data preprocessing only")
+                self.logger.info("=" * 60)
+
+                self.preprocess_data()
+
+                self.logger.info("=" * 60)
+                self.logger.info("Preprocessing completed successfully!")
+                self.logger.info(f"Processed data saved in: {self.processed_dir}")
+                self.logger.info("To continue with training, run without --preprocess-only flag")
+                self.logger.info("=" * 60)
+                return
+
+            # Full pipeline - check GPU is available (unless bypassing autoencoder)
+            if not self.bypass_autoencoder and self.device.type != "cuda":
+                raise RuntimeError("Training stages with autoencoder require CUDA GPU")
+
             # Log initial GPU memory status
-            free_mem, total_mem = torch.cuda.mem_get_info(self.device.index or 0)
-            self.logger.info(
-                f"Starting pipeline with {free_mem / 1e9:.1f}GB/{total_mem / 1e9:.1f}GB GPU memory free"
-            )
+            if self.device.type == "cuda":
+                free_mem, total_mem = torch.cuda.mem_get_info(self.device.index or 0)
+                self.logger.info(
+                    f"Starting pipeline with {free_mem / 1e9:.1f}GB/{total_mem / 1e9:.1f}GB GPU memory free"
+                )
 
             # Preprocess data if needed
             self.preprocess_data()
 
-            # Stage 1: Train autoencoder
+            # Stage 1: Train autoencoder (skipped if bypass_autoencoder=True)
             self.stage1_train_autoencoder()
 
-            # Stage 2: Generate latent dataset (always fresh)
+            # Stage 2: Generate latent dataset (skipped if bypass_autoencoder=True)
             self.stage2_generate_latent_data()
 
             # Stage 3: Train DeepONet
@@ -531,14 +761,21 @@ class AEDeepONetPipeline:
             self.logger.info("=" * 60)
             self.logger.info("Pipeline completed successfully!")
             self.logger.info(f"Results saved in: {self.run_dir}")
+            if self.bypass_autoencoder:
+                self.logger.info("Mode: Direct DeepONet (autoencoder bypassed)")
+            elif self.reuse_autoencoder:
+                self.logger.info("Mode: AE-DeepONet (autoencoder reused)")
+            else:
+                self.logger.info("Mode: AE-DeepONet (full training)")
             self.logger.info("=" * 60)
 
         except Exception as e:
             self.logger.error(f"Pipeline failed: {e}", exc_info=True)
             raise
         finally:
-            # Final GPU cleanup
-            torch.cuda.empty_cache()
+            # Final GPU cleanup (only if using CUDA)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
 
 def main():
@@ -546,17 +783,27 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="AE-DeepONet for Chemical Kinetics (GPU-optimized)",
+        description="AE-DeepONet for Chemical Kinetics",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
+  # Full training pipeline (requires GPU):
   python main.py --config config.json
 
+  # Preprocessing only (CPU is sufficient):
+  python main.py --config config.json --preprocess-only
+
+  # Direct DeepONet without autoencoder:
+  Set bypass_autoencoder=true in config.json
+
+  # Reuse existing autoencoder:
+  Set reuse_autoencoder=true in config.json
+
 The pipeline will:
-  1. Preprocess raw HDF5 data (if needed)
-  2. Train autoencoder for dimensionality reduction
-  3. Generate latent dataset (always fresh)
-  4. Train DeepONet on latent space with flexible time sampling
+  1. Preprocess raw HDF5 data (CPU sufficient)
+  2. Train autoencoder for dimensionality reduction (GPU required, unless bypassed)
+  3. Generate latent dataset (GPU required, unless bypassed)
+  4. Train DeepONet on latent/species space (GPU recommended)
 
 All models and logs are saved in a timestamped directory.
         """
@@ -576,6 +823,12 @@ All models and logs are saved in a timestamped directory.
         help="GPU device index to use (default: auto-detect)"
     )
 
+    parser.add_argument(
+        "--preprocess-only",
+        action="store_true",
+        help="Only run data preprocessing, then exit (no GPU required)"
+    )
+
     args = parser.parse_args()
 
     # Validate configuration file
@@ -587,18 +840,24 @@ All models and logs are saved in a timestamped directory.
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
-    # Check for CUDA availability
-    if not torch.cuda.is_available():
-        print("Error: CUDA GPU required. No GPU detected.")
-        print("This implementation requires an NVIDIA GPU with CUDA support.")
+    # Check for CUDA availability (only for full pipeline without bypass)
+    config = load_json_config(args.config)
+    bypass_ae = config.get("model", {}).get("bypass_autoencoder", False)
+
+    if not args.preprocess_only and not bypass_ae and not torch.cuda.is_available():
+        print("Error: CUDA GPU required for training with autoencoder. No GPU detected.")
+        print("\nOptions:")
+        print("  1. Run preprocessing only: python main.py --config config.json --preprocess-only")
+        print("  2. Use bypass_autoencoder=true in config for CPU-compatible training")
+        print("  3. Use a system with NVIDIA GPU for full training")
         print("\nAvailable devices:")
-        print(f"  CPU: {torch.cuda.device_count()} cores")
+        print(f"  CPU: {os.cpu_count()} cores")
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             print("  MPS: Available (Apple Silicon)")
         sys.exit(1)
 
     # Run the pipeline
-    pipeline = AEDeepONetPipeline(args.config)
+    pipeline = AEDeepONetPipeline(args.config, preprocess_only=args.preprocess_only)
     pipeline.run()
 
 
