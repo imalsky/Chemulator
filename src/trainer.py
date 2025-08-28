@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 Training module for AE-DeepONet with learning rate scheduling and PoU regularization.
-CORRECTED: Fixed masked MSE normalization, proper trunk feature extraction, consistent LR handling
-UPDATED: Support for bypass_autoencoder mode
+Supports both autoencoder pretraining and DeepONet training phases.
+Handles batch-dependent trunk outputs when global-conditioned time-warping is enabled.
+CORRECTED: Proper time-warp output regularization and PoU masking.
 """
 
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -51,6 +52,7 @@ class CosineAnnealingWarmupScheduler:
         self.current_epoch = 0
 
     def step(self, epoch: Optional[int] = None):
+        """Step the scheduler."""
         if epoch is not None:
             self.current_epoch = epoch
 
@@ -62,10 +64,12 @@ class CosineAnnealingWarmupScheduler:
 
         self.current_epoch += 1
 
-    def get_last_lr(self):
+    def get_last_lr(self) -> float:
+        """Get current learning rate."""
         return self.optimizer.param_groups[0]['lr']
 
-    def state_dict(self):
+    def state_dict(self) -> Dict[str, Any]:
+        """Get scheduler state."""
         state = {
             'current_epoch': self.current_epoch,
             'warmup_epochs': self.warmup_epochs,
@@ -78,7 +82,8 @@ class CosineAnnealingWarmupScheduler:
         state['cosine_scheduler'] = self.cosine_scheduler.state_dict()
         return state
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        """Load scheduler state."""
         self.current_epoch = state_dict['current_epoch']
         if self.warmup_scheduler and 'warmup_scheduler' in state_dict:
             self.warmup_scheduler.load_state_dict(state_dict['warmup_scheduler'])
@@ -87,8 +92,8 @@ class CosineAnnealingWarmupScheduler:
 
 class Trainer:
     """
-    Trainer for AE-DeepONet models with corrected batch processing.
-    Supports both latent space and direct species space training.
+    Trainer for AE-DeepONet models.
+    Handles both autoencoder pretraining and DeepONet training phases.
     """
 
     def __init__(
@@ -111,72 +116,119 @@ class Trainer:
         self.save_dir = Path(save_dir)
         self.device = device
         self.is_latent = bool(is_latent_stage)
-        self.is_species = bool(is_species_stage)  # NEW: For bypass mode
+        self.is_species = bool(is_species_stage)
 
+        # Extract training configuration
         train_cfg = self.config.get("training", {})
         self.lr = float(train_cfg.get("learning_rate", 1e-3))
         self.weight_decay = float(train_cfg.get("weight_decay", 1e-4))
-        betas_cfg = train_cfg.get("betas", (0.9, 0.999))
+        self.betas = train_cfg.get("betas", (0.9, 0.999))
         self.gradient_clip = float(train_cfg.get("gradient_clip", 0.0))
-        self.use_amp = bool(train_cfg.get("use_amp", True))
         self.pou_weight = float(train_cfg.get("pou_weight", 0.0))
         self.warmup_epochs = int(train_cfg.get("warmup_epochs", 10))
         self.min_lr = float(train_cfg.get("min_lr", 1e-6))
         self.epochs = epochs if epochs is not None else int(train_cfg.get("epochs", 200))
 
-        # Choose parameter set
-        if self.is_latent or self.is_species:
-            # DeepONet training (latent or species space)
-            # If AE is NOT frozen and not bypassed, train it jointly with the DeepONet.
-            freeze_ae = self.config.get("training", {}).get("freeze_ae_after_pretrain", True)
-            bypass_ae = self.config.get("model", {}).get("bypass_autoencoder", False)
+        # Setup AMP based on device capabilities
+        self.use_amp = bool(train_cfg.get("use_amp", True)) and (self.device.type == "cuda")
 
-            if bypass_ae or freeze_ae:
-                params = self.model.deeponet_parameters()
-            else:
-                from itertools import chain
-                params = chain(self.model.deeponet_parameters(), self.model.ae_parameters())
-        else:
-            params = self.model.ae_parameters()
+        # Determine AMP dtype
+        amp_dtype = torch.float16  # default for CUDA AMP
+        if self.device.type == "cuda" and any(p.dtype == torch.bfloat16 for p in self.model.parameters()):
+            amp_dtype = torch.bfloat16
 
+        # Configure autocast based on device
+        if self.device.type == "cuda":
+            self.autocast_kwargs = dict(
+                device_type='cuda',
+                enabled=self.use_amp,
+                dtype=amp_dtype
+            )
+        elif self.device.type == "cpu":
+            # CPU autocast only supports bfloat16
+            self.autocast_kwargs = dict(
+                device_type='cpu',
+                enabled=False,  # Disable by default, can enable for bf16
+                dtype=torch.bfloat16
+            )
+        else:  # MPS or other
+            self.autocast_kwargs = dict(
+                device_type=self.device.type,
+                enabled=False
+            )
+
+        # GradScaler only for CUDA FP16
+        self.scaler = GradScaler(enabled=self.use_amp and self.device.type == "cuda" and amp_dtype == torch.float16)
+
+        # Determine parameter set based on training stage
+        params = self._get_parameters()
+
+        # Initialize optimizer
         self.optimizer = AdamW(
             params,
             lr=self.lr,
             weight_decay=self.weight_decay,
-            betas=betas_cfg
+            betas=self.betas
         )
 
         self.scheduler = None
-        amp_dtype = torch.float16
 
-        if any(p.dtype == torch.bfloat16 for p in self.model.parameters()):
-            amp_dtype = torch.bfloat16
-        self.autocast_kwargs = dict(device_type='cuda', enabled=self.use_amp, dtype=amp_dtype)
-        self.scaler = GradScaler(enabled=self.use_amp and amp_dtype == torch.float16)
-
+        # Loss function
         self.criterion = nn.MSELoss()
 
+        # Training state
         self.current_epoch = 0
         self.best_val_loss = float("inf")
         self.best_epoch = -1
         self.train_history = []
         self.val_history = []
 
+        # Initialize model tracking lists if needed
+        self._initialize_model_tracking()
+
+        if self.use_amp:
+            self.logger.info(f"Automatic Mixed Precision (AMP) enabled on {self.device.type}")
+
+    def _get_parameters(self):
+        """Get the appropriate parameters based on training stage."""
+        if self.is_latent or self.is_species:
+            # DeepONet training phase
+            freeze_ae = self.config.get("training", {}).get("freeze_ae_after_pretrain", True)
+            bypass_ae = self.config.get("model", {}).get("bypass_autoencoder", False)
+
+            if bypass_ae or freeze_ae:
+                return self.model.deeponet_parameters()
+            else:
+                # Joint training of autoencoder and DeepONet
+                from itertools import chain
+                return chain(self.model.deeponet_parameters(), self.model.ae_parameters())
+        else:
+            # Autoencoder pretraining phase
+            return self.model.ae_parameters()
+
+    def _initialize_model_tracking(self):
+        """Initialize tracking lists on the model if they don't exist."""
         for name in ("index_list", "train_loss_list", "val_loss_list"):
             if not hasattr(self.model, name):
                 setattr(self.model, name, [])
 
-        if self.use_amp:
-            self.logger.info("Automatic Mixed Precision (AMP) enabled")
-
     def _ensure_time_2d(self, t: torch.Tensor) -> torch.Tensor:
-        """Ensure time tensor is 2D [M, 1]."""
+        """Ensure time tensor is 2D [M, 1] for trunk network."""
         return t if t.dim() == 2 else t.unsqueeze(-1)
 
     def train_ae_pretrain(self, epochs: int) -> float:
-        """Stage 1: Pretrain autoencoder with corrected scheduler handling."""
+        """
+        Stage 1: Pretrain autoencoder.
+
+        Args:
+            epochs: Number of training epochs
+
+        Returns:
+            Final training loss
+        """
         self.logger.info("Starting autoencoder pretraining...")
 
+        # Setup learning rate scheduler
         ae_warmup = self.config["training"].get("ae_warmup_epochs", 5)
         self.scheduler = CosineAnnealingWarmupScheduler(
             self.optimizer,
@@ -189,51 +241,16 @@ class Trainer:
         for epoch in range(1, epochs + 1):
             epoch_start_time = time.time()
             self.current_epoch = epoch
-            self.model.train()
-            train_loss = 0.0
-            n_batches = 0
 
-            for inputs, targets in self.train_loader:
-                targets = targets.to(self.device)
+            # Training epoch
+            avg_loss = self._train_ae_epoch()
 
-                # Handle both [B, S] and [B, M, S] shapes
-                if targets.dim() == 2:
-                    inputs_flat = targets
-                elif targets.dim() == 3:
-                    B, M, D = targets.shape
-                    inputs_flat = targets.reshape(B * M, D)
-                else:
-                    raise RuntimeError(f"Unexpected AE target shape: {tuple(targets.shape)}")
-
-                self.optimizer.zero_grad(set_to_none=True)
-
-                with autocast(**self.autocast_kwargs):
-                    recon = self.model.autoencoder(inputs_flat)
-                    loss = self.criterion(recon, inputs_flat)
-
-                self.scaler.scale(loss).backward()
-
-                if self.gradient_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    # Clip only optimizer params
-                    torch.nn.utils.clip_grad_norm_(
-                        self.optimizer.param_groups[0]['params'],
-                        self.gradient_clip
-                    )
-
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-
-                train_loss += loss.item()
-                n_batches += 1
-
-            avg_loss = train_loss / n_batches
-            epoch_time = time.time() - epoch_start_time
-
-            # Step scheduler after computing metrics
+            # Update scheduler
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()
 
+            # Log progress
+            epoch_time = time.time() - epoch_start_time
             self.logger.info(
                 f"[AE Pretrain] Epoch {epoch:3d}/{epochs} | "
                 f"Loss: {avg_loss:.3e} | "
@@ -241,32 +258,82 @@ class Trainer:
                 f"Time: {epoch_time:.1f}s"
             )
 
+            # Track progress
             self.model.index_list.append(epoch)
             self.model.train_loss_list.append(avg_loss)
 
+            # Periodic checkpointing
             if epoch % 10 == 0 or epoch == epochs:
                 self._save_checkpoint(epoch, avg_loss, prefix="ae_checkpoint")
 
         # Save final pretrained autoencoder
-        final_checkpoint = {
+        self._save_ae_final(epochs, avg_loss)
+
+        return avg_loss
+
+    def _train_ae_epoch(self) -> float:
+        """Train autoencoder for one epoch."""
+        self.model.train()
+        total_loss = 0.0
+        n_batches = 0
+
+        for inputs, targets in self.train_loader:
+            targets = targets.to(self.device)
+
+            # Handle both [B, S] and [B, M, S] shapes
+            if targets.dim() == 2:
+                inputs_flat = targets
+            elif targets.dim() == 3:
+                B, M, D = targets.shape
+                inputs_flat = targets.reshape(B * M, D)
+            else:
+                raise RuntimeError(f"Unexpected AE target shape: {tuple(targets.shape)}")
+
+            self.optimizer.zero_grad(set_to_none=True)
+
+            with autocast(**self.autocast_kwargs):
+                recon = self.model.autoencoder(inputs_flat)
+                loss = self.criterion(recon, inputs_flat)
+
+            self.scaler.scale(loss).backward()
+
+            if self.gradient_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                # Clip all parameter groups
+                for param_group in self.optimizer.param_groups:
+                    torch.nn.utils.clip_grad_norm_(param_group['params'], self.gradient_clip)
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            total_loss += loss.item()
+            n_batches += 1
+
+        return total_loss / n_batches
+
+    def _save_ae_final(self, epochs: int, final_loss: float):
+        """Save final autoencoder checkpoint."""
+        checkpoint = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
             "epoch": epochs,
-            "loss": avg_loss,
+            "loss": final_loss,
             "config": self.config
         }
-        torch.save(final_checkpoint, self.save_dir / "ae_pretrained.pt")
-
-        return avg_loss
+        torch.save(checkpoint, self.save_dir / "ae_pretrained.pt")
 
     def train_deeponet(self) -> float:
-        """Stage 3: Train DeepONet with corrected batch processing."""
-        if self.is_species:
-            self.logger.info("Starting DeepONet training directly on species space...")
-        else:
-            self.logger.info("Starting DeepONet training on latent space...")
+        """
+        Stage 3: Train DeepONet.
 
+        Returns:
+            Best validation loss achieved
+        """
+        stage_name = "species space" if self.is_species else "latent space"
+        self.logger.info(f"Starting DeepONet training on {stage_name}...")
+
+        # Setup learning rate scheduler
         self.scheduler = CosineAnnealingWarmupScheduler(
             self.optimizer,
             warmup_epochs=self.warmup_epochs,
@@ -279,15 +346,16 @@ class Trainer:
             epoch_start_time = time.time()
             self.current_epoch = epoch
 
-            train_loss, train_metrics = self._train_epoch_corrected()
-            val_loss, val_metrics = self._validate_corrected()
+            # Training and validation
+            train_loss, train_metrics = self._train_deeponet_epoch()
+            val_loss, val_metrics = self._validate_epoch()
 
-            epoch_time = time.time() - epoch_start_time
-
-            # Step scheduler after metrics
+            # Update scheduler
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()
 
+            # Log progress
+            epoch_time = time.time() - epoch_start_time
             self.logger.info(
                 f"Epoch {epoch:3d}/{self.epochs} | "
                 f"Train: {train_loss:.3e} (MSE: {train_metrics['mse']:.3e}, "
@@ -297,13 +365,14 @@ class Trainer:
                 f"Time: {epoch_time:.1f}s"
             )
 
+            # Track history
             self.train_history.append(train_metrics)
             self.val_history.append(val_metrics)
-
             self.model.index_list.append(epoch)
             self.model.train_loss_list.append(train_loss)
             self.model.val_loss_list.append(val_loss)
 
+            # Save best model
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.best_epoch = epoch
@@ -316,8 +385,8 @@ class Trainer:
         self._save_history()
         return self.best_val_loss
 
-    def _train_epoch_corrected(self) -> Tuple[float, Dict[str, float]]:
-        """Training epoch with corrected masked loss and vectorized branch computation."""
+    def _train_deeponet_epoch(self) -> Tuple[float, Dict[str, float]]:
+        """Train DeepONet for one epoch."""
         self.model.train()
         total_loss = 0.0
         total_mse = 0.0
@@ -326,7 +395,7 @@ class Trainer:
 
         for batch_data in self.train_loader:
             if len(batch_data) != 3:
-                raise RuntimeError("This _train_epoch handles only the DeepONet stage (latent or species).")
+                raise RuntimeError("DeepONet training expects (inputs, targets, times) batches")
 
             inputs, targets_data, times_data = batch_data
             B = inputs.size(0)
@@ -334,146 +403,269 @@ class Trainer:
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            # Fast path: uniform time grid (all samples share the same time vector)
+            # Check if we have uniform or variable time grids
             if torch.is_tensor(targets_data):
-                targets = targets_data.to(self.device, non_blocking=True)
-                times = self._ensure_time_2d(times_data.to(self.device, non_blocking=True))
-
-                with autocast(**self.autocast_kwargs):
-                    # Forward once to get predictions and (optionally) trunk basis
-                    z_pred, aux = self.model(inputs, decode=False, trunk_times=times)
-                    trunk_outputs = aux.get("trunk_outputs") if getattr(self.model, "use_pou", False) else None
-
-                    # Compute loss in working space (latent or species) + PoU
-                    loss, comps = self.model.compute_deeponet_loss(
-                        z_pred=z_pred,
-                        z_true=targets,
-                        mask=None,
-                        trunk_outputs=trunk_outputs,
-                        pou_weight=self.pou_weight
-                    )
-
-                batch_loss = loss
-                batch_mse = torch.as_tensor(comps.get("mse", 0.0), device=self.device, dtype=inputs.dtype)
-                batch_pou = torch.as_tensor(comps.get("pou", 0.0), device=self.device, dtype=inputs.dtype)
-
-            else:
-                # Variable-time path with corrected masked loss
-                targets_list = targets_data
-                times_list = times_data
-
-                # Find max length and create padded tensors
-                max_len = max(t.size(0) for t in targets_list)
-
-                # Use working_dim which is either latent_dim or num_species
-                working_dim = self.model.working_dim
-
-                padded_targets = torch.zeros(B, max_len, working_dim, device=self.device, dtype=inputs.dtype)
-                mask = torch.zeros(B, max_len, device=self.device, dtype=torch.bool)
-
-                # Fill padded tensors
-                for i in range(B):
-                    M_i = targets_list[i].size(0)
-                    padded_targets[i, :M_i] = targets_list[i].to(self.device, non_blocking=True)
-                    mask[i, :M_i] = True
-
-                # Collect unique times
-                all_times = torch.cat([t.to(self.device) for t in times_list])
-                unique_times, inverse = torch.unique(all_times, sorted=True, return_inverse=True)
-
-                with autocast(**self.autocast_kwargs):
-                    # Compute branch for entire batch once
-                    branch_all = self.model.deeponet.forward_branch(inputs)
-                    branch_all = branch_all.view(B, working_dim, self.model.p)
-
-                    # Compute trunk for unique times once
-                    unique_times_2d = self._ensure_time_2d(unique_times)
-                    trunk_all = self.model.deeponet.forward_trunk(unique_times_2d)
-                    trunk_all = trunk_all.view(-1, working_dim, self.model.p)
-
-                    # Apply basis transformation if needed
-                    if self.model.deeponet.trunk_basis == "softmax":
-                        trunk_all = torch.nn.functional.softmax(trunk_all, dim=-1)
-
-                    # Compute predictions for each sample
-                    z_pred_list = []
-                    start_idx = 0
-                    for i in range(B):
-                        M_i = times_list[i].size(0)
-                        sample_inverse = inverse[start_idx:start_idx + M_i]
-
-                        # Get relevant trunk outputs
-                        trunk_i = trunk_all[sample_inverse]  # [M_i, working_dim, p]
-                        branch_i = branch_all[i]  # [working_dim, p]
-
-                        # Prediction
-                        z_i = torch.einsum('lp,mlp->ml', branch_i, trunk_i)  # [M_i, working_dim]
-
-                        # Pad if necessary
-                        if M_i < max_len:
-                            padding = torch.zeros(max_len - M_i, working_dim, device=self.device, dtype=z_i.dtype)
-                            z_i = torch.cat([z_i, padding], dim=0)
-
-                        z_pred_list.append(z_i)
-                        start_idx += M_i
-
-                    z_pred = torch.stack(z_pred_list)  # [B, max_len, working_dim]
-
-                    # Proper masked loss normalization
-                    valid = mask.unsqueeze(-1)  # [B, max_len, 1]
-                    squared_error = (z_pred - padded_targets).pow(2) * valid
-                    total_valid_elements = (valid.sum() * z_pred.size(-1)).clamp_min(1)
-                    mse_loss = squared_error.sum() / total_valid_elements
-
-                    # PoU regularization on trunk outputs
-                    pou_loss = self.model.pou_regularization(trunk_all) if self.model.use_pou else torch.zeros_like(
-                        mse_loss)
-
-                    batch_loss = mse_loss + self.pou_weight * pou_loss
-                    batch_mse = mse_loss
-                    batch_pou = pou_loss
-
-            self.scaler.scale(batch_loss).backward()
-
-            if self.gradient_clip and self.gradient_clip > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.optimizer.param_groups[0]['params'],
-                    self.gradient_clip
+                # Uniform time grid across batch
+                loss, mse, pou = self._process_uniform_batch(
+                    inputs, targets_data, times_data
                 )
+            else:
+                # Variable time grids
+                loss, mse, pou = self._process_variable_batch(
+                    inputs, targets_data, times_data
+                )
+
+            # Backward pass
+            self.scaler.scale(loss).backward()
+
+            if self.gradient_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                # Clip all parameter groups
+                for param_group in self.optimizer.param_groups:
+                    torch.nn.utils.clip_grad_norm_(param_group['params'], self.gradient_clip)
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            total_loss += float(batch_loss.item())
-            total_mse += float(batch_mse.item())
-            total_pou += float(batch_pou.item())
+            # Accumulate metrics
+            total_loss += float(loss.item())
+            total_mse += float(mse.item())
+            total_pou += float(pou.item())
             n_samples += 1
 
+        # Average metrics
         avg_loss = total_loss / max(1, n_samples)
         avg_mse = total_mse / max(1, n_samples)
         avg_pou = total_pou / max(1, n_samples)
 
-        return float(avg_loss), {"mse": float(avg_mse), "pou": float(avg_pou)}
+        return avg_loss, {"mse": avg_mse, "pou": avg_pou}
+
+    def _process_uniform_batch(
+            self,
+            inputs: torch.Tensor,
+            targets: torch.Tensor,
+            times: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Process batch with uniform time grid."""
+        targets = targets.to(self.device, non_blocking=True)
+        times = self._ensure_time_2d(times.to(self.device, non_blocking=True))
+
+        with autocast(**self.autocast_kwargs):
+            # Forward pass
+            z_pred, aux = self.model(inputs, decode=False, trunk_times=times)
+            trunk_outputs = aux.get("trunk_outputs") if getattr(self.model, "use_pou", False) else None
+            time_warp_b = aux.get("time_warp_b", None)
+
+            # Compute loss with optional PoU regularization and time-warp regularization
+            loss, components = self.model.compute_deeponet_loss(
+                z_pred=z_pred,
+                z_true=targets,
+                mask=None,
+                trunk_outputs=trunk_outputs,
+                pou_weight=self.pou_weight,
+                pou_mask=None,
+                time_warp_b=time_warp_b
+            )
+
+        mse = torch.as_tensor(components.get("mse", 0.0), device=self.device, dtype=inputs.dtype)
+        pou = torch.as_tensor(components.get("pou", 0.0), device=self.device, dtype=inputs.dtype)
+
+        return loss, mse, pou
+
+    def _process_variable_batch(
+            self,
+            inputs: torch.Tensor,
+            targets_list: List[torch.Tensor],
+            times_list: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Process batch with variable time grids."""
+        B = inputs.size(0)
+
+        # Find maximum sequence length
+        max_len = max(t.size(0) for t in targets_list)
+        working_dim = self.model.working_dim
+
+        # Create padded tensors and mask
+        padded_targets = torch.zeros(B, max_len, working_dim, device=self.device, dtype=inputs.dtype)
+        mask = torch.zeros(B, max_len, device=self.device, dtype=torch.bool)
+
+        for i in range(B):
+            M_i = targets_list[i].size(0)
+            padded_targets[i, :M_i] = targets_list[i].to(self.device, non_blocking=True)
+            mask[i, :M_i] = True
+
+        # Handle time-warping if enabled
+        if getattr(self.model.deeponet, 'use_time_warp', False):
+            z_pred, trunk_outputs, time_warp_b = self._compute_warped_predictions(
+                inputs, times_list, max_len, mask
+            )
+        else:
+            z_pred, trunk_outputs = self._compute_standard_predictions(
+                inputs, times_list, max_len
+            )
+            time_warp_b = None
+
+        with autocast(**self.autocast_kwargs):
+            # Compute masked loss with proper PoU mask and time-warp regularization
+            loss, components = self.model.compute_deeponet_loss(
+                z_pred=z_pred,
+                z_true=padded_targets,
+                mask=mask,
+                trunk_outputs=trunk_outputs if self.model.use_pou else None,
+                pou_weight=self.pou_weight,
+                pou_mask=mask if self.model.use_pou and trunk_outputs is not None else None,
+                time_warp_b=time_warp_b
+            )
+
+        mse = torch.as_tensor(components.get("mse", 0.0), device=self.device, dtype=inputs.dtype)
+        pou = torch.as_tensor(components.get("pou", 0.0), device=self.device, dtype=inputs.dtype)
+
+        return loss, mse, pou
+
+    def _compute_warped_predictions(
+            self,
+            inputs: torch.Tensor,
+            times_list: List[torch.Tensor],
+            max_len: int,
+            mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Compute predictions with time-warping enabled."""
+        B = inputs.size(0)
+        working_dim = self.model.working_dim
+
+        # Collect time-warp bias values
+        time_warp_b_list = []
+
+        with autocast(**self.autocast_kwargs):
+            # Time-warping makes trunk batch-dependent
+            # Process each sample separately
+            z_pred_list = []
+            trunk_outputs_list = []
+
+            for i in range(B):
+                input_i = inputs[i:i + 1]
+                times_i = self._ensure_time_2d(times_list[i].to(self.device))
+                M_i = times_i.size(0)
+
+                # Forward pass for single sample
+                z_i, aux_i = self.model(input_i, decode=False, trunk_times=times_i)
+                z_i = z_i.squeeze(0)  # Remove batch dimension [1, M, D] -> [M, D]
+
+                # Collect time-warp bias
+                if "time_warp_b" in aux_i:
+                    time_warp_b_list.append(aux_i["time_warp_b"])
+
+                # Pad predictions if necessary
+                if M_i < max_len:
+                    padding = torch.zeros(max_len - M_i, working_dim, device=self.device, dtype=z_i.dtype)
+                    z_i = torch.cat([z_i, padding], dim=0)
+
+                z_pred_list.append(z_i)
+
+                # Handle trunk outputs for PoU (with padding)
+                if self.model.use_pou and "trunk_outputs" in aux_i:
+                    trunk_out_i = aux_i["trunk_outputs"]
+                    # Remove batch dimension if present
+                    if trunk_out_i.dim() == 4:  # [1, M, L, P]
+                        trunk_out_i = trunk_out_i.squeeze(0)  # [M, L, P]
+
+                    # Pad trunk outputs to match max_len
+                    if M_i < max_len:
+                        pad_shape = (max_len - M_i,) + trunk_out_i.shape[1:]
+                        trunk_padding = torch.zeros(pad_shape, device=self.device, dtype=trunk_out_i.dtype)
+                        trunk_out_i = torch.cat([trunk_out_i, trunk_padding], dim=0)
+
+                    trunk_outputs_list.append(trunk_out_i)
+
+            z_pred = torch.stack(z_pred_list)  # [B, max_len, working_dim]
+
+            # Stack trunk outputs if collected
+            trunk_outputs = torch.stack(trunk_outputs_list) if trunk_outputs_list else None
+
+            # Stack time-warp bias if collected
+            time_warp_b = torch.cat(time_warp_b_list) if time_warp_b_list else None
+
+        return z_pred, trunk_outputs, time_warp_b
+
+    def _compute_standard_predictions(
+            self,
+            inputs: torch.Tensor,
+            times_list: List[torch.Tensor],
+            max_len: int
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Compute predictions without time-warping (batch-independent trunk)."""
+        B = inputs.size(0)
+        working_dim = self.model.working_dim
+
+        # Collect unique time points
+        all_times = torch.cat([t.to(self.device) for t in times_list])
+        unique_times, inverse = torch.unique(all_times, sorted=True, return_inverse=True)
+
+        with autocast(**self.autocast_kwargs):
+            # Compute branch for entire batch
+            branch_all = self.model.deeponet.forward_branch(inputs)
+            branch_all = branch_all.view(B, working_dim, self.model.p)
+
+            # Compute trunk for unique times
+            unique_times_2d = self._ensure_time_2d(unique_times)
+            trunk_all = self.model.deeponet.forward_trunk(unique_times_2d)
+            trunk_all = trunk_all.view(-1, working_dim, self.model.p)
+
+            # Apply basis transformation
+            if self.model.deeponet.trunk_basis == "softmax":
+                trunk_all = torch.nn.functional.softmax(trunk_all, dim=-1)
+
+            # Compute predictions and collect trunk outputs for each sample
+            z_pred_list = []
+            trunk_list = []
+            start_idx = 0
+
+            for i in range(B):
+                M_i = times_list[i].size(0)
+                sample_inverse = inverse[start_idx:start_idx + M_i]
+
+                # Get relevant trunk outputs
+                trunk_i = trunk_all[sample_inverse]  # [M_i, working_dim, p]
+                branch_i = branch_all[i]  # [working_dim, p]
+
+                # Compute prediction
+                z_i = torch.einsum('lp,mlp->ml', branch_i, trunk_i)  # [M_i, working_dim]
+
+                # Pad predictions if necessary
+                if M_i < max_len:
+                    padding = torch.zeros(max_len - M_i, working_dim, device=self.device, dtype=z_i.dtype)
+                    z_i = torch.cat([z_i, padding], dim=0)
+
+                z_pred_list.append(z_i)
+
+                # Pad trunk outputs for PoU if enabled
+                if self.model.use_pou:
+                    if M_i < max_len:
+                        trunk_padding = torch.zeros(
+                            max_len - M_i, trunk_i.size(1), trunk_i.size(2),
+                            device=trunk_i.device, dtype=trunk_i.dtype
+                        )
+                        trunk_i = torch.cat([trunk_i, trunk_padding], dim=0)
+                    trunk_list.append(trunk_i)
+
+                start_idx += M_i
+
+            z_pred = torch.stack(z_pred_list)  # [B, max_len, working_dim]
+
+            # Stack trunk outputs if PoU is enabled
+            trunk_outputs = torch.stack(trunk_list) if trunk_list else None  # [B, max_len, working_dim, p]
+
+        return z_pred, trunk_outputs
 
     @torch.no_grad()
-    def _validate_corrected(self) -> Tuple[float, Dict[str, float]]:
-        """Validation with corrected time handling."""
+    def _validate_epoch(self) -> Tuple[float, Dict[str, float]]:
+        """Validate model performance."""
         if self.val_loader is None:
             return float("inf"), {}
 
-        # Lazy-load normalization helper
+        # Lazy-load normalization helper for physical space metrics
         if not hasattr(self, "_norm_helper"):
-            try:
-                from utils import load_json
-                from normalizer import NormalizationHelper
-                stats_path = Path(self.config["paths"]["processed_data_dir"]) / "normalization.json"
-                stats = load_json(stats_path)
-                self._norm_helper = NormalizationHelper(stats, self.device, self.config)
-                self._species_vars = list(self.config["data"]["target_species_variables"])
-            except Exception:
-                self._norm_helper = None
-                self._species_vars = None
+            self._load_normalization_helper()
 
         have_phys = self._norm_helper is not None and self._species_vars is not None
 
@@ -486,109 +678,185 @@ class Trainer:
 
         for batch_data in self.val_loader:
             if len(batch_data) != 3:
-                raise RuntimeError("Validation expects DeepONet dataset batches.")
+                raise RuntimeError("Validation expects DeepONet dataset batches")
 
             inputs, targets_data, times_data = batch_data
             B = inputs.size(0)
 
-            # Fast path: uniform time grid
+            # Process batch based on time grid type
             if torch.is_tensor(targets_data):
-                targets = targets_data
-                times = self._ensure_time_2d(times_data)
-
-                with autocast(**self.autocast_kwargs):
-                    z_pred, _ = self.model(inputs, decode=False, trunk_times=times)
-                    loss = self.criterion(z_pred, targets)
-
-                    # For bypass mode, we're already in species space
-                    if self.model.bypass_autoencoder:
-                        y_pred = z_pred
-                        y_true = targets
-                    else:
-                        # Decode for MAE
-                        B1, M1, LD = targets.shape
-                        y_pred = self.model.decode(z_pred.reshape(B1 * M1, LD)).view(B1, M1, -1)
-                        y_true = self.model.decode(targets.reshape(B1 * M1, LD)).view(B1, M1, -1)
-
-                    mae_n = (y_pred - y_true).abs().mean()
-
-                # Physical space MAE if available
-                if have_phys:
-                    y_pred_phys = self._norm_helper.denormalize(
-                        y_pred.reshape(-1, y_pred.shape[-1]), self._species_vars
-                    ).view_as(y_pred)
-                    y_true_phys = self._norm_helper.denormalize(
-                        y_true.reshape(-1, y_true.shape[-1]), self._species_vars
-                    ).view_as(y_true)
-                    mae_p = (y_pred_phys - y_true_phys).abs().mean().item()
-                else:
-                    mae_p = 0.0
-
-                total_loss += float(loss.item()) * B
-                total_mse += float(loss.item()) * B
-                total_mae_norm += float(mae_n.item()) * B
-                total_mae_phys += float(mae_p) * B
-                n_samples += B
-
+                # Uniform time grid
+                metrics = self._validate_uniform_batch(
+                    inputs, targets_data, times_data, have_phys
+                )
             else:
-                # Variable-time path
-                targets_list = targets_data
-                times_list = times_data
+                # Variable time grids
+                metrics = self._validate_variable_batch(
+                    inputs, targets_data, times_data, have_phys
+                )
 
-                for i in range(B):
-                    input_i = inputs[i:i + 1]
-                    targets_i = targets_list[i].unsqueeze(0)
-                    times_i = self._ensure_time_2d(times_list[i])
-
-                    with autocast(**self.autocast_kwargs):
-                        z_pred, _ = self.model(input_i, decode=False, trunk_times=times_i)
-                        loss = self.criterion(z_pred, targets_i)
-
-                        # For bypass mode, we're already in species space
-                        if self.model.bypass_autoencoder:
-                            y_pred = z_pred
-                            y_true = targets_i
-                        else:
-                            B1, M1, LD = targets_i.shape
-                            y_pred = self.model.decode(z_pred.reshape(B1 * M1, LD)).view(B1, M1, -1)
-                            y_true = self.model.decode(targets_i.reshape(B1 * M1, LD)).view(B1, M1, -1)
-
-                        mae_n = (y_pred - y_true).abs().mean()
-
-                    if have_phys:
-                        y_pred_phys = self._norm_helper.denormalize(
-                            y_pred.reshape(-1, y_pred.shape[-1]), self._species_vars
-                        ).view_as(y_pred)
-                        y_true_phys = self._norm_helper.denormalize(
-                            y_true.reshape(-1, y_true.shape[-1]), self._species_vars
-                        ).view_as(y_true)
-                        mae_p = (y_pred_phys - y_true_phys).abs().mean().item()
-                    else:
-                        mae_p = 0.0
-
-                    total_loss += float(loss.item())
-                    total_mse += float(loss.item())
-                    total_mae_norm += float(mae_n.item())
-                    total_mae_phys += float(mae_p)
-                    n_samples += 1
+            # Accumulate metrics
+            total_loss += metrics['loss'] * metrics['batch_size']
+            total_mse += metrics['mse'] * metrics['batch_size']
+            total_mae_norm += metrics['mae_norm'] * metrics['batch_size']
+            total_mae_phys += metrics.get('mae_phys', 0.0) * metrics['batch_size']
+            n_samples += metrics['batch_size']
 
         # Compute averages
         avg_loss = total_loss / max(1, n_samples)
         avg_mse = total_mse / max(1, n_samples)
-        avg_mae_n = total_mae_norm / max(1, n_samples)
-        avg_mae_p = total_mae_phys / max(1, n_samples)
+        avg_mae_norm = total_mae_norm / max(1, n_samples)
+        avg_mae_phys = total_mae_phys / max(1, n_samples)
 
         metrics = {
             "loss": avg_loss,
             "mse": avg_mse,
-            "decoded_mae": avg_mae_n,
+            "decoded_mae": avg_mae_norm,
         }
         if have_phys:
-            metrics["decoded_mae_phys"] = avg_mae_p
+            metrics["decoded_mae_phys"] = avg_mae_phys
 
         return avg_loss, metrics
 
-    def _save_checkpoint(self, epoch: int, loss: float, prefix: str = "checkpoint", is_best: bool = False):
+    def _validate_uniform_batch(
+            self,
+            inputs: torch.Tensor,
+            targets: torch.Tensor,
+            times: torch.Tensor,
+            have_phys: bool
+    ) -> Dict[str, float]:
+        """Validate batch with uniform time grid."""
+        B = inputs.size(0)
+
+        # Move tensors to device
+        inputs = inputs.to(self.device, non_blocking=True)
+        targets = targets.to(self.device, non_blocking=True)
+        times = self._ensure_time_2d(times.to(self.device, non_blocking=True))
+
+        with autocast(**self.autocast_kwargs):
+            z_pred, _ = self.model(inputs, decode=False, trunk_times=times)
+            # Ensure dtype consistency
+            loss = self.criterion(z_pred, targets.to(z_pred.dtype))
+
+            # Decode for MAE computation
+            if self.model.bypass_autoencoder:
+                y_pred = z_pred
+                y_true = targets.to(z_pred.dtype)
+            else:
+                B1, M1, LD = targets.shape
+                targets_matched = targets.to(z_pred.dtype)
+                y_pred = self.model.decode(z_pred.reshape(B1 * M1, LD)).view(B1, M1, -1)
+                y_true = self.model.decode(targets_matched.reshape(B1 * M1, LD)).view(B1, M1, -1)
+
+            mae_norm = (y_pred - y_true).abs().mean()
+
+        # Physical space MAE if available
+        mae_phys = 0.0
+        if have_phys:
+            y_pred_phys = self._norm_helper.denormalize(
+                y_pred.reshape(-1, y_pred.shape[-1]), self._species_vars
+            ).view_as(y_pred)
+            y_true_phys = self._norm_helper.denormalize(
+                y_true.reshape(-1, y_true.shape[-1]), self._species_vars
+            ).view_as(y_true)
+            mae_phys = (y_pred_phys - y_true_phys).abs().mean().item()
+
+        return {
+            'loss': float(loss.item()),
+            'mse': float(loss.item()),
+            'mae_norm': float(mae_norm.item()),
+            'mae_phys': float(mae_phys),
+            'batch_size': B
+        }
+
+    def _validate_variable_batch(
+            self,
+            inputs: torch.Tensor,
+            targets_list: List[torch.Tensor],
+            times_list: List[torch.Tensor],
+            have_phys: bool
+    ) -> Dict[str, float]:
+        """Validate batch with variable time grids."""
+        B = inputs.size(0)
+        inputs = inputs.to(self.device, non_blocking=True)
+
+        total_loss = 0.0
+        total_mse = 0.0
+        total_mae_norm = 0.0
+        total_mae_phys = 0.0
+
+        for i in range(B):
+            input_i = inputs[i:i + 1]
+            targets_i = targets_list[i].unsqueeze(0).to(self.device, non_blocking=True)
+            times_i = self._ensure_time_2d(times_list[i].to(self.device, non_blocking=True))
+
+            with autocast(**self.autocast_kwargs):
+                z_pred, _ = self.model(input_i, decode=False, trunk_times=times_i)
+                # Ensure dtype consistency
+                loss = self.criterion(z_pred, targets_i.to(z_pred.dtype))
+
+                # Decode for MAE
+                if self.model.bypass_autoencoder:
+                    y_pred = z_pred
+                    y_true = targets_i.to(z_pred.dtype)
+                else:
+                    B1, M1, LD = targets_i.shape
+                    targets_matched = targets_i.to(z_pred.dtype)
+                    y_pred = self.model.decode(z_pred.reshape(B1 * M1, LD)).view(B1, M1, -1)
+                    y_true = self.model.decode(targets_matched.reshape(B1 * M1, LD)).view(B1, M1, -1)
+
+                mae_norm = (y_pred - y_true).abs().mean()
+
+            # Physical space MAE
+            if have_phys:
+                y_pred_phys = self._norm_helper.denormalize(
+                    y_pred.reshape(-1, y_pred.shape[-1]), self._species_vars
+                ).view_as(y_pred)
+                y_true_phys = self._norm_helper.denormalize(
+                    y_true.reshape(-1, y_true.shape[-1]), self._species_vars
+                ).view_as(y_true)
+                mae_phys = (y_pred_phys - y_true_phys).abs().mean().item()
+            else:
+                mae_phys = 0.0
+
+            total_loss += float(loss.item())
+            total_mse += float(loss.item())
+            total_mae_norm += float(mae_norm.item())
+            total_mae_phys += float(mae_phys)
+
+        return {
+            'loss': total_loss / B,
+            'mse': total_mse / B,
+            'mae_norm': total_mae_norm / B,
+            'mae_phys': total_mae_phys / B,
+            'batch_size': B
+        }
+
+    def _load_normalization_helper(self):
+        """Load normalization helper for physical space metrics."""
+        try:
+            from utils import load_json
+            from normalizer import NormalizationHelper
+
+            stats_path = Path(self.config["paths"]["processed_data_dir"]) / "normalization.json"
+            stats = load_json(stats_path)
+            self._norm_helper = NormalizationHelper(stats, self.device, self.config)
+
+            # Try multiple possible keys for species variables
+            names = (self.config["data"].get("target_species_variables") or
+                     self.config["data"].get("species_variables"))
+            self._species_vars = list(names) if names else None
+        except Exception:
+            self._norm_helper = None
+            self._species_vars = None
+
+    def _save_checkpoint(
+            self,
+            epoch: int,
+            loss: float,
+            prefix: str = "checkpoint",
+            is_best: bool = False
+    ):
         """Save model checkpoint."""
         checkpoint = {
             "epoch": epoch,
@@ -614,7 +882,7 @@ class Trainer:
             self.logger.info(f"Saved best model at epoch {epoch} with loss {loss:.3e}")
 
     def _save_history(self):
-        """Save training history."""
+        """Save training history to JSON."""
         import json
 
         history = {

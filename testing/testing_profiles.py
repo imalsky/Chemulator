@@ -12,7 +12,7 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-
+MODEL_STR = "deepo"
 # -------------------------------
 # Configuration
 # -------------------------------
@@ -158,7 +158,7 @@ def main():
     output_dir.mkdir(exist_ok=True)
 
     # Load configuration
-    with open(processed_dir.parent.parent / "models" / "deepo-log-standard" / "config.json") as f:
+    with open(processed_dir.parent.parent / "models" / MODEL_STR / "config.json") as f:
         config = json.load(f)
 
     species_names = config["data"]["species_variables"]
@@ -196,7 +196,7 @@ def main():
     P = float(globals_arr[traj_idx, 0])
     T = float(globals_arr[traj_idx, 1])
 
-    print(f"Trajectory conditions: P = {P:.2e} Pa, T = {T:.1f} K")
+    print(f"Trajectory conditions: P = {P:.2e}, T = {T:.1f} K")
     print(f"Time points: {len(time)}, from {time[0]:.3e} to {time[-1]:.3e} s")
 
     # Normalize species and time
@@ -217,7 +217,7 @@ def main():
 
     # Panel 1: Normalized trajectories vs NORMALIZED time
     ax1.set_xlabel(f"{time_var} (normalized)")
-    ax1.set_ylabel("Normalized Abundance")
+    ax1.set_ylabel("Normalized Values")
     ax1.set_title(f"Normalized Species (Trajectory {traj_idx})")
     ax1.grid(True, alpha=0.3)
 
@@ -257,7 +257,7 @@ def main():
     # Panel 2: Physical units
     ax2.set_xlabel("Time (s)")
     ax2.set_ylabel("Species Abundance")
-    ax2.set_title(f"Physical Units (P={P:.1e} Pa, T={T:.0f} K)")
+    ax2.set_title(f"Physical Units (P={P:.1e}, T={T:.0f} K)")
     ax2.set_xscale("log")
     ax2.set_yscale("log")
     ax2.grid(True, alpha=0.3)
@@ -268,7 +268,7 @@ def main():
 
     ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
 
-    plt.suptitle(f"Trajectory from {Path(shard).name} (Sample {traj_idx})")
+    plt.suptitle(f"Profile from {Path(shard).name} (Sample {traj_idx})")
     plt.tight_layout()
 
     # Save
