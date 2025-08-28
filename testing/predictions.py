@@ -18,7 +18,7 @@ EXPORT_PATHS = [
     f"{MODEL_DIR}/final_model_exported.pt2",  # fallback
 ]
 
-SAMPLE_INDEX = 5  # which trajectory to plot
+SAMPLE_INDEX = 130  # which trajectory to plot
 OUTPUT_DIR = None  # None -> <model_dir>/plots
 SEED = 42
 
@@ -51,6 +51,8 @@ from torch.export import load as torch_load
 sys.path.append(str((Path(__file__).resolve().parent.parent / "src").resolve()))
 from utils import load_json, seed_everything
 from normalizer import NormalizationHelper
+
+plt.style.use("science.mplstyle")
 
 
 # =========================
@@ -316,7 +318,7 @@ def plot_results(t_phys, y_true, t_phys_sel, y_pred, sample_idx,
     # Add markers
     for i, sp in enumerate(species):
         ax.loglog(t_phys_sel[::marker_every], y_pred_plot[::marker_every, i],
-                  'o', color=colors[i], ms=3, alpha=0.9)
+                  'o', color=colors[i], edgecolor=colors[i], ms=5, alpha=0.9)
 
     # Legend
     from matplotlib.lines import Line2D
@@ -331,7 +333,6 @@ def plot_results(t_phys, y_true, t_phys_sel, y_pred, sample_idx,
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Species Abundance")
     ax.set_title(f"AE-DeepONet vs Ground Truth (Sample {sample_idx}) — {q_mode} K={q_count}")
-    ax.grid(True, which="both", alpha=0.3, ls="--")
 
     # Save
     plt.tight_layout()

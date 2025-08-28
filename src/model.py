@@ -3,6 +3,9 @@
 Autoencoder-DeepONet implementation following Goswami et al. (2023).
 Complete implementation with trunk_times required at inference.
 UPDATED: Support for bypassing autoencoder to work directly in species space.
+UPDATED: Added global-conditioned time-warping for trunk network.
+CORRECTED: Time-warp regularization on actual output b(g), not layer parameters.
+CORRECTED: Proper PoU masking for variable-length sequences.
 """
 
 import logging
@@ -72,12 +75,15 @@ class DeepONet(nn.Module):
 
     def __init__(self, latent_dim: int, num_globals: int, p: int,
                  branch_hidden_layers: List[int], trunk_hidden_layers: List[int],
-                 trunk_basis: str = "linear"):
+                 trunk_basis: str = "linear", use_time_warp: bool = False,
+                 time_warp_hidden_dim: int = 32, time_warp_bias_clamp: float = 0.25):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_globals = num_globals
         self.p = p
         self.trunk_basis = trunk_basis
+        self.use_time_warp = use_time_warp
+        self.time_warp_bias_clamp = time_warp_bias_clamp
 
         # Branch network with LayerNorm for stability
         self.branch_layers = nn.ModuleList()
@@ -100,12 +106,21 @@ class DeepONet(nn.Module):
             in_features = hidden_units
         self.trunk_layers.append(nn.Linear(in_features, latent_dim * p))
 
-        # Single consistent weight initialization
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # Global-conditioned time-warp network
+        if self.use_time_warp:
+            self.time_warp = nn.Sequential(
+                nn.Linear(num_globals, time_warp_hidden_dim),
+                nn.LeakyReLU(0.01, inplace=True),
+                nn.Linear(time_warp_hidden_dim, 2)  # outputs [log_s, b]
+            )
+
+        # Initialize all weights with Xavier normal first
+        self.apply(init_weights_glorot_normal)
+
+        # THEN override time-warp to identity transformation if enabled
+        if self.use_time_warp:
+            nn.init.zeros_(self.time_warp[-1].weight)
+            nn.init.zeros_(self.time_warp[-1].bias)
 
     def forward_branch(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through branch network."""
@@ -121,9 +136,25 @@ class DeepONet(nn.Module):
             y = layer(y)
         return y
 
-    def forward(self, branch_input: torch.Tensor, trunk_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_time_warp_params(self, g: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass returning both prediction and trunk outputs.
+        Compute time-warp parameters from global variables.
+        Returns scale and bias for time transformation.
+        """
+        log_s, b = self.time_warp(g).chunk(2, dim=-1)  # [B, 1] each
+        log_s = torch.clamp(log_s, -2.0, 2.0)  # Limit extreme scales
+
+        # Optionally clamp bias to prevent extreme time shifts
+        if self.time_warp_bias_clamp > 0:
+            b = torch.clamp(b, -self.time_warp_bias_clamp, self.time_warp_bias_clamp)
+
+        s = torch.exp(log_s)  # [B, 1]
+        return s, b
+
+    def forward(self, branch_input: torch.Tensor, trunk_input: torch.Tensor) -> Tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Forward pass returning prediction, trunk outputs, and time-warp bias.
 
         Args:
             branch_input: [B, latent_dim + num_globals]
@@ -131,25 +162,53 @@ class DeepONet(nn.Module):
 
         Returns:
             z_pred: [B, M, latent_dim] predictions
-            trunk_out: [M, latent_dim, p] trunk basis functions
+            trunk_out: [M, latent_dim, p] or [B, M, latent_dim, p] if time_warp enabled
+            time_warp_b: [B, 1] time-warp bias (only if time_warp enabled)
         """
         B = branch_input.size(0)
         M = trunk_input.size(0)
 
-        # Compute branch and trunk outputs
+        # Compute branch outputs
         branch_out = self.forward_branch(branch_input).view(B, self.latent_dim, self.p)
-        trunk_raw = self.forward_trunk(trunk_input).view(M, self.latent_dim, self.p)
 
-        # Apply basis transformation if needed
-        if self.trunk_basis == "softmax":
-            trunk_out = F.softmax(trunk_raw, dim=-1)
+        time_warp_b = None
+
+        if self.use_time_warp:
+            # Global-conditioned time warp
+            g = branch_input[:, self.latent_dim:]  # Extract globals [B, G]
+            s, b = self.get_time_warp_params(g)
+            time_warp_b = b  # Store for regularization
+
+            # Apply time warping
+            t = trunk_input.unsqueeze(0)  # [1, M, 1]
+            t_warp = s.unsqueeze(1) * t + b.unsqueeze(1)  # [B, M, 1]
+
+            # Compute trunk for each batch item
+            t_flat = t_warp.reshape(B * M, 1)
+            trunk_raw = self.forward_trunk(t_flat).view(B, M, self.latent_dim, self.p)
+
+            # Apply basis transformation
+            if self.trunk_basis == "softmax":
+                trunk_out = F.softmax(trunk_raw, dim=-1)
+            else:
+                trunk_out = trunk_raw
+
+            # Batch-dependent contraction
+            z_pred = torch.einsum('blp,bmlp->bml', branch_out, trunk_out)
         else:
-            trunk_out = trunk_raw
+            # Original batch-independent trunk
+            trunk_raw = self.forward_trunk(trunk_input).view(M, self.latent_dim, self.p)
 
-        # Tensor contraction: sum over basis functions
-        z_pred = torch.einsum('blp,mlp->bml', branch_out, trunk_out)
+            # Apply basis transformation
+            if self.trunk_basis == "softmax":
+                trunk_out = F.softmax(trunk_raw, dim=-1)
+            else:
+                trunk_out = trunk_raw
 
-        return z_pred, trunk_out
+            # Standard contraction
+            z_pred = torch.einsum('blp,mlp->bml', branch_out, trunk_out)
+
+        return z_pred, trunk_out, time_warp_b
 
 
 class AEDeepONet(nn.Module):
@@ -178,7 +237,13 @@ class AEDeepONet(nn.Module):
         self.p = model_cfg.get("p", 10)
         self.trunk_basis = model_cfg.get("trunk_basis", "linear")
 
-        # NEW: Check if we're bypassing the autoencoder
+        # Time-warp configuration
+        self.use_time_warp = model_cfg.get("use_time_warp", False)
+        self.time_warp_hidden_dim = model_cfg.get("time_warp_hidden_dim", 32)
+        self.time_warp_bias_clamp = model_cfg.get("time_warp_bias_clamp", 0.25)
+        self.time_warp_bias_reg = model_cfg.get("time_warp_bias_reg", 0.01)
+
+        # Check if we're bypassing the autoencoder
         self.bypass_autoencoder = model_cfg.get("bypass_autoencoder", False)
 
         # Set working dimension based on bypass mode
@@ -189,11 +254,20 @@ class AEDeepONet(nn.Module):
             self.working_dim = self.latent_dim
             self.logger.info(f"Using autoencoder with {self.working_dim}-D latent space")
 
+        if self.use_time_warp:
+            self.logger.info(
+                f"Global-conditioned time-warping enabled "
+                f"(hidden_dim={self.time_warp_hidden_dim}, bias_clamp={self.time_warp_bias_clamp})"
+            )
+
         # PoU (Partition of Unity) regularization settings
         # Only makes sense for linear basis (softmax already sums to 1)
         self.use_pou = model_cfg.get("use_pou", False) and self.trunk_basis == "linear"
         if model_cfg.get("use_pou", False) and self.trunk_basis == "softmax":
             self.logger.info("PoU regularization disabled for softmax basis (already sums to 1)")
+
+        if self.use_pou and self.trunk_basis == "linear":
+            self.logger.info("PoU enabled: enforcing affine partition (sum=1) for linear trunk basis")
 
         self.pou_weight = config["training"].get("pou_weight", 0.01)
 
@@ -237,6 +311,9 @@ class AEDeepONet(nn.Module):
             branch_hidden_layers=branch_layers,
             trunk_hidden_layers=trunk_layers,
             trunk_basis=self.trunk_basis,
+            use_time_warp=self.use_time_warp,
+            time_warp_hidden_dim=self.time_warp_hidden_dim,
+            time_warp_bias_clamp=self.time_warp_bias_clamp,
         )
 
         # Cache device using buffer
@@ -254,15 +331,19 @@ class AEDeepONet(nn.Module):
                 f"Species: {data_cfg['species_variables']}"
             )
 
+        # Validate global variables (more flexible check)
         expected_globals = data_cfg.get("expected_globals", ["P", "T"])
-        if data_cfg["global_variables"] != expected_globals:
-            raise ValueError(
-                f"Global variables mismatch: got {data_cfg['global_variables']}, expected {expected_globals}. "
-                "Note: this implementation intentionally uses [P, T] instead of [φ₀, T₀]."
+        if set(data_cfg["global_variables"]) != set(expected_globals):
+            self.logger.warning(
+                f"Global variables mismatch: got {data_cfg['global_variables']}, "
+                f"expected {expected_globals}. Ensure your data matches configuration."
             )
-
-        # NOTE: No default trunk_times - must be provided at inference
-        # This ensures explicit control over evaluation time points
+            # Only raise if strict checking is enabled
+            if data_cfg.get("strict_globals_check", False):
+                raise ValueError(
+                    f"Global variables must be exactly {expected_globals} in order. "
+                    f"Got: {data_cfg['global_variables']}"
+                )
 
         # Tracking lists for training history
         self.index_list = []
@@ -279,40 +360,101 @@ class AEDeepONet(nn.Module):
             z_pred: torch.Tensor,  # [B, M, working_dim]
             z_true: torch.Tensor,  # [B, M, working_dim]
             mask: Optional[torch.Tensor] = None,  # [B, M] booleans or {0,1}
-            trunk_outputs: Optional[torch.Tensor] = None,  # for PoU (e.g., [M, working_dim, P] or [..., P])
-            pou_weight: float = 0.0
+            trunk_outputs: Optional[torch.Tensor] = None,  # [M,L,P] or [B,M,L,P]
+            pou_weight: float = 0.0,
+            pou_mask: Optional[torch.Tensor] = None,  # [M] or [B,M]
+            time_warp_b: Optional[torch.Tensor] = None  # [B,1] the OUTPUT shift b(g)
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Working-space loss (latent if AE enabled; species if bypassing).
-        - Masked MSE over valid (B, M) positions, averaged per-element across the last dim.
-        - Optional PoU penalty if a *linear* trunk basis is used.
+        Working-space loss with proper masking for PoU and meaningful time-warp regularization.
+
+        Args:
+            z_pred: Predictions [B, M, working_dim]
+            z_true: Targets [B, M, working_dim]
+            mask: Optional mask for valid positions [B, M]
+            trunk_outputs: Trunk basis evaluations [M,L,P] or [B,M,L,P]
+            pou_weight: Weight for PoU regularization
+            pou_mask: Mask for PoU computation [M] or [B,M]
+            time_warp_b: Actual time-warp bias output [B,1] for regularization
 
         Returns:
-            total_loss, {"mse": ..., "pou": ...}
+            total_loss, metrics dictionary
         """
-        # ----- MSE (masked if provided) -----
+        # MSE with fp32 accumulation for better precision
         if mask is None:
             mse = F.mse_loss(z_pred, z_true, reduction="mean")
         else:
-            # Ensure mask lives with predictions and broadcasts to [..., working_dim]
-            m = mask.to(dtype=z_pred.dtype, device=z_pred.device).unsqueeze(-1)  # [B, M, 1]
-            sq = (z_pred - z_true) ** 2
-            sq = sq * m
-            # Denominator = (#valid B,M positions) * working_dim
-            valid = m.sum() * z_pred.shape[-1]
-            valid = valid.clamp_min(1)  # avoid div-by-zero
-            mse = sq.sum() / valid
+            sq = (z_pred - z_true).float().pow(2)
+            m32 = mask.to(dtype=torch.float32, device=z_pred.device).unsqueeze(-1)  # [B,M,1]
+            valid = m32.sum().clamp_min(1.0) * float(z_pred.shape[-1])
+            mse = (sq * m32).sum() / valid
+            mse = mse.to(z_pred.dtype)
 
-        # ----- PoU penalty (device-safe, no reliance on self.device) -----
-        if pou_weight > 0.0:
-            pou_loss = self.pou_regularization(trunk_outputs)
+        # PoU penalty with proper masking
+        if pou_weight > 0.0 and trunk_outputs is not None:
+            pou_loss = self.pou_regularization(trunk_outputs, pou_mask)
         else:
-            # create scalar 0 on the same device/dtype as z_pred (no self.device)
             pou_loss = torch.zeros((), device=z_pred.device, dtype=z_pred.dtype)
 
-        total = mse + pou_weight * pou_loss
-        stats = {"mse": float(mse.detach().cpu()), "pou": float(pou_loss.detach().cpu())}
+        # Time-warp regularization on actual output b(g)
+        time_warp_reg = torch.zeros((), device=z_pred.device, dtype=z_pred.dtype)
+        if self.use_time_warp and self.time_warp_bias_reg > 0 and time_warp_b is not None:
+            # Penalize the actual predicted shift, not the layer bias parameter
+            time_warp_reg = 0.5 * (time_warp_b.float().pow(2)).mean().to(z_pred.dtype)
+
+        total = mse + pou_weight * pou_loss + self.time_warp_bias_reg * time_warp_reg
+        stats = {
+            "mse": float(mse.detach().cpu()),
+            "pou": float(pou_loss.detach().cpu()),
+            "time_warp_reg": float(time_warp_reg.detach().cpu())
+        }
         return total, stats
+
+    def pou_regularization(self,
+                           trunk_outputs: Optional[torch.Tensor],
+                           mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Partition-of-Unity penalty with proper masking for variable-length batches.
+
+        Args:
+            trunk_outputs: [M, L, P] (batch-independent) or [B, M, L, P] (batch-dependent)
+            mask: [M] or [B,M]. Automatically adapted to match trunk_outputs shape.
+
+        Returns:
+            Scalar tensor with mean-squared deviation from unity
+        """
+        if trunk_outputs is None:
+            dev = next(self.parameters()).device if any(True for _ in self.parameters()) else torch.device("cpu")
+            return torch.tensor(0.0, device=dev, dtype=torch.float32)
+
+        pen = (trunk_outputs.sum(dim=-1) - 1.0) ** 2  # -> [M,L] or [B,M,L]
+
+        if mask is None:
+            return pen.mean()
+
+        # Move mask to the same device/dtype, then harmonize shapes
+        m = mask.to(device=pen.device, dtype=pen.dtype)
+
+        if pen.dim() == 2:  # [M, L]
+            # Accept [M] or [B,M] and reduce to [M]
+            if m.dim() == 2:
+                m = m.any(dim=0)  # [B,M] -> [M]
+            elif m.dim() != 1:
+                raise ValueError("PoU mask must be [M] or [B,M] when trunk_outputs is [M,L,P].")
+            m = m.unsqueeze(-1)  # [M,1] -> broadcast to [M,L]
+
+        elif pen.dim() == 3:  # [B, M, L]
+            # Accept [B,M] (preferred) or [M] (broadcast across B)
+            if m.dim() == 1:  # [M]
+                m = m.view(1, -1, 1).expand(pen.size(0), -1, 1)  # -> [B,M,1]
+            elif m.dim() == 2:  # [B,M]
+                m = m.unsqueeze(-1)  # -> [B,M,1]
+            else:
+                raise ValueError("PoU mask must be [B,M] or [M] when trunk_outputs is [B,M,L,P].")
+        else:
+            raise ValueError(f"Unexpected trunk_outputs rank (after sum over P): {pen.shape}")
+
+        return (pen * m).sum() / m.sum().clamp_min(1.0)
 
     def _init_normalized_clamp(self):
         """
@@ -391,29 +533,6 @@ class AEDeepONet(nn.Module):
             return z  # Identity mapping
         return self.autoencoder.decode(z)
 
-    def pou_regularization(self, trunk_outputs: Optional[torch.Tensor]) -> torch.Tensor:
-        """
-        Partition-of-Unity (PoU) penalty for a *linear* trunk basis.
-
-        trunk_outputs: Tensor of trunk basis evaluations. Expected to sum to 1.0 over the
-                       last dimension (basis dimension) at every evaluation coordinate.
-                       Shape may be [..., P] where P = number of trunk basis functions.
-
-        Returns:
-            Scalar tensor (mean-squared deviation from unity).
-            If trunk_outputs is None, returns 0 on a sensible device without using self.device.
-        """
-        if trunk_outputs is None:
-            # fall back to model parameter device (no reliance on self.device)
-            dev = next(self.parameters()).device if any(True for _ in self.parameters()) else torch.device("cpu")
-            return torch.tensor(0.0, device=dev, dtype=torch.float32)
-
-        # Sum over basis dimension (last dim). Expect each sum ≈ 1 for linear basis.
-        # Works for shapes like [M, L, P] or [B, M, L, P]; only the last dim is special.
-        s = trunk_outputs.sum(dim=-1)
-        penalty = (s - 1.0) ** 2
-        return penalty.mean()
-
     def forward(
             self,
             inputs: torch.Tensor,
@@ -432,7 +551,7 @@ class AEDeepONet(nn.Module):
 
         Returns:
             predictions: [B, M, working_dim] if decode=False or bypassed, [B, M, num_species] if decode=True
-            aux_dict: Dictionary with auxiliary outputs (z_pred, trunk_outputs)
+            aux_dict: Dictionary with auxiliary outputs (z_pred, trunk_outputs, time_warp_b)
 
         Raises:
             ValueError: If trunk_times not provided
@@ -443,7 +562,7 @@ class AEDeepONet(nn.Module):
                 f"Expected input dimension {expected_dim} ([{'latent' if not self.bypass_autoencoder else 'species'}, globals]), got {inputs.size(1)}"
             )
 
-        # CHANGED: trunk_times now always required - no defaults
+        # trunk_times now always required - no defaults
         if trunk_times is None:
             raise ValueError(
                 "trunk_times must be provided for forward pass. "
@@ -456,12 +575,14 @@ class AEDeepONet(nn.Module):
         trunk_in = trunk_times.to(inputs.device, inputs.dtype)
 
         # Single forward pass through DeepONet
-        z_pred, trunk_out = self.deeponet(inputs, trunk_in)  # [B, M, working_dim], [M, working_dim, p]
+        z_pred, trunk_out, time_warp_b = self.deeponet(inputs, trunk_in)
 
         # Store auxiliary outputs
         aux = {"z_pred": z_pred}
         if return_trunk_outputs or self.use_pou:
             aux["trunk_outputs"] = trunk_out
+        if time_warp_b is not None:
+            aux["time_warp_b"] = time_warp_b
 
         # If bypassing autoencoder, we're already in species space
         if self.bypass_autoencoder:

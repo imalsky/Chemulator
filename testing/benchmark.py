@@ -31,15 +31,15 @@ MODEL_FILE = "complete_model_exported.pt2"
 CONFIG_FILE = "config.json"
 
 # Batch sizes to test
-BATCH_SIZES: List[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+BATCH_SIZES: List[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
 # Number of time points to predict (trunk dimension)
 NUM_TIME_POINTS = 100
 
 # Warmup/timing parameters
 WARMUP_CALLS = 20
-CALLS_PER_MEASUREMENT = 32
-REPEATS = 5
+CALLS_PER_MEASUREMENT = 16
+REPEATS = 3
 
 # Plotting
 PLOT_DIR = MODEL_DIR / "plots"
@@ -151,7 +151,7 @@ def plot_results(
                 marker="o", markersize=6, capsize=4, linewidth=2)
     ax.set_xscale("log", base=2)
     ax.set_yscale("log", base=10)
-    ax.set_ylim(0.1, 100)
+    #ax.set_ylim(0.1, 100)
     ax.set_xlabel("Batch size")
     ax.set_ylabel("Time per sample point (μs)")
     ax.set_title("Inference time per sample point")
