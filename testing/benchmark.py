@@ -25,13 +25,13 @@ import torch
 import matplotlib.pyplot as plt
 
 # Configuration
-MODEL_STR = "deepo"
+MODEL_STR = "gosfour"
 MODEL_DIR = Path(f"../models/{MODEL_STR}")
 MODEL_FILE = "complete_model_exported.pt2"
 CONFIG_FILE = "config.json"
 
 # Batch sizes to test
-BATCH_SIZES: List[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+BATCH_SIZES: List[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 1024]
 
 # Number of time points to predict (trunk dimension)
 NUM_TIME_POINTS = 100

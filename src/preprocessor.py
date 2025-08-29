@@ -700,37 +700,37 @@ class DataPreprocessor:
             # Store combined statistics
             combined_metadata["statistics"] = combined_stats
             return combined_metadata
-    
+
     def _compile_normalization_stats(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """Compile normalization statistics from accumulated data."""
         combined_stats = metadata["statistics"]
         norm_cfg = self.config["normalization"]
         data_cfg = self.config["data"]
-        
+
         default_method = norm_cfg.get("default_method", "log-standard")
         methods = norm_cfg.get("methods", {})
         min_std = float(norm_cfg.get("min_std", DEFAULT_MIN_STD))
-        
+
         stats = {
             "per_key_stats": {},
             "normalization_methods": {}
         }
-        
+
         # Process each variable
-        all_vars = (set(data_cfg["species_variables"]) | 
-                   set(data_cfg.get("target_species_variables", data_cfg["species_variables"])) |
-                   set(data_cfg["global_variables"]) | 
-                   {data_cfg.get("time_variable", "t_time")})
-        
+        all_vars = (set(data_cfg["species_variables"]) |
+                    set(data_cfg.get("target_species_variables", data_cfg["species_variables"])) |
+                    set(data_cfg["global_variables"]) |
+                    {data_cfg.get("time_variable", "t_time")})
+
         for var in all_vars:
             if var not in combined_stats.accumulators:
                 continue
-            
+
             method = methods.get(var, default_method).lower()
             stats["normalization_methods"][var] = method
-            
+
             var_stats = combined_stats.accumulators[var].get_stats(min_std)
-            
+
             # Build statistics based on method
             if method == "log-standard":
                 stats["per_key_stats"][var] = {
@@ -761,19 +761,21 @@ class DataPreprocessor:
                     "max": var_stats["max"]
                 }
             elif method == "log10":
+                # Updated: Now save log_mean for mean-centering
                 stats["per_key_stats"][var] = {
                     "method": method,
+                    "log_mean": var_stats["mean"],
                     "log_min": var_stats["min"],
                     "log_max": var_stats["max"]
                 }
             else:  # "none"
                 stats["per_key_stats"][var] = {"method": method}
-        
+
         # Special handling for time normalization
         time_var = data_cfg.get("time_variable", "t_time")
         if time_var in stats["per_key_stats"]:
             time_method = methods.get(time_var, default_method).lower()
-            
+
             if time_method == "time-norm":
                 # Tau-space normalization
                 tau0 = float(norm_cfg.get("tau0", 1.0))
@@ -793,7 +795,7 @@ class DataPreprocessor:
                     "tmin_raw": 10 ** time_stats["log_min"],
                     "tmax_raw": 10 ** time_stats["log_max"]
                 }
-        
+
         return stats
     
     def _merge_metadata(self, target: Dict, source: Dict) -> None:
