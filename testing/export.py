@@ -8,7 +8,7 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 # Configuration
-MODEL_STR = "deepo"
+MODEL_STR = "gosfour"
 MODEL_DIR = f"../models/{MODEL_STR}"
 MODEL_PATH = f"{MODEL_DIR}/best_model.pt"
 CONFIG_PATH = f"{MODEL_DIR}/config.json"

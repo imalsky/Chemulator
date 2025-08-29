@@ -18,7 +18,7 @@ EXPORT_PATHS = [
     f"{MODEL_DIR}/final_model_exported.pt2",  # fallback
 ]
 
-SAMPLE_INDEX = 130  # which trajectory to plot
+SAMPLE_INDEX = 6  # which trajectory to plot
 OUTPUT_DIR = None  # None -> <model_dir>/plots
 SEED = 42
 
@@ -28,7 +28,7 @@ Q_MODE = "uniform"  # Options: uniform, random, log_uniform, anchors
 
 # Plot styling
 CONNECT_LINES = True
-MARKER_EVERY = 1
+MARKER_EVERY = 5
 
 # =========================
 #     ENV & IMPORTS
@@ -318,7 +318,7 @@ def plot_results(t_phys, y_true, t_phys_sel, y_pred, sample_idx,
     # Add markers
     for i, sp in enumerate(species):
         ax.loglog(t_phys_sel[::marker_every], y_pred_plot[::marker_every, i],
-                  'o', color=colors[i], edgecolor=colors[i], ms=5, alpha=0.9)
+                  'o', color=colors[i],  ms=5, alpha=0.9)
 
     # Legend
     from matplotlib.lines import Line2D
@@ -331,6 +331,7 @@ def plot_results(t_phys, y_true, t_phys_sel, y_pred, sample_idx,
 
     # Labels and formatting
     ax.set_xlabel("Time (s)")
+    ax.set_ylim(1e-9, 1)
     ax.set_ylabel("Species Abundance")
     ax.set_title(f"AE-DeepONet vs Ground Truth (Sample {sample_idx}) — {q_mode} K={q_count}")
 

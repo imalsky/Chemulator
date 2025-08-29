@@ -12,7 +12,7 @@
       "data/raw/run9009-result.h5",
       "data/raw/run9010-result.h5"
     ],
-    "processed_data_dir": "data/processed-10-log-standard",
+    "processed_data_dir": "data/processed-10-log10",
     "model_save_dir": "models",
     "log_dir": "logs"
   },
@@ -60,10 +60,10 @@
   },
 
   "normalization": {
-    "default_method": "log-standard",
+    "default_method": "log10",
     "methods": {
       "t_time": "log-min-max",
-      "P": "log-standard",
+      "P": "log-min-max",
       "T": "standard"
     },
     "epsilon": 1e-30,
@@ -74,36 +74,26 @@
 
   "model": {
     "type": "DeepONet",
-    "use_time_warp": true,
-    "time_warp_hidden_dim": 64,
-    "time_warp_bias_clamp": 0.25,  // Set to 0 to disable clamping
-    "time_warp_bias_reg": 0.05,     // L2 regularization weight for bias
 
-
-    // When true, DeepONet operates directly on species space without autoencoder
-    // This skips stages 1 & 2 (AE pretraining and latent generation)
     "bypass_autoencoder": true,
-
-    // When true, searches for compatible pre-trained autoencoders to reuse
-    "reuse_autoencoder": true,
-
-    // Latent dimension for autoencoder (ignored if bypass_autoencoder=true)
     "latent_dim": 64,
-    // DeepONet basis functions
+
+    "trunk_type": "fourier",
     "p": 256,
-    // Trunk basis type: "linear" or "softmax"
-    "trunk_basis": "linear",
-    // Enable PoU regularization for linear basis
-    "use_pou": true,
-    // Architecture
+    "fourier_K": 128,
+
+    "branch_layers": [2048, 2048, 2048, 2048, 2048],
+
+    "mixer_rank": 4,
+    "mixer_hidden": 64,
+
+    "decoder_output_mode": "linear",
+    "output_clamp": null,
+
     "ae_encoder_layers": [128, 128, 128, 120],
     "ae_decoder_layers": [128, 128, 128, 128, 128],
-    "branch_layers": [4096, 4096, 4096, 4096, 4096, 4096, 4096],
-    "trunk_layers": [4096, 4096, 4096, 4096, 4096, 4096, 4096],
-    // Decoder output mode
-    "decoder_output_mode": "linear",
-    // No clamping in normalized space
-    "output_clamp": null
+
+    "use_pou": false
   },
 
   "latent_generation": {
@@ -117,7 +107,7 @@
     "freeze_ae_after_pretrain": false,
 
     "epochs": 300,
-    "batch_size": 8192,
+    "batch_size": 4096,
 
     "train_time_sampling": "fixed",
     "train_fixed_times": "all",
@@ -136,16 +126,16 @@
     "weight_decay": 0.00005,
     "betas": [0.9, 0.999],
     "gradient_clip": 1.0,
-    "use_amp": false,
+    "use_amp": true,
 
-    "pou_weight": 0.05,
+    "pou_weight": 0.00,
     "num_workers": 0
   },
 
   "system": {
     "seed": 42,
     "use_torch_export": false,
-    "use_torch_compile": false,
+    "use_torch_compile": true,
     "compile_mode": "default",
     "cudnn_benchmark": true,
     "tf32": true,
