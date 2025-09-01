@@ -1,197 +1,192 @@
 #!/usr/bin/env python3
 """
-Export complete AE-DeepONet model including encoder for inference.
-Creates a model that accepts normalized initial species concentrations and outputs predictions.
+Export DeepONet (standard or flow-map) for inference.
+
+Interface (both modes):
+    forward(x0_norm[B,S], globals_norm[B,G], t_or_dt[K]) -> y_pred[B,K,S]
+
+- Standard mode: t_or_dt = absolute times
+- Flow-map mode:  t_or_dt = Δt (physical, > 0)
 """
-import os
+
+import os, sys, json
+from pathlib import Path
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-# Configuration
-MODEL_STR = "gosfour"
-MODEL_DIR = f"../models/{MODEL_STR}"
-MODEL_PATH = f"{MODEL_DIR}/best_model.pt"
-CONFIG_PATH = f"{MODEL_DIR}/config.json"
-EX_TRUNK_STEPS = 64
-DEVICE = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-
-import sys, json
-from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.export import export as texport, save as tsave, Dim
 
+# ---- Config ----
+MODEL_STR   = "big_deepo"            # adjust as needed
+MODEL_DIR   = Path("../models") / MODEL_STR
+MODEL_PATH  = MODEL_DIR / "best_model.pt"
+CONFIG_PATH = MODEL_DIR / "config.json"
+EX_TRUNK_STEPS = 64
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Project import (assumes this file lives in a sibling dir to src/)
 sys.path.append(str((Path(__file__).resolve().parent.parent / "src").resolve()))
-from model import AEDeepONet
+from model import create_model  # uses your config to build DeepONet or FlowMapDeepONet
 
-# State dict sanitizer
-_PREFIXES = ("_orig_mod.", "module.", "model.")
+# ---- Checkpoint utilities ----
+_PREFIXES = ("_orig_mod.", "module.", "model.", "_orig_mod.module.")
 
-
-def _strip_prefixes(k: str) -> str:
+def _strip_prefix(k: str) -> str:
     for p in _PREFIXES:
         if k.startswith(p):
             return k[len(p):]
     return k
 
-
-def _sanitize_state_for(model: nn.Module, sd: dict) -> dict:
+def _remap_state_dict(model: nn.Module, raw):
     want = set(model.state_dict().keys())
-    out, dropped = {}, []
-    for k, v in sd.items():
-        if k.endswith("._device_tensor") or k == "_device_tensor":
-            dropped.append(k);
-            continue
-        k2 = _strip_prefixes(k)
+    out = {}
+    if isinstance(raw, dict):
+        items = raw.items()
+    else:
+        # Fallback: torch.nn.Module.state_dict() object
+        items = raw.state_dict().items()
+    for k, v in items:
+        k2 = _strip_prefix(k)
         if k2 in want:
             out[k2] = v
-        else:
-            k3 = _strip_prefixes(k2)
-            if k3 in want:
-                out[k3] = v
-            else:
-                dropped.append(k)
-    if dropped:
-        print(f"[LOAD] dropped {len(dropped)} keys (first few): {dropped[:8]}")
-    print(f"[LOAD] mapped {len(out)}/{len(sd)} keys into model")
     return out
 
-
-class CompleteInferenceWrapper(nn.Module):
-    """
-    Complete inference wrapper that includes encoding.
-
-    Takes normalized initial species + globals, encodes to latent,
-    runs DeepONet, and decodes back to species.
-
-    Interface:
-      forward(x0_norm[B, S], globals_norm[B, G], trunk_times[K]) -> y_pred[B, K, S]
-    """
-
-    def __init__(self, model: AEDeepONet):
+# ---- Inference wrappers ----
+class StandardInferenceWrapper(nn.Module):
+    """Wraps standard DeepONet: branch takes [x0||globals], trunk takes absolute times."""
+    def __init__(self, model: nn.Module, s: int, g: int):
         super().__init__()
-        self.model = model
+        self.model = model.eval()
+        self.S = int(s); self.G = int(g)
 
-    def forward(self, x0_norm: torch.Tensor, globals_norm: torch.Tensor, trunk_times: torch.Tensor) -> torch.Tensor:
-        """
-        Complete forward pass from initial conditions to predictions.
+    def forward(self, x0_norm: torch.Tensor, globals_norm: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
+        # x0_norm: [B,S], globals_norm: [B,G], times: [K] or [K,1]
+        if times.dim() == 1:
+            times = times.unsqueeze(-1)           # [K,1]
+        if x0_norm.dim() != 2 or globals_norm.dim() != 2:
+            raise RuntimeError("x0_norm/globals_norm must be [B, S] / [B, G].")
+        if x0_norm.shape[0] != globals_norm.shape[0]:
+            raise RuntimeError("Batch size mismatch between x0_norm and globals_norm.")
+        if x0_norm.shape[1] != self.S or globals_norm.shape[1] != self.G:
+            raise RuntimeError(f"Feature mismatch: expected S={self.S}, G={self.G}, "
+                               f"got S={x0_norm.shape[1]}, G={globals_norm.shape[1]}")
+        branch = torch.cat([x0_norm, globals_norm], dim=-1)     # [B, S+G]
+        y_pred = self.model(branch, times)                      # [B, K, S]
+        return y_pred
 
-        Args:
-            x0_norm: [B, S] normalized initial species concentrations
-            globals_norm: [B, G] normalized global parameters
-            trunk_times: [K] or [K,1] normalized time points
+class FlowMapInferenceWrapper(nn.Module):
+    """Wraps FlowMapDeepONet to vectorize over K Δt values: returns [B,K,S]."""
+    def __init__(self, model: nn.Module, s: int, g: int):
+        super().__init__()
+        self.model = model.eval()
+        self.S = int(s); self.G = int(g)
 
-        Returns:
-            y_pred: [B, K, S] predicted species concentrations (normalized)
-        """
-        # Encode initial conditions to latent space
-        z0 = self.model.encode(x0_norm)  # [B, L]
+    def forward(self, y0_norm: torch.Tensor, globals_norm: torch.Tensor, dts: torch.Tensor) -> torch.Tensor:
+        # y0_norm: [B,S], globals_norm: [B,G], dts: [K] or [K,1] (physical, > 0)
+        if dts.dim() == 2 and dts.shape[1] == 1:
+            dts = dts.squeeze(-1)                 # [K]
+        if dts.dim() != 1:
+            raise RuntimeError("dts must be [K] or [K,1].")
+        if y0_norm.dim() != 2 or globals_norm.dim() != 2:
+            raise RuntimeError("y0_norm/globals_norm must be [B, S] / [B, G].")
+        if y0_norm.shape[0] != globals_norm.shape[0]:
+            raise RuntimeError("Batch size mismatch between y0_norm and globals_norm.")
+        if y0_norm.shape[1] != self.S or globals_norm.shape[1] != self.G:
+            raise RuntimeError(f"Feature mismatch: expected S={self.S}, G={self.G}, "
+                               f"got S={y0_norm.shape[1]}, G={globals_norm.shape[1]}")
 
-        # Combine with globals to form branch input
-        branch_input = torch.cat([z0, globals_norm], dim=-1)  # [B, L+G]
+        B, K = y0_norm.shape[0], dts.shape[0]
+        # Tile over K in a single call: [B,K,S] -> [B*K,S], same for G and Δt
+        y0_flat = y0_norm.unsqueeze(1).expand(B, K, self.S).reshape(B * K, self.S)
+        g_flat  = globals_norm.unsqueeze(1).expand(B, K, self.G).reshape(B * K, self.G) if self.G > 0 else None
+        dt_flat = dts.unsqueeze(0).expand(B, K).reshape(B * K)                             # [B*K]
 
-        # Ensure trunk times are 2D
-        if trunk_times.dim() == 1:
-            trunk_times = trunk_times.unsqueeze(-1)
-
-        # Run DeepONet and decode
-        y_pred, _ = self.model(branch_input, decode=True, trunk_times=trunk_times)
-
-        return y_pred  # [B, K, S]
-
+        y1_flat = self.model(y0_flat, dt_flat, g_flat)                                     # [B*K, S]
+        return y1_flat.view(B, K, self.S)                                                  # [B,K,S]
 
 def main():
-    device = torch.device(DEVICE)
-    model_dir = Path(MODEL_DIR)
-    model_dir.mkdir(parents=True, exist_ok=True)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load config & build model
+    # Load config and build model from your factory
     with open(CONFIG_PATH, "r") as f:
         cfg = json.load(f)
-    model = AEDeepONet(cfg).to(device).eval()
+
+    # Create model on chosen device (your factory also applies dtype)
+    model = create_model(cfg, DEVICE)
+    model.eval()
 
     # Load checkpoint
-    ckpt = torch.load(MODEL_PATH, map_location=device)
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        raw_sd = ckpt["model_state_dict"]
-    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
-        raw_sd = ckpt["state_dict"]
-    elif hasattr(ckpt, "state_dict"):
+    ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
+    raw_sd = None
+    if isinstance(ckpt, dict):
+        raw_sd = ckpt.get("model_state_dict") or ckpt.get("state_dict")
+    if raw_sd is None and hasattr(ckpt, "state_dict"):
         raw_sd = ckpt.state_dict()
-    else:
+    if raw_sd is None:
         raise RuntimeError(f"Unsupported checkpoint format: {type(ckpt)}")
 
-    clean_sd = _sanitize_state_for(model, raw_sd)
+    clean_sd = _remap_state_dict(model, raw_sd)
     missing, unexpected = model.load_state_dict(clean_sd, strict=False)
-    # Ignore compile-only buffer if present
-    missing = [k for k in missing if k != "_device_tensor"]
-    unexpected = [k for k in unexpected if k != "_device_tensor"]
-    if missing or unexpected:
-        raise RuntimeError(
-            "State_dict mismatch after sanitize.\n"
-            f"Missing: {missing[:8]}\nUnexpected: {unexpected[:8]}"
+    if missing:
+        print(f"[WARN] Missing keys: {sorted(missing)[:8]}{' ...' if len(missing)>8 else ''}")
+    if unexpected:
+        print(f"[WARN] Unexpected keys: {sorted(unexpected)[:8]}{' ...' if len(unexpected)>8 else ''}")
+
+    # Shapes
+    S = len(cfg["data"]["species_variables"])
+    G = len(cfg["data"]["global_variables"])
+    K = EX_TRUNK_STEPS
+
+    # Pick wrapper by mode
+    mode = cfg.get("model", {}).get("mode", "standard").lower()
+    if mode == "flowmap":
+        wrapper = FlowMapInferenceWrapper(model, S, G).to(DEVICE)
+        # Example inputs (Δt in physical units)
+        ex_x   = torch.randn(2, S, device=DEVICE, dtype=torch.float32)
+        ex_g   = torch.randn(2, G, device=DEVICE, dtype=torch.float32) if G > 0 else torch.zeros(2, 0, device=DEVICE)
+        ex_dt  = torch.linspace(1e-3, 1.0, steps=K, device=DEVICE, dtype=torch.float32)
+        dyn = (
+            {0: Dim("B", 1, 8192)},     # y0_norm
+            {0: Dim("B", 1, 8192)},     # globals_norm
+            {0: Dim("K", 1, 10000)},    # dts
         )
+        example_args = (ex_x, ex_g, ex_dt)
+    else:
+        wrapper = StandardInferenceWrapper(model, S, G).to(DEVICE)
+        # Example inputs (absolute, normalized times)
+        ex_x   = torch.randn(2, S, device=DEVICE, dtype=torch.float32)
+        ex_g   = torch.randn(2, G, device=DEVICE, dtype=torch.float32) if G > 0 else torch.zeros(2, 0, device=DEVICE)
+        ex_t   = torch.linspace(0.0, 1.0, steps=K, device=DEVICE, dtype=torch.float32)
+        dyn = (
+            {0: Dim("B", 1, 8192)},     # x0_norm
+            {0: Dim("B", 1, 8192)},     # globals_norm
+            {0: Dim("K", 1, 10000)},    # times
+        )
+        example_args = (ex_x, ex_g, ex_t)
 
-    # Check if bypass mode
-    bypass = bool(cfg["model"].get("bypass_autoencoder", False))
-
-    if bypass:
-        print("[WARN] Model was trained with bypass_autoencoder=True")
-        print("       The encoder is not used in this case.")
-
-    # Get dimensions
-    num_species = len(cfg["data"]["species_variables"])
-    num_globals = len(cfg["data"]["global_variables"])
-    latent_dim = cfg["model"]["latent_dim"]
-
-    # Build wrapper
-    wrapper = CompleteInferenceWrapper(model).to(device).eval()
-
-    # --- Export with dynamic shapes ---
-    print("[INFO] Exporting model with encoder...")
-
-    # Example inputs
-    ex_x0 = torch.randn(2, num_species, device=device, dtype=torch.float32)
-    ex_globals = torch.randn(2, num_globals, device=device, dtype=torch.float32)
-    ex_times = torch.linspace(0.0, 1.0, steps=EX_TRUNK_STEPS, device=device, dtype=torch.float32)
-
-    # Dynamic dimensions
-    Bdim = Dim("batch", min=1, max=8192)
-    Kdim = Dim("K", min=1, max=10000)
-
+    # Export
     prog = texport(
         wrapper,
-        args=(ex_x0, ex_globals, ex_times),
-        dynamic_shapes=(
-            {0: Bdim},  # x0_norm: dynamic batch
-            {0: Bdim},  # globals_norm: dynamic batch
-            {0: Kdim},  # trunk_times: dynamic K
-        ),
+        args=example_args,
+        dynamic_shapes=dyn,
         strict=False,
     )
 
-    out_path = model_dir / "complete_model_exported.pt2"
+    out_path = MODEL_DIR / "complete_model_exported.pt2"
     tsave(prog, str(out_path))
-    print(f"[OK] Complete model exported -> {out_path}")
+    print(f"[OK] Exported -> {out_path}")
 
-    # Test the exported model
-    print("\n[INFO] Testing exported model...")
+    # Smoke test (DON'T call .eval() on exported program’s module)
     try:
         from torch.export import load as tload
-        loaded_prog = tload(str(out_path)).module()
-
-        # Test with different shapes
-        test_x0 = torch.randn(1, num_species, device=device)
-        test_globals = torch.randn(1, num_globals, device=device)
-        test_times = torch.linspace(0, 1, 32, device=device)
-
-        out = loaded_prog(test_x0, test_globals, test_times)
-        print(f"  Test: input [{test_x0.shape}, {test_globals.shape}, {test_times.shape}] -> output {out.shape}")
-        print("[OK] Exported model works!")
-
+        m = tload(str(out_path)).module()
+        with torch.inference_mode():
+            y = m(*example_args)
+        print(f"[OK] Test call: out shape {tuple(y.shape)}")
     except Exception as e:
-        print(f"[WARN] Could not test: {e}")
-
+        print(f"[WARN] Smoke test failed: {e}")
 
 if __name__ == "__main__":
     main()
