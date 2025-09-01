@@ -132,65 +132,60 @@ class NormalizationHelper:
                 out[..., i] = self._normalize_variable(data[..., i], method, var_stats)
         
         return torch.clamp(out, -self.clamp_val, self.clamp_val)
-
+    
     def _normalize_variable(
             self,
             values: torch.Tensor,
             method: str,
             stats: Dict[str, float]
-    ) -> torch.Tensor:
-        """Apply normalization to a single variable with validation."""
-        if method == "log-standard":
-            if "log_mean" not in stats or "log_std" not in stats:
-                raise ValueError(f"Missing required 'log_mean'/'log_std' stats for method '{method}'. "
-                                 f"Available stats: {list(stats.keys())}")
-            # Apply log10 then standardize
-            log_values = torch.log10(torch.clamp(values, min=self.epsilon))
-            mean = stats["log_mean"]
-            std = max(stats["log_std"], self.min_std)
-            return (log_values - mean) / std
-
-        elif method == "standard":
-            if "mean" not in stats or "std" not in stats:
-                raise ValueError(f"Missing required 'mean'/'std' stats for method '{method}'. "
-                                 f"Available stats: {list(stats.keys())}")
-            # Direct standardization
-            mean = stats["mean"]
-            std = max(stats["std"], self.min_std)
-            return (values - mean) / std
-
-        elif method == "log-min-max":
-            if "log_min" not in stats or "log_max" not in stats:
-                raise ValueError(f"Missing required 'log_min'/'log_max' stats for method '{method}'. "
-                                 f"Available stats: {list(stats.keys())}")
-            # Log10 then min-max scaling
-            log_values = torch.log10(torch.clamp(values, min=self.epsilon))
-            log_min = stats["log_min"]
-            log_max = stats["log_max"]
-            range_val = max(log_max - log_min, MIN_DENOMINATOR)
-            return (log_values - log_min) / range_val
-
-        elif method == "min-max":
-            if "min" not in stats or "max" not in stats:
-                raise ValueError(f"Missing required 'min'/'max' stats for method '{method}'. "
-                                 f"Available stats: {list(stats.keys())}")
-            # Direct min-max scaling
-            min_val = stats["min"]
-            max_val = stats["max"]
-            range_val = max(max_val - min_val, MIN_DENOMINATOR)
-            return (values - min_val) / range_val
-
-        elif method == "log10":
-            # Updated: log10 transformation with mean centering
-            if "log_mean" not in stats:
-                raise ValueError(f"Missing required 'log_mean' stats for method '{method}'. "
-                                 f"Available stats: {list(stats.keys())}")
-            log_values = torch.log10(torch.clamp(values, min=self.epsilon))
-            mean = stats["log_mean"]
-            return log_values - mean
-
-        else:  # "none"
-            return values
+        ) -> torch.Tensor:
+            """Apply normalization to a single variable with validation."""
+            if method == "log-standard":
+                if "log_mean" not in stats or "log_std" not in stats:
+                    raise ValueError(f"Missing required 'log_mean'/'log_std' stats for method '{method}'. "
+                                f"Available stats: {list(stats.keys())}")
+                # Apply log10 then standardize
+                log_values = torch.log10(torch.clamp(values, min=self.epsilon))
+                mean = stats["log_mean"]
+                std = max(stats["log_std"], self.min_std)
+                return (log_values - mean) / std
+                
+            elif method == "standard":
+                if "mean" not in stats or "std" not in stats:
+                    raise ValueError(f"Missing required 'mean'/'std' stats for method '{method}'. "
+                                f"Available stats: {list(stats.keys())}")
+                # Direct standardization
+                mean = stats["mean"]
+                std = max(stats["std"], self.min_std)
+                return (values - mean) / std
+                
+            elif method == "log-min-max":
+                if "log_min" not in stats or "log_max" not in stats:
+                    raise ValueError(f"Missing required 'log_min'/'log_max' stats for method '{method}'. "
+                                f"Available stats: {list(stats.keys())}")
+                # Log10 then min-max scaling
+                log_values = torch.log10(torch.clamp(values, min=self.epsilon))
+                log_min = stats["log_min"]
+                log_max = stats["log_max"]
+                range_val = max(log_max - log_min, MIN_DENOMINATOR)
+                return (log_values - log_min) / range_val
+                
+            elif method == "min-max":
+                if "min" not in stats or "max" not in stats:
+                    raise ValueError(f"Missing required 'min'/'max' stats for method '{method}'. "
+                                f"Available stats: {list(stats.keys())}")
+                # Direct min-max scaling
+                min_val = stats["min"]
+                max_val = stats["max"]
+                range_val = max(max_val - min_val, MIN_DENOMINATOR)
+                return (values - min_val) / range_val
+                
+            elif method == "log10":
+                # Just log10 transformation - no stats needed
+                return torch.log10(torch.clamp(values, min=self.epsilon))
+                
+            else:  # "none"
+                return values
     
     def _normalize_time(self, t: torch.Tensor, method: str) -> torch.Tensor:
         """Normalize time values with special handling."""
@@ -287,10 +282,8 @@ class NormalizationHelper:
             return values * (max_val - min_val) + min_val
 
         elif method == "log10":
-            # Updated: Add mean back then exp10 with overflow/underflow protection
-            mean = stats.get("log_mean", 0.0)
-            log_values = values + mean
-            log_values_safe = torch.clamp(log_values, min=SAFE_MIN_EXPONENT, max=SAFE_MAX_EXPONENT)
+            # Just exp10 with overflow/underflow protection
+            log_values_safe = torch.clamp(values, min=SAFE_MIN_EXPONENT, max=SAFE_MAX_EXPONENT)
             return torch.pow(10.0, log_values_safe)
 
         else:  # "none"

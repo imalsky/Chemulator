@@ -8,41 +8,37 @@ Usage: python predictions.py
 # =========================
 #          CONFIG
 # =========================
-MODEL_STR = "deepo"
-MODEL_DIR = f"../models/{MODEL_STR}"
-CONFIG_PATH = f"{MODEL_DIR}/config.json"
+MODEL_STR     = "big_deep"
+MODEL_DIR     = f"../models/{MODEL_STR}"
+CONFIG_PATH   = f"{MODEL_DIR}/config.json"
 PROCESSED_DIR = "../data/processed-10-log-standard"
-
-EXPORT_PATHS = [
+EXPORT_PATHS  = [
     f"{MODEL_DIR}/complete_model_exported.pt2",
     f"{MODEL_DIR}/final_model_exported.pt2",  # fallback
 ]
 
-SAMPLE_INDEX = 6  # which trajectory to plot
-OUTPUT_DIR = None  # None -> <model_dir>/plots
-SEED = 42
+SAMPLE_INDEX = 1           # which trajectory to plot
+OUTPUT_DIR   = None        # None -> <model_dir>/plots
+SEED         = 42
 
 # Query time selection
-Q_COUNT = 100  # None or 0 for full dense grid
-Q_MODE = "uniform"  # Options: uniform, random, log_uniform, anchors
+Q_COUNT = 100              # None or 0 for full dense grid
+Q_MODE  = "uniform"        # Options: uniform, random, log_uniform, anchors
 
 # Plot styling
 CONNECT_LINES = True
-MARKER_EVERY = 5
+MARKER_EVERY  = 5
 
 # =========================
 #     ENV & IMPORTS
 # =========================
-import os
-
+import os, sys
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"]      = "1"
 
 from pathlib import Path
-import sys
 import numpy as np
 import torch
-
 torch.set_num_threads(1)
 import matplotlib.pyplot as plt
 from torch.export import load as torch_load
@@ -52,295 +48,178 @@ sys.path.append(str((Path(__file__).resolve().parent.parent / "src").resolve()))
 from utils import load_json, seed_everything
 from normalizer import NormalizationHelper
 
-plt.style.use("science.mplstyle")
+try:
+    plt.style.use("science.mplstyle")
+except Exception:
+    pass
 
 
 # =========================
 #     CORE FUNCTIONS
 # =========================
-def find_exported_model():
-    """Find and return path to exported model."""
-    for path in EXPORT_PATHS:
-        if Path(path).exists():
-            return path
+def _find_exported_model():
+    for p in EXPORT_PATHS:
+        if Path(p).exists():
+            return p
     raise FileNotFoundError(f"No exported model found. Tried: {EXPORT_PATHS}")
 
+def _infer_device_from_module(m: torch.nn.Module) -> torch.device:
+    for t in list(m.parameters()) + list(m.buffers()):
+        return t.device
+    return torch.device("cpu")
 
-def load_model(export_path):
-    """Load PT2 exported model and infer its device."""
-    print(f"[INFO] Loading exported model: {export_path}")
-    program = torch_load(export_path)
-    model = program.module()
+def _load_exported_model(path: str):
+    prog = torch_load(path)
+    mod  = prog.module()
+    dev  = _infer_device_from_module(mod)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Exported module is on CUDA but CUDA is unavailable.")
+    return mod, dev
 
-    # Infer device from model weights
-    try:
-        state_dict = model.state_dict()
-        if state_dict:
-            device = next(iter(state_dict.values())).device
-        else:
-            device = torch.device("cpu")
-    except Exception:
-        device = torch.device("cpu")
-
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("Model is on CUDA but CUDA is not available")
-
-    return model, device
-
-
-def load_test_data(data_dir, sample_idx=None):
-    """Load test shard and return single trajectory data."""
+def _load_single_test_sample(data_dir: str, sample_idx: int | None):
     test_shards = sorted((Path(data_dir) / "test").glob("shard_*.npz"))
     if not test_shards:
-        raise RuntimeError(f"No test shards found in {data_dir}/test")
+        raise RuntimeError(f"No test shards in {data_dir}/test")
 
-    # Load first shard
-    with np.load(test_shards[0], allow_pickle=False) as data:
-        if "t_vec" not in data.files:
-            raise RuntimeError("Shard missing 't_vec'")
-
-        x0 = data["x0"].astype(np.float32)
-        y_mat = data["y_mat"].astype(np.float32)
-        globals_arr = data["globals"].astype(np.float32)
-        t_vec = data["t_vec"]
-
-    # Select sample
+    with np.load(test_shards[0], allow_pickle=False) as d:
+        x0   = d["x0"].astype(np.float32)          # [N,S]
+        y    = d["y_mat"].astype(np.float32)       # [N,M,S]
+        g    = d["globals"].astype(np.float32)     # [N,G]
+        tvec = d["t_vec"]                          # [M] or [N,M]
     N = x0.shape[0]
     if sample_idx is None or not (0 <= sample_idx < N):
-        sample_idx = np.random.randint(0, N)
-
-    print(f"[INFO] Using shard={test_shards[0].name}, sample={sample_idx}/{N}")
-
-    # Extract single trajectory
+        sample_idx = np.random.default_rng(SEED).integers(0, N)
     return {
-        "x0": x0[sample_idx:sample_idx + 1],
-        "y_true": y_mat[sample_idx],
-        "t_phys": t_vec[sample_idx] if t_vec.ndim == 2 else t_vec,
-        "globals": globals_arr[sample_idx:sample_idx + 1],
-        "sample_idx": sample_idx
+        "x0":     x0[sample_idx:sample_idx+1],               # [1,S]
+        "y_true": y[sample_idx],                             # [M,S]
+        "t_phys": tvec[sample_idx] if tvec.ndim == 2 else tvec,  # [M]
+        "globals": g[sample_idx:sample_idx+1],               # [1,G]
+        "sample_idx": int(sample_idx),
     }
 
-
-def normalize_time(norm_helper, t_phys, t_name, device):
-    """Normalize physical time array with validation."""
-    assert t_phys.ndim == 1, "Expected 1D time array"
-
-    t_tensor = torch.as_tensor(t_phys, dtype=torch.float32, device=device)
-    t_norm = norm_helper.normalize(t_tensor.view(-1, 1), [t_name]).view(-1)
-
-    # Validate
+def _normalize_time(norm: NormalizationHelper, t_phys: np.ndarray, t_name: str, device: torch.device):
+    t = torch.as_tensor(t_phys, dtype=torch.float32, device=device).view(-1, 1)
+    t_norm = norm.normalize(t, [t_name]).view(-1)
     if not torch.isfinite(t_norm).all():
         raise RuntimeError("Normalized time contains non-finite values")
-
-    unique_vals = torch.unique(t_norm)
-    time_range = float(t_norm.max() - t_norm.min())
-
-    print(f"[DEBUG] t_norm: min={t_norm.min():.6f}, max={t_norm.max():.6f}, "
-          f"range={time_range:.6f}, unique={unique_vals.numel()}")
-
-    if unique_vals.numel() <= 2 or time_range == 0.0:
-        raise RuntimeError("Normalized time is effectively constant")
-
     return t_norm
 
-
-def denormalize_time(norm_helper, t_norm, t_name):
-    """Safely denormalize time."""
+def _denorm_time(norm: NormalizationHelper, t_norm: torch.Tensor, t_name: str):
     try:
-        return norm_helper.denormalize(t_norm.view(-1, 1), [t_name]).view(-1).cpu().numpy()
+        return norm.denormalize(t_norm.view(-1, 1), [t_name]).view(-1).cpu().numpy()
     except Exception:
         return t_norm.detach().cpu().numpy()
 
-
-def load_anchor_times(data_dir, q_count, norm_helper, t_name, device):
-    """Try to load anchor times from latent data."""
-    # Look for anchors file
+def _load_anchor_times(data_dir: str, q_count: int | None, norm: NormalizationHelper, t_name: str, device: torch.device):
     candidates = [
         Path(data_dir).parent / "latent_data" / "latent_shard_index.json",
         Path(data_dir) / "latent" / "latent_shard_index.json",
     ]
+    for fp in candidates:
+        if fp.exists():
+            anchors = load_json(fp).get("trunk_times")
+            if not anchors:
+                break
+            a = np.asarray(anchors, dtype=np.float32)
+            if q_count and q_count < a.size:
+                idx = np.linspace(0, a.size - 1, q_count).round().astype(int)
+                a = a[idx]
+            t_norm_sel = torch.tensor(a, dtype=torch.float32, device=device)
+            t_phys_sel = _denorm_time(norm, t_norm_sel, t_name)
+            return t_norm_sel, t_phys_sel, None
+    return None
 
-    anchor_file = None
-    for path in candidates:
-        if path.exists():
-            anchor_file = path
-            break
-
-    if not anchor_file:
-        return None
-
-    # Load anchors
-    meta = load_json(anchor_file)
-    anchors = meta.get("trunk_times")
-
-    if not anchors:
-        return None
-
-    anchors = np.array(anchors, dtype=np.float32)
-
-    # Subsample if needed
-    if q_count and q_count < len(anchors):
-        indices = np.linspace(0, len(anchors) - 1, q_count).round().astype(int)
-        anchors = anchors[indices]
-
-    t_norm_sel = torch.tensor(anchors, dtype=torch.float32, device=device)
-    t_phys_sel = denormalize_time(norm_helper, t_norm_sel, t_name)
-
-    return t_norm_sel, t_phys_sel, None
-
-
-def select_query_times(mode, count, t_phys, t_norm_dense, data_dir,
-                       norm_helper, t_name, device, seed):
-    """
-    Select query times based on mode.
-
-    Returns: (t_norm_selected, t_phys_selected, indices_in_dense_grid)
-    """
-    M = t_norm_dense.numel()
-
-    # Use full dense grid if requested
-    if count is None or count <= 0 or count >= M:
+def _select_query_times(mode: str, count: int | None, t_phys: np.ndarray, t_norm_dense: torch.Tensor,
+                        data_dir: str, norm: NormalizationHelper, t_name: str, device: torch.device):
+    M = int(t_norm_dense.numel())
+    if not count or count >= M:
         return t_norm_dense, t_phys, np.arange(M, dtype=int)
 
-    # Try anchors mode
     if mode == "anchors":
-        result = load_anchor_times(data_dir, count, norm_helper, t_name, device)
-        if result:
-            return result
-        print("[WARN] Anchors not found, falling back to uniform")
+        r = _load_anchor_times(data_dir, count, norm, t_name, device)
+        if r is not None:
+            return r
         mode = "uniform"
 
-    # Select indices based on mode
-    rng = np.random.default_rng(seed)
-
+    rng = np.random.default_rng(SEED)
     if mode == "uniform":
-        indices = np.linspace(0, M - 1, count).round().astype(int)
-
+        idx = np.linspace(0, M - 1, count).round().astype(int)
     elif mode == "random":
-        indices = np.sort(rng.choice(M, size=count, replace=False))
-
+        idx = np.sort(rng.choice(M, size=count, replace=False))
     elif mode == "log_uniform":
-        # Log-spaced in physical time
-        t_positive = t_phys[t_phys > 0]
-        if len(t_positive) == 0:
-            indices = np.linspace(0, M - 1, count).round().astype(int)
+        pos = t_phys[t_phys > 0]
+        if pos.size == 0:
+            idx = np.linspace(0, M - 1, count).round().astype(int)
         else:
-            tmin, tmax = t_positive.min(), t_phys.max()
-            log_grid = np.logspace(np.log10(tmin), np.log10(tmax), count)
-
-            # Map to nearest indices
-            indices = np.array([np.argmin(np.abs(t_phys - g)) for g in log_grid], dtype=int)
-            indices = np.unique(indices)
-
-            # Ensure we have enough points
-            if indices.size < count:
-                remaining = np.setdiff1d(np.arange(M), indices)
-                take = min(count - indices.size, remaining.size)
-                indices = np.sort(np.r_[indices, remaining[:take]])
+            tmin, tmax = float(pos.min()), float(t_phys.max())
+            grid = np.logspace(np.log10(tmin), np.log10(tmax), count)
+            idx  = np.unique(np.array([np.abs(t_phys - g).argmin() for g in grid], dtype=int))
+            if idx.size < count:  # pad if collisions
+                rest = np.setdiff1d(np.arange(M), idx)
+                idx  = np.sort(np.r_[idx, rest[:max(0, count - idx.size)]])
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
-    return t_norm_dense[indices], t_phys[indices], indices
+    return t_norm_dense[idx], t_phys[idx], idx
 
+@torch.inference_mode()
+def _predict(fn, x0_norm: torch.Tensor, g_norm: torch.Tensor, t_norm_sel: torch.Tensor,
+             norm: NormalizationHelper, species: list[str]) -> np.ndarray:
+    y_norm = fn(x0_norm, g_norm, t_norm_sel).squeeze(0)  # [K,S]
+    return norm.denormalize(y_norm, species).cpu().numpy()
 
-def run_prediction(model, x0_norm, g_norm, t_norm_sel, norm_helper, species):
-    """Run model prediction and denormalize."""
-    with torch.no_grad():
-        y_pred_norm = model(x0_norm, g_norm, t_norm_sel)  # [1, K, S]
-
-    y_pred = norm_helper.denormalize(y_pred_norm.squeeze(0), species).cpu().numpy()
-    return y_pred
-
-
-def check_time_sensitivity(model, x0_norm, g_norm, t_norm_sel):
-    """Quick check of model's sensitivity to time changes."""
+@torch.inference_mode()
+def _time_sensitivity(fn, x0_norm, g_norm, t_norm_sel):
     if t_norm_sel.numel() < 2:
         return 0.0
+    d = (fn(x0_norm, g_norm, t_norm_sel[:1]) - fn(x0_norm, g_norm, t_norm_sel[-1:])).abs().mean()
+    val = float(d.item())
+    print(f"[CHECK] Mean |Δpred| (first vs last time) = {val:.3e}")
+    return val
 
-    with torch.no_grad():
-        y_first = model(x0_norm, g_norm, t_norm_sel[:1])
-        y_last = model(x0_norm, g_norm, t_norm_sel[-1:])
+def _compute_errors(y_pred: np.ndarray, y_true: np.ndarray, idx, t_sel, t_dense, species: list[str]):
+    if idx is None:
+        td = t_dense.detach().cpu().numpy()
+        idx = np.array([np.abs(td - float(t)).argmin() for t in t_sel.cpu()], dtype=int)
+    y_true_aligned = y_true[idx, :]
+    rel = np.abs(y_pred - y_true_aligned) / (np.abs(y_true_aligned) + 1e-10)
 
-    delta = (y_first - y_last).abs().mean().item()
-    print(f"[CHECK] Mean |Δpred| between first and last times = {delta:.3e}")
-    return delta
-
-
-def compute_errors(y_pred, y_true, indices, t_norm_sel, t_norm_dense, species):
-    """Compute relative errors between predictions and ground truth."""
-    # Handle alignment
-    if indices is not None:
-        y_true_aligned = y_true[indices, :]
-    else:
-        # For anchors: find nearest dense times
-        t_dense_np = t_norm_dense.detach().cpu().numpy()
-        nearest = np.array([np.argmin(np.abs(t_dense_np - float(t)))
-                            for t in t_norm_sel], dtype=int)
-        y_true_aligned = y_true[nearest, :]
-
-    # Relative error
-    rel_error = np.abs(y_pred - y_true_aligned) / (np.abs(y_true_aligned) + 1e-10)
-
-    # Print summary
     print("\n[ERROR] Mean relative error per species:")
-    for sp, err in zip(species, rel_error.mean(axis=0)):
-        print(f"  {sp:15s}: {err:.3e}")
-    print(f"\n[ERROR] Overall mean={rel_error.mean():.3e}, max={rel_error.max():.3e}")
+    means = rel.mean(axis=0)
+    for sp, e in zip(species, means):
+        print(f"  {sp:15s}: {e:.3e}")
+    print(f"\n[ERROR] Overall mean={rel.mean():.3e}, max={rel.max():.3e}")
+    return rel
 
-    return rel_error
-
-
-def plot_results(t_phys, y_true, t_phys_sel, y_pred, sample_idx,
-                 species, q_mode, q_count, connect_lines, marker_every, output_path):
-    """Create and save the prediction plot."""
+def _plot(t_phys, y_true, t_phys_sel, y_pred, sample_idx, species, q_mode, q_count,
+          connect_lines, marker_every, out_path: Path):
     eps = 1e-30
-
-    # Prepare data for log plots
     t_plot = np.clip(t_phys, eps, None)
-    y_true_plot = np.clip(y_true, eps, None)
-    y_pred_plot = np.clip(y_pred, eps, None)
+    y_t    = np.clip(y_true, eps, None)
+    y_p    = np.clip(y_pred, eps, None)
 
-    # Setup plot
     fig, ax = plt.subplots(figsize=(10, 7))
-    colors = plt.cm.tab20(np.linspace(0, 0.95, len(species)))
+    colors  = plt.cm.tab20(np.linspace(0, 0.95, len(species)))
 
-    # Plot ground truth (full dense curves)
-    for i, sp in enumerate(species):
-        ax.loglog(t_plot, y_true_plot[:, i], '-',
-                  color=colors[i], lw=2.2, alpha=0.9)
-
-    # Plot predictions
+    for i in range(len(species)):
+        ax.loglog(t_plot, y_t[:, i], '-',  color=colors[i], lw=2.0, alpha=0.9)
     if connect_lines and len(t_phys_sel) > 1:
-        for i, sp in enumerate(species):
-            ax.loglog(t_phys_sel, y_pred_plot[:, i], '--',
-                      color=colors[i], lw=1.8, alpha=0.85)
+        for i in range(len(species)):
+            ax.loglog(t_phys_sel, y_p[:, i], '--', color=colors[i], lw=1.6, alpha=0.85)
+    for i in range(len(species)):
+        ax.loglog(t_phys_sel[::marker_every], y_p[::marker_every, i], 'o', color=colors[i], ms=5, alpha=0.9)
 
-    # Add markers
-    for i, sp in enumerate(species):
-        ax.loglog(t_phys_sel[::marker_every], y_pred_plot[::marker_every, i],
-                  'o', color=colors[i],  ms=5, alpha=0.9)
-
-    # Legend
     from matplotlib.lines import Line2D
-    legend_elements = [
-        Line2D([0], [0], color='black', lw=2.2, ls='-', label='True (dense)'),
-        Line2D([0], [0], color='black', lw=1.8, ls='--', label='Predicted (interp)'),
-        Line2D([0], [0], marker='o', color='black', lw=0, ms=5, label='Predicted (queries)')
-    ]
-    ax.legend(handles=legend_elements, loc='lower left', fontsize=10)
+    ax.legend(handles=[
+        Line2D([0],[0], color='black', lw=2.0, ls='-',  label='True (dense)'),
+        Line2D([0],[0], color='black', lw=1.6, ls='--', label='Predicted (interp)'),
+        Line2D([0],[0], color='black', marker='o', lw=0, ms=5, label='Predicted (queries)'),
+    ], loc='lower left', fontsize=10)
 
-    # Labels and formatting
-    ax.set_xlabel("Time (s)")
-    ax.set_ylim(1e-9, 1)
-    ax.set_ylabel("Species Abundance")
+    ax.set_xlabel("Time (s)"); ax.set_ylabel("Species Abundance")
     ax.set_title(f"AE-DeepONet vs Ground Truth (Sample {sample_idx}) — {q_mode} K={q_count}")
-
-    # Save
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"[OK] Plot saved to {output_path}")
-
+    plt.tight_layout(); plt.savefig(out_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"[OK] Plot saved to {out_path}")
 
 # =========================
 #           MAIN
@@ -348,67 +227,43 @@ def plot_results(t_phys, y_true, t_phys_sel, y_pred, sample_idx,
 def main():
     seed_everything(SEED)
 
-    # Load configuration
-    cfg = load_json(Path(CONFIG_PATH))
-    species = cfg["data"]["species_variables"]
-    global_vars = cfg["data"]["global_variables"]
-    time_var = cfg["data"]["time_variable"]
+    cfg        = load_json(Path(CONFIG_PATH))
+    species    = cfg["data"]["species_variables"]
+    globals_v  = cfg["data"]["global_variables"]
+    time_name  = cfg["data"]["time_variable"]
 
-    # Setup paths
-    output_dir = Path(OUTPUT_DIR) if OUTPUT_DIR else (Path(MODEL_DIR) / "plots")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(OUTPUT_DIR) if OUTPUT_DIR else (Path(MODEL_DIR) / "plots")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model
-    export_path = find_exported_model()
-    model, device = load_model(export_path)
+    model_path     = _find_exported_model()
+    fn, model_dev  = _load_exported_model(model_path)
 
-    # Initialize normalizer
-    norm = NormalizationHelper(
-        load_json(Path(PROCESSED_DIR) / "normalization.json"),
-        device,
-        cfg
+    norm = NormalizationHelper(load_json(Path(PROCESSED_DIR) / "normalization.json"),
+                               model_dev, cfg)
+
+    data = _load_single_test_sample(PROCESSED_DIR, SAMPLE_INDEX)
+
+    x0 = torch.from_numpy(data["x0"]).to(model_dev).contiguous()
+    g  = torch.from_numpy(data["globals"]).to(model_dev).contiguous()
+    x0n = norm.normalize(x0, species)
+    gn  = norm.normalize(g,  globals_v)
+
+    t_norm_dense = _normalize_time(norm, data["t_phys"], time_name, model_dev)
+    t_sel, t_phys_sel, idx = _select_query_times(
+        Q_MODE, Q_COUNT, data["t_phys"], t_norm_dense, PROCESSED_DIR, norm, time_name, model_dev
     )
 
-    # Load test data
-    data = load_test_data(PROCESSED_DIR, SAMPLE_INDEX)
+    print(f"[INFO] Query mode={Q_MODE}, count={int(t_sel.numel())}")
+    y_pred = _predict(fn, x0n, gn, t_sel, norm, species)
 
-    # Move to device and normalize inputs
-    x0_tensor = torch.from_numpy(data["x0"]).to(device)
-    g_tensor = torch.from_numpy(data["globals"]).to(device)
+    _time_sensitivity(fn, x0n, gn, t_sel)
 
-    x0_norm = norm.normalize(x0_tensor, species)
-    g_norm = norm.normalize(g_tensor, global_vars)
+    out_png = out_dir / f"predictions_K{int(t_sel.numel())}_{Q_MODE}_sample_{data['sample_idx']}.png"
+    _plot(data["t_phys"], data["y_true"], t_phys_sel, y_pred,
+          data["sample_idx"], species, Q_MODE, int(t_sel.numel()),
+          CONNECT_LINES, MARKER_EVERY, out_png)
 
-    # Normalize time
-    t_norm_dense = normalize_time(norm, data["t_phys"], time_var, device)
-
-    # Select query times
-    t_norm_sel, t_phys_sel, indices = select_query_times(
-        Q_MODE, Q_COUNT, data["t_phys"], t_norm_dense,
-        PROCESSED_DIR, norm, time_var, device, SEED
-    )
-
-    K = t_norm_sel.numel()
-    print(f"[INFO] Query mode={Q_MODE}, count={K}")
-
-    # Run prediction
-    y_pred = run_prediction(model, x0_norm, g_norm, t_norm_sel, norm, species)
-
-    # Check time sensitivity
-    check_time_sensitivity(model, x0_norm, g_norm, t_norm_sel)
-
-    # Plot results
-    output_file = output_dir / f"predictions_K{K}_{Q_MODE}_sample_{data['sample_idx']}.png"
-    plot_results(
-        data["t_phys"], data["y_true"], t_phys_sel, y_pred,
-        data["sample_idx"], species, Q_MODE, K,
-        CONNECT_LINES, MARKER_EVERY, output_file
-    )
-
-    # Compute errors
-    compute_errors(y_pred, data["y_true"], indices, t_norm_sel,
-                   t_norm_dense, species)
-
+    _compute_errors(y_pred, data["y_true"], idx, t_sel, t_norm_dense, species)
 
 if __name__ == "__main__":
     main()

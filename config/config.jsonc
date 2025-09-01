@@ -1,4 +1,6 @@
 {
+  "run_name": "deeponet-arb-pairs",
+
   "paths": {
     "raw_data_files": [
       "data/raw/run9001-result.h5",
@@ -10,9 +12,34 @@
       "data/raw/run9007-result.h5",
       "data/raw/run9008-result.h5",
       "data/raw/run9009-result.h5",
-      "data/raw/run9010-result.h5"
+      "data/raw/run9010-result.h5",
+      "data/raw/run11001-result.h5",
+      "data/raw/run11002-result.h5",
+      "data/raw/run11003-result.h5",
+      "data/raw/run11004-result.h5",
+      "data/raw/run11005-result.h5",
+      "data/raw/run11006-result.h5",
+      "data/raw/run11007-result.h5",
+      "data/raw/run11008-result.h5",
+      "data/raw/run11009-result.h5",
+      "data/raw/run11010-result.h5",
+      "data/raw/run11011-result.h5",
+      "data/raw/run11012-result.h5",
+      "data/raw/run11013-result.h5",
+      "data/raw/run11014-result.h5",
+      "data/raw/run11015-result.h5",
+      "data/raw/run11016-result.h5",
+      "data/raw/run11017-result.h5",
+      "data/raw/run11018-result.h5",
+      "data/raw/run11019-result.h5",
+      "data/raw/run11020-result.h5",
+      "data/raw/run11021-result.h5",
+      "data/raw/run11022-result.h5",
+      "data/raw/run11023-result.h5",
+      "data/raw/run11024-result.h5",
+      "data/raw/run11025-result.h5"
     ],
-    "processed_data_dir": "data/processed-10-log10",
+    "processed_data_dir": "data/processed-10-log-standard-big",
     "model_save_dir": "models",
     "log_dir": "logs"
   },
@@ -60,7 +87,7 @@
   },
 
   "normalization": {
-    "default_method": "log10",
+    "default_method": "log-standard",
     "methods": {
       "t_time": "log-min-max",
       "P": "log-min-max",
@@ -71,76 +98,69 @@
     "clamp_value": 50.0
   },
 
-
   "model": {
-    "type": "DeepONet",
+    "species_dim": 12,
+    "globals_dim": 2,
 
-    "bypass_autoencoder": true,
-    "latent_dim": 64,
+    "p": 64,
 
-    "trunk_type": "fourier",
-    "p": 256,
-    "fourier_K": 128,
+    // NEW: the model now expects fixed-width residual settings, not "branch_layers"
+    "branch_width": 1024,
+    "branch_depth": 4,
 
-    "branch_layers": [2048, 2048, 2048, 2048, 2048],
+    // keep your trunk width/depth the same
+    "trunk_layers": [1024, 1024, 1024, 1024],
 
-    "mixer_rank": 4,
-    "mixer_hidden": 64,
+    "predict_delta": true,
+    "trunk_dedup": false,
 
-    "decoder_output_mode": "linear",
-    "output_clamp": null,
+    // optional: keep this if you want α learnable (supported)
+    "branch_residual_learnable": false
 
-    "ae_encoder_layers": [128, 128, 128, 120],
-    "ae_decoder_layers": [128, 128, 128, 128, 128],
-
-    "use_pou": false
-  },
-
-  "latent_generation": {
-    "mode": "all"
+    // NOTE: "branch_residual" and "branch_residual_alpha_init" are ignored by this model
   },
 
   "training": {
-    "ae_per_trajectory": true,
-    "ae_pretrain_epochs": 200,
-    "ae_warmup_epochs": 10,
-    "freeze_ae_after_pretrain": false,
+    // RENAMED/ADDED so main.py can read them directly
+    "pairs_per_traj": 300,     // was pairwise.pairs_per_trajectory
+    "min_steps": 1,           // was pairwise.min_steps
+    "max_steps": 99,          // was pairwise.max_steps
 
-    "epochs": 300,
-    "batch_size": 4096,
+    "epochs": 500,
+    "batch_size": 16384,
 
-    "train_time_sampling": "fixed",
-    "train_fixed_times": "all",
-    //"train_min_time_points": 8,
-    //"train_max_time_points": 32,
+    "lr": 1e-4,             // was learning_rate
+    "min_lr": 1e-8,
+    "weight_decay": 0.00005,
 
-    "val_time_sampling": "fixed",
-    "val_fixed_times": "all",
-
-    "learning_rate": 0.0005,
-    "min_lr": 1e-08,
-    "warmup_epochs": 10,
+    // The rest are currently unused by the new trainer but harmless to keep:
+    "betas": [0.9, 0.999],
+    "gradient_clip": 1.0,
+    "use_amp": true,          // ignored (trainer uses system.use_bfloat16 instead)
+    "amp_dtype": "bfloat16",  // ignored (see system.use_bfloat16)
     "val_fraction": 0.15,
     "test_fraction": 0.15,
     "use_fraction": 1.0,
-    "weight_decay": 0.00005,
-    "betas": [0.9, 0.999],
-    "gradient_clip": 1.0,
-    "use_amp": true,
 
-    "pou_weight": 0.00,
-    "num_workers": 0
+    // DataLoader workers (you had 0; GPU-resident dataset is fine with 0–4)
+    "num_workers": 0,
+
+    // Optional trainer limits; currently ignored by my trainer
+    "max_steps_per_epoch": 1000,
+    "max_val_batches": 100
   },
 
   "system": {
     "seed": 42,
-    "use_torch_export": false,
-    "use_torch_compile": true,
-    "compile_mode": "default",
     "cudnn_benchmark": true,
     "tf32": true,
-    "cuda_memory_fraction": 0.95,
+    "cuda_memory_fraction": 0.90,
     "deterministic": false,
+
+    // NEW: this is what flips AMP bf16 in the trainer and sets dataset dtype
+    "use_bfloat16": true,
+
+    // "dtype" is ignored by the new code path
     "dtype": "float32"
   }
 }
