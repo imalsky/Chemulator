@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 """
+Flow-map DeepONet Training Pipeline
+====================================
 Main entry point for training Flow-map DeepONet with multi-time-per-anchor support.
 
-Pipeline
---------
-1) Load config (config/config.jsonc relative to repo root)
-2) Setup device + hardware knobs
-3) Ensure preprocessed NPZ shards + normalization.json exist (run preprocessor if not)
-4) Build datasets/dataloaders (optionally GPU-resident)
-5) Create model (supports K times per anchor)
-6) Train with shape-agnostic Trainer
-
-This script is compatible with:
-- model.py  (FlowMapDeepONet with K-time forward)
-- dataset.py (FlowMapPairsDataset that can emit [B,K] times and [B,K,S] targets)
-- trainer.py (shape-agnostic across [B,S] and [B,K,S])
+Pipeline:
+1. Load configuration from config/config.jsonc
+2. Setup device and optimize hardware settings
+3. Ensure preprocessed data exists (run preprocessor if needed)
+4. Build datasets and dataloaders (optionally GPU-resident)
+5. Create model with K-time forward support
+6. Train with shape-agnostic trainer
 """
 
 from __future__ import annotations
 
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 import logging
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional
 
+# Resolve duplicate library issue on macOS
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import torch
 
-# Local modules
 from utils import setup_logging, seed_everything, load_json_config, dump_json
 from hardware import setup_device, optimize_hardware
 from preprocessor import DataPreprocessor
@@ -36,235 +32,308 @@ from dataset import FlowMapPairsDataset, create_dataloader
 from model import create_model
 from trainer import Trainer
 
-# ------------------------------ Globals --------------------------------------
 
-# Repo root assumed to be the parent directory of 'src/'
+# Configuration constants
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-# Fixed config path (no CLI args)
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config.jsonc"
-
-# Global overrides (no CLI args)
-GLOBAL_SEED: int = 42
+GLOBAL_SEED = 42
 GLOBAL_WORK_DIR = REPO_ROOT / "models" / "flowmap-deeponet"
 
 
-# ------------------------------ Preprocess gate ------------------------------
-
-def ensure_preprocessed(cfg: Dict[str, Any], log: logging.Logger) -> Path:
+def ensure_preprocessed_data(
+    cfg: Dict[str, Any], 
+    logger: logging.Logger
+) -> Path:
     """
-    Idempotent: if normalization.json is missing under processed_data_dir, run preprocessor.
-    Returns the processed_data_dir path.
+    Ensure preprocessed data exists. Run preprocessor if needed.
+    
+    Args:
+        cfg: Configuration dictionary
+        logger: Logger instance
+        
+    Returns:
+        Path to processed data directory
+        
+    Raises:
+        RuntimeError: If preprocessing fails to create normalization.json
     """
-    pdir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
-    norm = pdir / "normalization.json"
-    if norm.exists():
-        log.info(f"Found normalization manifest at {norm}")
-        return pdir
+    processed_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
+    normalization_path = processed_dir / "normalization.json"
+    
+    if normalization_path.exists():
+        logger.info(f"Found normalization manifest at {normalization_path}")
+        return processed_dir
 
-    log.info(f"No normalization manifest found at {norm} — running preprocessing…")
-    pre = DataPreprocessor(cfg, logger=log.getChild("preprocessor"))
-    pre.run()  # expected to write normalization.json and NPZ shards
+    logger.info(f"Normalization manifest not found at {normalization_path}")
+    logger.info("Running preprocessing...")
+    
+    preprocessor = DataPreprocessor(cfg, logger=logger.getChild("preprocessor"))
+    preprocessor.run()
 
-    if not norm.exists():
-        raise RuntimeError("Preprocessing reported success but normalization.json was not created.")
-    log.info("Preprocessing complete.")
-    # Persist an expanded/normalized copy of the config alongside artifacts
-    dump_json(pdir / "config.snapshot.json", cfg)
-    return pdir
+    if not normalization_path.exists():
+        raise RuntimeError(
+            "Preprocessing completed but normalization.json was not created"
+        )
+        
+    logger.info("Preprocessing complete")
+    
+    # Save configuration snapshot with processed data
+    dump_json(processed_dir / "config.snapshot.json", cfg)
+    return processed_dir
 
-
-# --------------------------- Datasets & Dataloaders --------------------------
 
 def build_datasets_and_loaders(
     cfg: Dict[str, Any],
     device: torch.device,
     runtime_dtype: torch.dtype,
-    log: logging.Logger,
-) -> Tuple[FlowMapPairsDataset, FlowMapPairsDataset, torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    dcfg = cfg.get("dataset", {})
-    tcfg = cfg.get("training", {})
-
+    logger: logging.Logger,
+) -> Tuple[FlowMapPairsDataset, FlowMapPairsDataset, 
+           torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    """
+    Build training and validation datasets with their dataloaders.
+    
+    Supports GPU-resident datasets for high throughput when memory permits.
+    
+    Args:
+        cfg: Configuration dictionary
+        device: Target compute device
+        runtime_dtype: Data type for staged tensors
+        logger: Logger instance
+        
+    Returns:
+        Tuple of (train_dataset, val_dataset, train_loader, val_loader)
+        
+    Raises:
+        RuntimeError: If dataloaders are empty
+    """
+    dataset_cfg = cfg.get("dataset", {})
+    training_cfg = cfg.get("training", {})
     processed_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
 
-    # Train dataset
-    train_ds = FlowMapPairsDataset(
+    # Dataset parameters
+    pairs_per_traj = int(training_cfg.get("pairs_per_traj", 64))
+    pairs_per_traj_val = int(training_cfg.get("pairs_per_traj_val", pairs_per_traj))
+    min_steps = int(training_cfg.get("min_steps", 1))
+    max_steps = int(training_cfg.get("max_steps", 0)) or None
+    base_seed = int(cfg.get("system", {}).get("seed", 42))
+
+    # Create training dataset
+    train_dataset = FlowMapPairsDataset(
         processed_root=processed_dir,
         split="train",
         config=cfg,
-        pairs_per_traj=int(tcfg.get("pairs_per_traj", 64)),
-        min_steps=int(tcfg.get("min_steps", 1)),
-        max_steps=int(tcfg.get("max_steps", 0)) or None,
-        preload_to_gpu=bool(dcfg.get("preload_train_to_gpu", True)),
+        pairs_per_traj=pairs_per_traj,
+        min_steps=min_steps,
+        max_steps=max_steps,
+        preload_to_gpu=bool(dataset_cfg.get("preload_train_to_gpu", True)),
         device=device,
         dtype=runtime_dtype,
-        seed=int(cfg.get("system", {}).get("seed", 42)),
+        seed=base_seed,
     )
 
-    # Validation dataset
-    val_ds = FlowMapPairsDataset(
+    # Create validation dataset with different seed
+    val_dataset = FlowMapPairsDataset(
         processed_root=processed_dir,
         split="validation",
         config=cfg,
-        pairs_per_traj=int(tcfg.get("pairs_per_traj_val", tcfg.get("pairs_per_traj", 64))),
-        min_steps=int(tcfg.get("min_steps", 1)),
-        max_steps=int(tcfg.get("max_steps", 0)) or None,
-        preload_to_gpu=bool(dcfg.get("preload_val_to_gpu", True)),
+        pairs_per_traj=pairs_per_traj_val,
+        min_steps=min_steps,
+        max_steps=max_steps,
+        preload_to_gpu=bool(dataset_cfg.get("preload_val_to_gpu", True)),
         device=device,
         dtype=runtime_dtype,
-        seed=int(cfg.get("system", {}).get("seed", 42)) + 1337,
+        seed=base_seed + 1337,
     )
 
     # Batch sizes
-    bs_train = int(tcfg.get("batch_size", 512))
-    bs_val = int(tcfg.get("val_batch_size", bs_train))
+    batch_size_train = int(training_cfg.get("batch_size", 512))
+    batch_size_val = int(training_cfg.get("val_batch_size", batch_size_train))
 
-    # DataLoaders (dataset controls sampling; shuffling is redundant and disabled on GPU)
+    # Create dataloaders
+    # Note: Dataset handles sampling internally; shuffling disabled
     train_loader = create_dataloader(
-        dataset=train_ds,
-        batch_size=bs_train,
+        dataset=train_dataset,
+        batch_size=batch_size_train,
         shuffle=False,
-        num_workers=int(dcfg.get("num_workers", 0)),
-        pin_memory=bool(dcfg.get("pin_memory", False)),
-        prefetch_factor=int(dcfg.get("prefetch_factor", 2)),
-        persistent_workers=bool(dcfg.get("persistent_workers", False)),
+        num_workers=int(dataset_cfg.get("num_workers", 0)),
+        pin_memory=bool(dataset_cfg.get("pin_memory", False)),
+        prefetch_factor=int(dataset_cfg.get("prefetch_factor", 2)),
+        persistent_workers=bool(dataset_cfg.get("persistent_workers", False)),
     )
 
     val_loader = create_dataloader(
-        dataset=val_ds,
-        batch_size=bs_val,
+        dataset=val_dataset,
+        batch_size=batch_size_val,
         shuffle=False,
-        num_workers=int(dcfg.get("num_workers_val", dcfg.get("num_workers", 0))),
-        pin_memory=bool(dcfg.get("pin_memory_val", dcfg.get("pin_memory", False))),
-        prefetch_factor=int(dcfg.get("prefetch_factor_val", dcfg.get("prefetch_factor", 2))),
-        persistent_workers=bool(dcfg.get("persistent_workers_val", dcfg.get("persistent_workers", False))),
+        num_workers=int(dataset_cfg.get("num_workers_val", 
+                                       dataset_cfg.get("num_workers", 0))),
+        pin_memory=bool(dataset_cfg.get("pin_memory_val", 
+                                       dataset_cfg.get("pin_memory", False))),
+        prefetch_factor=int(dataset_cfg.get("prefetch_factor_val", 
+                                           dataset_cfg.get("prefetch_factor", 2))),
+        persistent_workers=bool(dataset_cfg.get("persistent_workers_val", 
+                                               dataset_cfg.get("persistent_workers", False))),
     )
 
-    # NEW: fast sanity checks so we fail loudly if a loader is empty
+    # Validate dataloaders contain data
+    validate_dataloaders(
+        train_loader, val_loader, 
+        batch_size_train, batch_size_val, 
+        processed_dir, logger
+    )
+
+    # Log multi-time configuration
+    logger.info(
+        f"Dataset configuration: "
+        f"multi_time_per_anchor={bool(dataset_cfg.get('multi_time_per_anchor', False))}, "
+        f"times_per_anchor={int(dataset_cfg.get('times_per_anchor', 1))}, "
+        f"share_times_across_batch={bool(dataset_cfg.get('share_times_across_batch', False))}"
+    )
+
+    return train_dataset, val_dataset, train_loader, val_loader
+
+
+def validate_dataloaders(
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: Optional[torch.utils.data.DataLoader],
+    batch_size_train: int,
+    batch_size_val: int,
+    processed_dir: Path,
+    logger: logging.Logger
+) -> None:
+    """
+    Validate that dataloaders contain data.
+    
+    Args:
+        train_loader: Training dataloader
+        val_loader: Validation dataloader
+        batch_size_train: Training batch size
+        batch_size_val: Validation batch size
+        processed_dir: Path to processed data
+        logger: Logger instance
+        
+    Raises:
+        RuntimeError: If either dataloader is empty
+    """
     try:
         n_train_items = len(train_loader.dataset)
-        n_val_items = len(val_loader.dataset) if val_loader is not None else -1
+        n_val_items = len(val_loader.dataset) if val_loader else 0
         n_train_batches = len(train_loader)
-        n_val_batches = len(val_loader) if val_loader is not None else -1
+        n_val_batches = len(val_loader) if val_loader else 0
     except Exception:
-        n_train_items = n_val_items = n_train_batches = n_val_batches = -1
+        n_train_items = n_val_items = n_train_batches = n_val_batches = 0
 
-    log.info(
-        f"sanity | train_ds={n_train_items} items, train_loader={n_train_batches} batches | "
-        f"val_ds={n_val_items} items, val_loader={n_val_batches} batches"
+    logger.info(
+        f"Dataset statistics: "
+        f"train={n_train_items} items, {n_train_batches} batches | "
+        f"val={n_val_items} items, {n_val_batches} batches"
     )
 
     if n_train_batches == 0:
         raise RuntimeError(
-            f"Train DataLoader is empty (len(dataset)={n_train_items}, batch_size={bs_train}, "
-            f"pairs_per_traj={getattr(train_ds, 'pairs_per_traj', None)}). "
-            f"Check training.pairs_per_traj (>0), shards under {processed_dir/'train'}, and split settings."
+            f"Training dataloader is empty. "
+            f"Items={n_train_items}, batch_size={batch_size_train}. "
+            f"Check training data in {processed_dir/'train'}"
         )
-    if val_loader is not None and n_val_batches == 0:
+        
+    if val_loader and n_val_batches == 0:
         raise RuntimeError(
-            f"Validation DataLoader is empty (len(dataset)={n_val_items}, batch_size={bs_val}, "
-            f"pairs_per_traj={getattr(val_ds, 'pairs_per_traj', None)}). "
-            f"Check shards under {processed_dir/'validation'} and config."
+            f"Validation dataloader is empty. "
+            f"Items={n_val_items}, batch_size={batch_size_val}. "
+            f"Check validation data in {processed_dir/'validation'}"
         )
 
-    # Log K-time settings for clarity
-    log.info(
-        f"Dataset config: multi_time_per_anchor={bool(dcfg.get('multi_time_per_anchor', False))}, "
-        f"times_per_anchor={int(dcfg.get('times_per_anchor', 1))}, "
-        f"share_times_across_batch={bool(dcfg.get('share_times_across_batch', False))}"
-    )
 
-    return train_ds, val_ds, train_loader, val_loader
-
-
-# ---------------------------------- Model ------------------------------------
-
-def build_model(cfg: Dict[str, Any], device: torch.device, log: logging.Logger) -> torch.nn.Module:
+def build_model(
+    cfg: Dict[str, Any], 
+    device: torch.device, 
+    logger: logging.Logger
+) -> torch.nn.Module:
+    """
+    Build and configure the Flow-map DeepONet model.
+    
+    Args:
+        cfg: Configuration dictionary
+        device: Target compute device
+        logger: Logger instance
+        
+    Returns:
+        Configured model on device
+    """
     model = create_model(cfg)
     model.to(device)
-    mcfg = cfg.get("model", {})
-    log.info(
-        f"Model: p={int(mcfg.get('p', 256))}, "
-        f"branch_width={int(mcfg.get('branch_width', 1024))}, "
-        f"branch_depth={int(mcfg.get('branch_depth', 3))}, "
-        f"trunk_layers={list(mcfg.get('trunk_layers', [512,512]))}, "
-        f"predict_delta={bool(mcfg.get('predict_delta', True))}, "
-        f"trunk_dedup={bool(mcfg.get('trunk_dedup', False))}"
+    
+    model_cfg = cfg.get("model", {})
+    logger.info(
+        f"Model architecture: "
+        f"p={int(model_cfg.get('p', 256))}, "
+        f"branch_width={int(model_cfg.get('branch_width', 1024))}, "
+        f"branch_depth={int(model_cfg.get('branch_depth', 3))}, "
+        f"trunk_layers={list(model_cfg.get('trunk_layers', [512, 512]))}, "
+        f"predict_delta={bool(model_cfg.get('predict_delta', True))}, "
+        f"trunk_dedup={bool(model_cfg.get('trunk_dedup', False))}"
     )
     return model
 
 
-# --------------------------------- Trainer -----------------------------------
+def main() -> None:
+    """Main training pipeline."""
+    # Initialize logging
+    setup_logging(None)
+    logger = logging.getLogger("main")
 
-def build_trainer(
-    cfg: Dict[str, Any],
-    model: torch.nn.Module,
-    train_loader: torch.utils.data.DataLoader,
-    val_loader: Optional[torch.utils.data.DataLoader],
-    work_dir: Path,
-    device: torch.device,
-    log: logging.Logger,
-) -> Trainer:
-    return Trainer(
+    # Load configuration
+    cfg = load_json_config(str(DEFAULT_CONFIG_PATH))
+    
+    # Apply global configuration overrides
+    cfg.setdefault("paths", {})["work_dir"] = str(GLOBAL_WORK_DIR)
+    cfg.setdefault("system", {})["seed"] = GLOBAL_SEED
+
+    # Setup work directory
+    work_dir = Path(cfg["paths"]["work_dir"]).expanduser().resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize hardware and reproducibility
+    seed_everything(int(cfg["system"]["seed"]))
+    device = setup_device()
+    optimize_hardware(cfg.get("system", {}), device)
+
+    # Determine runtime data type for staged tensors
+    storage_dtype_str = str(cfg.get("dataset", {}).get("storage_dtype", "float32")).lower()
+    if storage_dtype_str == "bf16":
+        runtime_dtype = torch.bfloat16
+    elif storage_dtype_str in ("fp16", "float16", "half"):
+        runtime_dtype = torch.float16
+    else:
+        runtime_dtype = torch.float32
+    logger.info(f"Dataset storage/runtime dtype: {runtime_dtype}")
+
+    # Ensure preprocessed data exists
+    processed_dir = ensure_preprocessed_data(cfg, logger)
+    assert processed_dir.exists(), "Processed data directory must exist after preprocessing"
+
+    # Build datasets and dataloaders
+    train_dataset, val_dataset, train_loader, val_loader = build_datasets_and_loaders(
+        cfg, device, runtime_dtype, logger
+    )
+
+    # Build model
+    model = build_model(cfg, device, logger)
+
+    # Initialize trainer
+    trainer = Trainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         cfg=cfg,
         work_dir=work_dir,
         device=device,
-        logger=log.getChild("trainer"),
+        logger=logger.getChild("trainer"),
     )
 
-
-# ----------------------------------- Main ------------------------------------
-
-def main() -> None:
-    # Logging
-    setup_logging(None)
-    log = logging.getLogger("main")
-
-    # Config (fixed path, no CLI)
-    cfg = load_json_config(str(DEFAULT_CONFIG_PATH))
-
-    # Apply global overrides for work_dir and seed
-    cfg.setdefault("paths", {})["work_dir"] = str(GLOBAL_WORK_DIR)
-    cfg.setdefault("system", {})["seed"] = int(GLOBAL_SEED)
-
-    # Work directory
-    work_dir = Path(cfg["paths"]["work_dir"]).expanduser().resolve()
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    # Seed + device + hardware knobs
-    seed_everything(int(cfg["system"]["seed"]))
-    device = setup_device()
-    optimize_hardware(cfg.get("system", {}), device)
-
-    # Optionally choose storage/runtime dtype for staged tensors
-    ds_storage = str(cfg.get("dataset", {}).get("storage_dtype", "float32")).lower()
-    if ds_storage == "bf16":
-        runtime_dtype = torch.bfloat16
-    elif ds_storage in ("fp16", "float16", "half"):
-        runtime_dtype = torch.float16
-    else:
-        runtime_dtype = torch.float32
-    log.info(f"Dataset storage/runtime dtype set to {runtime_dtype}")
-
-    # Preprocess if needed
-    processed_dir = ensure_preprocessed(cfg, log)
-    assert processed_dir.exists(), "Processed data directory must exist after preprocessing."
-
-    # Datasets & loaders
-    train_ds, val_ds, train_loader, val_loader = build_datasets_and_loaders(cfg, device, runtime_dtype, log)
-
-    # Model
-    model = build_model(cfg, device, log)
-
-    # Trainer
-    trainer = build_trainer(cfg, model, train_loader, val_loader, work_dir, device, log)
-
-    # Train
-    best_val = trainer.train()
-    log.info(f"Training complete. Best val loss: {best_val:.6e}")
+    # Execute training
+    best_val_loss = trainer.train()
+    logger.info(f"Training complete. Best validation loss: {best_val_loss:.6e}")
 
 
 if __name__ == "__main__":
