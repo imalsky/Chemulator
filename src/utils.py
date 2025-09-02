@@ -1,217 +1,224 @@
 #!/usr/bin/env python3
 """
-Utility functions for the DeepONet chemical kinetics pipeline.
-Provides logging, reproducibility, and I/O utilities.
+utils.py — small, focused helpers with clear separation of concerns.
+
+Provided APIs (used by the codebase):
+- setup_logging(log_file: Optional[PathLike]) -> None
+- seed_everything(seed: int) -> None
+- load_json_config(path: PathLike) -> dict        # accepts .json or .jsonc (with comments)
+- load_json(path: PathLike) -> dict               # strict JSON (also tolerates jsonc safely)
+- dump_json(path: PathLike, obj: dict) -> None    # atomic write with UTF-8 encoding
+
+No side effects at import time.
 """
 
+from __future__ import annotations
+
+import io
 import json
 import logging
 import os
 import random
-import sys
+import re
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any, Optional, Union
 
 import numpy as np
-import torch
+
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
 
 
-def setup_logging(level: int = logging.INFO, log_file: Path = None) -> None:
+PathLike = Union[str, os.PathLike]
+
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+
+def setup_logging(log_file: Optional[PathLike] = None, level: int = logging.INFO) -> None:
     """
-    Configure logging for the application.
-
-    Sets up both console and file logging with consistent formatting.
-
-    Args:
-        level: Logging level (default: INFO)
-        log_file: Optional path to log file for persistent logging
+    Configure root logging with a concise console formatter and optional file sink.
+    Idempotent: avoids adding duplicate handlers when called multiple times.
     """
-    format_string = "%(asctime)s | %(levelname)-8s | %(name)s - %(message)s"
+    root = logging.getLogger()
+    root.setLevel(level)
 
-    # Configure root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(level)
+    # Clear existing handlers only if we haven't configured yet
+    if not getattr(root, "_utils_logging_configured", False):
+        # Console
+        ch = logging.StreamHandler()
+        ch.setLevel(level)
+        ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s - %(message)s"))
+        root.addHandler(ch)
 
-    # Clear any existing handlers to avoid duplicates
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
+        # File sink (optional)
+        if log_file is not None:
+            p = Path(log_file)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(p, encoding="utf-8")
+            fh.setLevel(level)
+            fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s - %(message)s"))
+            root.addHandler(fh)
 
-    # Create formatter with consistent timestamp format
-    formatter = logging.Formatter(format_string, datefmt="%Y-%m-%d %H:%M:%S")
-
-    # Console handler for stdout
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
-
-    # File handler if log file specified
-    if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-        file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
+        setattr(root, "_utils_logging_configured", True)
+    else:
+        # If already configured, optionally add/replace file handler
+        if log_file is not None and not any(isinstance(h, logging.FileHandler) for h in root.handlers):
+            p = Path(log_file)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(p, encoding="utf-8")
+            fh.setLevel(level)
+            fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s - %(message)s"))
+            root.addHandler(fh)
 
 
-def seed_everything(seed: int) -> None:
+# -----------------------------------------------------------------------------
+# Reproducibility
+# -----------------------------------------------------------------------------
+
+def seed_everything(seed: int = 42) -> None:
     """
-    Set random seeds for complete reproducibility.
-
-    Seeds all random number generators:
-    - Python's random module
-    - NumPy
-    - PyTorch (CPU and CUDA)
-
-    Args:
-        seed: Integer seed for all RNGs
+    Seed Python, NumPy, and (if available) PyTorch RNGs for reproducibility.
+    Does not toggle framework determinism flags (those are handled elsewhere).
     """
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    # Ensure deterministic hashing
-    os.environ["PYTHONHASHSEED"] = str(seed)
-
-    logger = logging.getLogger(__name__)
-    logger.info(f"Random seed set to {seed} for reproducibility")
-
-
-def load_json_config(path: Union[str, Path]) -> Dict[str, Any]:
-    """
-    Load JSON configuration file with optional JSON5 support.
-
-    Attempts to use JSON5 for comment support, falls back to standard JSON.
-
-    Args:
-        path: Path to configuration file
-
-    Returns:
-        Parsed configuration dictionary
-
-    Raises:
-        FileNotFoundError: If configuration file doesn't exist
-    """
-    path = Path(path)
-
-    if not path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {path}")
-
-    # Try json5 first for comment support in config files
     try:
-        import json5
-        with open(path, 'r', encoding='utf-8') as f:
-            config = json5.load(f)
-    except ImportError:
-        # Fallback to standard json if json5 not available
-        with open(path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
+        os.environ["PYTHONHASHSEED"] = str(seed)
+    except Exception:
+        pass
 
-    return config
+    if torch is not None:
+        try:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():  # type: ignore[attr-defined]
+                torch.cuda.manual_seed_all(seed)  # type: ignore[attr-defined]
+        except Exception:
+            # Keep going; training can proceed without failing on some environments
+            pass
 
 
-def save_json(data: Dict[str, Any], path: Union[str, Path], indent: int = 2) -> None:
+# -----------------------------------------------------------------------------
+# JSON / JSONC
+# -----------------------------------------------------------------------------
+
+_JSONC_LINE = re.compile(r"(?P<code>[^\"/\n]*)(?P<comment>//[^\n]*)")
+_JSONC_BLOCK = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+def _strip_jsonc(text: str) -> str:
     """
-    Save dictionary to JSON file with proper type handling.
+    Remove // line comments and /* block */ comments from JSONC while preserving
+    string literals. Strategy:
+      1) Remove block comments first.
+      2) For each line, strip // comments that appear outside of strings.
 
-    Automatically handles conversion of numpy/torch types to JSON-serializable formats.
-
-    Args:
-        data: Dictionary to save
-        path: Output file path
-        indent: JSON indentation level for readability
+    This is a light-weight parser sufficient for typical config files.
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # 1) Strip block comments (/* ... */)
+    text = _JSONC_BLOCK.sub("", text)
 
-    class NumpyEncoder(json.JSONEncoder):
-        """Custom encoder for scientific computing types."""
+    # 2) Strip // comments outside strings
+    out_lines = []
+    for line in text.splitlines():
+        buf = []
+        in_str = False
+        esc = False
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if in_str:
+                buf.append(ch)
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                i += 1
+                continue
 
-        def default(self, obj):
-            # Handle numpy types
-            if isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                return float(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            # Handle torch types
-            elif isinstance(obj, torch.Tensor):
-                return obj.cpu().numpy().tolist()
-            # Handle Path objects
-            elif isinstance(obj, Path):
-                return str(obj)
-            # Default to parent class handling
-            return super().default(obj)
+            # not inside a string
+            if ch == '"':
+                in_str = True
+                buf.append(ch)
+                i += 1
+                continue
 
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=indent, cls=NumpyEncoder)
+            if ch == "/" and i + 1 < len(line) and line[i + 1] == "/":
+                # start of // comment outside string → discard rest of line
+                break
+
+            buf.append(ch)
+            i += 1
+
+        out_lines.append("".join(buf))
+    return "\n".join(out_lines)
 
 
-def load_json(path: Union[str, Path]) -> Dict[str, Any]:
+def load_json_config(path: PathLike) -> dict:
     """
-    Load JSON file.
+    Load a JSON or JSONC file from disk. If the contents contain comments, they
+    are stripped prior to parsing.
 
-    Args:
-        path: Path to JSON file
-
-    Returns:
-        Parsed JSON data as dictionary
+    Raises on parsing errors with a helpful message.
     """
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    p = Path(path)
+    raw = p.read_text(encoding="utf-8")
+    try:
+        # Try strict JSON first (fast path)
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Fallback: strip comments and parse again
+        cleaned = _strip_jsonc(raw)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse JSON/JSONC config at {p}: {e}") from e
 
 
-def ensure_directories(*paths: Union[str, Path]) -> None:
+def load_json(path: PathLike) -> dict:
     """
-    Create directories if they don't exist.
-
-    Args:
-        *paths: Variable number of directory paths to create
+    Load a JSON file. Also tolerates JSONC by stripping comments if strict parse fails.
+    Used for reading normalization manifests.
     """
-    for path in paths:
-        Path(path).mkdir(parents=True, exist_ok=True)
+    p = Path(path)
+    raw = p.read_text(encoding="utf-8")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        cleaned = _strip_jsonc(raw)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse JSON at {p}: {e}") from e
 
 
-def format_number(num: float, precision: int = 3) -> str:
+# -----------------------------------------------------------------------------
+# Filesystem
+# -----------------------------------------------------------------------------
+
+def _atomic_write_text(path: PathLike, data: str, encoding: str = "utf-8") -> None:
     """
-    Format number for display with appropriate precision.
-
-    Uses scientific notation for very large/small numbers.
-
-    Args:
-        num: Number to format
-        precision: Number of significant digits
-
-    Returns:
-        Formatted string representation
+    Write text atomically: write to a temp file in the same directory and rename.
+    Ensures readers never see a partially written file.
     """
-    if abs(num) < 1e-3 or abs(num) > 1e3:
-        return f"{num:.{precision}e}"
-    else:
-        return f"{num:.{precision}f}"
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with io.open(tmp, "w", encoding=encoding, newline="\n") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
 
 
-def get_model_size(model: torch.nn.Module) -> Dict[str, int]:
+def dump_json(path: PathLike, obj: Any, indent: int = 2) -> None:
     """
-    Calculate model size statistics.
-
-    Args:
-        model: PyTorch model
-
-    Returns:
-        Dictionary with parameter counts and memory usage
+    Serialize `obj` as JSON to `path` atomically (UTF-8). Minimal, stable formatting.
     """
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    # Calculate memory in MB (assuming float32)
-    param_memory_mb = (total_params * 4) / (1024 * 1024)
-
-    return {
-        "total_parameters": total_params,
-        "trainable_parameters": trainable_params,
-        "non_trainable_parameters": total_params - trainable_params,
-        "model_size_mb": param_memory_mb
-    }
+    text = json.dumps(obj, indent=indent, sort_keys=True)
+    _atomic_write_text(path, text, encoding="utf-8")
