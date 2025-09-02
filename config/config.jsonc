@@ -1,19 +1,21 @@
 {
+  // Data paths configuration
   "paths": {
-    // Input HDF5s for preprocessing
+    // List of input HDF5 files containing trajectory data
     "raw_data_files": [
       "data/raw/run9001-result.h5"
     ],
-
-    // Output directory for NPZ shards + normalization.json
+    
+    // Directory where preprocessed NPZ shards and normalization.json will be written
     "processed_data_dir": "data/processed-flowmap",
-
-    // Where checkpoints/logs go (trainer writes here)
+    
+    // Directory for training outputs (checkpoints, logs, best model)
     "work_dir": "models/deeponet-flowmap"
   },
-
+  
+  // Variable definitions
   "data": {
-    // Full species list (targets)
+    // List of species variables to extract from HDF5 files
     "species_variables": [
       "C2H2_evolution",
       "CH4_evolution",
@@ -28,7 +30,9 @@
       "OH_evolution",
       "O_evolution"
     ],
-    // If you use target!=species later, trainer/model still infer dims from this list
+    
+    // Target species for model output (can differ from input species)
+    // If same as species_variables, model predicts all species
     "target_species_variables": [
       "C2H2_evolution",
       "CH4_evolution",
@@ -43,143 +47,202 @@
       "OH_evolution",
       "O_evolution"
     ],
-    // Global/conditioning features
+    
+    // Global conditioning parameters (constant per trajectory)
     "global_variables": ["P", "T"],
-
-    // Name of the time column in HDF5 files
+    
+    // Name of time array in HDF5 groups
     "time_variable": "t_time"
   },
-
+  
+  // Preprocessing configuration
   "preprocessing": {
-    // Drop an entire trajectory if ANY species value is < threshold or non-finite
+    // Minimum value threshold - trajectories with any value below this are dropped
     "min_value_threshold": 1e-25,
-
-    // Shard sizing and NPZ compression
+    
+    // Number of trajectories to bundle per NPZ shard file
     "trajectories_per_shard": 1024,
+    
+    // Whether to compress NPZ files (false for faster I/O)
     "npz_compressed": false,
-
-    // Parallel file processing (process-based; 0 means serial)
-    "num_workers": 5,
-
-    // Optional chunk length along time axis for HDF5 reads (0 → auto)
+    
+    // Number of parallel workers for HDF5 scanning (0 = serial)
+    "num_workers": 1,
+    
+    // Chunk size for reading HDF5 datasets (0 = auto-detect from dataset)
     "hdf5_chunk_size": 0
   },
-
+  
+  // Normalization configuration
   "normalization": {
-    // Default per-key normalization unless overridden below
+    // Default normalization method if not specified per-variable
+    // Options: "standard", "min-max", "log-standard", "log-min-max"
     "default_method": "log-standard",
-
-    // Per-key overrides. IMPORTANT: keep "dt" as log-min-max for flow-map trunk.
+    
+    // Per-variable normalization method overrides
     "methods": {
-      "dt": "log-min-max",
-      "t_time": "log-min-max",
-      "P": "log-min-max",
-      "T": "standard"
-      // add per-species overrides here if needed, else default_method applies
+      "dt": "log-min-max",      // Time differences always use log-min-max
+      "t_time": "log-min-max",  // Absolute time normalization
+      "P": "log-min-max",       // Pressure in log scale
+      "T": "standard"           // Temperature in linear scale
+      // Species variables use default_method unless specified here
     },
-
-    // Numerical safety
+    
+    // Floor value before taking log10 to avoid log(0)
     "epsilon": 1e-25,
+    
+    // Minimum standard deviation to prevent division by zero
     "min_std": 1e-8,
+    
+    // Maximum absolute value for normalized outputs (prevents outliers)
     "clamp_value": 1e6
   },
-
+  
+  // Dataset configuration
   "dataset": {
-    // Multi-time-per-anchor controls
+    // Enable multi-time prediction mode (K > 1 targets per anchor)
     "multi_time_per_anchor": true,
-    "times_per_anchor": 32,              // K
-    "share_times_across_batch": false,   // set true only if Δt grid truly aligns
-
-    // Δt normalization table and manifest requirements
+    
+    // Number of target times to predict per anchor (K)
+    "times_per_anchor": 32,
+    
+    // Whether to use same time offsets for all samples in batch
+    // Set true only if time grid is truly uniform across trajectories
+    "share_times_across_batch": false,
+    
+    // Precompute dt normalization lookup table (requires shared time grid)
     "precompute_dt_table": true,
+    
+    // Require dt statistics in normalization.json (should be true)
     "require_dt_stats": true,
-
-    // Stage tensors to device memory for throughput (A100 has headroom)
+    
+    // Stage entire training dataset to GPU memory for fast access
     "preload_train_to_gpu": true,
+    
+    // Stage entire validation dataset to GPU memory
     "preload_val_to_gpu": true,
-
-    // DataLoader worker settings (ignored when dataset lives on GPU)
+    
+    // DataLoader workers for training (ignored when data is GPU-resident)
     "num_workers": 0,
+    
+    // DataLoader workers for validation
     "num_workers_val": 0,
+    
+    // Pin memory for CPU-GPU transfer (ignored when data is GPU-resident)
     "pin_memory": false,
     "pin_memory_val": false,
+    
+    // Number of batches to prefetch per worker
     "prefetch_factor": 2,
     "prefetch_factor_val": 2,
+    
+    // Keep workers alive between epochs
     "persistent_workers": false,
     "persistent_workers_val": false,
-
-    // On-device storage dtype for staged NPZ data (keep time-sensitive inputs at fp32)
-    "storage_dtype": "float32"           // "float32" | "bf16" | "fp16"
+    
+    // Data type for staged tensors: "float32", "bf16", or "fp16"
+    // Note: Keep time-sensitive inputs at float32 for precision
+    "storage_dtype": "float32"
   },
-
+  
+  // Model architecture configuration
   "model": {
-    // Basis size and MLP widths/depths
-    "p": 256,
-    "branch_width": 1024,
+    // Dimension of basis functions (p)
+    "p": 64,
+    
+    // Width of branch network hidden layers
+    "branch_width": 512,
+    
+    // Depth of branch network (number of hidden layers)
     "branch_depth": 4,
-    "trunk_layers": [512, 512, 512],
-
-    // Predict residual y_i + f(…)
+    
+    // Hidden layer dimensions for trunk network
+    "trunk_layers": [512, 512, 512, 512],
+    
+    // Predict residual (y_j - y_i) instead of direct y_j
     "predict_delta": true,
-
-    // Pre-LN residual α learnable inside branch blocks (usually false)
-    "branch_residual_learnable": false,
-
-    // Evaluate trunk once per unique Δt in batch if duplicates exist
-    "trunk_dedup": false
+    
+    // Deduplicate trunk evaluation for repeated dt values (not implemented)
+    "trunk_dedup": false,
+    
+    // Activation function: "relu", "gelu", "silu", "tanh", "leakyrelu"
+    "activation": "leakyrelu"
   },
-
+  
+  // Training configuration
   "training": {
-    // Preprocessor split fractions
+    // Fraction of data for validation
     "val_fraction": 0.15,
+    
+    // Fraction of data for testing
     "test_fraction": 0.10,
-
-    // Pair sampling: j - i ∈ [min_steps, max_steps], j > i, with T typically = 100
+    
+    // Fraction of data to actually use (for debugging with smaller datasets)
+    "use_fraction": 1.0,
+    
+    // Time step bounds for sampling: j - i ∈ [min_steps, max_steps]
     "min_steps": 1,
     "max_steps": 99,
-
-    // How many anchors per trajectory per epoch
-    "pairs_per_traj": 64,
-
-    // Batch sizes
-    "batch_size": 512,
-    "val_batch_size": 512,
-
-    // Optimizer & schedule (AdamW; betas are defaults inside Trainer)
+    
+    // Number of anchor points sampled per trajectory per epoch
+    "pairs_per_traj": 32,
+    
+    // Batch size for training
+    "batch_size": 1024,
+    
+    // Number of training epochs
     "epochs": 100,
+    
+    // Initial learning rate for AdamW optimizer
     "lr": 5e-4,
+    
+    // Weight decay (L2 regularization)
     "weight_decay": 1e-5,
+    
+    // Number of warmup epochs for learning rate schedule
     "warmup_epochs": 0,
+    
+    // Minimum learning rate for cosine annealing
     "min_lr": 1e-7,
-
-    // Execution controls
-    "gradient_clip": 0.0,
+    
+    // Gradient clipping value (0 = disabled)
+    "gradient_clip": 1.0,
+    
+    // Use torch.compile for model optimization
     "torch_compile": true,
-    "max_train_steps_per_epoch": 0,      // 0 = no cap
-    "max_val_batches": 0                 // 0 = full validation
+    
+    // Maximum training steps per epoch (0 = no limit)
+    "max_train_steps_per_epoch": 0,
+    
+    // Maximum validation batches (0 = full validation)
+    "max_val_batches": 0
   },
-
+  
+  // Mixed precision training configuration
   "mixed_precision": {
-    // Trainer compute dtype
-    "mode": "bf16"                       // "bf16" | "fp16" | "none"
+    // Precision mode: "bf16", "fp16", or "none"
+    // bf16 recommended for A100 GPUs
+    "mode": "bf16"
   },
-
+  
+  // System configuration
   "system": {
-    // Seeding and deterministic behavior
+    // Random seed for reproducibility
     "seed": 42,
+    
+    // Enable deterministic algorithms (reduces performance)
     "deterministic": false,
-
-    // CUDA/cuDNN knobs
+    
+    // Enable TensorFloat-32 for matrix operations on Ampere GPUs
     "tf32": true,
+    
+    // Enable cuDNN autotuner for optimal convolution algorithms
     "cudnn_benchmark": true,
-
-    // Optional cap on CUDA memory fraction for this process (0.0–1.0); omit or set 0 to skip
-    "cuda_memory_fraction": 0.0,
-
-    // OpenMP thread pool for BLAS/linear algebra on CPU
+    
+    // Number of OpenMP threads for CPU operations
     "omp_threads": 12,
-
-    // NPZ on-disk dtype emitted by the preprocessor
-    "io_dtype": "float32"                // "float32" | "float64"
+    
+    // Data type for NPZ files on disk: "float32" or "float64"
+    "io_dtype": "float32"
   }
 }
