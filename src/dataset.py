@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 """
-Dataset for flow-map DeepONet in Δt (autonomous) mode.
+Dataset for autonomous Flow-map DeepONet with multi-time-per-anchor support.
 
-- Loads NPZ shards from preprocessor.py
-- Normalizes globals, absolute time, and targets via NormalizationHelper on the target device
-- Randomly samples (i, j) with j > i; trunk input is normalized Δt = t_j − t_i
-- Vectorized, GPU-friendly batching; GPU-resident dataset without host-RAM spikes
+This dataset samples (trajectory n, anchor step i) and then, optionally,
+K strictly-later steps j_k > i for the *same* anchor, returning tensors:
+
+    y_i      : [B, S]
+    dt_norm  : [B, K]           (normalized Δt = t[j_k] - t[i])
+    y_j      : [B, K, S]
+    g        : [B, G]
+    ij_index : [B, K, 2] int32  (for logging/debugging)
+
+When K=1 it degrades to the classic pairwise interface.
+
+Key features
+------------
+- Deterministic, stateless GPU/CPU sampling per-epoch (no RNG state carried)
+- Supports shards with t_vec saved as [T] *or* [B, T]
+- Uses a shared Δt lookup table only when a truly shared time grid is detected
+- Preloading to GPU (optional) for high throughput
+- Batch-level option to share step offsets across anchors
 """
 
 from __future__ import annotations
@@ -14,11 +28,11 @@ import logging
 import time
 from glob import glob
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 from normalizer import NormalizationHelper
 from utils import load_json
@@ -32,60 +46,74 @@ def _fmt_bytes(n: int | float) -> str:
         if n < 1024.0 or unit == "TiB":
             return f"{n:.1f} {unit}"
         n /= 1024.0
-    return f"{n:.1f} TiB"
-
-
-# ------------------------------- I/O helpers --------------------------------
-
-def _discover_split_files(root: Path, split: str) -> List[Path]:
-    shard_dir = root / split
-    files = sorted(map(Path, glob(str(shard_dir / "*.npz"))))
-    if not files:
-        raise FileNotFoundError(f"No NPZ shards found under: {shard_dir}")
-    return files
 
 
 def _load_npz_keys(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    # Force materialization (avoid memmap lifetime issues)
-    with np.load(path, mmap_mode=None) as d:
-        x0 = np.array(d["x0"], copy=True)         # [N, S_in] (unused here)
-        g = np.array(d["globals"], copy=True)     # [N, G]
-        t = np.array(d["t_vec"], copy=True)       # [N, T] (PHYSICAL absolute time)
-        y = np.array(d["y_mat"], copy=True)       # [N, T, S]
+    """
+    Return (x0, globals, t_vec, y_mat) arrays from a shard.
+    Required shapes (flexible for t_vec):
+      - x0:   [N, S]
+      - g:    [N, G]
+      - t:    [T] or [N, T]
+      - y:    [N, T, S]
+    """
+    with np.load(path, allow_pickle=False, mmap_mode="r") as f:
+        x0 = f["x0"]
+        g = f["globals"]
+        t = f["t_vec"]
+        y = f["y_mat"]
     return x0, g, t, y
 
 
-# --------------------------- SplitMix64 on CPU (numpy) ----------------------
+# -------------------------- Stateless hash "random" --------------------------
+# CPU-safe 64-bit mixer using only int64 ops. We emulate logical rshift.
 
-_MASK64 = np.uint64((1 << 64) - 1)
-_C1 = np.uint64(0xbf58476d1ce4e5b9)
-_C2 = np.uint64(0x94d049bb133111eb)
+def _urshift64(x: torch.Tensor, n: int) -> torch.Tensor:
+    return (x >> n) & ((1 << (64 - n)) - 1)
 
-
-def _mix64_np(x: np.ndarray) -> np.ndarray:
-    x = np.bitwise_xor(x, np.right_shift(x, np.uint64(30)))
-    x = (x * _C1) & _MASK64
-    x = np.bitwise_xor(x, np.right_shift(x, np.uint64(27)))
-    x = (x * _C2) & _MASK64
-    x = np.bitwise_xor(x, np.right_shift(x, np.uint64(31)))
+def _mix64_torch(x: torch.Tensor) -> torch.Tensor:
+    """
+    Murmur-inspired 64-bit mixer using int64 with wraparound semantics.
+    Input/Output: torch.int64 (bit pattern only matters).
+    """
+    # Signed int64 equivalents of 0xff51afd7ed558ccd and 0xc4ceb9fe1a85ec53
+    C1 = torch.tensor(-49064778989728563, dtype=torch.int64, device=x.device)
+    C2 = torch.tensor(-4265267296055464877, dtype=torch.int64, device=x.device)
+    x = x ^ _urshift64(x, 33)
+    x = x * C1
+    x = x ^ _urshift64(x, 33)
+    x = x * C2
+    x = x ^ _urshift64(x, 33)
     return x
 
+def _u32_from_array_torch(seed: int, a: torch.Tensor) -> torch.Tensor:
+    """
+    Deterministic 32-bit hash per element of `a` (any integer-ish tensor).
+    Returns an int64 tensor whose values are in [0, 2^32-1].
+    Handles arbitrarily large Python ints by folding into signed int64
+    two's-complement first (avoids Overflow when creating the tensor).
+    """
+    # fold seed into 64-bit, then map to signed int64 range
+    seed_u64 = seed & 0xFFFFFFFFFFFFFFFF
+    if seed_u64 >= (1 << 63):
+        seed_i64 = seed_u64 - (1 << 64)
+    else:
+        seed_i64 = seed_u64
 
-def _u32_from_array(seed: int, a: np.ndarray) -> np.ndarray:
-    """Single 32-bit stream from seed and array."""
-    s = np.uint64(seed) & _MASK64
-    a64 = (np.uint64(a) & _MASK64)
-    x = s ^ (a64 << np.uint64(1))
-    r = _mix64_np(x)
-    return np.uint32(r & np.uint64(0xFFFFFFFF))
+    s = torch.as_tensor(seed_i64, dtype=torch.int64, device=a.device)
+    x = a.to(torch.int64) ^ s
+    y = _mix64_torch(x)
+    return _urshift64(y, 32) & 0xFFFFFFFF
 
 
-# ------------------------------- Dataset class ------------------------------
+# --------------------------------- Dataset ----------------------------------
 
 class FlowMapPairsDataset(Dataset):
     """
-    Dataset that samples arbitrary (i, j>i) pairs per trajectory.
-    Trunk input is Δt (normalized with log-min-max bounds derived from the first shard’s grid).
+    Samples (n, i) anchors and K strictly-later times j_k for training flow-map DeepONet.
+
+    Output of __getitem__ is just an integer index; DataLoader collates indices and
+    calls _gather_batch to build tensors on-device.
     """
 
     def __init__(
@@ -102,339 +130,405 @@ class FlowMapPairsDataset(Dataset):
         seed: int = 42,
         log_every_files: int = 5,
     ):
-        """
-        Autonomous flow-map dataset (Δt-only), GPU-resident without host-RAM spikes.
-
-        • Pass #1: scan shard shapes ONLY to compute N_total and grab the first time grid.
-        • Pre-allocate final tensors (G, t, Y) directly on target device (GPU if given).
-        • Pass #2: stream each shard, normalize on device, and write into the pre-alloc tensors.
-        • Δt bounds derived once from the FIRST shard's grid over [min_steps, max_steps].
-          Assumes all shards share the same time grid (warns once).
-        • Honors training.use_fraction for the train split (optional downsampling).
-        """
         super().__init__()
         self.root = Path(processed_root)
-        self.split = split
+        self.split = str(split)
         self.cfg = config
         self.base_seed = int(seed)
         self.log = logging.getLogger("dataset")
 
-        # ---- Normalizer & devices ----
-        t0_all = time.perf_counter()
+        ds_cfg = self.cfg.get("dataset", {})
+        self.require_dt_stats: bool = bool(ds_cfg.get("require_dt_stats", True))
+        self.precompute_dt_table_cfg: bool = bool(ds_cfg.get("precompute_dt_table", True))
+
+        # Multi-time-per-anchor
+        self.multi_time: bool = bool(ds_cfg.get("multi_time_per_anchor", False))
+        self.K: int = int(ds_cfg.get("times_per_anchor", 1))
+        if not self.multi_time:
+            self.K = 1
+        self.share_offsets_across_batch: bool = bool(ds_cfg.get("share_times_across_batch", False))
+
+        # Normalization manifest
         norm_path = self.root / "normalization.json"
         if not norm_path.exists():
             raise FileNotFoundError(f"Missing normalization.json at: {norm_path}")
-        norm_stats = load_json(norm_path)
+        manifest = load_json(norm_path)
 
-        self.preload_to_gpu = bool(preload_to_gpu)
-        self._target_device = device if (self.preload_to_gpu and device is not None) else torch.device("cpu")
-        self._norm_device = self._target_device
-        self.norm = NormalizationHelper(stats=norm_stats, device=self._norm_device, config=self.cfg)
+        # Staging device / dtype
+        self._stage_device = device if (preload_to_gpu and device is not None) else torch.device("cpu")
+        self._runtime_dtype = dtype
+        self.norm = NormalizationHelper(manifest, device=self._stage_device)
 
-        data_cfg = self.cfg.get("data", {})
-        self.target_vars = list(data_cfg.get("target_species_variables", data_cfg.get("species_variables", [])))
-        self.global_vars = list(data_cfg.get("global_variables", []))
-        self.time_var = data_cfg.get("time_variable", "t_time")
-
-        self.epoch = 0  # for epoch-fresh sampling
-
-        # ---- Discover shards; optionally subsample for training ----
-        self.log.info(f"[{split}] discovering shards under {self.root / split}")
-        files = _discover_split_files(self.root, split)
-
-        use_fraction = float(self.cfg.get("training", {}).get("use_fraction", 1.0))
-        if split == "train" and 0.0 < use_fraction < 1.0:
-            rng = np.random.RandomState(self.base_seed)
-            idx = np.arange(len(files))
-            rng.shuffle(idx)
-            k = max(1, int(round(use_fraction * len(files))))
-            files = [files[i] for i in idx[:k]]
-            self.log.warning("[train] training.use_fraction=%.3f -> using %d/%d shards",
-                             use_fraction, k, len(idx))
-
-        self.log.info(f"[{split}] found {len(files)} shard(s)")
-
-        # ---- PASS 1: shapes only + Δt-bounds from first shard ----
-        bytes_on_disk = 0
-        N_total = 0
-        T_global = None
-        G_dim = None
-        S_dim = None
-        first_time_grid = None
-        t0 = time.perf_counter()
-
-        for k, f in enumerate(files, 1):
-            with np.load(f, mmap_mode=None) as d:
-                y_shape = d["y_mat"].shape   # [N_shard, T, S]
-                g_shape = d["globals"].shape # [N_shard, G]
-                t_shape = d["t_vec"].shape   # [N_shard, T]
-                N_shard, T_shard, S_shard = y_shape
-                G_shard = g_shape[1]
-                if T_global is None:
-                    T_global = T_shard
-                    S_dim = S_shard
-                    G_dim = G_shard
-                    # Grid for Δt stats (first trajectory of first shard), float64 for safe subtraction
-                    first_time_grid = np.array(d["t_vec"][0], copy=True).astype(np.float64).reshape(-1)
-                else:
-                    if T_shard != T_global or S_shard != S_dim or G_shard != G_dim or t_shape[1] != T_global:
-                        raise ValueError(
-                            f"Shard {f} has inconsistent shapes: "
-                            f"T={T_shard} vs {T_global}, S={S_shard} vs {S_dim}, G={G_shard} vs {G_dim}"
-                        )
-                N_total += N_shard
-                try:
-                    bytes_on_disk += f.stat().st_size
-                except Exception:
-                    pass
-
-            if (k % max(1, log_every_files)) == 0 or k == len(files):
-                self.log.info(
-                    f"[{split}] scanned {k}/{len(files)} shards "
-                    f"({_fmt_bytes(bytes_on_disk)} so far) "
-                    f"in {time.perf_counter() - t0:.1f}s"
+        # Enforce presence of centralized Δt spec when required
+        if self.require_dt_stats:
+            dt_spec = manifest.get("dt", None)
+            if not isinstance(dt_spec, dict) or "log_min" not in dt_spec or "log_max" not in dt_spec:
+                raise RuntimeError(
+                    "normalization.json must include 'dt' with {'method','log_min','log_max'}; "
+                    "re-run preprocessing to write centralized Δt stats."
                 )
+            if str(dt_spec.get("method", "")).lower() != "log-min-max":
+                raise RuntimeError("Currently only 'log-min-max' is supported for Δt.")
 
-        if N_total <= 0 or T_global is None:
-            raise RuntimeError(f"[{split}] No data found.")
+        # Discover shards
+        pattern = str(self.root / self.split / "*.npz")
+        files = sorted(glob(pattern))
+        if not files:
+            raise RuntimeError(f"[{self.split}] no NPZ shards found under {pattern}")
 
-        # Δt bounds from first grid over allowed horizons
-        ms = int(min_steps)
-        M = int(max_steps) if max_steps is not None else (T_global - 1)
-        M = min(max(ms, 1), T_global - 1)
-        if ms < 1 or ms > M:
-            raise ValueError(f"Invalid step bounds: min_steps={ms}, max_steps={M}, T={T_global}")
+        # Pass 1: scan shapes and detect if a truly shared time grid exists
+        N_total = 0
+        T_global: Optional[int] = None
+        S_global: Optional[int] = None
+        G_global: Optional[int] = None
 
-        eps = float(getattr(self.norm, "epsilon", 1e-30))
-        dt_min_vec = first_time_grid[ms:] - first_time_grid[:-ms]
-        dt_min_vec = dt_min_vec[dt_min_vec > eps]
-        dt_max_vec = first_time_grid[M:] - first_time_grid[:-M]
-        dt_max_vec = dt_max_vec[dt_max_vec > eps]
-
-        if dt_min_vec.size == 0 or dt_max_vec.size == 0:
-            self.dt_log_min = float(self.norm.per_key_stats.get(self.time_var, {}).get("log_min", -3.0))
-            self.dt_log_max = float(self.norm.per_key_stats.get(self.time_var, {}).get("log_max", 8.0))
-            self.log.warning(
-                "[%s] Could not derive Δt stats from first shard; falling back to t_time stats: "
-                "log_min=%.6g, log_max=%.6g", split, self.dt_log_min, self.dt_log_max
-            )
-        else:
-            lo = float(np.percentile(np.log10(dt_min_vec), 0.5))
-            hi = float(np.percentile(np.log10(dt_max_vec), 99.5))
-            if hi <= lo:
-                hi = lo + 1.0
-            self.dt_log_min, self.dt_log_max = lo, hi
-            self.log.warning(
-                "[%s] Using Δt stats from FIRST shard grid (assumes ALL shards share this grid): "
-                "log10(Δt)_min=%.6g, log10(Δt)_max=%.6g", split, lo, hi
-            )
-        self.dt_log_denom = (self.dt_log_max - self.dt_log_min) if (self.dt_log_max > self.dt_log_min) else 1.0
-
-        # ---- Pre-allocate final tensors on target device ----
-        self.dtype = dtype
-        self.N, self.T, self.S = N_total, T_global, S_dim
-
-        # Note: keep t as float32. G and Y use requested dtype.
-        self.G = torch.empty((self.N, G_dim), device=self._target_device, dtype=dtype)
-        self.t = torch.empty((self.N, self.T), device=self._target_device, dtype=torch.float32)
-        self.Y = torch.empty((self.N, self.T, self.S), device=self._target_device, dtype=dtype)
-
-        # Shared physical grid on device; float64 for safe subtraction
-        self.time_grid_phys = torch.from_numpy(first_time_grid.astype(np.float64)).to(
-            device=self._target_device, non_blocking=True
-        )
-        self._dt_eps = eps
-
-        # ---- PASS 2: stream shards into GPU tensors ----
-        write_ptr = 0
         bytes_on_disk = 0
-        t0 = time.perf_counter()
+        shared_grid_possible = True
+        shared_grid_ref: Optional[np.ndarray] = None  # float64 copy for robust comparison
+        any_per_row_t = False
 
-        for k, f in enumerate(files, 1):
-            x0_np, g_np, t_np, y_np = _load_npz_keys(f)  # one shard in host RAM
-            N_shard = y_np.shape[0]
-            sl = slice(write_ptr, write_ptr + N_shard)
+        t0_scan = time.perf_counter()
+        for k, fpath in enumerate(files, 1):
+            f = Path(fpath)
+            _, g_np, t_np, y_np = _load_npz_keys(f)
 
-            # Globals
-            if self.global_vars:
-                g_tensor = torch.from_numpy(g_np.astype(np.float32)).to(self._norm_device, non_blocking=True)
-                g_norm = self.norm.normalize(g_tensor, self.global_vars)  # [N_shard, G]
-                self.G[sl] = g_norm.to(self._target_device, dtype=dtype, non_blocking=True)
-                del g_tensor, g_norm
+            # Validate shapes and record global dims
+            if t_np.ndim == 1:
+                T_shard = int(t_np.shape[0])
+                if y_np.shape[1] != T_shard:
+                    raise RuntimeError(f"[{self.split}] {f.name}: y_mat.shape[1]!=len(t_vec) ({y_np.shape} vs {t_np.shape})")
+            elif t_np.ndim == 2:
+                any_per_row_t = True
+                T_shard = int(t_np.shape[1])
+                if y_np.shape[0] != t_np.shape[0] or y_np.shape[1] != T_shard:
+                    raise RuntimeError(f"[{self.split}] {f.name}: y_mat and t_vec shapes incompatible ({y_np.shape} vs {t_np.shape})")
             else:
-                self.G[sl].zero_()
+                raise RuntimeError(f"[{self.split}] invalid t_vec ndim in {f.name}: {t_np.shape}")
 
-            # Time (absolute normalized; Δt is computed per-batch)
-            t_tensor = torch.from_numpy(t_np.astype(np.float32)).unsqueeze(-1).to(self._norm_device, non_blocking=True)
-            t_norm = self.norm.normalize(t_tensor, [self.time_var]).squeeze(-1)  # [N_shard, T]
-            self.t[sl] = t_norm.to(self._target_device, dtype=torch.float32, non_blocking=True)
-            del t_tensor, t_norm
+            N_shard, _, S_shard = int(y_np.shape[0]), int(y_np.shape[1]), int(y_np.shape[2])
+            G_shard = int(g_np.shape[1])
 
-            # Targets
-            y_tensor = torch.from_numpy(y_np.astype(np.float32)).reshape(-1, self.S).to(self._norm_device, non_blocking=True)
-            y_norm = self.norm.normalize(y_tensor, self.target_vars).reshape(N_shard, self.T, self.S)
-            self.Y[sl] = y_norm.to(self._target_device, dtype=dtype, non_blocking=True)
-            del y_tensor, y_norm
+            # Detect shared grid: require that every shard has identical grid bytes to the first shard
+            # For [B,T], require all rows be identical to row 0 within this shard.
+            if shared_grid_possible:
+                if t_np.ndim == 1:
+                    grid = np.asarray(t_np, dtype=np.float64)
+                else:
+                    row0 = np.asarray(t_np[0], dtype=np.float64)
+                    if not np.all(t_np == t_np[0]):  # fast exact check; dtype preserved in file
+                        shared_grid_possible = False
+                        grid = None
+                    else:
+                        grid = row0
+                if grid is not None:
+                    if shared_grid_ref is None:
+                        shared_grid_ref = grid.copy()
+                    else:
+                        if not np.array_equal(shared_grid_ref, grid):
+                            shared_grid_possible = False
 
-            write_ptr += N_shard
+            N_total += N_shard
+            if T_global is None:
+                T_global, S_global, G_global = T_shard, S_shard, G_shard
+            else:
+                if T_global != T_shard or S_global != S_shard or G_global != G_shard:
+                    raise RuntimeError(f"[{self.split}] heterogeneous shard dims detected; T/S/G must match across shards.")
+
             try:
                 bytes_on_disk += f.stat().st_size
             except Exception:
                 pass
+
+            if (k % max(1, log_every_files)) == 0 or k == len(files):
+                self.log.info(f"[{self.split}] scanned {k}/{len(files)} shards "
+                              f"({_fmt_bytes(bytes_on_disk)} so far) in {time.perf_counter() - t0_scan:.1f}s")
+
+        if N_total <= 0 or T_global is None or S_global is None or G_global is None:
+            raise RuntimeError(f"[{self.split}] No data found or invalid shard shapes.")
+
+        # Step bounds (STRICT)
+        ms = int(min_steps)
+        M = int(max_steps) if max_steps is not None else (T_global - 1)
+        if ms < 1 or M < ms or M > T_global - 1:
+            raise ValueError(f"Invalid step bounds: min_steps={ms}, max_steps={M}, T={T_global}")
+
+        self.N = int(N_total)
+        self.T = int(T_global)
+        self.S = int(S_global)
+        self.G_dim = int(G_global)
+        self.min_steps = ms
+        self.max_steps = M
+        self.pairs_per_traj = int(pairs_per_traj)
+
+        # Allocate staging buffers (host or device depending on preload_to_gpu)
+        self.G = torch.empty((self.N, self.G_dim), device=self._stage_device, dtype=torch.float32)
+        self.Y = torch.empty((self.N, self.T, self.S), device=self._stage_device, dtype=self._runtime_dtype)
+
+        # Time grid storage
+        self.shared_time_grid: Optional[torch.Tensor] = None
+        self.time_grid_per_row: Optional[torch.Tensor] = None
+        self.has_shared_grid = bool(shared_grid_possible and shared_grid_ref is not None)
+
+        if self.has_shared_grid:
+            self.shared_time_grid = torch.from_numpy(shared_grid_ref.astype(np.float64)).to(self._stage_device)
+        else:
+            # Per-row storage [N, T] float64
+            self.time_grid_per_row = torch.empty((self.N, self.T), device=self._stage_device, dtype=torch.float64)
+
+        # Pass 2: stream shards, normalize on-the-fly, and stage
+        write_ptr = 0
+        t0_load = time.perf_counter()
+        for k, fpath in enumerate(files, 1):
+            f = Path(fpath)
+            _, g_np, t_np, y_np = _load_npz_keys(f)
+            N_shard = int(y_np.shape[0])
+            sl = slice(write_ptr, write_ptr + N_shard)
+
+            # Globals → float32
+            g_tensor = torch.from_numpy(g_np.astype(np.float32, copy=False))
+            self.G[sl] = g_tensor.to(self._stage_device, dtype=torch.float32, non_blocking=True)
+
+            # Species → normalize columns per variables
+            y_tensor = torch.from_numpy(y_np)  # storage dtype
+            y_norm = self.norm.normalize(
+                y_tensor, self.cfg["data"].get("target_species_variables", self.cfg["data"]["species_variables"])
+            ).reshape(N_shard, self.T, self.S)
+            self.Y[sl] = y_norm.to(self._stage_device, dtype=self._runtime_dtype, non_blocking=True)
+
+            # Time grids
+            if not self.has_shared_grid:
+                if t_np.ndim == 1:
+                    # broadcast to all rows in this shard
+                    self.time_grid_per_row[sl] = torch.from_numpy(t_np.astype(np.float64, copy=False)).to(
+                        self._stage_device
+                    ).view(1, self.T).expand(N_shard, self.T)
+                else:
+                    self.time_grid_per_row[sl] = torch.from_numpy(t_np.astype(np.float64, copy=False)).to(
+                        self._stage_device
+                    )
+
+            write_ptr += N_shard
+
             if (k % max(1, log_every_files)) == 0 or k == len(files):
                 self.log.info(
-                    f"[{split}] loaded {k}/{len(files)} shards into GPU "
-                    f"({_fmt_bytes(bytes_on_disk)} read) in {time.perf_counter() - t0:.1f}s"
+                    f"[{self.split}] loaded {k}/{len(files)} shards into "
+                    f"{'GPU' if self._stage_device.type == 'cuda' else 'CPU'} "
+                    f"in {time.perf_counter() - t0_load:.1f}s"
                 )
 
-        # ---- GPU memory report ----
-        if self._target_device.type == "cuda":
+        # Flattened view for fast (n, t) gathers
+        self.Y_flat = self.Y.reshape(self.N * self.T, self.S)
+
+        # Optional Δt normalization table (float32, on staging device) only if shared grid
+        self.dt_table: Optional[torch.Tensor] = None
+        if self.has_shared_grid and self.precompute_dt_table_cfg:
+            self.dt_table = self.norm.make_dt_norm_table(
+                time_grid_phys=self.shared_time_grid, min_steps=self.min_steps, max_steps=self.max_steps
+            ).to(device=self._stage_device, dtype=torch.float32)
+        elif self.precompute_dt_table_cfg and not self.has_shared_grid:
+            self.log.info(f"[{self.split}] multiple time grids detected; disabling precompute_dt_table.")
+
+        # Dataset length is anchors-per-traj × N
+        self._length = int(self.N * self.pairs_per_traj)
+
+        # Epoch counter used for deterministic sampling
+        self.epoch = 0
+
+        # Memory report
+        if self._stage_device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize()
             free, total = torch.cuda.mem_get_info()
             used = total - free
             self.log.info(
-                f"[{split}] staged to GPU: "
-                f"G={_fmt_bytes(self.G.numel() * self.G.element_size())}, "
-                f"t={_fmt_bytes(self.t.numel() * self.t.element_size())}, "
-                f"Y={_fmt_bytes(self.Y.numel() * self.Y.element_size())} | "
-                f"GPU mem used {_fmt_bytes(used)} / {_fmt_bytes(total)}"
+                f"[{self.split}] staged: G={_fmt_bytes(self.G.numel()*self.G.element_size())}, "
+                f"Y={_fmt_bytes(self.Y.numel()*self.Y.element_size())} | "
+                f"GPU mem used {used / (1024 ** 3):.1f} GiB / {total / (1024 ** 3):.1f} GiB"
             )
 
-        # ---- Pair sampling params ----
-        self.pairs_per_traj = int(pairs_per_traj)
-        self.min_steps = int(min_steps)
-        self.max_steps = int(max_steps) if max_steps is not None else self.T - 1
-        if self.min_steps < 1:
-            raise ValueError("min_steps must be at least 1")
-        if self.max_steps > self.T - 1:
-            self.max_steps = self.T - 1
-        if self.min_steps > self.max_steps:
-            raise ValueError(f"min_steps ({self.min_steps}) > max_steps ({self.max_steps})")
-
-        self._length = int(self.N) * int(self.pairs_per_traj)
         self.log.info(
-            f"[{split}] ready (Δt mode): length={self._length:,} "
-            f"(pairs_per_traj={self.pairs_per_traj}, "
-            f"min_steps={self.min_steps}, max_steps={self.max_steps}) "
-            f"| init time={time.perf_counter() - t0_all:.1f}s"
+            f"[{self.split}] ready: N={self.N}, T={self.T}, S={self.S}, G={self.G_dim} | "
+            f"pairs_per_traj={self.pairs_per_traj}, min_steps={self.min_steps}, max_steps={self.max_steps} | "
+            f"multi_time={self.multi_time}, K={self.K}, share_offsets_across_batch={self.share_offsets_across_batch}"
         )
 
-    # ------------------------------- Map-style API ---------------------------
+    # ----------------------------- Epoch control -----------------------------
 
     def set_epoch(self, epoch: int) -> None:
-        """Set current epoch so (i,j) sampling changes deterministically each epoch."""
+        """Set current epoch so stateless sampling changes deterministically."""
         self.epoch = int(epoch)
+
+    # ------------------------------ Iteration API ----------------------------
 
     def __len__(self) -> int:
         return self._length
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int) -> int:
+        # DataLoader will batch integer indices and we build tensors in _gather_batch
         return int(idx)
 
     # ------------------------------ Batched gather ---------------------------
 
-    def _gather_batch(self, idx_list: List[int] | torch.Tensor):
+    def _gather_batch(self, idx_list):
         """
-        Vectorized batch fetch for autonomous flow-map (Δt mode ONLY).
+        Construct a batch on the dataset's staging device.
+        Returns (y_i, dt_norm, y_j, g, ij) with shapes in the module docstring.
 
-        Returns tuple:
-          (y_i[B,S], dt_norm[B,1], y_j[B,S], g[B,G], ij[B,2])
-        where:
-          - y_i, y_j, g are already normalized,
-          - dt_norm is Δt normalized ONCE using in-memory dt_log_min/max derived from first shard,
-            or falls back to t_time bounds if unavailable,
-          - ij = (i, j) integer indices for reference.
+        Variable-K handling near the end:
+        - We take all available later steps (span = j_hi-j_lo+1).
+        - If span < K, we pad with j=i (trainer can mask with (j>i)).
         """
-        device = self.Y.device
+        dev = self.Y.device
         B = len(idx_list)
+        K = self.K
 
-        # ----- 1) Compute trajectory index n -----
+        # Indices to device
         if isinstance(idx_list, torch.Tensor):
-            idx_cpu = idx_list.detach().cpu().numpy().astype(np.int64, copy=False)
+            idx = idx_list.to(device=dev, dtype=torch.int64, non_blocking=True)
         else:
-            idx_cpu = np.asarray(idx_list, dtype=np.int64)
+            idx = torch.as_tensor(idx_list, device=dev, dtype=torch.int64)
 
-        n_cpu = idx_cpu // int(self.pairs_per_traj)
+        # Decode sample index → trajectory id
+        n = torch.div(idx, self.pairs_per_traj, rounding_mode='floor')  # [B]
 
-        # ----- 2) Sample arbitrary (i, j>i) with epoch-fresh deterministic RNG -----
-        # IMPORTANT: make i depend on idx_cpu so it varies per sample (not per trajectory).
-        r_i = _u32_from_array(self.base_seed + 1315423911 * (self.epoch + 1), idx_cpu ^ 0x9E3779B9)
-        r_j = _u32_from_array(self.base_seed + 2654435761 * (self.epoch + 1), idx_cpu)
+        # Stateless RNG for anchors (i)
+        seed_i = self.base_seed + 1315423911 * (self.epoch + 1)
+        r_i_u32 = _u32_from_array_torch(seed_i, idx)               # uint32
+        i_max = max(0, self.T - 1 - self.min_steps)
+        i = (r_i_u32.remainder(i_max + 1)).to(torch.int64)         # [B]
 
-        i_max = max(0, self.T - 1 - self.min_steps)  # i ∈ [0, T-1-min_steps]
-        i_cpu = (r_i.astype(np.int64) % (i_max + 1))
+        # Bounds for j per anchor
+        j_lo = i + self.min_steps                                  # [B]
+        j_hi = torch.minimum(torch.full_like(i, self.T - 1),
+                             i + self.max_steps)                    # [B]
+        span = torch.clamp(j_hi - j_lo + 1, min=0)                 # [B] (#valid later steps)
 
-        j_lo = i_cpu + self.min_steps  # j ∈ [i+min_steps, min(T-1, i+max_steps)]
-        j_hi = np.minimum(self.T - 1, i_cpu + self.max_steps)
-        span = np.maximum(j_hi - j_lo + 1, 1)
-        j_cpu = j_lo + (r_j.astype(np.int64) % span)
+        # Build j indices with "all possible" when span<K, otherwise K without-replacement
+        j_out = torch.empty((B, K), dtype=torch.int64, device=dev)
+        j_out[:] = i.view(B, 1)  # pad with j=i by default (trainer can mask)
 
-        # ----- 3) Move indices to GPU and gather normalized tensors -----
-        n = torch.from_numpy(n_cpu).to(device=device, dtype=torch.long)
-        i = torch.from_numpy(i_cpu).to(device=device, dtype=torch.long)
-        j = torch.from_numpy(j_cpu).to(device=device, dtype=torch.long)
+        if K == 1:
+            # Fast path: choose one j uniformly in [j_lo, j_hi]
+            seed_j = self.base_seed ^ 0x9e3779b97f4a7c15 ^ (self.epoch + 7)
+            r_j = _u32_from_array_torch(seed_j, idx)
+            # guard span==0 case → keep j=i (already padded)
+            choose = (span > 0)
+            # compute offsets safely where span>0
+            off = torch.zeros_like(i)
+            if torch.any(choose):
+                off[choose] = (r_j[choose].remainder(span[choose])).to(torch.int64)
+            j = j_lo + off
+            j_out[:, 0] = torch.where(choose, j, i)
+        else:
+            if self.share_offsets_across_batch:
+                # Shared random permutation over [0, span_max)
+                span_max = int(torch.max(span).item()) if B > 0 else 0
+                if span_max > 0:
+                    seed_off = self.base_seed ^ 0xD2B74407B1CE6E93 ^ (self.epoch + 101)
+                    offs = torch.arange(span_max, device=dev, dtype=torch.int64)
+                    ranks = _u32_from_array_torch(seed_off, offs)  # [span_max]
+                    perm = torch.argsort(ranks)                    # ascending
+                    shared = offs[perm]                            # permutation
+                    for b in range(B):
+                        sb = int(span[b].item())
+                        used_k = min(K, sb)
+                        if used_k > 0:
+                            j_sel = j_lo[b].item() + shared[:used_k]
+                            j_out[b, :used_k] = j_sel
+            else:
+                # Independent per-row permutations limited to span[b]
+                seed_off = self.base_seed ^ 0xC3A5C85C97CB3127 ^ (self.epoch + 19)
+                for b in range(B):
+                    sb = int(span[b].item())
+                    if sb <= 0:
+                        continue  # keep padding (j=i)
+                    used_k = min(K, sb)
+                    offs = torch.arange(sb, device=dev, dtype=torch.int64)
+                    # Mix idx[b] into the ranks to differ per row deterministically
+                    ranks = _u32_from_array_torch(seed_off ^ int(idx[b].item()), offs)
+                    perm = torch.argsort(ranks)
+                    sel = offs[perm[:used_k]]
+                    j_out[b, :used_k] = int(j_lo[b].item()) + sel
 
-        y_i = self.Y[n, i]  # [B, S] normalized
-        y_j = self.Y[n, j]  # [B, S] normalized
-        g   = self.G[n]     # [B, G] normalized
+        # Gather tensors
+        # y_i: [B,S]
+        lin_i = n * self.T + i
+        y_i = self.Y_flat.index_select(0, lin_i)  # [B,S]
 
-        # ----- 4) Build Δt from the SHARED physical grid, then normalize ONCE -----
-        # time_grid_phys: [T] on device (float64); assume shared grid (warned once at init)
-        t_i_phys = self.time_grid_phys[i].to(dtype=torch.float64)  # [B]
-        t_j_phys = self.time_grid_phys[j].to(dtype=torch.float64)  # [B]
-        dt_phys  = torch.clamp(t_j_phys - t_i_phys, min=self._dt_eps)
+        # y_j: [B,K,S]
+        lin_j = n.view(B, 1) * self.T + j_out    # [B,K]
+        y_j = self.Y_flat.index_select(0, lin_j.reshape(-1)).reshape(B, K, self.S)
 
-        # log-min-max using in-memory dt_log_min/max
-        dt_log = torch.log10(dt_phys)  # [B], float64
-        x = (dt_log - self.dt_log_min) / self.dt_log_denom
-        dt_norm = torch.clamp(x, 0.0, 1.0).to(dtype=torch.float32).unsqueeze(-1)  # [B,1]
+        # g: [B,G]
+        g = self.G.index_select(0, n)            # [B,G]
 
-        ij = torch.stack([i, j], dim=-1)  # [B, 2]
+        # Δt normalization
+        # Mask for padded positions (j==i)
+        pad_mask = (j_out == i.view(B, 1))
+
+        if self.dt_table is not None:
+            # Shared grid table
+            dt_norm = self.dt_table[i.view(B, 1), j_out].to(dtype=self._runtime_dtype)  # [B,K]
+            # Force padded to 0 so trainers can optionally ignore even if they forget to mask
+            dt_norm = torch.where(pad_mask, torch.zeros_like(dt_norm), dt_norm)
+        else:
+            # Compute from physical times per-row or shared vector
+            if self.time_grid_per_row is not None:
+                # Per-row grids: advanced indexing
+                t_i = self.time_grid_per_row[n, i]                                  # [B]
+                t_j = self.time_grid_per_row[n.view(B, 1).expand(-1, K), j_out]     # [B,K]
+            else:
+                # Shared vector
+                vec = self.shared_time_grid  # [T]
+                t_i = vec.index_select(0, i)                                       # [B]
+                t_j = vec.index_select(0, j_out.reshape(-1)).view(B, K)            # [B,K]
+            dt_phys = t_j - t_i.view(B, 1)
+            eps = float(self.norm.epsilon)
+            dt_phys = torch.where(dt_phys > 0, dt_phys,
+                                  torch.as_tensor(eps, dtype=dt_phys.dtype, device=dt_phys.device))
+            dt_norm = self.norm.normalize_dt_from_phys(dt_phys).to(dtype=self._runtime_dtype)
+            # Zero out padded for niceness
+            dt_norm = torch.where(pad_mask, torch.zeros_like(dt_norm), dt_norm)
+
+        # ij indices (int32): [B,K,2]
+        ij = torch.stack((i.view(B, 1).expand(B, K).to(torch.int32),
+                          j_out.to(torch.int32)), dim=-1)
 
         return y_i, dt_norm, y_j, g, ij
 
 
-# ---------------------------- DataLoader helper -----------------------------
+# ------------------------------- Dataloader ----------------------------------
 
 def create_dataloader(
     dataset: FlowMapPairsDataset,
     batch_size: int,
-    num_workers: int = 4,
-    pin_memory: bool = True,
+    shuffle: bool = False,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    prefetch_factor: int = 2,
     persistent_workers: bool = False,
-    prefetch_factor: int = 4,
-) -> DataLoader:
+) -> torch.utils.data.DataLoader:
     """
-    Build a DataLoader with optimized settings for GPU-resident data.
-    Validation/Test do not shuffle by default.
+    Build a DataLoader for this dataset.
+    The dataset performs its own stateless sampling; DataLoader shuffling is redundant.
     """
-    target_device = getattr(dataset, "_target_device", torch.device("cpu"))
-    on_cuda = isinstance(target_device, torch.device) and target_device.type == "cuda"
-
-    def _collate_indices(batch_indices: List[int]):
-        return dataset._gather_batch(batch_indices)
-
+    # If dataset tensors live on GPU, keep workers=0 and pin_memory=False
+    on_cuda = (dataset.Y.device.type == "cuda")
     if on_cuda:
         num_workers = 0
         pin_memory = False
-        persistent_workers = False
+        shuffle = False
 
-    shuffle = (getattr(dataset, "split", "train") == "train")
-
-    # Build kwargs dict
     kwargs = dict(
         dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers if num_workers > 0 else False,
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle),
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+        persistent_workers=bool(persistent_workers) if num_workers > 0 else False,
         drop_last=False,
-        collate_fn=_collate_indices,
+        collate_fn=lambda idxs: dataset._gather_batch(idxs),
     )
-
-    # Only add prefetch_factor if we have workers
     if num_workers > 0:
-        kwargs["prefetch_factor"] = prefetch_factor
+        kwargs["prefetch_factor"] = int(prefetch_factor)
 
-    return DataLoader(**kwargs)
+    return torch.utils.data.DataLoader(**kwargs)

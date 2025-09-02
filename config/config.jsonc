@@ -1,50 +1,19 @@
 {
-  "run_name": "deeponet-arb-pairs",
-
   "paths": {
+    // Input HDF5s for preprocessing
     "raw_data_files": [
-      "data/raw/run9001-result.h5",
-      "data/raw/run9002-result.h5",
-      "data/raw/run9003-result.h5",
-      "data/raw/run9004-result.h5",
-      "data/raw/run9005-result.h5",
-      "data/raw/run9006-result.h5",
-      "data/raw/run9007-result.h5",
-      "data/raw/run9008-result.h5",
-      "data/raw/run9009-result.h5",
-      "data/raw/run9010-result.h5",
-      "data/raw/run11001-result.h5",
-      "data/raw/run11002-result.h5",
-      "data/raw/run11003-result.h5",
-      "data/raw/run11004-result.h5",
-      "data/raw/run11005-result.h5",
-      "data/raw/run11006-result.h5",
-      "data/raw/run11007-result.h5",
-      "data/raw/run11008-result.h5",
-      "data/raw/run11009-result.h5",
-      "data/raw/run11010-result.h5",
-      "data/raw/run11011-result.h5",
-      "data/raw/run11012-result.h5",
-      "data/raw/run11013-result.h5",
-      "data/raw/run11014-result.h5",
-      "data/raw/run11015-result.h5",
-      "data/raw/run11016-result.h5",
-      "data/raw/run11017-result.h5",
-      "data/raw/run11018-result.h5",
-      "data/raw/run11019-result.h5",
-      "data/raw/run11020-result.h5",
-      "data/raw/run11021-result.h5",
-      "data/raw/run11022-result.h5",
-      "data/raw/run11023-result.h5",
-      "data/raw/run11024-result.h5",
-      "data/raw/run11025-result.h5"
+      "data/raw/run9001-result.h5"
     ],
-    "processed_data_dir": "data/processed-10-log-standard-big",
-    "model_save_dir": "models",
-    "log_dir": "logs"
+
+    // Output directory for NPZ shards + normalization.json
+    "processed_data_dir": "data/processed-flowmap",
+
+    // Where checkpoints/logs go (trainer writes here)
+    "work_dir": "models/deeponet-flowmap"
   },
 
   "data": {
+    // Full species list (targets)
     "species_variables": [
       "C2H2_evolution",
       "CH4_evolution",
@@ -59,6 +28,7 @@
       "OH_evolution",
       "O_evolution"
     ],
+    // If you use target!=species later, trainer/model still infer dims from this list
     "target_species_variables": [
       "C2H2_evolution",
       "CH4_evolution",
@@ -73,94 +43,143 @@
       "OH_evolution",
       "O_evolution"
     ],
+    // Global/conditioning features
     "global_variables": ["P", "T"],
-    "expected_globals": ["P", "T"],
+
+    // Name of the time column in HDF5 files
     "time_variable": "t_time"
   },
 
   "preprocessing": {
+    // Drop an entire trajectory if ANY species value is < threshold or non-finite
     "min_value_threshold": 1e-25,
-    "num_workers": 8,
-    "hdf5_chunk_size": 16384,
-    "trajectories_per_shard": 10000,
-    "npz_compressed": false
+
+    // Shard sizing and NPZ compression
+    "trajectories_per_shard": 1024,
+    "npz_compressed": false,
+
+    // Parallel file processing (process-based; 0 means serial)
+    "num_workers": 5,
+
+    // Optional chunk length along time axis for HDF5 reads (0 → auto)
+    "hdf5_chunk_size": 0
   },
 
   "normalization": {
+    // Default per-key normalization unless overridden below
     "default_method": "log-standard",
+
+    // Per-key overrides. IMPORTANT: keep "dt" as log-min-max for flow-map trunk.
     "methods": {
+      "dt": "log-min-max",
       "t_time": "log-min-max",
       "P": "log-min-max",
       "T": "standard"
+      // add per-species overrides here if needed, else default_method applies
     },
-    "epsilon": 1e-30,
-    "min_std": 1e-10,
-    "clamp_value": 50.0
+
+    // Numerical safety
+    "epsilon": 1e-25,
+    "min_std": 1e-8,
+    "clamp_value": 1e6
+  },
+
+  "dataset": {
+    // Multi-time-per-anchor controls
+    "multi_time_per_anchor": true,
+    "times_per_anchor": 32,              // K
+    "share_times_across_batch": false,   // set true only if Δt grid truly aligns
+
+    // Δt normalization table and manifest requirements
+    "precompute_dt_table": true,
+    "require_dt_stats": true,
+
+    // Stage tensors to device memory for throughput (A100 has headroom)
+    "preload_train_to_gpu": true,
+    "preload_val_to_gpu": true,
+
+    // DataLoader worker settings (ignored when dataset lives on GPU)
+    "num_workers": 0,
+    "num_workers_val": 0,
+    "pin_memory": false,
+    "pin_memory_val": false,
+    "prefetch_factor": 2,
+    "prefetch_factor_val": 2,
+    "persistent_workers": false,
+    "persistent_workers_val": false,
+
+    // On-device storage dtype for staged NPZ data (keep time-sensitive inputs at fp32)
+    "storage_dtype": "float32"           // "float32" | "bf16" | "fp16"
   },
 
   "model": {
-    "species_dim": 12,
-    "globals_dim": 2,
-
-    "p": 64,
-
-    // NEW: the model now expects fixed-width residual settings, not "branch_layers"
+    // Basis size and MLP widths/depths
+    "p": 256,
     "branch_width": 1024,
     "branch_depth": 4,
+    "trunk_layers": [512, 512, 512],
 
-    // keep your trunk width/depth the same
-    "trunk_layers": [1024, 1024, 1024, 1024],
-
+    // Predict residual y_i + f(…)
     "predict_delta": true,
-    "trunk_dedup": false,
 
-    // optional: keep this if you want α learnable (supported)
-    "branch_residual_learnable": false
+    // Pre-LN residual α learnable inside branch blocks (usually false)
+    "branch_residual_learnable": false,
 
-    // NOTE: "branch_residual" and "branch_residual_alpha_init" are ignored by this model
+    // Evaluate trunk once per unique Δt in batch if duplicates exist
+    "trunk_dedup": false
   },
 
   "training": {
-    // RENAMED/ADDED so main.py can read them directly
-    "pairs_per_traj": 300,     // was pairwise.pairs_per_trajectory
-    "min_steps": 1,           // was pairwise.min_steps
-    "max_steps": 99,          // was pairwise.max_steps
-
-    "epochs": 500,
-    "batch_size": 16384,
-
-    "lr": 1e-4,             // was learning_rate
-    "min_lr": 1e-8,
-    "weight_decay": 0.00005,
-
-    // The rest are currently unused by the new trainer but harmless to keep:
-    "betas": [0.9, 0.999],
-    "gradient_clip": 1.0,
-    "use_amp": true,          // ignored (trainer uses system.use_bfloat16 instead)
-    "amp_dtype": "bfloat16",  // ignored (see system.use_bfloat16)
+    // Preprocessor split fractions
     "val_fraction": 0.15,
-    "test_fraction": 0.15,
-    "use_fraction": 1.0,
+    "test_fraction": 0.10,
 
-    // DataLoader workers (you had 0; GPU-resident dataset is fine with 0–4)
-    "num_workers": 0,
+    // Pair sampling: j - i ∈ [min_steps, max_steps], j > i, with T typically = 100
+    "min_steps": 1,
+    "max_steps": 99,
 
-    // Optional trainer limits; currently ignored by my trainer
-    "max_steps_per_epoch": 1000,
-    "max_val_batches": 100
+    // How many anchors per trajectory per epoch
+    "pairs_per_traj": 64,
+
+    // Batch sizes
+    "batch_size": 512,
+    "val_batch_size": 512,
+
+    // Optimizer & schedule (AdamW; betas are defaults inside Trainer)
+    "epochs": 100,
+    "lr": 5e-4,
+    "weight_decay": 1e-5,
+    "warmup_epochs": 0,
+    "min_lr": 1e-7,
+
+    // Execution controls
+    "gradient_clip": 0.0,
+    "torch_compile": true,
+    "max_train_steps_per_epoch": 0,      // 0 = no cap
+    "max_val_batches": 0                 // 0 = full validation
+  },
+
+  "mixed_precision": {
+    // Trainer compute dtype
+    "mode": "bf16"                       // "bf16" | "fp16" | "none"
   },
 
   "system": {
+    // Seeding and deterministic behavior
     "seed": 42,
-    "cudnn_benchmark": true,
-    "tf32": true,
-    "cuda_memory_fraction": 0.90,
     "deterministic": false,
 
-    // NEW: this is what flips AMP bf16 in the trainer and sets dataset dtype
-    "use_bfloat16": true,
+    // CUDA/cuDNN knobs
+    "tf32": true,
+    "cudnn_benchmark": true,
 
-    // "dtype" is ignored by the new code path
-    "dtype": "float32"
+    // Optional cap on CUDA memory fraction for this process (0.0–1.0); omit or set 0 to skip
+    "cuda_memory_fraction": 0.0,
+
+    // OpenMP thread pool for BLAS/linear algebra on CPU
+    "omp_threads": 12,
+
+    // NPZ on-disk dtype emitted by the preprocessor
+    "io_dtype": "float32"                // "float32" | "float64"
   }
 }
