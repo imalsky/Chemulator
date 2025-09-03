@@ -184,29 +184,27 @@ class Trainer:
     def _setup_mixed_precision(self) -> None:
         """Configure mixed precision training settings."""
         mixed_precision_cfg = self.cfg.get("mixed_precision", {})
-        self.amp_mode = str(mixed_precision_cfg.get("mode", "bf16"))
-        
+        self.amp_mode = str(mixed_precision_cfg.get("mode", "bf16")).lower()
+
         if self.amp_mode not in ("bf16", "fp16", "none"):
             self.amp_mode = "bf16"
-        
-        # Set autocast dtype
+
+        # autocast dtype
         if self.amp_mode == "bf16":
             self.autocast_dtype = torch.bfloat16
         elif self.amp_mode == "fp16":
             self.autocast_dtype = torch.float16
         else:
             self.autocast_dtype = None
-        
-        # Setup gradient scaler for fp16 only
-        self.use_scaler = (self.amp_mode == "fp16")
+
+        # GradScaler only makes sense for fp16 on CUDA
+        self.use_scaler = (self.amp_mode == "fp16" and self.device.type == "cuda")
         if self.use_scaler:
-            # Use new API for GradScaler
-            if self.device.type == "cuda":
-                self.scaler = torch.amp.GradScaler('cuda', enabled=True)
-            else:
-                self.scaler = torch.amp.GradScaler(self.device.type, enabled=True)
+            # Use the CUDA GradScaler; no positional args
+            self.scaler = torch.cuda.amp.GradScaler(enabled=True)
         else:
             self.scaler = None
+
     
     def _setup_optimizer(self) -> None:
         """Initialize optimizer with fused operations if available."""
@@ -270,7 +268,7 @@ class Trainer:
                 val_loss = train_loss
             
             # Update learning rate
-            current_lr = self.scheduler.step(epoch)
+            current_lr = self.scheduler.step(epoch - 1)
             
             # Save best model
             saved = False
@@ -287,8 +285,8 @@ class Trainer:
             loss_delta = val_loss - self.best_val_loss
             self.logger.info(
                 f"Epoch {epoch:03d} | "
-                f"train_loss={train_loss:.6e} | "
-                f"val_loss={val_loss:.6e} | "
+                f"train_loss={train_loss:.4e} | "
+                f"val_loss={val_loss:.4e} | "
                 f"lr={current_lr:.2e} | "
                 f"time={epoch_time:.1f}s | "
                 f"delta_best={loss_delta:+.2e} | "
@@ -298,7 +296,7 @@ class Trainer:
         total_time = time.perf_counter() - start_time
         self.logger.info(
             f"Training completed in {total_time/3600:.2f} hours. "
-            f"Best validation loss: {self.best_val_loss:.6e}"
+            f"Best validation loss: {self.best_val_loss:.4e}"
         )
         
         return self.best_val_loss
@@ -332,7 +330,7 @@ class Trainer:
     ) -> None:
         """Append epoch metrics to CSV log file."""
         with self.log_file.open("a", encoding="utf-8") as f:
-            f.write(f"{epoch},{train_loss:.8e},{val_loss:.8e},{lr:.8e}\n")
+            f.write(f"{epoch},{train_loss:.4e},{val_loss:.4e},{lr:.4e}\n")
     
     def _run_epoch(self, train: bool) -> float:
         """
@@ -430,20 +428,21 @@ class Trainer:
         
         # Forward pass with autocast
         with autocast_context:
-            # Model forward
-            pred = self.model(y_i, dt_norm, g)
-            
-            # Harmonize shapes between prediction and target
+            # ---- SQUEEZE dt_norm from [B,K,1] -> [B,K] when needed ----
+            if dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
+                dt_in = dt_norm.squeeze(-1)
+            else:
+                dt_in = dt_norm
+
+            pred = self.model(y_i, dt_in, g)
             pred, y_j = self._harmonize_shapes(pred, y_j)
-            
-            # Compute loss
             loss = self._compute_loss(pred, y_j, k_mask)
         
         # Backward pass and optimization
         if train:
             self._backward_and_step(loss)
         
-        return float(loss.detach())
+        return loss.detach().item()
     
     def _harmonize_shapes(
         self,

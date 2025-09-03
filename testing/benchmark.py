@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""CPU-only benchmark: AE-DeepONet model inference time vs batch size."""
+"""CPU-only benchmark: Flow-map DeepONet inference vs batch size (K=1)."""
 from __future__ import annotations
 
-import os, sys, time, gc, json
+import os, sys, time, gc
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
@@ -13,32 +13,43 @@ os.environ["OMP_NUM_THREADS"]                  = str(CPU_THREADS)
 os.environ["MKL_NUM_THREADS"]                  = str(CPU_THREADS)
 os.environ["OPENBLAS_NUM_THREADS"]             = str(CPU_THREADS)
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(CPU_THREADS))
-os.environ.setdefault("ACCELERATE_MATMUL_MULTITHREADING", "1")
+os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+REPO_ROOT    = PROJECT_ROOT.parent
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+import json5  # <-- supports JSONC (comments, trailing commas)
 
 # ---------- Config ----------
-MODEL_STR   = "big_deep"
-MODEL_DIR   = Path(f"../models/{MODEL_STR}")
-MODEL_FILE  = "complete_model_exported.pt2"
-CONFIG_FILE = "config.json"
+MODEL_STR   = "flowmap-deeponet"
+MODEL_DIR   = REPO_ROOT / "models" / MODEL_STR
+MODEL_FILE  = "complete_model_exported_k1.pt2"  # or "complete_model_exported.pt2"
+CFG_PATH    = REPO_ROOT / "config" / "config.jsonc"
 
+# We benchmark one time jump per call (K=1):
+NUM_TIME_POINTS = 1
+
+# Batch sizes to scan:
 BATCH_SIZES: List[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 1024]
-NUM_TIME_POINTS = 100
 
-WARMUP_CALLS           = 20
+# Timings
+WARMUP_CALLS           = 50
 CALLS_PER_MEASUREMENT  = 16
-REPEATS                = 3
+REPEATS                = 5
+
+# Optional: try `torch.compile` on the loaded exported module for extra CPU speed
+USE_COMPILE = False  # set True to try inductor on CPU (can help or hurt—measure!)
 
 PLOT_DIR = MODEL_DIR / "plots"
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
 def _set_torch_threads(n: int) -> None:
     torch.set_num_threads(int(n))
-    torch.set_num_interop_threads(max(1, int(n // 2)))
+    torch.set_num_interop_threads(1)  # often better on CPU
 
 def _safe_style():
     try:
@@ -47,9 +58,8 @@ def _safe_style():
         pass
 
 def _load_exported_model() -> Tuple[Any, Dict[str, Any], torch.device, Any]:
-    cfg_path = MODEL_DIR / CONFIG_FILE
-    with open(cfg_path, "r") as f:
-        cfg = json.load(f)
+    with open(CFG_PATH, "r") as f:
+        cfg = json5.load(f)  # <-- parse jsonc
 
     device = torch.device("cpu")
     _set_torch_threads(CPU_THREADS)
@@ -60,22 +70,31 @@ def _load_exported_model() -> Tuple[Any, Dict[str, Any], torch.device, Any]:
     from torch.export import load as tload
     prog = tload(str(mp))
     fn   = prog.module()
+    if USE_COMPILE:
+        try:
+            fn = torch.compile(fn, backend="inductor", mode="max-autotune", fullgraph=True)
+            print("[INFO] torch.compile enabled (inductor, CPU)")
+        except Exception as e:
+            print(f"[WARN] torch.compile failed: {e}")
     return prog, cfg, device, fn
 
 def _create_batch(bs: int, cfg: dict, device: torch.device, num_t: int = NUM_TIME_POINTS) -> Dict[str, torch.Tensor]:
     S = len(cfg["data"]["species_variables"])
     G = len(cfg["data"]["global_variables"])
+    if num_t != 1:
+        raise ValueError("This benchmark is for K=1 only. Set NUM_TIME_POINTS = 1.")
     return {
-        "x0_norm":      torch.randn(bs, S, device=device, dtype=torch.float32).contiguous(),
-        "globals_norm": torch.randn(bs, G, device=device, dtype=torch.float32).contiguous(),
-        "trunk_times":  torch.linspace(0.0, 1.0, steps=num_t, device=device, dtype=torch.float32),
+        "y0_norm":      torch.randn(bs, S, device=device, dtype=torch.float32).contiguous(),
+        "globals_norm": (torch.randn(bs, G, device=device, dtype=torch.float32).contiguous() if G > 0
+                         else torch.zeros(bs, 0, device=device, dtype=torch.float32)),
+        "dt_norm":      torch.tensor([0.5], device=device, dtype=torch.float32),  # one normalized jump
     }
 
 @torch.inference_mode()
 def _run_calls(fn, batch: Dict[str, torch.Tensor], calls: int) -> None:
-    x0, g, t = batch["x0_norm"], batch["globals_norm"], batch["trunk_times"]
+    y0, g, dt = batch["y0_norm"], batch["globals_norm"], batch["dt_norm"]
     for _ in range(calls):
-        _ = fn(x0, g, t)
+        _ = fn(y0, g, dt)
 
 @torch.inference_mode()
 def _bench_once(fn, batch: Dict[str, torch.Tensor]) -> Tuple[float, float]:
@@ -88,31 +107,33 @@ def _bench_once(fn, batch: Dict[str, torch.Tensor]) -> Tuple[float, float]:
     arr = np.asarray(xs, dtype=np.float64)
     return float(arr.mean()), float(arr.std(ddof=1) if arr.size > 1 else 0.0)
 
-def _plot(batch_sizes: List[int], mean_us: List[float], std_us: List[float], threads: int, num_times: int) -> None:
+def _plot(batch_sizes: List[int], mean_us: List[float], std_us: List[float], threads: int) -> None:
     _safe_style()
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    per_point_mean = [m / (bs * num_times) for m, bs in zip(mean_us, batch_sizes)]
-    per_point_std  = [s / (bs * num_times) for s, bs in zip(std_us,  batch_sizes)]
-    ax1.errorbar(batch_sizes, per_point_mean, yerr=per_point_std, marker="o", markersize=6, capsize=4, linewidth=2)
+    # Each call does B * K predictions; here K=1, so per-jump = mean_us / B
+    per_jump_mean = [m / bs for m, bs in zip(mean_us, batch_sizes)]
+    per_jump_std  = [s / bs for s, bs in zip(std_us,  batch_sizes)]
+    ax1.errorbar(batch_sizes, per_jump_mean, yerr=per_jump_std, marker="o", markersize=6, capsize=4, linewidth=2)
     ax1.set_xscale("log", base=2); ax1.set_yscale("log", base=10)
-    ax1.set_xlabel("Batch size"); ax1.set_ylabel("Time per sample point (μs)")
-    ax1.set_title("Inference time per sample point")
+    ax1.set_xlabel("Batch size"); ax1.set_ylabel("Time per jump (μs)")
+    ax1.set_title("Inference time per jump (K=1)")
 
-    thr_pts = [(bs * num_times) / (m / 1e6) for bs, m in zip(batch_sizes, mean_us)]
-    ax2.plot(batch_sizes, thr_pts, marker="s", markersize=6, linewidth=2)
+    # Throughput in jumps/s
+    thr_jumps = [bs / (m / 1e6) for bs, m in zip(batch_sizes, mean_us)]
+    ax2.plot(batch_sizes, thr_jumps, marker="s", markersize=6, linewidth=2)
     ax2.set_xscale("log", base=2); ax2.set_yscale("log", base=10)
-    ax2.set_xlabel("Batch size"); ax2.set_ylabel("Throughput (points/s)")
-    ax2.set_title("Inference throughput")
+    ax2.set_xlabel("Batch size"); ax2.set_ylabel("Throughput (jumps/s)")
+    ax2.set_title("Inference throughput (K=1)")
 
-    bidx = int(np.argmax(thr_pts))
-    ax2.scatter(batch_sizes[bidx], thr_pts[bidx], s=160, marker="*", color="red",
-                zorder=5, label=f"Peak: {thr_pts[bidx]:.0f} points/s")
-    ax2.legend()
+    #bidx = int(np.argmax(thr_jumps))
+    #ax2.scatter(batch_sizes[bidx], thr_jumps[bidx], s=160, marker="*", color="red",
+    #            zorder=5, label=f"Peak: {thr_jumps[bidx]:.0f} jumps/s")
+    #ax2.legend()
 
-    fig.suptitle(f"AE-DeepONet CPU Inference Benchmark (threads={threads}, {num_times} points/trajectory)")
+    fig.suptitle(f"Flow-map CPU Inference Benchmark (threads={threads}, K=1)")
     fig.tight_layout()
-    out_png = PLOT_DIR / "benchmark_ae_deeponet_cpu.png"
+    out_png = PLOT_DIR / "benchmark_flowmap_cpu_k1.png"
     plt.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"\nSaved: {out_png}")
@@ -120,18 +141,17 @@ def _plot(batch_sizes: List[int], mean_us: List[float], std_us: List[float], thr
 def _print_model_summary(cfg: dict) -> None:
     mc, dc = cfg.get("model", {}), cfg.get("data", {})
     print("\nModel Configuration:")
-    print(f"  Latent dimension: {mc.get('latent_dim', 'N/A')}")
     print(f"  Branch layers:    {mc.get('branch_layers', 'N/A')}")
     print(f"  Trunk layers:     {mc.get('trunk_layers', 'N/A')}")
-    print(f"  Bypass AE:        {mc.get('bypass_autoencoder', False)}")
+    print(f"  Latent dim:       {mc.get('latent_dim', 'N/A')}")
     print("\nData Configuration:")
-    print(f"  Species:          {len(dc.get('species_variables', []))}")
-    print(f"  Globals:          {len(dc.get('global_variables', []))}")
-    print(f"  Time points/traj: {NUM_TIME_POINTS}")
+    print(f"  Species (S):      {len(dc.get('species_variables', []))}")
+    print(f"  Globals (G):      {len(dc.get('global_variables', []))}")
+    print(f"  K (jumps/call):   1")
 
 def main():
     print("=" * 60)
-    print("AE-DeepONet CPU INFERENCE BENCHMARK")
+    print("FLOW-MAP CPU INFERENCE BENCHMARK (K=1)")
     print("=" * 60)
     print(f"CPU threads (intra-op): {CPU_THREADS}")
     print(f"Warmup calls:           {WARMUP_CALLS}")
@@ -153,18 +173,18 @@ def main():
     batches = {bs: _create_batch(bs, cfg, dev, NUM_TIME_POINTS) for bs in BATCH_SIZES}
 
     means, stds = [], []
-    print("\nRunning benchmarks (amortized timing)...")
+    print("\nRunning benchmarks (amortized timing, K=1)...")
     print("-" * 75)
-    print(f"{'Batch':>8} | {'Mean (μs)':>12} | {'Std (μs)':>10} | {'μs/point':>12} | {'Points/s':>12}")
+    print(f"{'Batch':>8} | {'Mean (μs)':>12} | {'Std (μs)':>10} | {'μs/jump':>12} | {'Jumps/s':>12}")
     print("-" * 75)
 
     for bs in BATCH_SIZES:
         try:
             mean_us, std_us = _bench_once(fn, batches[bs])
             means.append(mean_us); stds.append(std_us)
-            us_per_point = mean_us / (bs * NUM_TIME_POINTS)
-            thr_pts = (bs * NUM_TIME_POINTS) / (mean_us / 1e6)
-            print(f"{bs:>8} | {mean_us:>12.2f} | {std_us:>10.2f} | {us_per_point:>12.3f} | {thr_pts:>10.0f} p/s")
+            us_per_jump = mean_us / bs
+            thr_jumps = bs / (mean_us / 1e6)
+            print(f"{bs:>8} | {mean_us:>12.2f} | {std_us:>10.2f} | {us_per_jump:>12.3f} | {thr_jumps:>10.0f}")
         except Exception as e:
             print(f"{bs:>8} | Error: {e}")
             means.append(float('nan')); stds.append(float('nan'))
@@ -174,19 +194,19 @@ def main():
     valid = [(bs, m, s) for bs, m, s in zip(BATCH_SIZES, means, stds) if not np.isnan(m)]
     if valid:
         v_bs, v_m, v_s = zip(*valid)
-        thr_pts = [(bs * NUM_TIME_POINTS) / (m / 1e6) for bs, m in zip(v_bs, v_m)]
-        bidx = int(np.argmax(thr_pts))
+        thr_jumps = [bs / (m / 1e6) for bs, m in zip(v_bs, v_m)]
+        bidx = int(np.argmax(thr_jumps))
         print(f"\nOptimal batch size: {v_bs[bidx]}")
-        print(f"Peak throughput:    {thr_pts[bidx]:.0f} points/s")
-        print(f"Time per point:     {v_m[bidx] / (v_bs[bidx] * NUM_TIME_POINTS):.3f} μs")
+        print(f"Peak throughput:    {thr_jumps[bidx]:.0f} jumps/s")
+        print(f"Time per jump:      {v_m[bidx] / v_bs[bidx]:.3f} μs")
 
         S = len(cfg["data"]["species_variables"])
         G = len(cfg["data"]["global_variables"])
-        bytes_per_sample = 4 * (S + G + NUM_TIME_POINTS * S)
+        bytes_per_sample = 4 * (S + G + 1 * S)  # y0[S] + g[G] + (K=1)*S output payload-ish
         print(f"\nMemory/sample:      {bytes_per_sample / 1024:.1f} KB")
         print(f"Memory at peak BS:  {v_bs[bidx] * bytes_per_sample / (1024**2):.1f} MB")
 
-        _plot(list(v_bs), list(v_m), list(v_s), CPU_THREADS, NUM_TIME_POINTS)
+        _plot(list(v_bs), list(v_m), list(v_s), CPU_THREADS)
 
     gc.enable()
     print("\nBenchmark complete.")
