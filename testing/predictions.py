@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Plot AE-DeepONet predictions vs ground truth using a PT2-exported model.
+Plot Flow-map DeepONet predictions vs ground truth using a PT2-exported model.
+
+- Trunk input is **normalized Δt** (dt-spec).
+- We evaluate from the first physical time t0 of a chosen trajectory:
+    Δt_k = t_phys[k] - t0  (clamped ≥ 0), then normalize via manifest dt-spec.
 
 Usage: python predictions.py
 """
@@ -8,22 +12,27 @@ Usage: python predictions.py
 # =========================
 #          CONFIG
 # =========================
-MODEL_STR     = "big_deep"
-MODEL_DIR     = f"../models/{MODEL_STR}"
-CONFIG_PATH   = f"{MODEL_DIR}/config.json"
-PROCESSED_DIR = "../data/processed-10-log-standard"
+import os, sys
+from pathlib import Path
+
+MODEL_STR     = "flowmap-deeponet"
+REPO_ROOT     = Path(__file__).resolve().parent.parent
+MODEL_DIR     = REPO_ROOT / "models" / MODEL_STR
+CONFIG_PATH   = REPO_ROOT / "config" / "config.jsonc"
+PROCESSED_DIR = REPO_ROOT / "data" / "processed-flowmap"
+
 EXPORT_PATHS  = [
-    f"{MODEL_DIR}/complete_model_exported.pt2",
-    f"{MODEL_DIR}/final_model_exported.pt2",  # fallback
+    MODEL_DIR / "complete_model_exported.pt2",
+    MODEL_DIR / "final_model_exported.pt2",  # fallback
 ]
 
 SAMPLE_INDEX = 1           # which trajectory to plot
 OUTPUT_DIR   = None        # None -> <model_dir>/plots
 SEED         = 42
 
-# Query time selection
+# Query time selection on the PHYSICAL grid (normalization comes after)
 Q_COUNT = 100              # None or 0 for full dense grid
-Q_MODE  = "uniform"        # Options: uniform, random, log_uniform, anchors
+Q_MODE  = "uniform"        # Options: uniform, random, log_uniform
 
 # Plot styling
 CONNECT_LINES = True
@@ -32,19 +41,18 @@ MARKER_EVERY  = 5
 # =========================
 #     ENV & IMPORTS
 # =========================
-import os, sys
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"]      = "1"
 
-from pathlib import Path
 import numpy as np
 import torch
 torch.set_num_threads(1)
 import matplotlib.pyplot as plt
 from torch.export import load as torch_load
+import json5
 
 # Add src to path
-sys.path.append(str((Path(__file__).resolve().parent.parent / "src").resolve()))
+sys.path.append(str((REPO_ROOT / "src").resolve()))
 from utils import load_json, seed_everything
 from normalizer import NormalizationHelper
 
@@ -60,24 +68,16 @@ except Exception:
 def _find_exported_model():
     for p in EXPORT_PATHS:
         if Path(p).exists():
-            return p
+            return str(p)
     raise FileNotFoundError(f"No exported model found. Tried: {EXPORT_PATHS}")
-
-def _infer_device_from_module(m: torch.nn.Module) -> torch.device:
-    for t in list(m.parameters()) + list(m.buffers()):
-        return t.device
-    return torch.device("cpu")
 
 def _load_exported_model(path: str):
     prog = torch_load(path)
     mod  = prog.module()
-    dev  = _infer_device_from_module(mod)
-    if dev.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("Exported module is on CUDA but CUDA is unavailable.")
-    return mod, dev
+    return mod, torch.device("cpu")
 
-def _load_single_test_sample(data_dir: str, sample_idx: int | None):
-    test_shards = sorted((Path(data_dir) / "test").glob("shard_*.npz"))
+def _load_single_test_sample(data_dir: Path, sample_idx: int | None):
+    test_shards = sorted((data_dir / "test").glob("shard_*.npz"))
     if not test_shards:
         raise RuntimeError(f"No test shards in {data_dir}/test")
 
@@ -90,56 +90,28 @@ def _load_single_test_sample(data_dir: str, sample_idx: int | None):
     if sample_idx is None or not (0 <= sample_idx < N):
         sample_idx = np.random.default_rng(SEED).integers(0, N)
     return {
-        "x0":     x0[sample_idx:sample_idx+1],               # [1,S]
-        "y_true": y[sample_idx],                             # [M,S]
-        "t_phys": tvec[sample_idx] if tvec.ndim == 2 else tvec,  # [M]
-        "globals": g[sample_idx:sample_idx+1],               # [1,G]
+        "y0":     y[sample_idx:sample_idx+1, 0, :],                # [1,S] (state at first time)
+        "y_true": y[sample_idx],                                   # [M,S]
+        "t_phys": tvec[sample_idx] if tvec.ndim == 2 else tvec,    # [M]
+        "globals": g[sample_idx:sample_idx+1],                     # [1,G]
         "sample_idx": int(sample_idx),
     }
 
-def _normalize_time(norm: NormalizationHelper, t_phys: np.ndarray, t_name: str, device: torch.device):
-    t = torch.as_tensor(t_phys, dtype=torch.float32, device=device).view(-1, 1)
-    t_norm = norm.normalize(t, [t_name]).view(-1)
-    if not torch.isfinite(t_norm).all():
-        raise RuntimeError("Normalized time contains non-finite values")
-    return t_norm
+def _normalize_dt(norm: NormalizationHelper, dt_phys: np.ndarray | torch.Tensor, device: torch.device):
+    """Flow-map: normalize Δt with the dt-spec (e.g., log-min-max)."""
+    if not isinstance(dt_phys, torch.Tensor):
+        dt = torch.as_tensor(dt_phys, dtype=torch.float32, device=device)
+    else:
+        dt = dt_phys.to(device=device, dtype=torch.float32)
+    dt = torch.clamp(dt, min=float(getattr(norm, "epsilon", 1e-25)))
+    dt_norm = norm.normalize_dt_from_phys(dt.view(-1))  # [K] in [0,1]
+    return dt_norm
 
-def _denorm_time(norm: NormalizationHelper, t_norm: torch.Tensor, t_name: str):
-    try:
-        return norm.denormalize(t_norm.view(-1, 1), [t_name]).view(-1).cpu().numpy()
-    except Exception:
-        return t_norm.detach().cpu().numpy()
-
-def _load_anchor_times(data_dir: str, q_count: int | None, norm: NormalizationHelper, t_name: str, device: torch.device):
-    candidates = [
-        Path(data_dir).parent / "latent_data" / "latent_shard_index.json",
-        Path(data_dir) / "latent" / "latent_shard_index.json",
-    ]
-    for fp in candidates:
-        if fp.exists():
-            anchors = load_json(fp).get("trunk_times")
-            if not anchors:
-                break
-            a = np.asarray(anchors, dtype=np.float32)
-            if q_count and q_count < a.size:
-                idx = np.linspace(0, a.size - 1, q_count).round().astype(int)
-                a = a[idx]
-            t_norm_sel = torch.tensor(a, dtype=torch.float32, device=device)
-            t_phys_sel = _denorm_time(norm, t_norm_sel, t_name)
-            return t_norm_sel, t_phys_sel, None
-    return None
-
-def _select_query_times(mode: str, count: int | None, t_phys: np.ndarray, t_norm_dense: torch.Tensor,
-                        data_dir: str, norm: NormalizationHelper, t_name: str, device: torch.device):
-    M = int(t_norm_dense.numel())
+def _select_query_indices(mode: str, count: int | None, t_phys: np.ndarray):
+    """Select indices into the dense physical time grid for evaluation."""
+    M = int(t_phys.size)
     if not count or count >= M:
-        return t_norm_dense, t_phys, np.arange(M, dtype=int)
-
-    if mode == "anchors":
-        r = _load_anchor_times(data_dir, count, norm, t_name, device)
-        if r is not None:
-            return r
-        mode = "uniform"
+        return np.arange(M, dtype=int)
 
     rng = np.random.default_rng(SEED)
     if mode == "uniform":
@@ -159,28 +131,17 @@ def _select_query_times(mode: str, count: int | None, t_phys: np.ndarray, t_norm
                 idx  = np.sort(np.r_[idx, rest[:max(0, count - idx.size)]])
     else:
         raise ValueError(f"Unsupported mode: {mode}")
-
-    return t_norm_dense[idx], t_phys[idx], idx
+    return idx
 
 @torch.inference_mode()
-def _predict(fn, x0_norm: torch.Tensor, g_norm: torch.Tensor, t_norm_sel: torch.Tensor,
+def _predict(fn, y0_norm: torch.Tensor, g_norm: torch.Tensor, dt_norm_sel: torch.Tensor,
              norm: NormalizationHelper, species: list[str]) -> np.ndarray:
-    y_norm = fn(x0_norm, g_norm, t_norm_sel).squeeze(0)  # [K,S]
+    """Call exported module and denormalize species back to physical space."""
+    y_norm = fn(y0_norm, g_norm, dt_norm_sel).squeeze(0)  # [K,S]
     return norm.denormalize(y_norm, species).cpu().numpy()
 
-@torch.inference_mode()
-def _time_sensitivity(fn, x0_norm, g_norm, t_norm_sel):
-    if t_norm_sel.numel() < 2:
-        return 0.0
-    d = (fn(x0_norm, g_norm, t_norm_sel[:1]) - fn(x0_norm, g_norm, t_norm_sel[-1:])).abs().mean()
-    val = float(d.item())
-    print(f"[CHECK] Mean |Δpred| (first vs last time) = {val:.3e}")
-    return val
-
-def _compute_errors(y_pred: np.ndarray, y_true: np.ndarray, idx, t_sel, t_dense, species: list[str]):
-    if idx is None:
-        td = t_dense.detach().cpu().numpy()
-        idx = np.array([np.abs(td - float(t)).argmin() for t in t_sel.cpu()], dtype=int)
+def _compute_errors(y_pred: np.ndarray, y_true: np.ndarray, idx, species: list[str]):
+    """Compare predictions to ground truth at selected indices."""
     y_true_aligned = y_true[idx, :]
     rel = np.abs(y_pred - y_true_aligned) / (np.abs(y_true_aligned) + 1e-10)
 
@@ -217,9 +178,10 @@ def _plot(t_phys, y_true, t_phys_sel, y_pred, sample_idx, species, q_mode, q_cou
     ], loc='lower left', fontsize=10)
 
     ax.set_xlabel("Time (s)"); ax.set_ylabel("Species Abundance")
-    ax.set_title(f"AE-DeepONet vs Ground Truth (Sample {sample_idx}) — {q_mode} K={q_count}")
+    ax.set_title(f"Flow-map DeepONet vs Ground Truth (Sample {sample_idx}) — {q_mode} K={q_count}")
     plt.tight_layout(); plt.savefig(out_path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[OK] Plot saved to {out_path}")
+
 
 # =========================
 #           MAIN
@@ -227,43 +189,71 @@ def _plot(t_phys, y_true, t_phys_sel, y_pred, sample_idx, species, q_mode, q_cou
 def main():
     seed_everything(SEED)
 
-    cfg        = load_json(Path(CONFIG_PATH))
+    cfg        = json5.load(open(CONFIG_PATH, "r"))
     species    = cfg["data"]["species_variables"]
     globals_v  = cfg["data"]["global_variables"]
-    time_name  = cfg["data"]["time_variable"]
 
-    out_dir = Path(OUTPUT_DIR) if OUTPUT_DIR else (Path(MODEL_DIR) / "plots")
+    out_dir = Path(OUTPUT_DIR) if OUTPUT_DIR else (MODEL_DIR / "plots")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     model_path     = _find_exported_model()
     fn, model_dev  = _load_exported_model(model_path)
 
-    norm = NormalizationHelper(load_json(Path(PROCESSED_DIR) / "normalization.json"),
-                               model_dev, cfg)
+    norm = NormalizationHelper(load_json(PROCESSED_DIR / "normalization.json"))
 
     data = _load_single_test_sample(PROCESSED_DIR, SAMPLE_INDEX)
 
-    x0 = torch.from_numpy(data["x0"]).to(model_dev).contiguous()
-    g  = torch.from_numpy(data["globals"]).to(model_dev).contiguous()
-    x0n = norm.normalize(x0, species)
+    # Normalize inputs
+    y0 = torch.from_numpy(data["y0"]).to(model_dev).contiguous()          # [1,S]
+    g  = torch.from_numpy(data["globals"]).to(model_dev).contiguous()      # [1,G]
+    y0n = norm.normalize(y0, species)
     gn  = norm.normalize(g,  globals_v)
 
-    t_norm_dense = _normalize_time(norm, data["t_phys"], time_name, model_dev)
-    t_sel, t_phys_sel, idx = _select_query_times(
-        Q_MODE, Q_COUNT, data["t_phys"], t_norm_dense, PROCESSED_DIR, norm, time_name, model_dev
-    )
+    # Dense physical time grid for this trajectory
+    t_phys_dense = data["t_phys"].astype(np.float64)
+    t0 = float(t_phys_dense[0])
 
-    print(f"[INFO] Query mode={Q_MODE}, count={int(t_sel.numel())}")
-    y_pred = _predict(fn, x0n, gn, t_sel, norm, species)
+    # Select query indices on the PHYSICAL time grid
+    M   = int(t_phys_dense.size)
+    idx = np.arange(M, dtype=int) if (not Q_COUNT or Q_COUNT >= M) else None
+    if idx is None:
+        # Subsample per mode
+        rng = np.random.default_rng(SEED)
+        if Q_MODE == "uniform":
+            idx = np.linspace(0, M - 1, Q_COUNT).round().astype(int)
+        elif Q_MODE == "random":
+            idx = np.sort(rng.choice(M, size=Q_COUNT, replace=False))
+        elif Q_MODE == "log_uniform":
+            pos = t_phys_dense[t_phys_dense > 0]
+            if pos.size == 0:
+                idx = np.linspace(0, M - 1, Q_COUNT).round().astype(int)
+            else:
+                tmin, tmax = float(pos.min()), float(t_phys_dense.max())
+                grid = np.logspace(np.log10(tmin), np.log10(tmax), Q_COUNT)
+                idx  = np.unique(np.array([np.abs(t_phys_dense - g).argmin() for g in grid], dtype=int))
+                if idx.size < Q_COUNT:
+                    rest = np.setdiff1d(np.arange(M), idx)
+                    idx  = np.sort(np.r_[idx, rest[:max(0, Q_COUNT - idx.size)]])
+        else:
+            raise ValueError(f"Unsupported Q_MODE: {Q_MODE}")
 
-    _time_sensitivity(fn, x0n, gn, t_sel)
+    t_phys_sel  = t_phys_dense[idx]
+    dt_phys_sel = np.maximum(t_phys_sel - t0, 0.0)
+    dt_norm_sel = _normalize_dt(norm, dt_phys_sel, model_dev)
 
-    out_png = out_dir / f"predictions_K{int(t_sel.numel())}_{Q_MODE}_sample_{data['sample_idx']}.png"
-    _plot(data["t_phys"], data["y_true"], t_phys_sel, y_pred,
-          data["sample_idx"], species, Q_MODE, int(t_sel.numel()),
+    print(f"[INFO] Flow-map inference: Query mode={Q_MODE}, K={int(dt_norm_sel.numel())}")
+
+    # Predict (fn expects normalized Δt)
+    y_pred = _predict(fn, y0n, gn, dt_norm_sel, norm, species)
+
+    # Plot against ground truth at the selected PHYSICAL times
+    out_png = out_dir / f"predictions_K{int(dt_norm_sel.numel())}_{Q_MODE}_sample_{data['sample_idx']}.png"
+    _plot(t_phys_dense, data["y_true"], t_phys_sel, y_pred,
+          data["sample_idx"], species, Q_MODE, int(dt_norm_sel.numel()),
           CONNECT_LINES, MARKER_EVERY, out_png)
 
-    _compute_errors(y_pred, data["y_true"], idx, t_sel, t_norm_dense, species)
+    # Error metrics (align by selected indices)
+    _ = _compute_errors(y_pred, data["y_true"], idx, species)
 
 if __name__ == "__main__":
     main()
