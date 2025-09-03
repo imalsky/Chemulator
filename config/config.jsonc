@@ -154,7 +154,31 @@
     "times_per_anchor": 32,
     
     // Whether to use same time offsets for all samples in batch
-    // Set true only if time grid is truly uniform across trajectories
+    // 
+    // When true (shared offsets):
+    //   - Generates ONE set of K offset indices per batch
+    //   - All samples use identical offsets (e.g., all use [+5, +12, +27, ...] steps)
+    //   - Different samples still have different targets due to different anchors
+    //   - Pro: ~1-2% faster - better GPU utilization, coalesced memory access
+    //   - Pro: Simpler computation path, single random sampling per batch
+    //   - Con: Less temporal diversity within each batch
+    //   - Con: All samples see same temporal patterns, potentially slower exploration
+    //   Example: If offsets=[5,15,30], Sample1(anchor@10)→[15,25,40], 
+    //            Sample2(anchor@20)→[25,35,50], Sample3(anchor@35)→[40,50,65]
+    //
+    // When false (independent offsets):
+    //   - Each sample independently samples its K offsets
+    //   - Maximum sampling diversity - every sample explores different temporal patterns
+    //   - Pro: Better exploration of time×position space per batch
+    //   - Pro: Potentially faster convergence and better generalization
+    //   - Con: ~1-2% slower due to more random operations and scattered memory access
+    //   - Con: Less efficient GPU utilization (divergent execution paths)
+    //   Example: Sample1 offsets=[3,18,41], Sample2 offsets=[7,22,29], 
+    //            Sample3 offsets=[11,15,38] - all different
+    //
+    // Recommendation: Set false for maximum diversity (especially with large K),
+    //                 set true if training for many epochs where diversity 
+    //                 accumulates across batches, or if efficiency is critical
     "share_times_across_batch": false,
     
     // Precompute dt normalization lookup table (requires shared time grid)
