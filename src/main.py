@@ -292,6 +292,11 @@ def main() -> None:
     # Setup work directory
     work_dir = Path(cfg["paths"]["work_dir"]).expanduser().resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save the configuration used for this run
+    config_save_path = work_dir / "config.json"
+    dump_json(config_save_path, cfg)
+    logger.info(f"Saved training configuration to {config_save_path}")
 
     # Initialize hardware and reproducibility
     seed_everything(int(cfg["system"]["seed"]))
