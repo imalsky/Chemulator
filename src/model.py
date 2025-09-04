@@ -333,10 +333,10 @@ def create_model(config: dict) -> FlowMapDeepONet:
     """
     # --- Resolve data dims ---
     data_cfg = config.get("data", {})
-    species_vars = data_cfg.get("target_species_variables") or data_cfg.get("species_variables")
+    species_vars = data_cfg.get("species_variables")
     global_vars = data_cfg.get("global_variables", [])
     if not species_vars:
-        raise KeyError("data.species_variables or data.target_species_variables must be set")
+        raise KeyError("data.species_variables must be set and non-empty")
     if global_vars is None:
         raise KeyError("data.global_variables must be set (use [] for none)")
 
@@ -353,11 +353,6 @@ def create_model(config: dict) -> FlowMapDeepONet:
     trunk_dedup   = bool(mcfg.get("trunk_dedup", False))
     activation    = str(mcfg.get("activation", "gelu"))
 
-    # --- Dropout (single knob, with per-subnet overrides) ---
-    dropout        = float(mcfg.get("dropout", 0.0))
-    branch_dropout = float(mcfg.get("branch_dropout", dropout))
-    trunk_dropout  = float(mcfg.get("trunk_dropout",  dropout))
-
     return FlowMapDeepONet(
         state_dim=state_dim,
         global_dim=global_dim,
@@ -368,6 +363,6 @@ def create_model(config: dict) -> FlowMapDeepONet:
         predict_delta=predict_delta,
         trunk_dedup=trunk_dedup,
         activation_name=activation,
-        branch_dropout=branch_dropout,
-        trunk_dropout=trunk_dropout,
+        branch_dropout=float(mcfg.get("branch_dropout", mcfg.get("dropout", 0.0))),
+        trunk_dropout=float(mcfg.get("trunk_dropout",  mcfg.get("dropout", 0.0))),
     )
