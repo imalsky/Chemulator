@@ -507,17 +507,10 @@ class Trainer:
                 )
             
             if B_pred != B_target:
-                raise RuntimeError(
-                    f"Batch size mismatch: "
-                    f"Predictions batch={B_pred}, Target batch={B_target}"
-                )
+                raise RuntimeError(f"Batch size mismatch")
             
             if S_pred != S_target:
-                raise RuntimeError(
-                    f"State dimension mismatch: "
-                    f"Predictions S={S_pred}, Target S={S_target}. "
-                    f"Check model configuration and target_species_variables."
-                )
+                raise RuntimeError(f"State dimension mismatch")
         
         elif pred.ndim == 2 and target.ndim == 2:
             # Both are 2D - verify dimensions match
@@ -531,19 +524,11 @@ class Trainer:
                 )
             
             if S_pred != S_target:
-                raise RuntimeError(
-                    f"State dimension mismatch: "
-                    f"Predictions S={S_pred}, Target S={S_target}. "
-                    f"Check model configuration and target_species_variables."
-                )
+                raise RuntimeError(f"State dimension mismatch")
         
         else:
             # Unexpected dimensionality
-            raise RuntimeError(
-                f"Unexpected tensor dimensions: "
-                f"Predictions ndim={pred.ndim} shape={tuple(pred.shape)}, "
-                f"Target ndim={target.ndim} shape={tuple(target.shape)}"
-            )
+            raise RuntimeError(f"Unexpected tensor dimensions")
         
         return pred, target
     

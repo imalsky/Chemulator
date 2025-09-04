@@ -93,7 +93,7 @@ class DataPreprocessor:
         }
         self._valid_group_names = {}
         self._canonical_time = None
-    
+
     def _load_configuration(self) -> None:
         """Load configuration parameters."""
         # Paths
@@ -103,22 +103,19 @@ class DataPreprocessor:
         self.processed_dir = Path(load_config_value(
             self.cfg, ["paths", "processed_data_dir"], required=True
         ))
-        
+
         # Data schema
         data_cfg = self.cfg.get("data", {})
         self.species_vars = list(load_config_value(
             data_cfg, ["species_variables"], required=True
         ))
-        self.target_species_vars = list(
-            data_cfg.get("target_species_variables", self.species_vars)
-        )
         self.global_vars = list(load_config_value(
             data_cfg, ["global_variables"], required=True
         ))
         self.time_key = str(load_config_value(
             data_cfg, ["time_variable"], required=True
         ))
-        
+
         # Normalization
         norm_cfg = self.cfg.get("normalization", {})
         self.default_method = str(norm_cfg["default_method"])
@@ -126,7 +123,7 @@ class DataPreprocessor:
         self.epsilon = float(norm_cfg["epsilon"])
         self.min_std = float(norm_cfg["min_std"])
         self.clamp_value = float(norm_cfg["clamp_value"])
-        
+
         # Preprocessing
         preproc_cfg = self.cfg.get("preprocessing", {})
         self.npz_compressed = bool(load_config_value(
@@ -141,12 +138,11 @@ class DataPreprocessor:
         self.min_value_threshold = float(load_config_value(
             preproc_cfg, ["min_value_threshold"], required=True
         ))
-        
+
         # Worker configuration
         requested_workers = int(load_config_value(
             preproc_cfg, ["num_workers"], default=0
         ))
-        
         if len(self.raw_files) <= 2:
             self.num_workers = 0
             if requested_workers > 0:
@@ -160,7 +156,7 @@ class DataPreprocessor:
             else:
                 cpu_count = os.cpu_count() or 1
                 self.num_workers = min(4, cpu_count, len(self.raw_files))
-        
+
         # Training configuration
         train_cfg = self.cfg.get("training", {})
         self.val_fraction = float(load_config_value(
@@ -176,7 +172,7 @@ class DataPreprocessor:
         self.max_steps = int(load_config_value(
             train_cfg, ["max_steps"], required=True
         ))
-        
+
         # Storage dtype
         self.storage_dtype = get_storage_dtype(self.cfg)
     
@@ -952,17 +948,17 @@ class DataPreprocessor:
             "clamp_value": self.clamp_value,
             "dt": dt_spec
         }
-    
+
     def _write_shard_index(self, shards_metadata: Dict[str, List]) -> None:
         """Write shard index file."""
         T = int(self._canonical_time.shape[0]) if self._canonical_time is not None else 0
-        
+
         shard_index = {
             "sequence_mode": True,
             "variable_length": False,
             "M_per_sample": T,
             "n_input_species": len(self.species_vars),
-            "n_target_species": len(self.target_species_vars),
+            "n_target_species": len(self.species_vars),
             "n_globals": len(self.global_vars),
             "compression": "npz",
             "splits": {
@@ -973,10 +969,10 @@ class DataPreprocessor:
                 for key, value in shards_metadata.items()
             }
         }
-        
+
         with open(self.processed_dir / "shard_index.json", "w", encoding="utf-8") as f:
             json.dump(shard_index, f, indent=2)
-        
+
         self.logger.info("Wrote shard_index.json")
     
     def _write_preprocessing_summary(self, split_counts: Dict[str, int]) -> None:

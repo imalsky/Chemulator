@@ -29,14 +29,14 @@
       "data/raw/run11024-result.h5",
       "data/raw/run11025-result.h5"
     ],
-    
+
     // Directory where preprocessed NPZ shards and normalization.json will be written
     "processed_data_dir": "data/processed-flowmap",
-    
+
     // Directory for training outputs (checkpoints, logs, best model)
-    "work_dir": "models/deeponet-flowmap"
+    "work_dir": "models/deeponet-flowmap_v2"
   },
-  
+
   // Variable definitions
   "data": {
     // List of species variables to extract from HDF5 files
@@ -54,55 +54,38 @@
       "OH_evolution",
       "O_evolution"
     ],
-    
-    // Target species for model output (can differ from input species)
-    // If same as species_variables, model predicts all species
-    "target_species_variables": [
-      "C2H2_evolution",
-      "CH4_evolution",
-      "CO2_evolution",
-      "CO_evolution",
-      "H2O_evolution",
-      "H2_evolution",
-      "HCN_evolution",
-      "H_evolution",
-      "N2_evolution",
-      "NH3_evolution",
-      "OH_evolution",
-      "O_evolution"
-    ],
-    
+
     // Global conditioning parameters (constant per trajectory)
     "global_variables": ["P", "T"],
-    
+
     // Name of time array in HDF5 groups
     "time_variable": "t_time"
   },
-  
+
   // Preprocessing configuration
   "preprocessing": {
     // Minimum value threshold - trajectories with any value below this are dropped
     "min_value_threshold": 1e-25,
-    
+
     // Number of trajectories to bundle per NPZ shard file
     "trajectories_per_shard": 1024,
-    
+
     // Whether to compress NPZ files (false for faster I/O)
     "npz_compressed": false,
-    
+
     // Number of parallel workers for HDF5 scanning (0 = serial)
     "num_workers": 14,
-    
+
     // Chunk size for reading HDF5 datasets (0 = auto-detect from dataset)
     "hdf5_chunk_size": 0
   },
-  
+
   // Normalization configuration
   "normalization": {
     // Default normalization method if not specified per-variable
     // Options: "standard", "min-max", "log-standard", "log-min-max"
     "default_method": "log-standard",
-    
+
     // Per-variable normalization method overrides
     "methods": {
       "dt": "log-min-max",      // Time differences always use log-min-max
@@ -111,28 +94,28 @@
       "T": "standard"           // Temperature in linear scale
       // Species variables use default_method unless specified here
     },
-    
+
     // Floor value before taking log10 to avoid log(0)
     "epsilon": 1e-25,
-    
+
     // Minimum standard deviation to prevent division by zero
     "min_std": 1e-8,
-    
+
     // Maximum absolute value for normalized outputs (prevents outliers)
     "clamp_value": 1e6
   },
-  
+
   // Dataset configuration
   "dataset": {
     // Sampling strategy for target time points:
-    // 
+    //
     // When true (uniform offset sampling):
     //   - Samples offsets uniformly from [min_steps, max_steps] range
     //   - Each offset value (1, 2, ..., 99) has equal probability
     //   - Adjusts anchor positions backward if needed to accommodate large offsets
     //   - Pro: Unbiased learning across all timescales (short and long-term equally)
     //   - Con: Forces anchors to early trajectory positions when K is large
-    //   Example: With K=80, all anchors forced to positions [0-20] to accommodate 
+    //   Example: With K=80, all anchors forced to positions [0-20] to accommodate
     //            potential offset=99, missing 80% of possible anchor positions
     //
     // When false (per-row window sampling):
@@ -149,36 +132,12 @@
 
     // Enable multi-time prediction mode (K > 1 targets per anchor)
     "multi_time_per_anchor": true,
-    
+
     // Number of target times to predict per anchor (K)
-    "times_per_anchor": 32,
-    
+    "times_per_anchor": 64,
+
     // Whether to use same time offsets for all samples in batch
-    // 
-    // When true (shared offsets):
-    //   - Generates ONE set of K offset indices per batch
-    //   - All samples use identical offsets (e.g., all use [+5, +12, +27, ...] steps)
-    //   - Different samples still have different targets due to different anchors
-    //   - Pro: ~1-2% faster - better GPU utilization, coalesced memory access
-    //   - Pro: Simpler computation path, single random sampling per batch
-    //   - Con: Less temporal diversity within each batch
-    //   - Con: All samples see same temporal patterns, potentially slower exploration
-    //   Example: If offsets=[5,15,30], Sample1(anchor@10)→[15,25,40], 
-    //            Sample2(anchor@20)→[25,35,50], Sample3(anchor@35)→[40,50,65]
-    //
-    // When false (independent offsets):
-    //   - Each sample independently samples its K offsets
-    //   - Maximum sampling diversity - every sample explores different temporal patterns
-    //   - Pro: Better exploration of time×position space per batch
-    //   - Pro: Potentially faster convergence and better generalization
-    //   - Con: ~1-2% slower due to more random operations and scattered memory access
-    //   - Con: Less efficient GPU utilization (divergent execution paths)
-    //   Example: Sample1 offsets=[3,18,41], Sample2 offsets=[7,22,29], 
-    //            Sample3 offsets=[11,15,38] - all different
-    //
-    // Recommendation: Set false for maximum diversity (especially with large K),
-    //                 set true if training for many epochs where diversity 
-    //                 accumulates across batches, or if efficiency is critical
+    // Set true only if time grid is truly uniform across trajectories
     "share_times_across_batch": false,
     
     // Precompute dt normalization lookup table (requires shared time grid)
@@ -213,7 +172,7 @@
     
     // Data type for staged tensors: "float32", "bf16", or "fp16"
     // Note: Keep time-sensitive inputs at float32 for precision
-    "storage_dtype": "float32"
+    "storage_dtype": "bf16"
   },
   
   // Model architecture configuration

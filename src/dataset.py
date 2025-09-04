@@ -110,19 +110,19 @@ class FlowMapPairsDataset(Dataset):
     """
 
     def __init__(
-        self,
-        processed_root: Path | str,
-        split: str,
-        config: dict,
-        *,
-        pairs_per_traj: int = 64,
-        min_steps: int = 1,
-        max_steps: Optional[int] = None,
-        preload_to_gpu: bool = False,
-        device: Optional[torch.device] = None,
-        dtype: torch.dtype = torch.float32,
-        seed: int = 42,
-        log_every_files: int = 50,
+            self,
+            processed_root: Path | str,
+            split: str,
+            config: dict,
+            *,
+            pairs_per_traj: int = 64,
+            min_steps: int = 1,
+            max_steps: Optional[int] = None,
+            preload_to_gpu: bool = False,
+            device: Optional[torch.device] = None,
+            dtype: torch.dtype = torch.float32,
+            seed: int = 42,
+            log_every_files: int = 50,
     ):
         super().__init__()
         self.root = Path(processed_root)
@@ -134,12 +134,11 @@ class FlowMapPairsDataset(Dataset):
         # Dataset cfg
         dcfg = self.cfg.get("dataset", {})
         self.require_dt_stats = bool(dcfg.get("require_dt_stats", True))
-        # We normalize Δt with *time* stats regardless of dt stats; this flag is harmless to keep.
         self.precompute_dt_table = bool(dcfg.get("precompute_dt_table", True))
         self.multi_time = bool(dcfg.get("multi_time_per_anchor", False))
         self.K = int(dcfg.get("times_per_anchor", 1)) if self.multi_time else 1
         self.share_offsets_across_batch = bool(dcfg.get("share_times_across_batch", False))
-        self.uniform_offset_sampling = bool(dcfg.get("uniform_offset_sampling", False))  # optional
+        self.uniform_offset_sampling = bool(dcfg.get("uniform_offset_sampling", False))
 
         # Manifest & normalization
         norm_path = self.root / "normalization.json"
@@ -156,7 +155,6 @@ class FlowMapPairsDataset(Dataset):
         # Time normalization setup
         self.time_var = self.cfg.get("data", {}).get("time_variable", "t_time")
         tn = getattr(self.norm, "time_norm", {}) or {}
-        # Prefer stats-driven transform; else fall back to config methods -> "log-min-max"
         self.time_method = tn.get(
             "time_transform",
             self.cfg.get("normalization", {}).get("methods", {}).get(self.time_var, "log-min-max")
@@ -168,10 +166,25 @@ class FlowMapPairsDataset(Dataset):
         scan = self._scan_shards()
         self.N = int(scan["total_trajectories"])
         self.T = int(scan["time_length"])
-        self.S = int(scan["state_dim"])
+        self.S_full = int(scan["state_dim"])
         self.G_dim = int(scan["global_dim"])
 
-        cfg_globals = self.cfg["data"].get("global_variables", [])
+        # Species variables from config - simplified, no targets
+        data_cfg = self.cfg.get("data", {})
+        self.species_vars = list(data_cfg.get("species_variables", []))
+        if not self.species_vars:
+            raise KeyError("config.data.species_variables must be set and non-empty.")
+        if len(self.species_vars) != self.S_full:
+            raise RuntimeError(
+                f"Shard species dim (S_full={self.S_full}) does not match "
+                f"len(config.data.species_variables)={len(self.species_vars)}. "
+                "Were the shards generated with a different species list?"
+            )
+
+        # Dataset species dimension is simply S_full
+        self.S = self.S_full
+
+        cfg_globals = data_cfg.get("global_variables", [])
         if self.G_dim > 0 and not cfg_globals:
             raise KeyError(f"Shards contain {self.G_dim} global feature(s), but config.data.global_variables is empty.")
 
@@ -190,7 +203,8 @@ class FlowMapPairsDataset(Dataset):
 
         # Time grids
         if self.has_shared_grid:
-            self.shared_time_grid = torch.from_numpy(shared_grid_ref.astype(np.float64, copy=False)).to(self._stage_device)
+            self.shared_time_grid = torch.from_numpy(shared_grid_ref.astype(np.float64, copy=False)).to(
+                self._stage_device)
             self.time_grid_per_row = None
         else:
             self.shared_time_grid = None
@@ -199,8 +213,8 @@ class FlowMapPairsDataset(Dataset):
         # Load data & normalize Y on device
         self._load_and_stage_data()
 
-        # Optional Δt lookup (normalized with *time* stats)
-        self.dt_table: Optional[torch.Tensor] = None
+        # Optional Δt lookup (normalized with dt spec)
+        self.dt_table = None
         if self.has_shared_grid and self.precompute_dt_table:
             self._precompute_dt_table_from_time_stats()
 
@@ -315,14 +329,13 @@ class FlowMapPairsDataset(Dataset):
             g = torch.from_numpy(g_np.astype(np.float32, copy=False)).to(self._stage_device)
             global_vars = self.cfg["data"].get("global_variables", [])
             if global_vars:
-                g = self.norm.normalize(g, global_vars)                  # [n,G] normalized
+                g = self.norm.normalize(g, global_vars)  # [n,G] normalized
             self.G[sl] = g.to(dtype=torch.float32, non_blocking=True)
 
-            # -------- Targets Y (normalize via Helper) --------
-            y = torch.from_numpy(y_np)                                   # [n, T, S]
-            target_vars = self.cfg["data"].get("target_species_variables",
-                                            self.cfg["data"]["species_variables"])
-            y_norm = self.norm.normalize(y, target_vars).reshape(n, self.T, self.S)
+            # -------- Species Y (normalize via Helper) --------
+            y = torch.from_numpy(y_np)  # [n, T, S]
+            species_vars = self.cfg["data"]["species_variables"]
+            y_norm = self.norm.normalize(y, species_vars).reshape(n, self.T, self.S)
             self.Y[sl] = y_norm.to(self._stage_device, dtype=torch.float32, non_blocking=True)
 
             # -------- Time grids --------
