@@ -1,0 +1,228 @@
+#!/bin/bash
+# --- PBS ---
+#PBS -N gh200_train_job
+#PBS -q gpu_normal
+#PBS -l select=1:ncpus=72:ngpus=1:model=gh200
+#PBS -l walltime=24:00:00
+#PBS -W group_list=s2458
+#PBS -j oe
+# --- end PBS ---
+
+set -euo pipefail
+
+# ===== Canonical repo root & logging (follow bind mounts/symlinks) =====
+cd -P "${PBS_O_WORKDIR:?}"
+export ROOT="$(/bin/pwd -P)"
+mkdir -p "$ROOT/logs"
+LOG="$ROOT/logs/${PBS_JOBNAME:-job}.${PBS_JOBID:-$$}.log"
+exec > >(stdbuf -oL -eL tee -a "$LOG") 2>&1
+
+echo "#####################################################"
+echo "Job starting on $(hostname) at $(date)"
+echo "#####################################################"
+echo "Changed directory to: $ROOT"
+
+# ===== Environment (modules + conda) =====
+echo "Setting up environment..."
+module purge
+module use -a /swbuild/analytix/tools/modulefiles
+module load miniconda3/gh2
+
+CONDA_BASE=$(conda info --base)
+# shellcheck disable=SC1090
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+
+set +e
+conda activate pyt2_7_gh
+ACT_RC=$?
+set -e
+# quiet env-log if unavailable
+conda env-log log -n pyt2_7_gh >/dev/null 2>&1 || true
+
+if [ $ACT_RC -ne 0 ] || [ -z "${CONDA_PREFIX:-}" ] || [[ "${CONDA_PREFIX##*/}" != "pyt2_7_gh" ]]; then
+  echo "ERROR: failed to activate conda env 'pyt2_7_gh'"; exit 2
+fi
+echo "Conda env: $CONDA_PREFIX"
+
+PY="$(command -v python)"
+echo "Python: $PY"
+
+# ===== Stability & FS toggles =====
+export HDF5_USE_FILE_LOCKING=FALSE
+export PYTHONNOUSERSITE=1
+
+# ===== Project paths =====
+SRC="$ROOT/src"
+VENDOR="$ROOT/.deps"
+mkdir -p "$VENDOR"
+
+# Ensure project + vendored wheels on PYTHONPATH
+export PYTHONPATH="$VENDOR:$ROOT:$SRC:${PYTHONPATH:-}"
+
+# ===== Vendor numpy/h5py (to avoid re-pulling numpy deps) =====
+echo "Cleaning any stale NumPy in $VENDOR ..."
+rm -rf "$VENDOR/numpy" "$VENDOR"/numpy-*.dist-info "$VENDOR"/numpy.libs || true
+
+echo "Ensuring NumPy (binary wheel) for this interpreter..."
+"$PY" - <<'PY' || true
+import numpy, sys
+print("numpy present:", numpy.__version__, "from", numpy.__file__)
+PY
+
+if ! "$PY" - <<'PY'
+ok=True
+try:
+    import numpy, sys
+    print("numpy present:", numpy.__version__, "from", numpy.__file__)
+except Exception as e:
+    print("numpy import failed pre-install:", repr(e)); ok=False
+import sys; sys.exit(0 if ok else 1)
+PY
+then
+  echo "Installing numpy==1.26.4 into $VENDOR ..."
+  "$PY" -m pip install --no-cache-dir --only-binary=:all: \
+    --target "$VENDOR" --no-deps --upgrade --force-reinstall "numpy==1.26.4"
+fi
+
+# Verify C-extension actually loads
+"$PY" - <<'PY'
+import importlib, numpy as np
+m = importlib.import_module('numpy.core._multiarray_umath')
+print("numpy:", np.__version__, "from", np.__file__)
+print("_multiarray_umath loaded from:", m.__file__)
+PY
+
+echo "Ensuring h5py (vendored, no deps)..."
+"$PY" - <<'PY' || true
+import h5py, sys
+print("h5py present:", h5py.__version__, "from", h5py.__file__)
+PY
+if ! "$PY" - <<'PY'
+ok=True
+try:
+    import h5py, sys
+    print("h5py present:", h5py.__version__, "from", h5py.__file__)
+except Exception as e:
+    print("h5py import failed pre-install:", repr(e)); ok=False
+import sys; sys.exit(0 if ok else 1)
+PY
+then
+  "$PY" -m pip install --no-cache-dir --only-binary=:all: \
+    --no-deps --target "$VENDOR" "h5py>=3.9,<3.15"
+  "$PY" - <<'PY'
+import h5py
+print("h5py (vendored):", h5py.__version__, "from", h5py.__file__)
+PY
+fi
+
+# Quick sanity printout
+"$PY" - <<'PY'
+import os, sys, numpy, h5py
+print("os.getcwd():", os.getcwd())
+print("ROOT env:   ", os.environ.get("ROOT"))
+print("src on sys.path:", any(p.endswith('/src') for p in sys.path))
+print("utils exists at ROOT/src:", os.path.exists(os.path.join(os.environ["ROOT"], "src", "utils.py")))
+print("numpy:", numpy.__version__, "from", numpy.__file__)
+print("h5py :", h5py.__version__,  "from", h5py.__file__)
+PY
+
+echo "---------------------------------"
+echo "GPU check:"
+"$PY" - <<'PY'
+import torch
+print("CUDA available:", torch.cuda.is_available())
+print("Device count:", torch.cuda.device_count())
+print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A")
+PY
+echo "---------------------------------"
+nvidia-smi || true
+
+# ===== Preflight raw data =====
+echo "Preflight: verifying raw files and h5py I/O..."
+"$PY" - <<'PY'
+import os, glob, h5py
+ROOT = os.environ["ROOT"]
+raw = os.path.join(ROOT, "data", "raw")
+files = sorted(glob.glob(os.path.join(raw, "*.h5"))) + sorted(glob.glob(os.path.join(raw, "*.hdf5")))
+print("Preflight ROOT:", ROOT)
+print("Using raw dir:", raw, "| count:", len(files))
+if not files:
+    raise SystemExit("ERROR: no HDF5 files in "+raw)
+with h5py.File(files[0], "r") as h:
+    print("Opened:", files[0], "| top keys:", list(h.keys())[:5])
+PY
+
+# ===== Phase A: PREPROCESS (MPI) — skip if normalization.json exists =====
+echo "Phase A: Preprocessing with MPI (32 ranks)…"
+
+# Decide whether to skip preprocessing (print SKIP=0/1 and PROC_DIR=...)
+DECISION_OUT="$("$PY" - <<'PY'
+from pathlib import Path
+import os, json
+from utils import load_json_config
+
+ROOT = Path(os.environ["ROOT"]).resolve()
+cfg  = load_json_config(ROOT / "config" / "config.jsonc")
+
+# processed_data_dir may be relative or absolute; resolve under ROOT and canonicalize
+pdir_cfg = cfg["paths"]["processed_data_dir"]
+proc_dir = (ROOT / pdir_cfg).resolve() if not Path(pdir_cfg).is_absolute() else Path(pdir_cfg).resolve()
+
+print(f"Processed dir (from config): {pdir_cfg}")
+print(f"Resolved processed dir: {proc_dir}")
+
+norm = proc_dir / "normalization.json"
+if norm.exists():
+    print(f"Found {norm} — skipping preprocessing.")
+    print(f"SKIP=1")
+else:
+    print("Normalization manifest not found — will run preprocessing.")
+    print(f"SKIP=0")
+print(f"PROC_DIR={proc_dir}")
+PY
+)"
+
+echo "$DECISION_OUT"
+eval "$(echo "$DECISION_OUT" | egrep '^(SKIP|PROC_DIR)=' )"
+
+if [ "${SKIP:-0}" -eq 0 ]; then
+  # small driver script for the preprocessor
+  cat > .preprocess.py <<'PY'
+from pathlib import Path
+from utils import load_json_config, setup_logging
+from preprocessor import DataPreprocessor
+cfg = load_json_config(Path("config/config.jsonc"))
+setup_logging()
+DataPreprocessor(cfg).run()
+PY
+
+  # 32 ranks * 2 threads = 64 (under 72 cores)
+  export OMP_NUM_THREADS=2
+  export MKL_NUM_THREADS=2
+  export OPENBLAS_NUM_THREADS=2
+  export NUMEXPR_NUM_THREADS=2
+
+  # HYDRA/OpenMPI: propagate env
+  mpiexec -np 32 -genvall "$PY" ./.preprocess.py
+
+  # unset threads for GPU phase
+  unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS
+fi
+
+# ===== Phase B: TRAIN single-process on the GPU =====
+echo "---------------------------------"
+echo "GPU check before training:"
+"$PY" - <<'PY'
+import torch
+print("CUDA available:", torch.cuda.is_available())
+print("Device count:", torch.cuda.device_count())
+print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A")
+PY
+echo "---------------------------------"
+
+echo "Phase B: Training single-process…"
+"$PY" -u src/main.py
+
+echo "#####################################################"
+echo "Job finished at $(date)"
+echo "#####################################################"

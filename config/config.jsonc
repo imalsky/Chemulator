@@ -1,59 +1,19 @@
 {
   // Data paths configuration
   "paths": {
-    // List of input HDF5 files containing trajectory data
-    "raw_data_files": [
-      "data/raw/run11001-result.h5",
-      "data/raw/run11002-result.h5",
-      "data/raw/run11003-result.h5",
-      "data/raw/run11004-result.h5",
-      "data/raw/run11005-result.h5",
-      "data/raw/run11006-result.h5",
-      "data/raw/run11007-result.h5",
-      "data/raw/run11008-result.h5",
-      "data/raw/run11009-result.h5",
-      "data/raw/run11010-result.h5",
-      "data/raw/run11011-result.h5",
-      "data/raw/run11012-result.h5",
-      "data/raw/run11013-result.h5",
-      "data/raw/run11014-result.h5",
-      "data/raw/run11015-result.h5",
-      "data/raw/run11016-result.h5",
-      "data/raw/run11017-result.h5",
-      "data/raw/run11018-result.h5",
-      "data/raw/run11019-result.h5",
-      "data/raw/run11020-result.h5",
-      "data/raw/run11021-result.h5",
-      "data/raw/run11022-result.h5",
-      "data/raw/run11023-result.h5",
-      "data/raw/run11024-result.h5",
-      "data/raw/run11025-result.h5"
-    ],
+    // IMPORTANT: Leave raw_data_files out to auto-scan ./data/raw for *.h5 / *.hdf5.
+    // The current preprocessor ignores any "raw_data_dir" field; it is hardcoded to "data/raw".
+    // "raw_data_files": [],
 
-    // Directory where preprocessed NPZ shards and normalization.json will be written
-    "processed_data_dir": "data/processed-flowmap",
-
-    // Directory for training outputs (checkpoints, logs, best model)
-    "work_dir": "models/deeponet-flowmap_v2"
+    // Repo-relative outputs (resolve under the checkout you qsub from)
+    "processed_data_dir": "data/processed",
+    "work_dir": "models/flowmap-deeponet"
   },
 
   // Variable definitions
   "data": {
-    // List of species variables to extract from HDF5 files
-    "species_variables": [
-      "C2H2_evolution",
-      "CH4_evolution",
-      "CO2_evolution",
-      "CO_evolution",
-      "H2O_evolution",
-      "H2_evolution",
-      "HCN_evolution",
-      "H_evolution",
-      "N2_evolution",
-      "NH3_evolution",
-      "OH_evolution",
-      "O_evolution"
-    ],
+    // Let preprocessing/hydration auto-detect and inject species_variables.
+    // "species_variables": [],
 
     // Global conditioning parameters (constant per trajectory)
     "global_variables": ["P", "T"],
@@ -64,218 +24,128 @@
 
   // Preprocessing configuration
   "preprocessing": {
-    // Minimum value threshold - trajectories with any value below this are dropped
-    "min_value_threshold": 1e-25,
+    // Drop any trajectory with values below threshold
+    "min_value_threshold": 1e-30,
 
-    // Number of trajectories to bundle per NPZ shard file
-    "trajectories_per_shard": 1024,
+    // Trajectories per NPZ shard
+    "trajectories_per_shard": 65536,
 
-    // Whether to compress NPZ files (false for faster I/O)
+    // NPZ compression off for faster I/O
     "npz_compressed": false,
 
-    // Number of parallel workers for HDF5 scanning (0 = serial)
-    "num_workers": 14,
+    // HDF5 scanning workers if not using MPI (ignored with MPI)
+    "num_workers": 12,
 
-    // Chunk size for reading HDF5 datasets (0 = auto-detect from dataset)
+    // 0 = auto-detect from dataset
     "hdf5_chunk_size": 0
   },
 
   // Normalization configuration
   "normalization": {
-    // Default normalization method if not specified per-variable
-    // Options: "standard", "min-max", "log-standard", "log-min-max"
     "default_method": "log-standard",
-
-    // Per-variable normalization method overrides
     "methods": {
-      "dt": "log-min-max",      // Time differences always use log-min-max
-      "t_time": "log-min-max",  // Absolute time normalization
-      "P": "log-min-max",       // Pressure in log scale
-      "T": "standard"           // Temperature in linear scale
-      // Species variables use default_method unless specified here
+      "dt":     "log-min-max",
+      "t_time": "log-min-max",
+      "P":      "log-min-max",
+      "T":      "standard"
     },
-
-    // Floor value before taking log10 to avoid log(0)
-    "epsilon": 1e-25,
-
-    // Minimum standard deviation to prevent division by zero
-    "min_std": 1e-8,
-
-    // Maximum absolute value for normalized outputs (prevents outliers)
+    "epsilon": 1e-30,
+    "min_std": 1e-10,
     "clamp_value": 1e6
   },
 
   // Dataset configuration
   "dataset": {
-    // Sampling strategy for target time points:
-    //
-    // When true (uniform offset sampling):
-    //   - Samples offsets uniformly from [min_steps, max_steps] range
-    //   - Each offset value (1, 2, ..., 99) has equal probability
-    //   - Adjusts anchor positions backward if needed to accommodate large offsets
-    //   - Pro: Unbiased learning across all timescales (short and long-term equally)
-    //   - Con: Forces anchors to early trajectory positions when K is large
-    //   Example: With K=80, all anchors forced to positions [0-20] to accommodate
-    //            potential offset=99, missing 80% of possible anchor positions
-    //
-    // When false (per-row window sampling):
-    //   - Keeps anchor at chosen position, samples from available future points
-    //   - Samples K targets from whatever points exist after the anchor
-    //   - Natural bias: short-term predictions more common than long-term
-    //   - Pro: Can use anchors anywhere in trajectory (full position diversity)
-    //   - Con: Less uniform coverage of timescales
-    //   Example: Anchor at position 70 can only sample 30 future points,
-    //            so gets 30 valid targets and 50 masked (if K=80)
-    //
-    // Recommendation: Use false with large K to maintain anchor diversity,
-    //                 use true with small K for unbiased temporal learning    "uniform_offset_sampling": false,
+    // Keep anchor diversity with large K
+    "uniform_offset_sampling": false,
 
-    // Enable multi-time prediction mode (K > 1 targets per anchor)
     "multi_time_per_anchor": true,
-
-    // Number of target times to predict per anchor (K)
     "times_per_anchor": 64,
 
-    // Whether to use same time offsets for all samples in batch
-    // Set true only if time grid is truly uniform across trajectories
+    // Only set true if time grid truly shared
     "share_times_across_batch": false,
-    
-    // Precompute dt normalization lookup table (requires shared time grid)
+
+    // Precompute Δt table if shared grid is used
     "precompute_dt_table": true,
-    
-    // Require dt statistics in normalization.json (should be true)
+
+    // Require dt stats in normalization.json
     "require_dt_stats": true,
-    
-    // Stage entire training dataset to GPU memory for fast access
+
+    // GPU-resident datasets for throughput (GH200 has the RAM for it)
     "preload_train_to_gpu": true,
-    
-    // Stage entire validation dataset to GPU memory
     "preload_val_to_gpu": true,
-    
-    // DataLoader workers for training (ignored when data is GPU-resident)
+
+    // With GPU-resident data, keep workers at 0
     "num_workers": 0,
-    
-    // DataLoader workers for validation
     "num_workers_val": 0,
-    
-    // Pin memory for CPU-GPU transfer (ignored when data is GPU-resident)
+
     "pin_memory": false,
     "pin_memory_val": false,
-    
-    // Number of batches to prefetch per worker
+
     "prefetch_factor": 2,
     "prefetch_factor_val": 2,
-    
-    // Keep workers alive between epochs
+
     "persistent_workers": false,
     "persistent_workers_val": false,
-    
-    // Data type for staged tensors: "float32", "bf16", or "fp16"
-    // Note: Keep time-sensitive inputs at float32 for precision
+
+    // Runtime dtype for staged tensors
     "storage_dtype": "bf16"
   },
-  
+
   // Model architecture configuration
   "model": {
-    // Dimension of basis functions (p)
     "p": 256,
-    
-    // Width of branch network hidden layers
     "branch_width": 1024,
-    
-    // Depth of branch network (number of hidden layers)
     "branch_depth": 4,
-    
-    // Hidden layer dimensions for trunk network
     "trunk_layers": [1024, 1024, 1024, 1024],
-    
-    // Predict residual (y_j - y_i) instead of direct y_j
     "predict_delta": false,
-    
-    // Deduplicate trunk evaluation for repeated dt values (not implemented)
     "trunk_dedup": false,
-    
-    // optional dropout
     "dropout": 0.0,
-    
-    // Activation function: "relu", "gelu", "silu", "tanh", "leakyrelu"
     "activation": "leakyrelu"
   },
-  
+
   // Training configuration
   "training": {
-    // Fraction of data for validation
     "val_fraction": 0.15,
-    
-    // Fraction of data for testing
     "test_fraction": 0.10,
-    
-    // Fraction of data to actually use (for debugging with smaller datasets)
     "use_fraction": 1.0,
-    
-    // Time step bounds for sampling: j - i ∈ [min_steps, max_steps]
+
     "min_steps": 1,
     "max_steps": 99,
-    
-    // Number of anchor points sampled per trajectory per epoch
-    "pairs_per_traj": 16,
-    
-    // Batch size for training
+
+    "pairs_per_traj": 32,
+
     "batch_size": 2048,
-    
-    // Number of training epochs
     "epochs": 200,
-    
-    // Initial learning rate for AdamW optimizer
     "lr": 5e-4,
-    
-    // Weight decay (L2 regularization)
     "weight_decay": 1e-5,
-    
-    // Number of warmup epochs for learning rate schedule
+
     "warmup_epochs": 10,
-    
-    // Minimum learning rate for cosine annealing
     "min_lr": 1e-7,
-    
-    // Gradient clipping value (0 = disabled)
     "gradient_clip": 1.0,
-    
-    // Use torch.compile for model optimization
+
     "torch_compile": true,
-    
-    // Maximum training steps per epoch (0 = no limit)
+
     "max_train_steps_per_epoch": 0,
-    
-    // Maximum validation batches (0 = full validation)
     "max_val_batches": 0
   },
-  
-  // Mixed precision training configuration
+
+  // Mixed precision
   "mixed_precision": {
-    // Precision mode: "bf16", "fp16", or "none"
-    // bf16 recommended for A100 GPUs
     "mode": "bf16"
   },
-  
+
   // System configuration
   "system": {
-    // Random seed for reproducibility
     "seed": 42,
-    
-    // Enable deterministic algorithms (reduces performance)
     "deterministic": false,
-    
-    // Enable TensorFloat-32 for matrix operations on Ampere GPUs
     "tf32": true,
-    
-    // Enable cuDNN autotuner for optimal convolution algorithms
     "cudnn_benchmark": true,
-    
-    // Number of OpenMP threads for CPU operations
+
+    // Target PyTorch intra-op threads (your hardware.py already sets this)
     "omp_threads": 12,
-    
-    // Data type for NPZ files on disk: "float32" or "float64"
+
+    // NPZ on disk
     "io_dtype": "float32"
   }
 }

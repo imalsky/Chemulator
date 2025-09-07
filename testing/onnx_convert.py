@@ -1,174 +1,197 @@
 #!/usr/bin/env python3
 """
-flowmap_ort_cpu.py — ONNX Runtime CPU runner for Flow-map DeepONet (K=1)
+ONNX Runtime CPU-only optimization + multi-thread benchmark for Flow-map DeepONet (K=1).
 
-Features
+- Loads flowmap_deeponet_k1.onnx (B dynamic, K=1 static)
 - CPUExecutionProvider only
-- Fixed, tuned threading (defaults: intra=6, inter=1)
-- Single session reused across calls
-- Correct IO binding with reusable OrtValues for zero-copy in/out
-- Works with FP32 or INT8 (dynamic-quantized) K=1 model
+- Graph opt = ORT_ENABLE_ALL; saves optimized model
+- Tunable intra_op threads; inter_op=1
+- Correct IO binding via OrtValue to reuse output buffers
+- Optional dynamic INT8 quantization (per-tensor) with ORT
+- Reports µs/sample and throughput for a grid of (B, threads)
 """
 
 from __future__ import annotations
 import os
+import sys
+import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
-import onnxruntime as ort
 
-# ---------------- Config ----------------
-REPO_ROOT = Path(__file__).resolve().parent.parent
-MODEL_DIR = REPO_ROOT / "models" / "flowmap-deeponet"
-MODEL_FP32 = MODEL_DIR / "flowmap_deeponet_k1.onnx"
-MODEL_INT8 = MODEL_DIR / "flowmap_deeponet_k1_int8.onnx"  # optional
+# -------- Paths --------
+PROJECT_ROOT = Path(__file__).resolve().parent
+REPO_ROOT    = PROJECT_ROOT.parent
 
-# Tuned for your results on M-series
-INTRA_THREADS = 6
-INTER_THREADS = 1
+MODEL_STR = "flowmap-deeponet"
+MODEL_DIR = REPO_ROOT / "models" / MODEL_STR
+ONNX_K1   = MODEL_DIR / "flowmap_deeponet_k1.onnx"
+CONFIG    = REPO_ROOT / "config" / "config.jsonc"
 
-# Optional: reduce spin/jitter on some libomp builds
-os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
-os.environ.setdefault("KMP_BLOCKTIME", "0")
+# -------- Benchmark settings --------
+BATCH_GRID = [128, 256, 512, 1024]   # adjust as needed
+INTRA_GRID = None                    # None -> derive from CPU count; or set like [4, 8, 12]
+WARMUP     = 20
+RUNS       = 100
+DO_QUANT   = True                    # dynamic INT8 pass (optional)
 
+# Add src/ for config loader
+sys.path.append(str((REPO_ROOT / "src").resolve()))
+from utils import load_json_config
 
-class FlowmapOrtRunner:
-    def __init__(self,
-                 onnx_path: Path,
-                 intra_threads: int = INTRA_THREADS,
-                 inter_threads: int = INTER_THREADS):
-        self.onnx_path = Path(onnx_path)
-        if not self.onnx_path.exists():
-            raise FileNotFoundError(self.onnx_path)
+def _cpu_count() -> int:
+    try:
+        import multiprocessing as mp
+        return mp.cpu_count()
+    except Exception:
+        return os.cpu_count() or 1
 
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        so.intra_op_num_threads = max(1, int(intra_threads))
-        so.inter_op_num_threads = max(1, int(inter_threads))
-        so.enable_cpu_mem_arena = True
-        so.enable_mem_pattern   = True
-        so.enable_mem_reuse     = True
-        # Save optimized graph alongside the model (faster reloads next time)
-        opt_path = self.onnx_path.with_suffix("").with_name(self.onnx_path.stem + ".opt.onnx")
-        so.optimized_model_filepath = str(opt_path)
+def _choose_intra_grid() -> List[int]:
+    if INTRA_GRID:
+        return [int(x) for x in INTRA_GRID]
+    cores = _cpu_count()
+    # representative sweep
+    grid = sorted(set([
+        max(1, cores // 4),
+        max(1, cores // 2),
+        cores
+    ]))
+    return grid
 
-        self.sess = ort.InferenceSession(str(self.onnx_path),
-                                         sess_options=so,
-                                         providers=["CPUExecutionProvider"])
-        outs = self.sess.get_outputs()
-        assert len(outs) == 1, "Expected single output"
-        self.out_name = outs[0].name
+def build_session_cpu(model_path: Path,
+                      intra_threads: int,
+                      inter_threads: int = 1,
+                      optimized_out: Optional[Path] = None,
+                      enable_mem_arena: bool = True,
+                      enable_mem_pattern: bool = True,
+                      parallel_exec: bool = False):
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.intra_op_num_threads = max(1, int(intra_threads))
+    so.inter_op_num_threads = max(1, int(inter_threads))
+    so.enable_cpu_mem_arena = bool(enable_mem_arena)
+    so.enable_mem_pattern   = bool(enable_mem_pattern)
+    so.enable_mem_reuse     = True
+    if optimized_out is not None:
+        so.optimized_model_filepath = str(optimized_out)
+    so.execution_mode = (ort.ExecutionMode.ORT_PARALLEL
+                         if parallel_exec else ort.ExecutionMode.ORT_SEQUENTIAL)
+    providers = ["CPUExecutionProvider"]  # CPU only
+    sess = ort.InferenceSession(str(model_path), sess_options=so, providers=providers)
+    return sess
 
-        # IO binding + reusable OrtValues
-        self.binding = self.sess.io_binding()
-        self.ov_y0: Optional[ort.OrtValue] = None
-        self.ov_g:  Optional[ort.OrtValue] = None
-        self.ov_dt: Optional[ort.OrtValue] = None
-        self.ov_out: Optional[ort.OrtValue] = None
-        self.out_buf: Optional[np.ndarray] = None
-        self.last_shapes: Tuple[int, int, int] = (-1, -1, -1)
-
-        # Warmup with a tiny batch to trigger prepacking/fusions once
-        self._warmup()
-
-    def _ensure_buffers(self, B: int, S: int, G: int):
-        """(Re)allocate OrtValues if shape changed."""
-        if self.last_shapes == (B, S, G) and self.ov_out is not None:
-            return
-        self.last_shapes = (B, S, G)
-
-        # Allocate new host buffers (float32)
-        # Inputs are user-provided; we just create OrtValues that will wrap them at bind time.
-        self.ov_y0 = None
-        self.ov_g  = None
-        self.ov_dt = None
-
-        # Output buffer (B,1,S), reused across calls
-        self.out_buf = np.empty((B, 1, S), dtype=np.float32)
-        self.ov_out  = ort.OrtValue.ortvalue_from_numpy(self.out_buf, "cpu", 0)
-
-    def _bind_inputs(self, y0: np.ndarray, g: np.ndarray, dt: np.ndarray):
-        """Bind inputs/outputs for one run. Inputs can be re-bound each call without realloc."""
-        b = self.binding
-        b.clear_binding_inputs()
-        b.clear_binding_outputs()
-
-        # Use OrtValue wrapping to ensure zero-copy
-        ov_y0 = ort.OrtValue.ortvalue_from_numpy(y0, "cpu", 0)
-        ov_g  = ort.OrtValue.ortvalue_from_numpy(g,  "cpu", 0)
-        ov_dt = ort.OrtValue.ortvalue_from_numpy(dt, "cpu", 0)
-
-        b.bind_ortvalue_input("y0_norm", ov_y0)
-        b.bind_ortvalue_input("globals_norm", ov_g)
-        b.bind_ortvalue_input("dt_norm", ov_dt)
-        b.bind_ortvalue_output(self.out_name, self.ov_out)
-
-    def _warmup(self):
-        # Attempt a minimal warmup if dimensions are known; otherwise no-op.
+def dynamic_quantize(model_path: Path) -> Optional[Path]:
+    if not DO_QUANT:
+        return None
+    try:
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+        qpath = model_path.with_name(model_path.stem + "_int8.onnx")
+        # Be compatible with various ORT versions: call with minimal args
         try:
-            # Try to infer S and G from model metadata; fall back to a small guess
-            # Most models have input shapes with -1 for B; second dim is S/G; K=1 for dt.
-            S = int(self.sess.get_inputs()[0].shape[1])
-            G = int(self.sess.get_inputs()[1].shape[1])
-            B = 32
-        except Exception:
-            B, S, G = 32, 16, 0
+            quantize_dynamic(str(model_path), str(qpath), weight_type=QuantType.QInt8)
+        except TypeError:
+            # Some older builds use positional args only
+            quantize_dynamic(str(model_path), str(qpath))
+        print(f"[OK] Wrote dynamic-quantized model: {qpath.name}")
+        return qpath
+    except Exception as e:
+        print(f"[WARN] Dynamic quantization skipped: {e}")
+        return None
 
-        y0 = np.zeros((B, S), dtype=np.float32)
-        g  = np.zeros((B, G), dtype=np.float32)
-        dt = np.zeros((B, 1), dtype=np.float32)
+def load_dims(cfg_path: Path) -> Tuple[int, int]:
+    cfg = load_json_config(str(cfg_path))
+    data = cfg["data"]
+    species_vars = data.get("target_species_variables", data["species_variables"])
+    S = len(species_vars)
+    G = len(data["global_variables"])
+    return S, G
 
-        self._ensure_buffers(B, S, G)
-        self._bind_inputs(y0, g, dt)
-        self.sess.run_with_iobinding(self.binding)
+def run_once_with_iobinding(sess, y0: np.ndarray, g: np.ndarray, dt: np.ndarray,
+                            out_buf: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Correct IO binding for CPU: pre-bind output using OrtValue (if provided) to reuse memory.
+    Otherwise, bind output to CPU and copy once.
+    """
+    import onnxruntime as ort
+    io = sess.io_binding()
 
-    def predict_k1(self, y0_norm: np.ndarray, globals_norm: np.ndarray, dt_norm: np.ndarray) -> np.ndarray:
-        """
-        Inference for K=1 model.
-        y0_norm:      [B, S] float32
-        globals_norm: [B, G] float32 (use shape [B,0] if no globals)
-        dt_norm:      [B, 1] float32
-        Returns:      [B, 1, S] float32 (view into internal buffer; copy if you need to keep it)
-        """
-        if y0_norm.dtype != np.float32 or globals_norm.dtype != np.float32 or dt_norm.dtype != np.float32:
-            raise TypeError("All inputs must be float32 numpy arrays.")
-        if y0_norm.ndim != 2 or globals_norm.ndim != 2 or dt_norm.ndim != 2 or dt_norm.shape[1] != 1:
-            raise ValueError("Shapes must be [B,S], [B,G], [B,1].")
+    io.bind_cpu_input("y0_norm",      y0)
+    io.bind_cpu_input("globals_norm", g)
+    io.bind_cpu_input("dt_norm",      dt)
 
-        B, S = y0_norm.shape
-        G = globals_norm.shape[1]
-        if globals_norm.shape[0] != B or dt_norm.shape[0] != B:
-            raise ValueError("Batch sizes must match across inputs.")
+    out_name = sess.get_outputs()[0].name
+    if out_buf is not None:
+        ov = ort.OrtValue.ortvalue_from_numpy(out_buf, "cpu", 0)
+        io.bind_ortvalue_output(out_name, ov)
+        sess.run_with_iobinding(io)
+        return out_buf
+    else:
+        io.bind_output(out_name, "cpu")
+        sess.run_with_iobinding(io)
+        return io.copy_outputs()[0]  # one copy
 
-        self._ensure_buffers(B, S, G)
-        self._bind_inputs(y0_norm, globals_norm, dt_norm)
-        self.sess.run_with_iobinding(self.binding)
-        return self.out_buf  # (B,1,S)
+def bench_model(model_path: Path, S: int, G: int, intra_list: List[int]):
+    # Save an optimized graph once (faster to load in production)
+    opt_path = model_path.with_name(model_path.stem + ".opt.onnx")
+    sess0 = build_session_cpu(model_path, intra_threads=intra_list[-1], optimized_out=opt_path)
+    sess0 = None  # release
 
-# ---------------- Example usage ----------------
+    # Optional INT8 variant
+    q_path = dynamic_quantize(model_path)
+    variants = [("fp32", model_path)]
+    if q_path is not None:
+        variants.append(("int8", q_path))
+
+    for tag, path in variants:
+        print(f"\n[{tag}] Using model: {path.name}")
+        for intra in intra_list:
+            sess = build_session_cpu(path, intra_threads=intra, inter_threads=1)
+            print(f"  threads={intra:>2d} | providers={sess.get_providers()}")
+
+            for B in BATCH_GRID:
+                # Inputs for K=1 model
+                y0 = np.random.randn(B, S).astype(np.float32)
+                g  = (np.random.randn(B, G).astype(np.float32)
+                      if G > 0 else np.zeros((B, 0), dtype=np.float32))
+                dt = np.random.randn(B, 1).astype(np.float32)
+
+                out_buf = np.empty((B, 1, S), dtype=np.float32)
+
+                # Warm-up
+                for _ in range(WARMUP):
+                    _ = run_once_with_iobinding(sess, y0, g, dt, out_buf)
+
+                # Timed runs
+                t = []
+                for _ in range(RUNS):
+                    t0 = time.perf_counter()
+                    _ = run_once_with_iobinding(sess, y0, g, dt, out_buf)
+                    t.append(time.perf_counter() - t0)
+                t = np.asarray(t)
+
+                mean_batch = float(t.mean())
+                us_per_sample = (mean_batch / B) * 1e6
+                thr = B / mean_batch
+
+                print(f"    B={B:<5d}  mean={us_per_sample:7.2f} µs/sample   "
+                      f"throughput={thr:,.0f} samples/s   "
+                      f"min={(t.min()/B)*1e6:7.2f} µs   med={(np.median(t)/B)*1e6:7.2f} µs")
+
+def main():
+    if not ONNX_K1.exists():
+        raise FileNotFoundError(f"Missing K=1 ONNX: {ONNX_K1}")
+
+    S, G = load_dims(CONFIG)
+    print(f"[INFO] Dims: S={S}, G={G}")
+
+    # CPU thread hints (reduce latency jitter on some libomp builds)
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+    os.environ.setdefault("KMP_BLOCKTIME", "0")
+
+    intra_list = _choose_intra_grid()
+    bench_model(ONNX_K1, S, G, intra_list)
+
 if __name__ == "__main__":
-    import time
-
-    # Choose INT8 if available
-    onnx_path = MODEL_INT8 if MODEL_INT8.exists() else MODEL_FP32
-    runner = FlowmapOrtRunner(onnx_path, intra_threads=INTRA_THREADS, inter_threads=INTER_THREADS)
-
-    # Demo batch
-    B, S, G = 512, 12, 2
-    y0 = np.random.randn(B, S).astype(np.float32)
-    g  = np.random.randn(B, G).astype(np.float32)
-    dt = np.random.randn(B, 1).astype(np.float32)
-
-    # Warm measurement
-    n = 100
-    t = []
-    for _ in range(n):
-        t0 = time.perf_counter()
-        y = runner.predict_k1(y0, g, dt)
-        t.append(time.perf_counter() - t0)
-    t = np.asarray(t)
-    print(f"mean: {(t.mean()/B)*1e6:6.2f} µs/sample | "
-          f"median: {(np.median(t)/B)*1e6:6.2f} µs | "
-          f"min: {(t.min()/B)*1e6:6.2f} µs | "
-          f"throughput: {B/t.mean():,.0f} samples/s")
+    main()
