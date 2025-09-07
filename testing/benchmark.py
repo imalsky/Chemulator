@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU-only benchmark: Flow-map DeepONet inference vs batch size (K=1)."""
+"""CPU-only benchmark: Flow-map DeepONet inference vs batch size (K=1), with torch.compile and 4 CPU threads."""
 from __future__ import annotations
 
 import os, sys, time, gc
@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
 # ---------- CPU env BEFORE importing torch ----------
-CPU_THREADS = min(os.cpu_count() or 4, 6)
+CPU_THREADS = 1  # fixed to 4 threads
 os.environ["CUDA_VISIBLE_DEVICES"]             = ""
 os.environ["OMP_NUM_THREADS"]                  = str(CPU_THREADS)
 os.environ["MKL_NUM_THREADS"]                  = str(CPU_THREADS)
@@ -38,11 +38,11 @@ BATCH_SIZES: List[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 1024]
 
 # Timings
 WARMUP_CALLS           = 50
-CALLS_PER_MEASUREMENT  = 16
+CALLS_PER_MEASUREMENT  = 2
 REPEATS                = 5
 
-# Optional: try `torch.compile` on the loaded exported module for extra CPU speed
-USE_COMPILE = False  # set True to try inductor on CPU (can help or hurt—measure!)
+# Use torch.compile on the loaded exported module (CPU / Inductor)
+USE_COMPILE = True
 
 PLOT_DIR = MODEL_DIR / "plots"
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -98,6 +98,7 @@ def _run_calls(fn, batch: Dict[str, torch.Tensor], calls: int) -> None:
 
 @torch.inference_mode()
 def _bench_once(fn, batch: Dict[str, torch.Tensor]) -> Tuple[float, float]:
+    # Warmup includes potential torch.compile first-run compile cost
     _run_calls(fn, batch, WARMUP_CALLS)
     xs = []
     for _ in range(REPEATS):
@@ -109,31 +110,25 @@ def _bench_once(fn, batch: Dict[str, torch.Tensor]) -> Tuple[float, float]:
 
 def _plot(batch_sizes: List[int], mean_us: List[float], std_us: List[float], threads: int) -> None:
     _safe_style()
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    fig, ax1 = plt.subplots(1, 1, figsize=(8, 6))
 
     # Each call does B * K predictions; here K=1, so per-jump = mean_us / B
     per_jump_mean = [m / bs for m, bs in zip(mean_us, batch_sizes)]
     per_jump_std  = [s / bs for s, bs in zip(std_us,  batch_sizes)]
     ax1.errorbar(batch_sizes, per_jump_mean, yerr=per_jump_std, marker="o", markersize=6, capsize=4, linewidth=2)
     ax1.set_xscale("log", base=2); ax1.set_yscale("log", base=10)
-    ax1.set_xlabel("Batch size"); ax1.set_ylabel("Time per jump (μs)")
-    ax1.set_title("Inference time per jump (K=1)")
+    ax1.set_xlabel("Batch size")
+    ax1.set_ylabel("Inference time per prediction (all species)")
 
     # Throughput in jumps/s
-    thr_jumps = [bs / (m / 1e6) for bs, m in zip(batch_sizes, mean_us)]
-    ax2.plot(batch_sizes, thr_jumps, marker="s", markersize=6, linewidth=2)
-    ax2.set_xscale("log", base=2); ax2.set_yscale("log", base=10)
-    ax2.set_xlabel("Batch size"); ax2.set_ylabel("Throughput (jumps/s)")
-    ax2.set_title("Inference throughput (K=1)")
+    #thr_jumps = [bs / (m / 1e6) for bs, m in zip(batch_sizes, mean_us)]
+    #ax2.plot(batch_sizes, thr_jumps, marker="s", markersize=6, linewidth=2)
+    #ax2.set_xscale("log", base=2); ax2.set_yscale("log", base=10)
+    #ax2.set_xlabel("Batch size"); ax2.set_ylabel("Throughput (jumps/s)")
+    #ax2.set_title("Inference throughput (K=1)")#
 
-    #bidx = int(np.argmax(thr_jumps))
-    #ax2.scatter(batch_sizes[bidx], thr_jumps[bidx], s=160, marker="*", color="red",
-    #            zorder=5, label=f"Peak: {thr_jumps[bidx]:.0f} jumps/s")
-    #ax2.legend()
-
-    fig.suptitle(f"Flow-map CPU Inference Benchmark (threads={threads}, K=1)")
     fig.tight_layout()
-    out_png = PLOT_DIR / "benchmark_flowmap_cpu_k1.png"
+    out_png = PLOT_DIR / "benchmark_cpu_k1.png"
     plt.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"\nSaved: {out_png}")
