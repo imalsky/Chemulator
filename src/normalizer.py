@@ -233,20 +233,25 @@ class NormalizationHelper:
         device = get_device(time_grid_phys) or self.device
         t = time_grid_phys.to(device=device, dtype=torch.float64)
         T = int(t.numel())
-        
+
+
         # Compute pairwise time differences
-        t_i = t.view(1, T)  # [1, T]
-        t_j = t.view(T, 1)  # [T, 1]
-        dt = torch.clamp(t_j - t_i, min=self.epsilon)  # [T, T]
+        t_i = t.view(T, 1)  # [T, 1]
+        t_j = t.view(1, T)  # [1, T]
+        dt = torch.clamp(t_j - t_i, min=self.epsilon)  # dt[i,j] = t[j] - t[i]
         
         # Normalize using centralized dt method
         dt_norm = self.normalize_dt_from_phys(dt)
         
         # Create validity mask
         steps = torch.arange(T, device=device, dtype=torch.int64)
-        step_diff = steps.view(T, 1) - steps.view(1, T)  # [T, T]
+        step_diff = steps.view(1, T) - steps.view(T, 1)  # j - i
         valid_mask = (step_diff >= min_steps) & (step_diff <= max_steps)
-        
+
+
+
+
+
         # Zero out invalid entries
         dt_table = torch.where(valid_mask, dt_norm, torch.zeros_like(dt_norm))
         

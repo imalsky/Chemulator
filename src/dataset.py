@@ -394,7 +394,9 @@ class FlowMapPairsDataset(Dataset):
         - `self.dt_table[i, j]` equals the dt-spec normalized Δt for j > i (and ε-clamped otherwise).
         """
         t_phys = self.shared_time_grid.to(torch.float64)                   # [T]
-        dt_phys = t_phys.view(1, -1) - t_phys.view(-1, 1)                  # [T,T]
+        t_i = t_phys.view(-1, 1)
+        t_j = t_phys.view(1, -1)
+        dt_phys = t_j - t_i  # [i,j]
         eps = self.epsilon
         dt_phys = torch.where(
             dt_phys > 0,

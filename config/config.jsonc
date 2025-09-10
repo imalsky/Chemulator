@@ -1,25 +1,40 @@
 {
-  // Data paths configuration
+  // ---------- Paths ----------
   "paths": {
-    // IMPORTANT: Leave raw_data_files out to auto-scan ./data/raw for *.h5 / *.hdf5.
-    // The current preprocessor ignores any "raw_data_dir" field; it is hardcoded to "data/raw".
-    // "raw_data_files": [],
-
-    // Repo-relative outputs (resolve under the checkout you qsub from)
+    // Where preprocessed shards + manifests live (normalization.json, shard_index.json, …)
     "processed_data_dir": "data/processed",
-    "work_dir": "models/flowmap-deeponet"
+
+    // Where checkpoints, logs, CSV, etc. are written
+    "work_dir": "models/trained_model",
+
+    // Optional: explicit list of HDF5 files. Leave [] to auto-scan data/raw/*.h5(hdf5)
+    "raw_data_files": []
   },
 
-  // Variable definitions
+  // ---------- Data schema (authoritative values are re-hydrated from normalization.json) ----------
   "data": {
-    // Let preprocessing/hydration auto-detect and inject species_variables.
-    // "species_variables": [],
-
-    // Global conditioning parameters (constant per trajectory)
+    // Globals that condition the branch (constant per trajectory)
     "global_variables": ["P", "T"],
 
-    // Name of time array in HDF5 groups
+    // Name of the absolute time dataset in the raw HDF5
     "time_variable": "t_time"
+
+    // NOTE: species_variables are auto-detected during preprocessing
+    // and then injected back into config from normalization.json.
+  },
+
+  // ---------- Normalization applied everywhere (preprocessor + runtime) ----------
+  "normalization": {
+    "default_method": "log-standard",
+    "methods": {
+      "dt":     "log-min-max",
+      "t_time": "log-min-max",
+      "P":      "log-min-max",
+      "T":      "standard"
+    },
+    "epsilon": 1e-30,
+    "min_std": 1e-10,
+    "clamp_value": 1e6
   },
 
   // Preprocessing configuration
@@ -34,118 +49,131 @@
     "npz_compressed": false,
 
     // HDF5 scanning workers if not using MPI (ignored with MPI)
-    "num_workers": 12,
+    "num_workers": 25,
 
     // 0 = auto-detect from dataset
     "hdf5_chunk_size": 0
   },
 
-  // Normalization configuration
-  "normalization": {
-    "default_method": "log-standard",
-    "methods": {
-      "dt":     "log-min-max",
-      "t_time": "log-min-max",
-      "P":      "log-min-max",
-      "T":      "standard"
-    },
-    "epsilon": 1e-30,
-    "min_std": 1e-10,
-    "clamp_value": 1e6
-  },
-
-  // Dataset configuration
+  // ---------- Dataset (pair sampling & loader behavior) ----------
   "dataset": {
-    // Keep anchor diversity with large K
-    "uniform_offset_sampling": false,
-
-    "multi_time_per_anchor": true,
-    "times_per_anchor": 64,
-
-    // Only set true if time grid truly shared
-    "share_times_across_batch": false,
-
-    // Precompute Δt table if shared grid is used
-    "precompute_dt_table": true,
-
-    // Require dt stats in normalization.json
+    // Require dt-spec (log-min-max over Δt) in normalization.json; protects you from bad manifests
     "require_dt_stats": true,
 
-    // GPU-resident datasets for throughput (GH200 has the RAM for it)
+    // If all trajectories share the exact same time grid, precompute a [T,T] Δt table (fast path)
+    "precompute_dt_table": true,
+
+    // Sample multiple target times per anchor (vectorized trunk; better coverage per batch)
+    "multi_time_per_anchor": true,
+    "times_per_anchor": 64,          // K; good balance of coverage and memory
+
+    // If grids are shared, reuse the same K offsets across the batch and mask rows that can’t use all
+    // Throughput win and more uniform gradients w.r.t. Δt.
+    "share_times_across_batch": true,
+
+    // CRITICAL for long-time accuracy: flatten the natural triangular bias of offsets
+    "uniform_offset_sampling": true,
+
+    // Put shards on GPU for max throughput (set false if memory is tight)
     "preload_train_to_gpu": true,
     "preload_val_to_gpu": true,
 
-    // With GPU-resident data, keep workers at 0
+    // Loader knobs (ignored when GPU-resident; workers forced to 0)
     "num_workers": 0,
-    "num_workers_val": 0,
-
     "pin_memory": false,
-    "pin_memory_val": false,
-
     "prefetch_factor": 2,
-    "prefetch_factor_val": 2,
-
-    "persistent_workers": false,
-    "persistent_workers_val": false,
-
-    // Runtime dtype for staged tensors
-    "storage_dtype": "bf16"
+    "persistent_workers": false
   },
 
-  // Model architecture configuration
-  "model": {
-    "p": 256,
-    "branch_width": 1024,
-    "branch_depth": 4,
-    "trunk_layers": [1024, 1024, 1024, 1024],
-    "predict_delta": false,
-    "trunk_dedup": false,
-    "dropout": 0.0,
-    "activation": "leakyrelu"
-  },
-
-  // Training configuration
+  // ---------- Training (sampler bounds, schedule, regularization) ----------
   "training": {
-    "val_fraction": 0.15,
-    "test_fraction": 0.10,
-    "use_fraction": 1.0,
+    "epochs": 110,
 
+    // Batch sizes (effective compute cost ~ batch_size × times_per_anchor)
+    "batch_size": 512,
+    "val_batch_size": 512,
+
+    // How many anchors per trajectory per epoch (controls epoch length)
+    "pairs_per_traj": 1,
+    "pairs_per_traj_val": 1,
+
+    // Δt index bounds in steps (NOT seconds). Set max_steps = T-1.
+    // If your processed grid has T=100, use 99. This must match the manifest’s grid.
     "min_steps": 1,
     "max_steps": 99,
 
-    "pairs_per_traj": 32,
+    // Optimizer (AdamW) + scheduler (linear warmup → cosine)
+    "lr": 2e-4,          // lower LR helps stiff transitions
+    "min_lr": 1e-6,
+    "warmup_epochs": 10,
 
-    "batch_size": 2048,
-    "epochs": 200,
-    "lr": 5e-4,
+    // Gentle weight decay (don’t over-regularize the trunk)
     "weight_decay": 1e-5,
 
-    "warmup_epochs": 10,
-    "min_lr": 1e-7,
+    // Clip to tame rare spikes from difficult Δt windows
     "gradient_clip": 1.0,
 
-    "torch_compile": true,
+    // Leave compile off for now (GPU training); turn on only if you profile a win
+    "torch_compile": false,
 
+    // 0 means “no cap” (process full loader)
     "max_train_steps_per_epoch": 0,
-    "max_val_batches": 0
+    "max_val_batches": 0,
+
+    // Restart policy
+    "resume": null,
+    "auto_resume": true
   },
 
-  // Mixed precision
+  // ---------- Model (DeepONet) ----------
+  "model": {
+    // Basis size (φ·ψ dimension). 512 is the sweet spot for your species count.
+    "p": 512,
+
+    // Branch MLP (state+globals → φ)
+    "branch_width": 1024,
+    "branch_depth": 4,
+
+    // Trunk MLP (Δt̂ → ψ). Deep/wide to capture decades-wide stiffness.
+    "trunk_layers": [1024, 1024, 1024],
+
+    // Nonlinearity
+    "activation": "leakyrelu",
+
+    // Dropout isn’t usually beneficial for these smooth targets; keep it off
+    "dropout": 0.0,
+    "branch_dropout": 0.0,
+    "trunk_dropout": 0.0,
+
+    // Predict Δy and add residual; best for small-to-medium Δt
+    "predict_delta": true,
+
+    // Keep trunk per-time (no dedup across K) unless you verify identical Δt̂ rows
+    "trunk_dedup": false
+  },
+
+  // ---------- Mixed precision ----------
   "mixed_precision": {
+    // "bf16" is usually stable on A100/GH200. If you see training noise, switch to "none" for fp32.
     "mode": "bf16"
   },
 
-  // System configuration
+  // ---------- System / hardware ----------
   "system": {
     "seed": 42,
-    "deterministic": false,
+
+    // Storage dtype for NPZ + default torch dtype at runtime
+    "dtype": "float32",
+    "io_dtype": "float32",
+
+    // CPU threading (effective if you ever run CPU-side work)
+    "omp_threads": 8,
+
+    // GPU fast-math; safe with bf16/float32
     "tf32": true,
     "cudnn_benchmark": true,
 
-    // Target PyTorch intra-op threads (your hardware.py already sets this)
-    "omp_threads": 12,
-
-    // NPZ on disk
-    "io_dtype": "float32"
+    // Don’t enable deterministic unless reproducing a bug (it hurts speed)
+    "deterministic": false
   }
 }
