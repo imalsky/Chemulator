@@ -482,6 +482,22 @@ def build_model(
     model = create_model(cfg)
     model.to(device)
 
+    # --- I/O dimension + target-index diagnostics (robust to old/new model variants) ---
+    S_in  = getattr(model, "S_in", getattr(model, "S", None))
+    S_out = getattr(model, "S_out", getattr(model, "S", None))
+    G     = getattr(model, "G", "?")
+    p     = getattr(model, "p", "?")
+    logger.info(f"Model dims: S_in={S_in}, S_out={S_out}, G={G}, p={p}")
+
+    ti = getattr(model, "target_idx", None)
+    if ti is not None:
+        try:
+            logger.info(f"Target indices: {ti.detach().cpu().tolist()}")
+        except Exception:
+            # Fallback if it's a plain list / numpy / CPU tensor without .detach()
+            logger.info(f"Target indices: {list(map(int, ti))}")
+
+    # Existing model-architecture summary
     model_cfg = cfg.get("model", {})
     logger.info(
         "Model architecture: "
