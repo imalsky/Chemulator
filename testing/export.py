@@ -282,6 +282,38 @@ def _load_nonshape_flags() -> Dict[str, Any]:
     }
 
 # --------------------------------------------------------------------------------------
+# Data configuration loading from MODEL_DIR
+# --------------------------------------------------------------------------------------
+def _load_data_overrides() -> Dict[str, Any]:
+    """
+    Recover data block (species_variables, target_species, global_variables, time_variable)
+    from files in MODEL_DIR, in priority order: config.json, config.jsonc, config.snapshot.json.
+    """
+    paths = [
+        MODEL_DIR / "config.json",
+        MODEL_DIR / "config.jsonc",
+        MODEL_DIR / "config.snapshot.json",
+    ]
+    for p in paths:
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    doc = json.load(f)
+            except Exception:
+                with open(p, "r", encoding="utf-8") as f:
+                    doc = json5.load(f)
+            data = (doc.get("data") or
+                    (doc.get("config", {}) or {}).get("data"))
+            if isinstance(data, dict):
+                return {
+                    "species_variables": list(data.get("species_variables") or []),
+                    "target_species":   list(data.get("target_species")   or []),
+                    "global_variables": list(data.get("global_variables") or []),
+                    "time_variable":    data.get("time_variable"),
+                }
+    return {}
+
+# --------------------------------------------------------------------------------------
 # Data hydration (names)
 # --------------------------------------------------------------------------------------
 def _load_normalization(processed_dir: Path) -> Dict[str, Any] | None:
@@ -298,38 +330,85 @@ def _load_normalization(processed_dir: Path) -> Dict[str, Any] | None:
 def _synthesize_names(prefix: str, n: int) -> List[str]:
     return [f"{prefix}_{i}" for i in range(n)]
 
-def _build_data_cfg(inferred: Dict[str, Any], norm: Dict[str, Any] | None) -> Dict[str, Any]:
-    # Prefer names from normalization.json
-    species = None
-    globals_ = None
-    time_var = None
-    if norm:
-        meta = norm.get("meta", {}) or {}
-        species = list(meta.get("species_variables", []) or []) or None
-        globals_ = list(meta.get("global_variables", []) or []) if meta.get("global_variables") is not None else None
-        time_var = meta.get("time_variable")
+def _build_data_cfg(inferred: Dict[str, Any], norm: Dict[str, Any] | None,
+                    overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    overrides = overrides or {}
+    # names from normalization.json (preferred for full species/globals)
+    meta = (norm or {}).get("meta", {}) if norm else {}
+    full_species_norm = list(meta.get("species_variables") or [])
+    globals_norm      = list(meta.get("global_variables") or []) if meta.get("global_variables") is not None else None
+    time_var_norm     = meta.get("time_variable") or "t_time"
 
-    S_out = int(inferred.get("S_from_out") or (len(species) if species else 0))
-    if not species or len(species) != S_out:
-        if species is None:
-            log.info(f"[data] No species names; synthesizing {S_out} names.")
-        elif len(species) != S_out:
-            log.warning(f"[data] Species length {len(species)} != S (out.weight rows) {S_out}; adjusting.")
-        species = _synthesize_names("species", S_out)
+    # overrides from MODEL_DIR configs
+    full_species_cfg  = list(overrides.get("species_variables") or [])
+    target_cfg        = list(overrides.get("target_species") or [])
+    globals_cfg       = list(overrides.get("global_variables") or [])
+    time_var_cfg      = overrides.get("time_variable") or None
 
-    # Infer G from branch input if not provided
-    if globals_ is None:
-        in_branch = inferred.get("branch_input_dim")
-        if isinstance(in_branch, int) and in_branch >= S_out:
-            G = in_branch - S_out
-            globals_ = _synthesize_names("global", G) if G > 0 else []
+    # infer dims from checkpoint
+    S_out = int(inferred.get("S_from_out", 0))
+    in_branch = inferred.get("branch_input_dim")  # = S_in + G
+    # choose G from normalization/config if present; else try to infer minimal
+    if globals_norm is not None:
+        G = len(globals_norm)
+    elif globals_cfg:
+        G = len(globals_cfg)
+    else:
+        # last resort: assume no globals
+        G = 0
+    if isinstance(in_branch, int) and in_branch >= G:
+        S_in = int(in_branch) - int(G)
+    else:
+        # fallbacks: if we can't infer, use normalization or overrides
+        S_in = len(full_species_norm) or len(full_species_cfg) or S_out
+
+    # choose full species list (inputs)
+    full_species = full_species_cfg or full_species_norm
+    if not full_species or len(full_species) != S_in:
+        # synthesize or resize
+        if not full_species:
+            full_species = [f"species_{i}" for i in range(S_in)]
+        elif len(full_species) != S_in:
+            # truncate/extend to S_in to match checkpoint
+            if len(full_species) > S_in:
+                full_species = full_species[:S_in]
+            else:
+                full_species += [f"species_{i}" for i in range(len(full_species), S_in)]
+
+    # choose target species (outputs)
+    target_species = target_cfg[:] if target_cfg else []
+    if not target_species:
+        if S_out == S_in:
+            target_species = full_species[:]  # all species
         else:
-            globals_ = []
+            # best-effort default when we don't have the training-time list
+            # (keeps order stable; warn)
+            log.warning(f"[data] target_species not found; defaulting to first {S_out} of full_species.")
+            target_species = full_species[:S_out]
+    else:
+        if len(target_species) != S_out:
+            log.warning(f"[data] target_species length {len(target_species)} != S_out {S_out}; "
+                        f"truncating/expanding to match checkpoint.")
+            if len(target_species) > S_out:
+                target_species = target_species[:S_out]
+            else:
+                target_species += [f"{target_species[-1]}_pad{i}" for i in range(S_out - len(target_species))]
+
+    # choose globals list
+    globals_ = globals_cfg or globals_norm or []
+    if len(globals_) != G:
+        log.warning(f"[data] global_variables length {len(globals_)} != inferred G {G}; "
+                    f"adjusting to {G}.")
+        if len(globals_) > G:
+            globals_ = globals_[:G]
+        else:
+            globals_ += [f"global_{i}" for i in range(len(globals_), G)]
 
     return {
-        "species_variables": species,
-        "global_variables": globals_,
-        "time_variable": time_var or "t_time",
+        "species_variables": full_species,   # inputs (S_in)
+        "target_species":    target_species, # outputs (S_out)
+        "global_variables":  globals_,
+        "time_variable":     (time_var_cfg or time_var_norm or "t_time"),
     }
 
 # --------------------------------------------------------------------------------------
@@ -415,11 +494,12 @@ def main():
              + ", ".join(f"{k}: {inferred[k]}" for k in sorted(inferred.keys()))
              + "}}")
 
-    # 3) Data names (normalization.json optional)
+    # 3) Data names (normalization.json optional) with overrides
     norm = _load_normalization(PROCESSED_DIR)
     if norm is None:
         log.warning(f"[data] normalization.json not found at {PROCESSED_DIR}/normalization.json; synthesizing names.")
-    data_cfg = _build_data_cfg(inferred, norm)
+    data_overrides = _load_data_overrides()
+    data_cfg = _build_data_cfg(inferred, norm, overrides=data_overrides)
 
     # 4) Non-shape flags from MODEL_DIR config(s)
     flags = _load_nonshape_flags()
@@ -456,7 +536,7 @@ def main():
     model = _maybe_dynamic_quantize(base)
 
     # 8) Export dynamic (B,K)
-    S = len(cfg["data"]["species_variables"])
+    S = len(cfg["data"]["species_variables"])  # S_in
     G = len(cfg["data"]["global_variables"])
     wrapper = InferenceWrapper(model, S, G).to(DEVICE)
 

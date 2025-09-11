@@ -22,7 +22,7 @@
     // NOTE: species_variables are auto-detected during preprocessing
     // and then injected back into config from normalization.json.
     //"species_variables": ["C2H2_evolution", "... 16 more ..."],
-    //"target_species": ["C2H2_evolution"]
+    //"target_species": ["H2_evolution"]
   },
 
   // ---------- Normalization applied everywhere (preprocessor + runtime) ----------
@@ -89,11 +89,11 @@
 
   // ---------- Training (sampler bounds, schedule, regularization) ----------
   "training": {
-    "loss_mode": "frac_l1_phys",   // options: "mse" (MSE on log-standard z), "frac_l1_phys" (|ŷ−y|/(|y|+eps)), "mae_log_phys" (L1 on log10 phys)
-    "loss_epsilon": 1e-27,         // >0; denom/log guard. Typical 1e-30…1e-20
-    "loss_rel_cap": 100.0,         // optional >0; cap fractional error. Omit/null = no cap
+    "loss_mode": "mae_log_phys",   // options: "mse" (MSE on log-standard z), "frac_l1_phys" (|ŷ−y|/(|y|+eps)), "mae_log_phys" (L1 on log10 phys)
+    "loss_epsilon": 1e-30,         // >0; denom/log guard. Typical 1e-30…1e-20
+    "loss_rel_cap": 500.0,         // optional >0; cap fractional error. Omit/null = no cap
 
-    "epochs": 110,
+    "epochs": 100,
 
     // Batch sizes (effective compute cost ~ batch_size × times_per_anchor)
     "batch_size": 4096,
@@ -109,12 +109,12 @@
     "max_steps": 99,
 
     // Optimizer (AdamW) + scheduler (linear warmup → cosine)
-    "lr": 2e-4,          // lower LR helps stiff transitions
+    "lr": 1e-4,          // lower LR helps stiff transitions
     "min_lr": 1e-6,
     "warmup_epochs": 0,
 
     // Gentle weight decay (don’t over-regularize the trunk)
-    "weight_decay": 1e-5,
+    "weight_decay": 0,
 
     // Clip to tame rare spikes from difficult Δt windows
     "gradient_clip": 1.0,
@@ -134,14 +134,14 @@
   // ---------- Model (DeepONet) ----------
   "model": {
     // Basis size (φ·ψ dimension). 512 is the sweet spot for your species count.
-    "p": 256,
+    "p": 4096,
 
     // Branch MLP (state+globals → φ)
-    "branch_width": 512,
+    "branch_width": 1024,
     "branch_depth": 4,
 
     // Trunk MLP (Δt̂ → ψ). Deep/wide to capture decades-wide stiffness.
-    "trunk_layers": [512, 512, 512, 512],
+    "trunk_layers": [1024, 1024, 1024, 1024],
 
     // Nonlinearity
     "activation": "leakyrelu",

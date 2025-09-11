@@ -341,6 +341,108 @@ class Trainer:
 
         return NullLogger()
 
+    def _ensure_norm_helper(self):
+        """
+        Lazily load NormalizationHelper and resolve the correct species list
+        (target subset if provided, else all species).
+        """
+        if not hasattr(self, "_norm_helper"):
+            import json
+            from pathlib import Path
+            from normalizer import NormalizationHelper
+
+            manifest_path = Path(self.cfg["paths"]["processed_data_dir"]) / "normalization.json"
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            self._norm_helper = NormalizationHelper(manifest, device=self.device)
+
+            data_cfg = self.cfg.get("data", {})
+            self._species_keys = list(
+                data_cfg.get("target_species") or data_cfg.get("species_variables")
+            )
+        return self._norm_helper, self._species_keys
+
+    @torch.inference_mode()
+    def evaluate_frac_l1_phys(
+        self,
+        loader: Optional[torch.utils.data.DataLoader] = None,
+        max_batches: Optional[int] = None
+    ) -> float:
+        """
+        Compute true mean fractional absolute error in PHYSICAL units over a loader:
+          mean(|y_pred - y_true| / (|y_true| + eps))
+        Respects target species subset if configured.
+        """
+        loader = loader or self.val_loader
+        if loader is None:
+            return float("nan")
+
+        self.model.eval()
+        eps = float(self.cfg.get("training", {}).get("loss_epsilon", 1e-27))
+        norm, species_keys = self._ensure_norm_helper()
+
+        total = torch.tensor(0.0, device=self.device)
+        count = torch.tensor(0.0, device=self.device)
+
+        # Ensure we have target index mapping like in _process_batch
+        if not hasattr(self, "_target_idx"):
+            data_cfg = self.cfg.get("data", {})
+            species_vars = list(data_cfg.get("species_variables") or [])
+            target_vars  = list(data_cfg.get("target_species") or species_vars)
+            if target_vars != species_vars:
+                name_to_idx = {n: i for i, n in enumerate(species_vars)}
+                try:
+                    idx_list = [name_to_idx[n] for n in target_vars]
+                except KeyError as e:
+                    raise KeyError(f"target_species contains unknown name: {e.args[0]!r}")
+                self._target_idx = torch.tensor(idx_list, dtype=torch.long, device=self.device)
+            else:
+                self._target_idx = None
+
+        for step, batch in enumerate(loader, 1):
+            if max_batches and step > max_batches:
+                break
+
+            # Unpack (supports 5- or 6-tuples)
+            if len(batch) == 6:
+                y_i, dt_norm, y_j, g, ij, k_mask = batch
+            else:
+                y_i, dt_norm, y_j, g, ij = batch
+                k_mask = None
+
+            # To device
+            y_i = y_i.to(self.device, non_blocking=True)
+            dt  = dt_norm.to(self.device, non_blocking=True)
+            y_j = y_j.to(self.device, non_blocking=True)
+            g   = g.to(self.device, non_blocking=True)
+            if k_mask is not None:
+                k_mask = k_mask.to(self.device, non_blocking=True)
+
+            # Slice targets to match model S_out if needed
+            if self._target_idx is not None:
+                y_j = y_j.index_select(dim=-1, index=self._target_idx)
+
+            # Forward (mirror training path)
+            dt_in = dt.squeeze(-1) if (dt.ndim == 3 and dt.shape[-1] == 1) else dt
+            pred = self.model(y_i, dt_in, g)
+            pred, tgt = self._harmonize_shapes(pred, y_j)
+
+            # Denormalize to physical units
+            y_pred = norm.denormalize(pred, species_keys)
+            y_true = norm.denormalize(tgt,  species_keys)
+
+            rel = (y_pred - y_true).abs() / (y_true.abs() + eps)
+
+            if k_mask is not None and rel.ndim == 3 and k_mask.ndim == 2:
+                w = k_mask.unsqueeze(-1).expand_as(rel)
+                total += (rel * w).sum()
+                count += w.sum()
+            else:
+                total += rel.sum()
+                count += rel.numel()
+
+        return (total / count).item() if count.item() > 0 else float("nan")
+
     def train(self) -> float:
         """
         Execute training loop.
@@ -387,14 +489,12 @@ class Trainer:
 
             # Console output
             epoch_time = time.perf_counter() - epoch_start
-            loss_delta = val_loss - self.best_val_loss
             self.logger.info(
                 f"Epoch {epoch:03d}/{self.epochs} | "
                 f"train_loss={train_loss:.4e} | "
                 f"val_loss={val_loss:.4e} | "
                 f"lr={current_lr:.2e} | "
                 f"time={epoch_time:.1f}s | "
-                f"delta_best={loss_delta:+.2e} | "
                 f"saved={'yes' if saved else 'no'}"
             )
 
@@ -403,6 +503,28 @@ class Trainer:
             f"Training completed in {total_time / 3600:.2f} hours. "
             f"Best validation loss: {self.best_val_loss:.4e}"
         )
+
+        # --- Final metric on validation set (true physical fractional L1) ---
+        which = "last-epoch"
+        try:
+            best_blob = torch.load(self.best_model_path, map_location=self.device)
+            best_state = best_blob.get("model") if isinstance(best_blob, dict) else None
+            if best_state:
+                self.model.load_state_dict(best_state, strict=False)
+                which = "best_model.pt"
+        except Exception:
+            pass
+
+        final_frac = self.evaluate_frac_l1_phys(self.val_loader)
+        self.logger.info(f"Final validation fractional L1 (physical) [{which}]: {final_frac:.6e}")
+
+        # Optional: persist for downstream scripts
+        try:
+            import json
+            with open(self.work_dir / "final_metrics.json", "w", encoding="utf-8") as f:
+                json.dump({"val_frac_l1_phys_mean": final_frac, "which": which}, f, indent=2)
+        except Exception:
+            pass
 
         return self.best_val_loss
 
@@ -655,7 +777,10 @@ class Trainer:
                 with open(manifest_path, "r") as f:
                     manifest = json.load(f)
                 self._norm_helper = NormalizationHelper(manifest, device=pred.device)
-                self._species_keys = self.cfg["data"]["species_variables"]
+                data_cfg = self.cfg.get("data", {})
+                self._species_keys = list(
+                    data_cfg.get("target_species") or data_cfg.get("species_variables")
+                )
 
             # Denormalize to physical units
             y_pred = self._norm_helper.denormalize(pred, self._species_keys)
