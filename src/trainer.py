@@ -518,6 +518,25 @@ class Trainer:
             if k_mask is not None:
                 k_mask = k_mask.to(self.device, non_blocking=True)
 
+        # Lazily resolve and cache target indices from cfg (if any)
+        if not hasattr(self, "_target_idx"):
+            data_cfg = self.cfg.get("data", {})
+            species_vars = list(data_cfg.get("species_variables") or [])
+            target_vars = list(data_cfg.get("target_species") or species_vars)
+            if target_vars != species_vars:
+                name_to_idx = {n: i for i, n in enumerate(species_vars)}
+                try:
+                    idx_list = [name_to_idx[n] for n in target_vars]
+                except KeyError as e:
+                    raise KeyError(f"target_species contains unknown name: {e.args[0]!r}")
+                self._target_idx = torch.tensor(idx_list, dtype=torch.long, device=self.device)
+            else:
+                self._target_idx = None
+
+        # Slice targets to match model's S_out before shape checks/loss
+        if self._target_idx is not None:
+            y_j = y_j.index_select(dim=-1, index=self._target_idx)
+
         # Zero gradients
         if train:
             self.optimizer.zero_grad(set_to_none=True)
@@ -601,40 +620,81 @@ class Trainer:
 
     def _compute_loss(
             self,
-            pred: torch.Tensor,
-            target: torch.Tensor,
-            mask: Optional[torch.Tensor]
+            pred: torch.Tensor,  # [B, S] or [B, K, S] in normalized (log-standard) space
+            target: torch.Tensor,  # same shape as pred
+            mask: Optional[torch.Tensor],  # None or [B, K] for multi-time batches
     ) -> torch.Tensor:
         """
-        Compute masked MSE loss.
+        Loss modes (set training.loss_mode):
+          - 'mse'           : normalized-space MSE (your current baseline on log-standard z)
+          - 'frac_l1_phys'  : mean absolute fractional error in *physical* space
+                              = mean(|y_pred - y_true| / (|y_true| + eps))
+          - 'mae_log_phys'  : L1 in log10(physical) space (≈ fractional error / ln(10) for small errors)
 
-        Args:
-            pred: Predictions [B, K, S] or [B, S]
-            target: Targets [B, K, S] or [B, S]
-            mask: Optional mask for valid samples [B, K]
-
-        Returns:
-            Scalar loss tensor
+        Notes:
+          * 'frac_l1_phys' exactly matches your runtime metric; use loss_rel_cap to clip huge ratios if desired.
+          * 'mae_log_phys' is a cheap, smoother proxy that often optimizes better early on.
         """
-        loss_elements = (pred - target) ** 2
+        # Read mode/knobs from attributes if present, else fall back to config defaults
+        tr_cfg = self.cfg.get("training", {})
+        mode = getattr(self, "loss_mode", tr_cfg.get("loss_mode", "mse"))
+        eps = float(getattr(self, "loss_epsilon", tr_cfg.get("loss_epsilon", 1e-27)))
+        rel_cap = getattr(self, "loss_rel_cap", tr_cfg.get("loss_rel_cap", None))
 
-        if mask is not None:
-            if loss_elements.ndim == 3 and mask.ndim == 2:
-                B, K, S = loss_elements.shape
-                mask_expanded = mask.unsqueeze(-1).expand(B, K, S)
-                if mask.any():
-                    loss = (loss_elements * mask_expanded).sum() / mask_expanded.sum()
-                else:
-                    loss = torch.tensor(0.0, device=loss_elements.device, dtype=loss_elements.dtype)
-            else:
-                if mask.any():
-                    loss = (loss_elements * mask).sum() / mask.sum()
-                else:
-                    loss = torch.tensor(0.0, device=loss_elements.device, dtype=loss_elements.dtype)
+        if mode == "mse":
+            loss_elems = (pred - target) ** 2
+
+        elif mode in ("frac_l1_phys", "mae_log_phys"):
+            # --- Lazy-load normalization helper on first use ---
+            if not hasattr(self, "_norm_helper"):
+                import json
+                from pathlib import Path
+                from normalizer import NormalizationHelper
+
+                manifest_path = Path(self.cfg["paths"]["processed_data_dir"]) / "normalization.json"
+                with open(manifest_path, "r") as f:
+                    manifest = json.load(f)
+                self._norm_helper = NormalizationHelper(manifest, device=pred.device)
+                self._species_keys = self.cfg["data"]["species_variables"]
+
+            # Denormalize to physical units
+            y_pred = self._norm_helper.denormalize(pred, self._species_keys)
+            y_true = self._norm_helper.denormalize(target, self._species_keys)
+
+            if mode == "frac_l1_phys":
+                denom = y_true.abs() + eps
+                rel = (y_pred - y_true).abs() / denom
+                if rel_cap is not None:
+                    rel = torch.clamp(rel, max=float(rel_cap))  # optional robustness to tiny denominators
+                loss_elems = rel
+
+            else:  # 'mae_log_phys'
+                y_pred = torch.clamp(y_pred, min=eps)
+                y_true = torch.clamp(y_true, min=eps)
+                loss_elems = (torch.log10(y_pred) - torch.log10(y_true)).abs()
+
+            # Optional per-species weights (vector [S]); leave unset if not needed
+            w = getattr(self, "loss_weights", None)
+            if w is not None:
+                w = w.to(loss_elems.device, dtype=loss_elems.dtype)
+                while w.ndim < loss_elems.ndim:
+                    w = w.unsqueeze(0)
+                loss_elems = loss_elems * w
+
         else:
-            loss = loss_elements.mean()
+            raise ValueError(f"Unknown loss_mode='{mode}'")
 
-        return loss
+        # --- Masked reduction for [B,K,S] ---
+        if mask is not None:
+            if loss_elems.ndim == 3 and mask.ndim == 2:
+                mask_exp = mask.unsqueeze(-1).expand_as(loss_elems)
+                denom = mask_exp.sum()
+                return (loss_elems * mask_exp).sum() / denom if denom > 0 else loss_elems.new_tensor(0.0)
+            else:
+                denom = mask.sum()
+                return (loss_elems * mask).sum() / denom if denom > 0 else loss_elems.new_tensor(0.0)
+
+        return loss_elems.mean()
 
     def _backward_and_step(self, loss: torch.Tensor) -> None:
         """

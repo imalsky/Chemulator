@@ -17,7 +17,7 @@ Features:
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import List, Sequence, Optional
 
 import torch
 import torch.nn as nn
@@ -103,7 +103,7 @@ def build_mlp(
 
 class BranchNet(nn.Module):
     """
-    Branch network: processes concatenated [y_i, g] -> φ ∈ R^p.
+    Branch network: processes concatenated [y_i, g] -> Ï† âˆˆ R^p.
     """
 
     def __init__(
@@ -149,7 +149,7 @@ class BranchNet(nn.Module):
 
 class TrunkNet(nn.Module):
     """
-    Trunk network: maps normalized time input (Δt_norm) to ψ ∈ R^p.
+    Trunk network: maps normalized time input (Î”t_norm) to Ïˆ âˆˆ R^p.
     Accepts t with shapes [B], [B,1], [B,K], or [B,K,1].
     """
 
@@ -203,13 +203,15 @@ class TrunkNet(nn.Module):
 
 class FlowMapDeepONet(nn.Module):
     """
-    Flow-map DeepONet: y_i, g, Δt_norm -> y_j (direct or residual).
-    Always returns [B,K,S] (K=1 is kept as singleton for consistency).
+    Flow-map DeepONet: y_i, g, Î”t_norm -> y_j (direct or residual).
+
+    Returns [B,K,S_out] (K=1 kept as singleton).
     """
 
     def __init__(
         self,
-        state_dim: int,
+        state_dim_in: int,
+        state_dim_out: int,
         global_dim: int,
         basis_dim: int,
         branch_width: int,
@@ -217,23 +219,33 @@ class FlowMapDeepONet(nn.Module):
         trunk_layers: Sequence[int],
         *,
         predict_delta: bool = True,
-        trunk_dedup: bool = False,  # reserved for possible future optimization
+        trunk_dedup: bool = False,
         activation_name: str = "gelu",
         branch_dropout: float = 0.0,
         trunk_dropout: float = 0.0,
+        target_idx: Optional[torch.Tensor] = None,  # indices mapping chosen targets within input state
     ) -> None:
         super().__init__()
-        self.S = int(state_dim)
-        self.G = int(global_dim)
-        self.p = int(basis_dim)
+        self.S_in  = int(state_dim_in)
+        self.S_out = int(state_dim_out)
+        self.G     = int(global_dim)
+        self.p     = int(basis_dim)
         self.predict_delta = bool(predict_delta)
-        self.trunk_dedup = bool(trunk_dedup)
+        self.trunk_dedup   = bool(trunk_dedup)
+
+        # Will be used for residual add when S_out < S_in
+        if target_idx is not None:
+            if not isinstance(target_idx, torch.Tensor):
+                target_idx = torch.tensor(target_idx, dtype=torch.long)
+            self.register_buffer("target_idx", target_idx.to(torch.long))
+        else:
+            self.register_buffer("target_idx", None)
 
         act = get_activation(activation_name)
 
-        # Branch: [y_i, g] -> φ ∈ R^p
+        # Branch: [y_i, g] -> Ï† âˆˆ R^p  (note input uses S_in + G)
         self.branch = BranchNet(
-            input_dim=self.S + self.G,
+            input_dim=self.S_in + self.G,
             width=int(branch_width),
             depth=int(branch_depth),
             output_dim=self.p,
@@ -241,7 +253,7 @@ class FlowMapDeepONet(nn.Module):
             dropout_p=float(branch_dropout),
         )
 
-        # Trunk: Δt_norm -> ψ ∈ R^p
+        # Trunk: Î”t_norm -> Ïˆ âˆˆ R^p
         self.trunk = TrunkNet(
             output_dim=self.p,
             hidden_dims=[int(h) for h in trunk_layers],
@@ -249,17 +261,17 @@ class FlowMapDeepONet(nn.Module):
             dropout_p=float(trunk_dropout),
         )
 
-        # Final linear maps elementwise φ ⊙ ψ to state dimension
-        self.out = nn.Linear(self.p, self.S)
+        # Final linear maps elementwise Ï† âŠ™ Ïˆ to the *output* state dimension
+        self.out = nn.Linear(self.p, self.S_out)
 
     def forward(
         self,
-        y_i: torch.Tensor,     # [B,S] or [B,K,S]
+        y_i: torch.Tensor,     # [B,S_in] or [B,K,S_in]
         dt_norm: torch.Tensor, # [B], [B,1], [B,K], or [B,K,1]
         g: torch.Tensor        # [B,G]
     ) -> torch.Tensor:
         """
-        Returns predictions as [B,K,S] (K=1 kept as singleton).
+        Returns predictions as [B,K,S_out] (K=1 kept as singleton).
         """
         # --------- validate g -----------
         if g.ndim != 2:
@@ -268,28 +280,30 @@ class FlowMapDeepONet(nn.Module):
         if getattr(self, "G", None) is not None and g.shape[1] != self.G:
             raise ValueError(f"Expected G={self.G}, got {g.shape[1]}")
 
-        # --------- normalize y_i to [B,S] -----------
+        # --------- normalize y_i to [B,S_in] -----------
         if y_i.ndim == 2:
             if y_i.shape[0] != B:
                 raise ValueError(f"Batch mismatch: y_i has B={y_i.shape[0]}, g has B={B}")
-            y_i_base = y_i  # [B,S]
+            y_i_base = y_i  # [B,S_in]
         elif y_i.ndim == 3:
             if y_i.shape[0] != B:
                 raise ValueError(f"Batch mismatch: y_i has B={y_i.shape[0]}, g has B={B}")
-            y_i_base = y_i[:, 0, :]  # [B,S]
+            y_i_base = y_i[:, 0, :]  # [B,S_in]
         else:
-            raise ValueError(f"Expected y_i as [B,S] or [B,K,S], got {tuple(y_i.shape)}")
-        if y_i_base.shape[1] != self.S:
-            raise ValueError(f"Expected state dim S={self.S}, got {y_i_base.shape[1]}")
+            raise ValueError(f"Expected y_i as [B,S_in] or [B,K,S_in], got {tuple(y_i.shape)}")
+        if y_i_base.shape[1] != self.S_in:
+            raise ValueError(f"Expected state dim S_in={self.S_in}, got {y_i_base.shape[1]}")
 
         # --------- determine K from dt_norm -----------
-        if dt_norm.ndim == 1:               # [B] -> K=1
+        if dt_norm.ndim == 1:             # [B]
+            if dt_norm.shape[0] != B:
+                raise ValueError(f"Batch mismatch: dt_norm has B={dt_norm.shape[0]}, g has B={B}")
             K = 1
-        elif dt_norm.ndim == 2:             # [B,K] or [B,1]
+        elif dt_norm.ndim == 2:           # [B,K] or [B,1]
             if dt_norm.shape[0] != B:
                 raise ValueError(f"Batch mismatch: dt_norm has B={dt_norm.shape[0]}, g has B={B}")
             K = dt_norm.shape[1]
-        elif dt_norm.ndim == 3:             # [B,K,1]
+        elif dt_norm.ndim == 3:           # [B,K,1]
             if dt_norm.shape[-1] != 1:
                 raise ValueError(f"Expected dt_norm last dim 1 when 3D, got {tuple(dt_norm.shape)}")
             if dt_norm.shape[0] != B:
@@ -298,8 +312,8 @@ class FlowMapDeepONet(nn.Module):
         else:
             raise ValueError(f"Unsupported dt_norm shape {tuple(dt_norm.shape)}")
 
-        # --------- branch: [B,S+G] -> [B,p] -----------
-        branch_input = torch.cat([y_i_base, g], dim=-1)   # [B, S+G]
+        # --------- branch: [B,S_in+G] -> [B,p] -----------
+        branch_input = torch.cat([y_i_base, g], dim=-1)   # [B, S_in+G]
         phi = self.branch(branch_input)                   # [B, p]
 
         # --------- trunk: dt_norm -> [B,K,p] -----------
@@ -310,16 +324,23 @@ class FlowMapDeepONet(nn.Module):
 
         # --------- combine & project -----------
         combined = phi.unsqueeze(1) * psi                 # [B,K,p]
-        y_pred = self.out(combined)                       # [B,K,S]
+        y_pred = self.out(combined)                       # [B,K,S_out]
 
         # --------- residual add (if enabled) -----------
         if self.predict_delta:
-            if y_i.ndim == 3:
-                y_pred = y_pred + y_i                     # [B,K,S]
+            if self.S_out != self.S_in:
+                if self.target_idx is None:
+                    raise RuntimeError("predict_delta=True requires target_idx when S_out != S_in")
+                base_subset = y_i_base.index_select(dim=1, index=self.target_idx)  # [B,S_out]
+                y_pred = y_pred + base_subset.unsqueeze(1)                          # [B,K,S_out]
             else:
-                y_pred = y_pred + y_i_base.unsqueeze(1)   # [B,1,S] -> [B,K,S]
+                # Exact match case (S_out == S_in)
+                if y_i.ndim == 3:
+                    y_pred = y_pred + y_i                     # [B,K,S_in]
+                else:
+                    y_pred = y_pred + y_i_base.unsqueeze(1)   # [B,1,S_in] -> [B,K,S_in]
 
-        return y_pred                                     # [B,K,S]
+        return y_pred  # [B,K,S_out]
 
 
 # ------------------------------ Factory --------------------------------------
@@ -328,20 +349,31 @@ class FlowMapDeepONet(nn.Module):
 def create_model(config: dict) -> FlowMapDeepONet:
     """
     Factory for FlowMapDeepONet using config["data"] and config["model"].
-    Supports model-level "dropout" and optional overrides
-    "branch_dropout", "trunk_dropout".
+    Supports optional data.target_species (subset of species_variables) to
+    decouple input vs output dimensions.
     """
     # --- Resolve data dims ---
     data_cfg = config.get("data", {})
-    species_vars = data_cfg.get("species_variables")
-    global_vars = data_cfg.get("global_variables", [])
+    species_vars = list(data_cfg.get("species_variables") or [])
+    global_vars  = list(data_cfg.get("global_variables", []))
     if not species_vars:
         raise KeyError("data.species_variables must be set and non-empty")
     if global_vars is None:
         raise KeyError("data.global_variables must be set (use [] for none)")
 
-    state_dim = len(species_vars)
-    global_dim = len(global_vars)
+    # Targets default to "all species" unless user specifies a subset
+    target_vars = list(data_cfg.get("target_species") or species_vars)
+
+    # Validate and build index mapping from input-state to target-state
+    name_to_idx = {name: i for i, name in enumerate(species_vars)}
+    try:
+        target_idx = [name_to_idx[name] for name in target_vars]
+    except KeyError as e:
+        raise KeyError(f"target_species contains unknown name: {e.args[0]!r}")
+
+    state_dim_in  = len(species_vars)   # e.g., 17
+    state_dim_out = len(target_vars)    # e.g., 8
+    global_dim    = len(global_vars)
 
     # --- Model hyperparams ---
     mcfg = config.get("model", {})
@@ -352,9 +384,12 @@ def create_model(config: dict) -> FlowMapDeepONet:
     predict_delta = bool(mcfg.get("predict_delta", True))
     trunk_dedup   = bool(mcfg.get("trunk_dedup", False))
     activation    = str(mcfg.get("activation", "gelu"))
+    branch_do     = float(mcfg.get("branch_dropout", mcfg.get("dropout", 0.0)))
+    trunk_do      = float(mcfg.get("trunk_dropout",  mcfg.get("dropout", 0.0)))
 
     return FlowMapDeepONet(
-        state_dim=state_dim,
+        state_dim_in=state_dim_in,
+        state_dim_out=state_dim_out,
         global_dim=global_dim,
         basis_dim=basis_dim,
         branch_width=branch_width,
@@ -363,6 +398,7 @@ def create_model(config: dict) -> FlowMapDeepONet:
         predict_delta=predict_delta,
         trunk_dedup=trunk_dedup,
         activation_name=activation,
-        branch_dropout=float(mcfg.get("branch_dropout", mcfg.get("dropout", 0.0))),
-        trunk_dropout=float(mcfg.get("trunk_dropout",  mcfg.get("dropout", 0.0))),
+        branch_dropout=branch_do,
+        trunk_dropout=trunk_do,
+        target_idx=torch.tensor(target_idx, dtype=torch.long),
     )
