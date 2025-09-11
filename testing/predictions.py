@@ -17,16 +17,16 @@ MODEL_DIR = Path(os.environ.get("MODEL_DIR", REPO_ROOT / "models" / "flowmap-dee
 PROCESSED_DIR = Path(os.environ.get("PROCESSED_DIR", REPO_ROOT / "data" / "processed"))
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", REPO_ROOT / "config" / "config.jsonc"))
 
-# We’ll search these in order:
+# We'll search these in order:
 EXPORT_CANDIDATES = [
     MODEL_DIR / "complete_model_exported_k1.pt2",
     MODEL_DIR / "complete_model_exported_k1_int8.pt2",
 ]
 
-SAMPLE_INDEX = 4            # which trajectory to plot
-OUTPUT_DIR = None            # None -> <model_dir>/plots
+SAMPLE_INDEX = 4  # which trajectory to plot
+OUTPUT_DIR = None  # None -> <model_dir>/plots
 SEED = 42
-Q_COUNT = 100                # None or 0 = use all times after t0
+Q_COUNT = 100  # None or 0 = use all times after t0
 CONNECT_LINES = True
 MARKER_EVERY = 2000
 
@@ -38,6 +38,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import numpy as np
 import torch
+
 torch.set_num_threads(1)
 import matplotlib.pyplot as plt
 from torch.export import load as torch_load
@@ -53,6 +54,7 @@ try:
 except Exception:
     pass
 
+
 # =========================
 #     SMALL HELPERS
 # =========================
@@ -62,11 +64,13 @@ def _first_existing(paths):
             return Path(p)
     return None
 
+
 def _load_species_globals():
     """
     Prefer MODEL_DIR/config.snapshot.json (the config that lives with the model).
     Fallback to PROCESSED_DIR/normalization.json meta.
     Last resort: CONFIG_PATH (json/jsonc).
+    Returns: (species_full, globals_v, target_species_or_None)
     """
     snap = MODEL_DIR / "config.snapshot.json"
     if snap.exists():
@@ -75,8 +79,9 @@ def _load_species_globals():
             data = conf.get("data", {})
             species = list(data.get("species_variables", []))
             globals_v = list(data.get("global_variables", []))
+            target = list(data.get("target_species", [])) or None
             if species:
-                return species, globals_v
+                return species, globals_v, target
         except Exception:
             pass
 
@@ -90,16 +95,19 @@ def _load_species_globals():
         meta = (manifest or {}).get("meta", {}) or {}
         species = list(meta.get("species_variables", []) or [])
         globals_v = list(meta.get("global_variables", []) or [])
-        if species:
-            return species, globals_v
+        return species, globals_v, None
 
     # Last resort: original config.jsonc
     try:
         cfg = json5.load(open(CONFIG_PATH, "r"))
         data = cfg.get("data", {})
-        return list(data.get("species_variables", [])), list(data.get("global_variables", []))
+        species = list(data.get("species_variables", []) or [])
+        globals_v = list(data.get("global_variables", []) or [])
+        target = list(data.get("target_species", []) or []) or None
+        return species, globals_v, target
     except Exception:
-        return [], []
+        return [], [], None
+
 
 def _find_exported_model():
     p = _first_existing(EXPORT_CANDIDATES)
@@ -107,10 +115,12 @@ def _find_exported_model():
         raise FileNotFoundError(f"No exported model found. Tried:\n  " + "\n  ".join(map(str, EXPORT_CANDIDATES)))
     return str(p)
 
+
 def _load_exported_model(path: str):
     prog = torch_load(path)
     mod = prog.module()
     return mod, torch.device("cpu")
+
 
 def _load_single_test_sample(data_dir: Path, sample_idx: int | None):
     test_dir = data_dir / "test"
@@ -118,25 +128,27 @@ def _load_single_test_sample(data_dir: Path, sample_idx: int | None):
     if not test_shards:
         raise RuntimeError(f"No test shards in {test_dir}")
     with np.load(test_shards[0], allow_pickle=False) as d:
-        x0 = d["x0"].astype(np.float32)          # [N,S]
-        y = d["y_mat"].astype(np.float32)        # [N,M,S]
-        g = d["globals"].astype(np.float32)      # [N,G]
-        tvec = d["t_vec"]                        # [M] or [N,M]
+        x0 = d["x0"].astype(np.float32)  # [N,S]
+        y = d["y_mat"].astype(np.float32)  # [N,M,S]
+        g = d["globals"].astype(np.float32)  # [N,G]
+        tvec = d["t_vec"]  # [M] or [N,M]
     N = x0.shape[0]
     if sample_idx is None or not (0 <= sample_idx < N):
         sample_idx = np.random.default_rng(SEED).integers(0, N)
     return {
-        "y0": y[sample_idx:sample_idx + 1, 0, :],                           # [1,S] (state at first time)
-        "y_true": y[sample_idx],                                            # [M,S]
-        "t_phys": tvec[sample_idx] if tvec.ndim == 2 else tvec,             # [M]
-        "globals": g[sample_idx:sample_idx + 1],                            # [1,G]
+        "y0": y[sample_idx:sample_idx + 1, 0, :],  # [1,S] (state at first time)
+        "y_true": y[sample_idx],  # [M,S]
+        "t_phys": tvec[sample_idx] if tvec.ndim == 2 else tvec,  # [M]
+        "globals": g[sample_idx:sample_idx + 1],  # [1,G]
         "sample_idx": int(sample_idx),
     }
+
 
 def _normalize_dt(norm: NormalizationHelper, dt_phys, device):
     dt = torch.as_tensor(dt_phys, dtype=torch.float32, device=device)
     dt = torch.clamp(dt, min=float(getattr(norm, "epsilon", 1e-25)))
     return norm.normalize_dt_from_phys(dt.view(-1))  # [K]
+
 
 def _select_query_indices(count: int | None, t_phys: np.ndarray, exclude_first: bool = True):
     M = int(t_phys.size)
@@ -147,32 +159,38 @@ def _select_query_indices(count: int | None, t_phys: np.ndarray, exclude_first: 
         return np.arange(start_idx, M, dtype=int)
     return np.linspace(start_idx, M - 1, count).round().astype(int)
 
+
 @torch.inference_mode()
 def _predict_one(fn, y0_norm: torch.Tensor, g_norm: torch.Tensor, dt_norm_scalar: torch.Tensor,
-                 norm: NormalizationHelper, species: list[str]) -> np.ndarray:
+                 norm: NormalizationHelper, species_out: list[str]) -> np.ndarray:
     dt1 = torch.as_tensor(dt_norm_scalar, dtype=torch.float32, device=y0_norm.device).reshape(-1)  # [1]
     if dt1.numel() != 1:
         raise ValueError(f"dt_norm_scalar must be scalar/len-1, got {tuple(dt1.shape)}")
     out = fn(y0_norm, g_norm, dt1)  # exported K=1 expects dt shape [1]
     if not isinstance(out, torch.Tensor):
         out = torch.as_tensor(out, device=y0_norm.device)
-    S = y0_norm.shape[-1]
-    if out.shape[-1] != S:
-        raise RuntimeError(f"Exported model output last dim != S: got {out.shape}, expected last={S}")
-    out_2d = out.reshape(-1, S)
+
+    # Check output dimension matches species_out
+    out_2d = out.reshape(-1, out.shape[-1])
+    if out_2d.shape[-1] != len(species_out):
+        raise RuntimeError(f"Exported model output last dim {out_2d.shape[-1]} "
+                           f"!= len(species_out) {len(species_out)}")
+
     if out_2d.shape[0] != 1:
         out_2d = out_2d[:1, :]
-    y_phys = norm.denormalize(out_2d, species)  # [1,S]
+    y_phys = norm.denormalize(out_2d, species_out)  # [1,S_out]
     return y_phys.squeeze(0).detach().cpu().numpy()
+
 
 @torch.inference_mode()
 def _predict_many(fn, y0_norm: torch.Tensor, g_norm: torch.Tensor, dt_norm_vec: torch.Tensor,
-                  norm: NormalizationHelper, species: list[str]) -> np.ndarray:
+                  norm: NormalizationHelper, species_out: list[str]) -> np.ndarray:
     preds = []
     K = int(dt_norm_vec.numel())
     for k in range(K):
-        preds.append(_predict_one(fn, y0_norm, g_norm, dt_norm_vec[k:k+1], norm, species))
-    return np.stack(preds, axis=0)  # [K,S]
+        preds.append(_predict_one(fn, y0_norm, g_norm, dt_norm_vec[k:k + 1], norm, species_out))
+    return np.stack(preds, axis=0)  # [K,S_out]
+
 
 def _compute_errors(y_pred: np.ndarray, y_true: np.ndarray, idx, species: list[str]):
     y_true_aligned = y_true[idx, :]
@@ -183,6 +201,7 @@ def _compute_errors(y_pred: np.ndarray, y_true: np.ndarray, idx, species: list[s
         print(f"  {sp:15s}: {e:.3e}")
     print(f"\n[ERROR] Overall mean={rel.mean():.3e}, max={rel.max():.3e}")
     return rel
+
 
 def _plot(t_phys, y_true, t_phys_sel, y_pred, sample_idx, species,
           connect_lines, marker_every, out_path: Path):
@@ -210,7 +229,7 @@ def _plot(t_phys, y_true, t_phys_sel, y_pred, sample_idx, species,
     legend_handles = [Line2D([0], [0], color=colors[idx], lw=2.0, alpha=0.9) for idx in sorted_indices]
     legend_labels = [species[idx] for idx in sorted_indices]
     ax.set_xlim(1e-3, 1e8)
-    #ax.set_ylim(1e-3, 2)
+    # ax.set_ylim(1e-3, 2)
     ax.set_xlabel("Time (s)", fontsize=12)
     ax.set_ylabel("Species Abundance", fontsize=12)
     ax.grid(False)
@@ -232,16 +251,21 @@ def _plot(t_phys, y_true, t_phys_sel, y_pred, sample_idx, species,
     plt.close(fig)
     print(f"[OK] Plot saved to {out_path}")
 
+
 # =========================
 #           MAIN
 # =========================
 def main():
     seed_everything(SEED)
 
-    # Prefer config that lives with the model
-    species, globals_v = _load_species_globals()
-    if not species:
-        raise RuntimeError("Could not resolve species/global variables from model snapshot, normalization.json, or config.jsonc")
+    # Prefer config that lives with the model, get both full and target species
+    species_full, globals_v, target_species = _load_species_globals()
+    if not species_full:
+        raise RuntimeError(
+            "Could not resolve species/global variables from model snapshot, normalization.json, or config.jsonc")
+
+    # Determine output species
+    species_out = target_species if (target_species and len(target_species) > 0) else species_full
 
     out_dir = Path(OUTPUT_DIR) if OUTPUT_DIR else (MODEL_DIR / "plots")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -252,11 +276,20 @@ def main():
     norm = NormalizationHelper(load_json(PROCESSED_DIR / "normalization.json"))
     data = _load_single_test_sample(PROCESSED_DIR, SAMPLE_INDEX)
 
-    # Normalize inputs
-    y0 = torch.from_numpy(data["y0"]).to(model_dev).contiguous()      # [1,S]
-    g  = torch.from_numpy(data["globals"]).to(model_dev).contiguous() # [1,G]
-    y0n = norm.normalize(y0, species)
-    gn  = norm.normalize(g, globals_v)
+    # Build index map from full to target for slicing ground truth
+    norm_manifest = load_json(PROCESSED_DIR / "normalization.json")
+    full_from_norm = list((norm_manifest.get("meta", {}) or {}).get("species_variables", []) or species_full)
+    name_to_idx = {n: i for i, n in enumerate(full_from_norm)}
+    try:
+        target_idx = [name_to_idx[n] for n in species_out]
+    except KeyError as e:
+        raise KeyError(f"target_species contains unknown name: {e.args[0]!r}")
+
+    # Normalize inputs using full species
+    y0 = torch.from_numpy(data["y0"]).to(model_dev).contiguous()  # [1,S_in]
+    g = torch.from_numpy(data["globals"]).to(model_dev).contiguous()  # [1,G]
+    y0n = norm.normalize(y0, species_full)
+    gn = norm.normalize(g, globals_v)
 
     # Build PHYSICAL time grid (exclude t0)
     t_phys_dense = data["t_phys"].astype(np.float64)
@@ -275,14 +308,18 @@ def main():
     print(f"[INFO] First prediction at t={t_phys_sel[0]:.3e}s (Δt={dt_phys_sel[0]:.3e}s)")
 
     # Loop over K with K=1 export
-    y_pred = _predict_many(fn, y0n, gn, dt_norm_sel, norm, species)  # [K,S]
+    y_pred = _predict_many(fn, y0n, gn, dt_norm_sel, norm, species_out)  # [K,S_out]
+
+    # Slice ground truth to match target species
+    y_true_subset = data["y_true"][:, target_idx]  # [M, S_out]
 
     # Plot + errors
     out_png = out_dir / f"predictions_K{int(dt_norm_sel.numel())}_sample_bigy_{data['sample_idx']}.png"
-    _plot(t_phys_dense, data["y_true"], t_phys_sel, y_pred,
-          data["sample_idx"], species, CONNECT_LINES, MARKER_EVERY, out_png)
+    _plot(t_phys_dense, y_true_subset, t_phys_sel, y_pred,
+          data["sample_idx"], species_out, CONNECT_LINES, MARKER_EVERY, out_png)
 
-    _ = _compute_errors(y_pred, data["y_true"], idx, species)
+    _ = _compute_errors(y_pred, y_true_subset, idx, species_out)
+
 
 if __name__ == "__main__":
     main()

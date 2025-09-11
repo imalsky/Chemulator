@@ -122,7 +122,7 @@ class FlowMapPairsDataset(Dataset):
             device: Optional[torch.device] = None,
             dtype: torch.dtype = torch.float32,
             seed: int = 42,
-            log_every_files: int = 50,
+            log_every_files: int = 1000,
     ):
         super().__init__()
         self.root = Path(processed_root)
