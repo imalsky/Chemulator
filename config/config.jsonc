@@ -17,12 +17,46 @@
     "global_variables": ["P", "T"],
 
     // Name of the absolute time dataset in the raw HDF5
-    "time_variable": "t_time"
+    "time_variable": "t_time",
 
     // NOTE: species_variables are auto-detected during preprocessing
     // and then injected back into config from normalization.json.
-    //"species_variables": ["C2H2_evolution", "... 16 more ..."],
-    //"target_species": ["H2_evolution"]
+
+    "species_variables": ["C2H2_evolution",
+      "C2H4_evolution",
+      "CH3_evolution",
+      "CH4_evolution",
+      "CO2_evolution",
+      "CO_evolution",
+      "H2O_evolution",
+      "H2_evolution",
+      "HCN_evolution",
+      "H_evolution",
+      "N2_evolution",
+      "NH3_evolution",
+      "NO_evolution",
+      "O2_evolution",
+      "OH_evolution",
+      "O_evolution"],
+
+    "target_species": [
+      "C2H2_evolution",
+      "C2H4_evolution",
+      "CH3_evolution",
+      "CH4_evolution",
+      "CO2_evolution",
+      "CO_evolution",
+      "H2O_evolution",
+      "H2_evolution",
+      "HCN_evolution",
+      "H_evolution",
+      "N2_evolution",
+      "NH3_evolution",
+      "NO_evolution",
+      "O2_evolution",
+      "OH_evolution",
+      "O_evolution"
+    ]
   },
 
   // ---------- Normalization applied everywhere (preprocessor + runtime) ----------
@@ -59,26 +93,30 @@
 
   // ---------- Dataset (pair sampling & loader behavior) ----------
   "dataset": {
-    // Require dt-spec (log-min-max over Δt) in normalization.json; protects you from bad manifests
-    "require_dt_stats": true,
+    // for quick tests, use less of the data
+    "sample_fraction": 0.01,
+
+    "min_dt_phys": 1e-3,   // seconds; null/omitted => no lower bound
+    "max_dt_phys": 1e4,     // seconds; null/omitted => no upper bound
+
 
     // If all trajectories share the exact same time grid, precompute a [T,T] Δt table (fast path)
     "precompute_dt_table": true,
 
     // Sample multiple target times per anchor (vectorized trunk; better coverage per batch)
     "multi_time_per_anchor": true,
-    "times_per_anchor": 64,          // K; good balance of coverage and memory
+    "times_per_anchor": 32,          // K; good balance of coverage and memory
 
     // If grids are shared, reuse the same K offsets across the batch and mask rows that can’t use all
     // Throughput win and more uniform gradients w.r.t. Δt.
-    "share_times_across_batch": false,
+    "share_times_across_batch": true,
 
     // CRITICAL for long-time accuracy: flatten the natural triangular bias of offsets
     "uniform_offset_sampling": false,
 
     // Put shards on GPU for max throughput (set false if memory is tight)
-    "preload_train_to_gpu": true,
-    "preload_val_to_gpu": true,
+    "preload_train_to_gpu": false, // should be true for real training
+    "preload_val_to_gpu": false, // should be true for real training
 
     // Loader knobs (ignored when GPU-resident; workers forced to 0)
     "num_workers": 0,
@@ -89,15 +127,18 @@
 
   // ---------- Training (sampler bounds, schedule, regularization) ----------
   "training": {
-    "loss_mode": "mae_log_phys",   // options: "mse" (MSE on log-standard z), "frac_l1_phys" (|ŷ−y|/(|y|+eps)), "mae_log_phys" (L1 on log10 phys)
-    "loss_epsilon": 1e-30,         // >0; denom/log guard. Typical 1e-30…1e-20
-    "loss_rel_cap": 500.0,         // optional >0; cap fractional error. Omit/null = no cap
+    // for preprocessing
+    "val_fraction": 0.15,
+    "test_fraction": 0.1,
+    "use_fraction": 1.0,
+
+    "loss_mode": "custom_mse",
 
     "epochs": 100,
 
     // Batch sizes (effective compute cost ~ batch_size × times_per_anchor)
-    "batch_size": 4096,
-    "val_batch_size": 4096,
+    "batch_size": 1024,
+    "val_batch_size": 1024,
 
     // How many anchors per trajectory per epoch (controls epoch length)
     "pairs_per_traj": 1,
@@ -114,7 +155,7 @@
     "warmup_epochs": 0,
 
     // Gentle weight decay (don’t over-regularize the trunk)
-    "weight_decay": 0,
+    "weight_decay": 1e-5,
 
     // Clip to tame rare spikes from difficult Δt windows
     "gradient_clip": 1.0,
@@ -134,14 +175,14 @@
   // ---------- Model (DeepONet) ----------
   "model": {
     // Basis size (φ·ψ dimension). 512 is the sweet spot for your species count.
-    "p": 4096,
+    "p": 512,
 
     // Branch MLP (state+globals → φ)
-    "branch_width": 1024,
+    "branch_width": 512,
     "branch_depth": 4,
 
     // Trunk MLP (Δt̂ → ψ). Deep/wide to capture decades-wide stiffness.
-    "trunk_layers": [1024, 1024, 1024, 1024],
+    "trunk_layers": [256, 256, 256],
 
     // Nonlinearity
     "activation": "leakyrelu",
@@ -152,10 +193,8 @@
     "trunk_dropout": 0.0,
 
     // Predict Δy and add residual; best for small-to-medium Δt
-    "predict_delta": false,
+    "predict_delta": true
 
-    // Keep trunk per-time (no dedup across K) unless you verify identical Δt̂ rows
-    "trunk_dedup": false
   },
 
   // ---------- Mixed precision ----------
