@@ -362,6 +362,50 @@ class Trainer:
             )
         return self._norm_helper, self._species_keys
 
+    def _logspace_abundance_weight(
+            self,
+            y_phys: torch.Tensor,
+            *,
+            low: float = 1e-25,
+            high: float = 1e-10,
+            eps: float = 1e-300,
+    ) -> torch.Tensor:
+        """
+        Smooth weight in [0,1] as a function of PHYSICAL abundance using a quintic
+        'smootherstep' in log10-space.
+
+            x <= low  -> weight = 0
+            x >= high -> weight = 1
+            low < x < high -> smooth transition in log-space
+
+        Args:
+            y_phys:  Tensor of physical abundances, shape [..., S] or [..., K, S]
+            low:     Lower abundance threshold (<= this gets weight 0)
+            high:    Upper abundance threshold (>= this gets weight 1)
+            eps:     Small clamp to avoid log10(0)
+
+        Returns:
+            weights with the same shape as y_phys
+        """
+        import math
+
+        # Guard for nonsensical thresholds
+        if not (low > 0.0 and high > 0.0 and high > low):
+            raise ValueError(f"Invalid thresholds: low={low}, high={high} (require 0<low<high)")
+
+        y = torch.clamp(y_phys, min=eps)
+        logy = torch.log10(y)
+
+        lo = math.log10(low)
+        hi = math.log10(high)
+        # Normalize to [0,1] in log-space, then clamp
+        t = (logy - lo) / (hi - lo)
+        t = torch.clamp(t, 0.0, 1.0)
+
+        # Quintic smootherstep: 6t^5 - 15t^4 + 10t^3
+        w = t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+        return w
+
     @torch.inference_mode()
     def evaluate_frac_l1_phys(
         self,
@@ -742,84 +786,65 @@ class Trainer:
 
     def _compute_loss(
             self,
-            pred: torch.Tensor,  # [B, S] or [B, K, S] in normalized (log-standard) space
+            pred: torch.Tensor,  # [B,S] or [B,K,S] in normalized space
             target: torch.Tensor,  # same shape as pred
-            mask: Optional[torch.Tensor],  # None or [B, K] for multi-time batches
+            mask: Optional[torch.Tensor]  # None or [B,K] for multi-time batches
     ) -> torch.Tensor:
         """
-        Loss modes (set training.loss_mode):
-          - 'mse'           : normalized-space MSE (your current baseline on log-standard z)
-          - 'frac_l1_phys'  : mean absolute fractional error in *physical* space
-                              = mean(|y_pred - y_true| / (|y_true| + eps))
-          - 'mae_log_phys'  : L1 in log10(physical) space (≈ fractional error / ln(10) for small errors)
+        Supports two modes (training.loss_mode):
+          - "mse": unweighted MSE in normalized space. If a k_mask is provided, uses a masked mean.
+          - "custom_mse": MSE in normalized space, but each element is weighted by a smooth
+            log10(abundance) weight computed from the *physical* TARGET abundance:
+                <= custom_mse_low_phys  -> weight = 0
+                >= custom_mse_high_phys -> weight = 1
+                in-between              -> quintic smootherstep in log-space.
+            The mask (if present) multiplies the weights before reduction.
 
-        Notes:
-          * 'frac_l1_phys' exactly matches your runtime metric; use loss_rel_cap to clip huge ratios if desired.
-          * 'mae_log_phys' is a cheap, smoother proxy that often optimizes better early on.
+        Config keys:
+          training.loss_mode             : "mse" | "custom_mse" (default "mse")
+          training.custom_mse_low_phys   : float, default 1e-25
+          training.custom_mse_high_phys  : float, default 1e-10
         """
-        # Read mode/knobs from attributes if present, else fall back to config defaults
-        tr_cfg = self.cfg.get("training", {})
-        mode = getattr(self, "loss_mode", tr_cfg.get("loss_mode", "mse"))
-        eps = float(getattr(self, "loss_epsilon", tr_cfg.get("loss_epsilon", 1e-27)))
-        rel_cap = getattr(self, "loss_rel_cap", tr_cfg.get("loss_rel_cap", None))
+        tr_cfg = self.cfg.get("training", {}) or {}
+        mode = str(tr_cfg.get("loss_mode", "mse")).lower()
+
+        # Squared error in the CURRENT training space (normalized)
+        se = (pred - target) ** 2  # [B,S] or [B,K,S]
 
         if mode == "mse":
-            loss_elems = (pred - target) ** 2
+            # Plain (masked) mean squared error in normalized space
+            if mask is not None:
+                if se.ndim == 3 and mask.ndim == 2:
+                    m = mask.unsqueeze(-1).to(dtype=se.dtype, device=se.device).expand_as(se)
+                else:
+                    m = mask.to(dtype=se.dtype, device=se.device)
+                denom = m.sum()
+                return (se * m).sum() / denom if denom.item() > 0 else se.new_tensor(0.0)
+            return se.mean()
 
-        elif mode in ("frac_l1_phys", "mae_log_phys"):
-            # --- Lazy-load normalization helper on first use ---
-            if not hasattr(self, "_norm_helper"):
-                import json
-                from pathlib import Path
-                from normalizer import NormalizationHelper
+        if mode == "custom_mse":
+            # Compute per-element weights from PHYSICAL target abundance (smooth in log10-space)
+            norm, species_keys = self._ensure_norm_helper()
+            y_true_phys = norm.denormalize(target, species_keys)  # same shape as target
 
-                manifest_path = Path(self.cfg["paths"]["processed_data_dir"]) / "normalization.json"
-                with open(manifest_path, "r") as f:
-                    manifest = json.load(f)
-                self._norm_helper = NormalizationHelper(manifest, device=pred.device)
-                data_cfg = self.cfg.get("data", {})
-                self._species_keys = list(
-                    data_cfg.get("target_species") or data_cfg.get("species_variables")
-                )
+            low = float(tr_cfg.get("custom_mse_low_phys", 1e-25))
+            high = float(tr_cfg.get("custom_mse_high_phys", 1e-10))
 
-            # Denormalize to physical units
-            y_pred = self._norm_helper.denormalize(pred, self._species_keys)
-            y_true = self._norm_helper.denormalize(target, self._species_keys)
+            w = self._logspace_abundance_weight(
+                y_true_phys, low=low, high=high
+            ).to(dtype=se.dtype, device=se.device)  # [B,S] or [B,K,S]
 
-            if mode == "frac_l1_phys":
-                denom = y_true.abs() + eps
-                rel = (y_pred - y_true).abs() / denom
-                if rel_cap is not None:
-                    rel = torch.clamp(rel, max=float(rel_cap))  # optional robustness to tiny denominators
-                loss_elems = rel
+            # Apply k_mask if present
+            if mask is not None:
+                if se.ndim == 3 and mask.ndim == 2:
+                    w = w * mask.unsqueeze(-1).to(dtype=w.dtype, device=w.device)
+                else:
+                    w = w * mask.to(dtype=w.dtype, device=w.device)
 
-            else:  # 'mae_log_phys'
-                y_pred = torch.clamp(y_pred, min=eps)
-                y_true = torch.clamp(y_true, min=eps)
-                loss_elems = (torch.log10(y_pred) - torch.log10(y_true)).abs()
+            denom = w.sum()
+            return (se * w).sum() / denom if denom.item() > 0 else se.new_tensor(0.0)
 
-            # Optional per-species weights (vector [S]); leave unset if not needed
-            w = getattr(self, "loss_weights", None)
-            if w is not None:
-                w = w.to(loss_elems.device, dtype=loss_elems.dtype)
-                while w.ndim < loss_elems.ndim:
-                    w = w.unsqueeze(0)
-                loss_elems = loss_elems * w
-
-        else:
-            raise ValueError(f"Unknown loss_mode='{mode}'")
-
-        # --- Masked reduction for [B,K,S] ---
-        if mask is not None:
-            if loss_elems.ndim == 3 and mask.ndim == 2:
-                mask_exp = mask.unsqueeze(-1).expand_as(loss_elems)
-                denom = mask_exp.sum()
-                return (loss_elems * mask_exp).sum() / denom if denom > 0 else loss_elems.new_tensor(0.0)
-            else:
-                denom = mask.sum()
-                return (loss_elems * mask).sum() / denom if denom > 0 else loss_elems.new_tensor(0.0)
-
-        return loss_elems.mean()
+        raise ValueError("training.loss_mode must be 'mse' or 'custom_mse'.")
 
     def _backward_and_step(self, loss: torch.Tensor) -> None:
         """

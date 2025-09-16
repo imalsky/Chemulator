@@ -57,7 +57,7 @@ def _repo_rel(p: str | Path) -> Path:
     return p if p.is_absolute() else (REPO_ROOT / p).resolve()
 
 # Default MODEL_DIR: prefer .../flowmap-deeponet_done if it exists; otherwise 14; else plain
-_default_model_dir = REPO_ROOT / "models" / "flowmap-deeponet_done"
+_default_model_dir = REPO_ROOT / "models" / "flowmap-deeponet"
 if not _default_model_dir.exists():
     alt = REPO_ROOT / "models" / "flowmap-deeponet_14"
     _default_model_dir = alt if alt.exists() else (REPO_ROOT / "models" / "flowmap-deeponet")

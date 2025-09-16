@@ -50,6 +50,73 @@ from utils import load_json
 
 # --------------------------------- Utilities ---------------------------------
 
+def pretty_dt_debug_string(
+    dt_phys: torch.Tensor,         # [B,K]
+    dt_time_norm: torch.Tensor,    # [B,K,1]
+    dt_dt_norm: torch.Tensor,      # [B,K,1]
+    min_dt_phys: float | None = None,
+    max_dt_phys: float | None = None,
+) -> str:
+    """
+    Return a formatted, human-readable summary of Δt ranges/stats.
+
+    Includes percentiles, coverage relative to optional [min_dt_phys, max_dt_phys],
+    and a compact table comparing time-spec vs dt-spec normalization stats.
+    """
+    with torch.no_grad():
+        dtp = dt_phys.flatten()
+        tnorm = dt_time_norm.flatten()
+        dtnorm = dt_dt_norm.flatten()
+
+        # Basic stats
+        def stats(x: torch.Tensor):
+            return (
+                float(x.min().item()),
+                float(x.mean().item()),
+                float(x.median().item()),
+                float(x.quantile(0.9).item()),
+                float(x.max().item()),
+            )
+
+        dt_min, dt_mean, dt_med, dt_p90, dt_max = stats(dtp)
+        t_min, t_mean, t_med, t_p90, t_max = stats(tnorm)
+        d_min, d_mean, d_med, d_p90, d_max = stats(dtnorm)
+
+        # Differences
+        mad = float((tnorm - dtnorm).abs().mean().item())
+
+        # Coverage in optional window
+        cov_str = ""
+        if (min_dt_phys is not None) or (max_dt_phys is not None):
+            m = torch.ones_like(dtp, dtype=torch.bool)
+            if min_dt_phys is not None:
+                m &= (dtp >= float(min_dt_phys))
+            if max_dt_phys is not None:
+                m &= (dtp <= float(max_dt_phys))
+            cov = float(m.float().mean().item()) * 100.0
+            cov_str = f"\n  coverage within window: {cov:.2f}%"
+
+        def fmt_row(label, vmin, vmean, vmed, vp90, vmax):
+            return f"{label:<10}  min={vmin:>11.6g}  mean={vmean:>11.6g}  med={vmed:>11.6g}  p90={vp90:>11.6g}  max={vmax:>11.6g}"
+
+        # Assemble message
+        lines = [
+            "[dataset] Δt normalization debug:",
+            "  raw Δt (phys, seconds):",
+            fmt_row("", dt_min, dt_mean, dt_med, dt_p90, dt_max),
+            "  normalized Δt (time-spec vs dt-spec):",
+            fmt_row("time-spec", t_min, t_mean, t_med, t_p90, t_max),
+            fmt_row("dt-spec",   d_min, d_mean, d_med, d_p90, d_max),
+            f"  mean |time-spec − dt-spec|: {mad:.6g}",
+        ]
+        if (min_dt_phys is not None) or (max_dt_phys is not None):
+            wlow  = "-∞" if min_dt_phys is None else f"{float(min_dt_phys):.6g}"
+            whigh = "+∞" if max_dt_phys is None else f"{float(max_dt_phys):.6g}"
+            lines.append(f"  requested Δt window: [{wlow}, {whigh}]"+cov_str)
+
+        lines.append("  Using: dt-spec normalization for model input.")
+        return "\n".join(lines)
+
 def format_bytes(n: int | float) -> str:
     n = float(n)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -517,50 +584,29 @@ class FlowMapPairsDataset(Dataset):
 
     @torch.no_grad()
     def _gather_batch(
-        self,
-        idx_list: torch.LongTensor,  # [B] indices into self.index_map
-        *,
-        K: int,
-        min_steps: int,
-        max_steps: int,
-        shared_offsets: bool = False,
-        gen: torch.Generator | None = None,
+            self,
+            idx_list: torch.LongTensor,  # [B] indices into self.index_map
+            *,
+            K: int,
+            min_steps: int,
+            max_steps: int,
+            shared_offsets: bool = False,
+            gen: torch.Generator | None = None,
     ):
         """
-        Assemble a batch on `dataset.device`.
+        Assemble a batch on `dataset.device` and apply optional physical-Δt masking.
 
-        Pipeline
-        --------
-        1) Sample K strictly-later targets j for each anchor (possibly updating anchors if needed).
-        2) Gather normalized states (y_i, y_j) and globals g.
-        3) Compute Δt in **physical units** from the appropriate grid (shared or per-row).
-        - Clamp Δt to ε > 0.
-        - Normalize **twice** for debugging:
-            (A) time-spec  : normalize(..., [self.time_var])   [historical]
-            (B) dt-spec    : normalize_dt_from_phys(...)       [current, used]
-        - Log a one-time INFO comparison (range stats and mean absolute difference).
-        4) Return (y_i, dt_dt_norm, y_j, g, aux[, k_mask]), where `dt_dt_norm` is **dt-spec** normalized.
+        Returns (shared_offsets=False):
+            (y_i, dt_norm, y_j, g, aux)
 
-        Returns
-        -------
-        When `shared_offsets` is False:
-            y_i, dt, y_j, g, aux
-        When `shared_offsets` is True:
-            y_i, dt, y_j, g, aux, k_mask
-
-        Shapes
-        ------
-        - y_i: [B, S]
-        - dt : [B, K, 1]  (normalized via **dt spec**)
-        - y_j: [B, K, S]
-        - g  : [B, G]
-        - aux: dict with 'i':[B], 'j':[B,K]
-        - k_mask: [B, K] only if `share_offsets_across_batch=True`.
+        Returns (shared_offsets=True):
+            (y_i, dt_norm, y_j, g, aux, k_mask)
+        where k_mask is [B,K] boolean indicating which offsets are valid after all masking.
         """
         import logging
         logger = logging.getLogger(__name__)
 
-        # Indices → device,long
+        # Indices -> proper device, dtype
         if not isinstance(idx_list, torch.Tensor):
             idx_list = torch.tensor(idx_list, dtype=torch.long, device=self.device)
         elif idx_list.device != self.device:
@@ -571,37 +617,37 @@ class FlowMapPairsDataset(Dataset):
         if self.index_map.device != self.device:
             self.index_map = self.index_map.to(self.device, non_blocking=True)
 
-        pair = self.index_map[idx_list]                        # [B,2]
-        traj = pair[:, 0].to(torch.long)                       # [B]
-        i0   = pair[:, 1].to(torch.long)                       # [B]
+        pair = self.index_map[idx_list]  # [B,2]
+        traj = pair[:, 0].to(torch.long)  # [B]
+        i0 = pair[:, 1].to(torch.long)  # [B]
         B = int(traj.shape[0])
 
-        # Targets & (possibly) updated anchors
+        # Targets & possibly updated anchors
         j, k_mask, i_used = self._sample_target_indices(
             i=i0,
             K=K,
             min_steps=min_steps,
             max_steps=max_steps,
             shared_offsets=shared_offsets,
-            generator=(gen or getattr(self, "_torch_gen", None)),
-        )                                                       # j:[B,K], k_mask:[B,K], i_used:[B]
+            gen=(gen or getattr(self, "_torch_gen", None)),
+        )  # j:[B,K], k_mask:[B,K] (or None), i_used:[B]
 
-        # Gather states/globals (already normalized)
-        g   = self.G[traj, :]                                   # [B,G]
-        y_i = self.Y[traj, i_used, :]                           # [B,S]
-        bK  = traj.unsqueeze(1).expand(B, K)                    # [B,K]
-        y_j = self.Y[bK, j, :]                                  # [B,K,S]
+        # Gather y_i, y_j, g
+        g = self.G[traj, :]  # [B,G]
+        y_i = self.Y[traj, i_used, :]  # [B,S]
+        y_j = self.Y[traj, j, :].contiguous()  # [B,K,S]
 
-        # ---- Build Δt in PHYSICAL units (always) for normalization & debugging ----
-        if self.time_grid_per_row is not None:
-            t_i = self.time_grid_per_row[traj, i_used]                 # [B]
-            t_j = self.time_grid_per_row[traj.unsqueeze(1), j]         # [B,K]
+        # Δt in physical seconds
+        if self.shared_time_grid is None:
+            row = self.time_grid_per_row[traj, :]  # [B,T]
+            t_i = row.gather(1, i_used.view(B, 1)).squeeze(1)  # [B]
+            t_j = row[torch.arange(B, device=self.device).unsqueeze(1), j]  # [B,K]
         else:
-            vec = self.shared_time_grid                                # [T]
-            t_i = vec.index_select(0, i_used)                           # [B]
-            t_j = vec.index_select(0, j.reshape(-1)).view(B, K)         # [B,K]
+            vec = self.shared_time_grid  # [T]
+            t_i = vec.index_select(0, i_used)  # [B]
+            t_j = vec.index_select(0, j.reshape(-1)).view(B, K)  # [B,K]
 
-        dt_phys = t_j - t_i.unsqueeze(1)                                # [B,K]
+        dt_phys = t_j - t_i.unsqueeze(1)  # [B,K]
         eps = self.epsilon
         dt_phys = torch.where(
             dt_phys > 0,
@@ -609,53 +655,54 @@ class FlowMapPairsDataset(Dataset):
             torch.as_tensor(eps, dtype=dt_phys.dtype, device=dt_phys.device),
         )
 
-        # ---- Normalize Δt via BOTH pathways for comparison ----
-        # (A) time-spec normalization (previous behavior)
+        # Normalize Δt (both pathways for one-time debug)
+        # (A) time-spec normalization (previous behavior; not used for model)
         dt_time_norm = self.norm.normalize(
             dt_phys.to(torch.float32).unsqueeze(-1),
             [self.time_var]
         ).to(torch.float32)  # [B,K,1]
 
-        # (B) dt-spec normalization (recommended & USED)
+        # (B) dt-spec normalization (USED for model)
         if self.dt_table is not None:
-            # Use precomputed table, but also form a dt-spec tensor for consistent shape
             dt_dt_norm = self.dt_table[i_used.unsqueeze(1), j].unsqueeze(-1)  # [B,K,1]
         else:
             dt_dt_norm = self.norm.normalize_dt_from_phys(dt_phys).to(torch.float32).unsqueeze(-1)  # [B,K,1]
 
-        # ---- One-time log comparing both normalizations ----
-        if not hasattr(self, "_dt_norm_debug_logged") or not self._dt_norm_debug_logged:
-            with torch.no_grad():
-                dtp_min = float(dt_phys.min().item())
-                dtp_max = float(dt_phys.max().item())
-                dtp_log = torch.log10(dt_phys)  # safe; dt_phys already clamped
-                dtpl_min = float(dtp_log.min().item())
-                dtpl_max = float(dtp_log.max().item())
+        # One-time debug print with nicer formatting
+        if not getattr(self, "_dt_norm_debug_logged", False):
+            try:
+                ds_cfg = self.cfg.get("dataset", {}) or {}
+                min_dt = ds_cfg.get("min_dt_phys", None)
+                max_dt = ds_cfg.get("max_dt_phys", None)
+                s = pretty_dt_debug_string(dt_phys, dt_time_norm, dt_dt_norm, min_dt, max_dt)
+                logger.info(s)
+            finally:
+                self._dt_norm_debug_logged = True
 
-                def _summ(x: torch.Tensor) -> tuple[float, float, float]:
-                    return float(x.min().item()), float(x.mean().item()), float(x.max().item())
+        # Apply physical-Δt window mask if requested
+        ds_cfg = self.cfg.get("dataset", {}) or {}
+        min_dt_phys = ds_cfg.get("min_dt_phys", None)
+        max_dt_phys = ds_cfg.get("max_dt_phys", None)
 
-                t_min, t_mean, t_max = _summ(dt_time_norm)
-                d_min, d_mean, d_max = _summ(dt_dt_norm)
-                mad = float((dt_time_norm - dt_dt_norm).abs().mean().item())
+        final_mask = None
+        if (min_dt_phys is not None) or (max_dt_phys is not None):
+            m = torch.ones((B, K), dtype=torch.bool, device=self.device)
+            if min_dt_phys is not None:
+                m &= (dt_phys >= float(min_dt_phys))
+            if max_dt_phys is not None:
+                m &= (dt_phys <= float(max_dt_phys))
+            final_mask = m
 
-            logger.info(
-                "[dataset] Δt normalization debug:\n"
-                "  raw Δt (phys): min=%.6g, max=%.6g, log10Δt: min=%.6g, max=%.6g\n"
-                "  time-spec  norm Δt: min=%.6g, mean=%.6g, max=%.6g\n"
-                "  dt-spec    norm Δt: min=%.6g, mean=%.6g, max=%.6g\n"
-                "  mean |time-spec − dt-spec|: %.6g\n"
-                "  Using: dt-spec normalization for model input.",
-                dtp_min, dtp_max, dtpl_min, dtpl_max,
-                t_min, t_mean, t_max,
-                d_min, d_mean, d_max,
-                mad,
-            )
-            self._dt_norm_debug_logged = True
+        # Merge with k_mask (shared-offset masking) if present
+        if shared_offsets:
+            if final_mask is not None:
+                k_mask = k_mask & final_mask if k_mask is not None else final_mask
+            # Ensure a mask tensor is returned
+            if k_mask is None:
+                k_mask = torch.ones((B, K), dtype=torch.bool, device=self.device)
 
-        # ---- Use dt-spec normalization as the model input ----
+        # Prepare outputs
         dt_norm = dt_dt_norm  # [B,K,1]
-
         aux = {"i": i_used, "j": j}
         if shared_offsets:
             return y_i, dt_norm, y_j, g, aux, k_mask

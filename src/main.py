@@ -45,12 +45,49 @@ from trainer import Trainer
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config.jsonc"
 GLOBAL_SEED = 42
-GLOBAL_WORK_DIR = REPO_ROOT / "models" / "flowmap-deeponet"
+GLOBAL_WORK_DIR = REPO_ROOT / "models" / "trained_model"
 
 
 # --------------------------------------------------------------------------------------
 # Helper: re-hydrate cfg.data.* from an existing processed data directory
 # --------------------------------------------------------------------------------------
+def maybe_subsample_dataset(ds, *, fraction: float, seed: int, role: str = "train"):
+    """
+    Return a Subset-wrapped dataset if 0 < fraction < 1, otherwise the original dataset.
+
+    - Subsamples by dataset index, so it uniformly reduces total (anchor,target) pairs,
+      without touching shards or normalization.
+    - By default applies to TRAIN only; pass role="val" if you want to downsample val too.
+    """
+    import math
+    import torch
+    from torch.utils.data import Subset
+
+    f = float(fraction)
+    if not (0.0 < f <= 1.0):
+        return ds  # ignore invalid or full fraction
+
+    n = len(ds)
+    k = max(1, int(math.ceil(f * n)))
+
+    # Deterministic subset
+    g = torch.Generator()
+    g.manual_seed(int(seed) & 0xFFFFFFFF)
+    perm = torch.randperm(n, generator=g)
+    idx = perm[:k].tolist()
+
+    # Log a clear message (avoid spamming)
+    try:
+        import logging
+        logging.getLogger(__name__).info(
+            f"[data] {role}: using sample_fraction={f:.6g} → {k}/{n} items ({100.0*k/n:.2f}%)."
+        )
+    except Exception:
+        pass
+
+    return Subset(ds, idx)
+
+
 
 def hydrate_config_from_processed(
         cfg: Dict[str, Any],
@@ -334,94 +371,164 @@ def build_datasets_and_loaders(
         runtime_dtype: torch.dtype,
         logger: logging.Logger,
 ) -> Tuple[FlowMapPairsDataset, FlowMapPairsDataset,
-torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+           torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
     Build training and validation datasets with their dataloaders.
 
     - Supports GPU-resident datasets for maximum throughput when memory permits.
-    - Sampling (pairs/anchor times) is implemented inside the dataset; no external shuffling.
-
-    Returns:
-        (train_dataset, val_dataset, train_loader, val_loader)
+    - Can subsample datasets via cfg['dataset'].sample_fraction without touching shards.
+    - Preserves the project's vectorized batching (_gather_batch) even when using Subset.
     """
-    dataset_cfg = cfg.get("dataset", {})
-    training_cfg = cfg.get("training", {})
+    dataset_cfg = cfg.get("dataset", {}) or {}
+    training_cfg = cfg.get("training", {}) or {}
     processed_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
 
     # Dataset sampling parameters
     pairs_per_traj = int(training_cfg.get("pairs_per_traj", 64))
     pairs_per_traj_val = int(training_cfg.get("pairs_per_traj_val", pairs_per_traj))
     min_steps = int(training_cfg.get("min_steps", 1))
-    max_steps_val = int(training_cfg.get("max_steps", 0)) or None
+    max_steps_cfg = int(training_cfg.get("max_steps", 0))
+    max_steps = max_steps_cfg if max_steps_cfg > 0 else None
     base_seed = int(cfg.get("system", {}).get("seed", 42))
 
-    # Train dataset (optionally GPU-resident)
+    # ---------------------------
+    # Build base datasets
+    # ---------------------------
     train_dataset = FlowMapPairsDataset(
         processed_root=processed_dir,
         split="train",
         config=cfg,
         pairs_per_traj=pairs_per_traj,
         min_steps=min_steps,
-        max_steps=max_steps_val,
-        preload_to_gpu=bool(dataset_cfg.get("preload_train_to_gpu", True)),
+        max_steps=max_steps,
+        preload_to_gpu=bool(dataset_cfg.get("preload_train_to_gpu", False)),
         device=device,
         dtype=runtime_dtype,
         seed=base_seed,
     )
 
-    # Validation dataset (different seed for independent sampling)
     val_dataset = FlowMapPairsDataset(
         processed_root=processed_dir,
-        split="validation",
+        split="val",
         config=cfg,
         pairs_per_traj=pairs_per_traj_val,
         min_steps=min_steps,
-        max_steps=max_steps_val,
-        preload_to_gpu=bool(dataset_cfg.get("preload_val_to_gpu", True)),
+        max_steps=max_steps,
+        preload_to_gpu=bool(dataset_cfg.get("preload_val_to_gpu", False)),
         device=device,
         dtype=runtime_dtype,
-        seed=base_seed + 1337,
+        seed=base_seed + 1,
     )
 
-    # Batch sizes
-    batch_size_train = int(training_cfg.get("batch_size", 512))
+    # ---------------------------
+    # Optional subsampling
+    # ---------------------------
+    frac_train = float(dataset_cfg.get("sample_fraction", 1.0))
+    frac_val   = float(dataset_cfg.get("sample_fraction_val", 1.0))  # optional; defaults to full val
+    frac_seed  = int(dataset_cfg.get("sample_seed", 1337))
+
+    # Apply to TRAIN
+    if 0.0 < frac_train < 1.0:
+        train_dataset = maybe_subsample_dataset(
+            train_dataset, fraction=frac_train, seed=frac_seed, role="train"
+        )
+
+    # Apply to VAL (only if explicitly requested)
+    if 0.0 < frac_val < 1.0:
+        val_dataset = maybe_subsample_dataset(
+            val_dataset, fraction=frac_val, seed=frac_seed + 1, role="val"
+        )
+
+    # ---------------------------
+    # Loader builder (handles Subset)
+    # ---------------------------
+    def _make_loader(ds, batch_size: int, is_train: bool):
+        # If ds is a torch.utils.data.Subset, we need to reference the base dataset
+        base_ds = ds.dataset if hasattr(ds, "dataset") else ds
+        gpu_resident = (getattr(base_ds, "device", torch.device("cpu")).type == "cuda")
+
+        # Dataloader knobs
+        if is_train:
+            num_workers = 0 if gpu_resident else int(dataset_cfg.get("num_workers", 0))
+            pin_memory = False if gpu_resident else bool(dataset_cfg.get("pin_memory", False))
+            prefetch_factor = int(dataset_cfg.get("prefetch_factor", 2))
+            persistent_workers = bool(dataset_cfg.get("persistent_workers", False))
+        else:
+            num_workers = 0 if gpu_resident else int(dataset_cfg.get("num_workers_val", dataset_cfg.get("num_workers", 0)))
+            pin_memory = False if gpu_resident else bool(dataset_cfg.get("pin_memory_val", dataset_cfg.get("pin_memory", False)))
+            prefetch_factor = int(dataset_cfg.get("prefetch_factor_val", dataset_cfg.get("prefetch_factor", 2)))
+            persistent_workers = bool(dataset_cfg.get("persistent_workers_val", dataset_cfg.get("persistent_workers", False)))
+
+        # If it's a Subset, the project's create_dataloader() can't see base_ds attributes.
+        # Provide a collate that calls base_ds._gather_batch directly.
+        if hasattr(ds, "dataset"):
+            def _collate(idxs):
+                # idxs are values returned by base_ds.__getitem__ wrapped by Subset.
+                # In this project, __getitem__ returns the index itself; make it a tensor on the base device.
+                if isinstance(idxs, (list, tuple)):
+                    idxs_t = torch.tensor(idxs, dtype=torch.long, device=base_ds.device)
+                elif isinstance(idxs, torch.Tensor):
+                    idxs_t = idxs.to(base_ds.device, dtype=torch.long, non_blocking=True)
+                else:
+                    idxs_t = torch.tensor(list(idxs), dtype=torch.long, device=base_ds.device)
+
+                return base_ds._gather_batch(
+                    idxs_t,
+                    K=base_ds.K,
+                    min_steps=base_ds.min_steps,
+                    max_steps=base_ds.max_steps,
+                    shared_offsets=base_ds.share_offsets_across_batch,
+                    gen=getattr(base_ds, "_torch_gen", None),
+                )
+
+            kwargs = {
+                "dataset": ds,
+                "batch_size": int(batch_size),
+                "shuffle": bool(is_train),
+                "num_workers": int(num_workers),
+                "pin_memory": bool(pin_memory),
+                "drop_last": False,
+                "collate_fn": _collate,
+            }
+            if num_workers > 0:
+                kwargs["prefetch_factor"] = int(prefetch_factor)
+                kwargs["persistent_workers"] = bool(persistent_workers)
+            return torch.utils.data.DataLoader(**kwargs)
+
+        # Otherwise use the project helper (respects GPU-resident fast path)
+        return create_dataloader(
+            dataset=base_ds,
+            batch_size=int(batch_size),
+            shuffle=bool(is_train),
+            num_workers=int(num_workers),
+            pin_memory=bool(pin_memory),
+            prefetch_factor=int(prefetch_factor),
+            persistent_workers=bool(persistent_workers),
+        )
+
+    # ---------------------------
+    # Build loaders + validation
+    # ---------------------------
+    batch_size_train = int(training_cfg.get("batch_size", 1024))
     batch_size_val = int(training_cfg.get("val_batch_size", batch_size_train))
 
-    # DataLoaders (workers typically 0 when data are GPU-resident)
-    train_loader = create_dataloader(
-        dataset=train_dataset,
-        batch_size=batch_size_train,
-        shuffle=False,
-        num_workers=int(dataset_cfg.get("num_workers", 0)),
-        pin_memory=bool(dataset_cfg.get("pin_memory", False)),
-        prefetch_factor=int(dataset_cfg.get("prefetch_factor", 2)),
-        persistent_workers=bool(dataset_cfg.get("persistent_workers", False)),
-    )
+    train_loader = _make_loader(train_dataset, batch_size_train, is_train=True)
+    val_loader   = _make_loader(val_dataset,   batch_size_val,   is_train=False)
 
-    val_loader = create_dataloader(
-        dataset=val_dataset,
-        batch_size=batch_size_val,
-        shuffle=False,
-        num_workers=int(dataset_cfg.get("num_workers_val", dataset_cfg.get("num_workers", 0))),
-        pin_memory=bool(dataset_cfg.get("pin_memory_val", dataset_cfg.get("pin_memory", False))),
-        prefetch_factor=int(dataset_cfg.get("prefetch_factor_val", dataset_cfg.get("prefetch_factor", 2))),
-        persistent_workers=bool(
-            dataset_cfg.get("persistent_workers_val", dataset_cfg.get("persistent_workers", False))),
-    )
-
-    # Sanity-check that loaders are non-empty
+    # Sanity check + concise stats
     validate_dataloaders(
         train_loader, val_loader,
         batch_size_train, batch_size_val,
         processed_dir, logger
     )
 
-    # Log multi-time configuration clearly
+    # Log multi-time & subsample configuration clearly
     logger.info(
         "Dataset configuration: "
         f"multi_time_per_anchor={bool(dataset_cfg.get('multi_time_per_anchor', False))}, "
         f"times_per_anchor={int(dataset_cfg.get('times_per_anchor', 1))}, "
-        f"share_times_across_batch={bool(dataset_cfg.get('share_times_across_batch', False))}"
+        f"share_times_across_batch={bool(dataset_cfg.get('share_times_across_batch', False))}, "
+        f"sample_fraction(train)={frac_train:.6g}, sample_fraction(val)={frac_val:.6g}"
     )
 
     return train_dataset, val_dataset, train_loader, val_loader
@@ -580,8 +687,10 @@ def main() -> None:
     cfg = load_json_config(str(args.config))
 
     # Set/ensure common run-time parameters
-    cfg.setdefault("paths", {})["work_dir"] = str(GLOBAL_WORK_DIR)
-    cfg.setdefault("system", {})["seed"] = GLOBAL_SEED
+    paths = cfg.setdefault("paths", {})
+    paths.setdefault("work_dir", str(GLOBAL_WORK_DIR))
+    system_cfg = cfg.setdefault("system", {})
+    system_cfg.setdefault("seed", GLOBAL_SEED)
 
     # Apply resume overrides (NEW)
     apply_resume_overrides(cfg, args.resume, logger)
@@ -599,7 +708,7 @@ def main() -> None:
     optimize_hardware(cfg.get("system", {}), device)
 
     # Determine runtime dtype for staged tensors
-    storage_dtype_str = str(cfg.get("dataset", {}).get("storage_dtype", "float32")).lower()
+    storage_dtype_str = str(cfg.get("system", {}).get("dtype", "float32")).lower()
     if storage_dtype_str == "bf16":
         runtime_dtype = torch.bfloat16
     elif storage_dtype_str in ("fp16", "float16", "half"):
