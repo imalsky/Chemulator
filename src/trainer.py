@@ -717,7 +717,13 @@ class Trainer:
 
             pred = self.model(y_i, dt_in, g)
             pred, y_j = self._harmonize_shapes(pred, y_j)
+
+            # Primary flow-map loss
             loss = self._compute_loss(pred, y_j, k_mask)
+
+            # Optional AE reconstruction loss (joint training, no pretrain)
+            if hasattr(self.model, "compute_ae_loss"):
+                loss = loss + self.model.compute_ae_loss(y_i, y_j)
 
         # Backward pass and optimization
         if train:

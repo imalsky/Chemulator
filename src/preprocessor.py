@@ -759,6 +759,22 @@ class DataPreprocessor:
         """
         seed = self.seed  # Use the seed from config for deterministic hashing
 
+        # PERSISTENT BUFFERS ACROSS CHUNKS (avoid tiny shards)
+        buffers = {
+            "train": {"x0": [], "g": [], "t": [], "y": []},
+            "validation": {"x0": [], "g": [], "t": [], "y": []},
+            "test": {"x0": [], "g": [], "t": [], "y": []},
+        }
+        # Per-split shard indices to avoid collisions across ranks
+        shard_idx = {
+            "train": self.rank * 100000,
+            "validation": self.rank * 100000,
+            "test": self.rank * 100000,
+        }
+        # Honor config; you can cap this if memory requires
+        flush_threshold = max(1, int(self.traj_per_shard))
+
+
         # Initialize statistics accumulators for training data only
         all_keys = list(dict.fromkeys(self.species_vars + self.global_vars + [self.time_key]))
         need_flags = {
@@ -824,12 +840,31 @@ class DataPreprocessor:
             if self.rank == 0 and work_idx % 10 == 0:
                 self.logger.info(f"Rank 0 processing chunk {work_idx + 1}/{len(my_work)}")
 
-            shard_counter = self._process_chunk_to_shards(
+            self._process_chunk_to_shards(
                 Path(path_str), group_chunk, seed,
                 local_split_counts, local_shards_metadata,
-                local_train_stats, shard_counter
+                local_train_stats,
+                buffers, shard_idx, flush_threshold
             )
-            # shard_counter now reflects how many shards were actually written
+
+        for split_name in ("train", "validation", "test"):
+            buf = buffers[split_name]
+            if buf["x0"]:
+                self._write_shard(
+                    self.processed_dir / split_name,
+                    buf,
+                    f"ALL_r{self.rank}",
+                    split_name,
+                    shard_idx[split_name]
+                )
+                local_shards_metadata[split_name].append({
+                    "filename": f"shard_{split_name}_ALL_r{self.rank}_{shard_idx[split_name]:05d}.npz",
+                    "n_trajectories": len(buf["x0"])
+                })
+                shard_idx[split_name] += 1
+                for k in buf.keys():
+                    buf[k].clear()
+
 
         # Aggregate statistics across all ranks
         if self.comm:
@@ -988,26 +1023,19 @@ class DataPreprocessor:
             split_counts: Dict[str, int],
             shards_metadata: Dict[str, List],
             train_stats: Dict[str, RunningStatistics],
-            shard_counter: int
-    ) -> int:
-        """Process a chunk of groups from a single HDF5 file and write to shards.
+            buffers: Dict[str, Dict[str, list]],
+            shard_idx: Dict[str, int],
+            flush_threshold: int,
+    ) -> None:
+        """Process a chunk of groups from a single HDF5 file and append to shared buffers.
 
-        Returns:
-            Updated shard_counter after writing any shards from this chunk.
+        Shards are written only when a buffer reaches `flush_threshold`.
         """
         # Deterministic shuffling using deterministic_hash for reproducibility
         file_hash_seed = int(deterministic_hash(path.name, seed) * 2 ** 32)
         rng = np.random.default_rng(seed ^ file_hash_seed)
         order = rng.permutation(len(group_chunk))
         groups_ordered = [group_chunk[i] for i in order]
-
-        # Buffers for batching - use less memory by flushing more frequently
-        max_buffer_size = max(self.traj_per_shard // 4, 32)  # Flush at 1/4 of shard size
-        buffers = {
-            "train": {"x0": [], "g": [], "t": [], "y": []},
-            "validation": {"x0": [], "g": [], "t": [], "y": []},
-            "test": {"x0": [], "g": [], "t": [], "y": []},
-        }
 
         with h5py.File(path, "r") as hdf:
             for group_name in groups_ordered:
@@ -1073,44 +1101,25 @@ class DataPreprocessor:
                     )
 
                 # Flush buffers if they exceed max_buffer_size
-                for split_name in ("train", "validation", "test"):
-                    buffer = buffers[split_name]
-                    if len(buffer["x0"]) >= max_buffer_size:
-                        self._write_shard(
-                            self.processed_dir / split_name,
-                            buffer,
-                            f"{path.stem[:20]}_r{self.rank}",
-                            split_name,
-                            shard_counter
-                        )
-                        shards_metadata[split_name].append({
-                            "filename": f"shard_{split_name}_{path.stem[:20]}_r{self.rank}_{shard_counter:05d}.npz",
-                            "n_trajectories": len(buffer["x0"])
-                        })
-                        shard_counter += 1
-                        for key in buffer.keys():
-                            buffer[key].clear()
+                buf = buffers[split]
+                if len(buf["x0"]) >= flush_threshold:
+                    self._write_shard(
+                        self.processed_dir / split,
+                        buf,
+                        f"{path.stem[:20]}_r{self.rank}",
+                        split,
+                        shard_idx[split]
+                    )
+                    shards_metadata[split].append({
+                        "filename": f"shard_{split}_{path.stem[:20]}_r{self.rank}_{shard_idx[split]:05d}.npz",
+                        "n_trajectories": len(buf["x0"])
+                    })
+                    shard_idx[split] += 1
+                    for k in buf.keys():
+                        buf[k].clear()
 
         # Flush remaining buffers
-        for split_name in ("train", "validation", "test"):
-            buffer = buffers[split_name]
-            if buffer["x0"]:
-                self._write_shard(
-                    self.processed_dir / split_name,
-                    buffer,
-                    f"{path.stem[:20]}_r{self.rank}",
-                    split_name,
-                    shard_counter
-                )
-                shards_metadata[split_name].append({
-                    "filename": f"shard_{split_name}_{path.stem[:20]}_r{self.rank}_{shard_counter:05d}.npz",
-                    "n_trajectories": len(buffer["x0"])
-                })
-                shard_counter += 1
-                for key in buffer.keys():
-                    buffer[key].clear()
-
-        return shard_counter
+        return None
 
     def _read_species_matrix(self, group, T: int) -> np.ndarray:
         """Read species data into matrix form."""

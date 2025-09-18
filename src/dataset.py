@@ -295,11 +295,29 @@ class FlowMapPairsDataset(Dataset):
 
     # ----------------------------- Initialization -----------------------------
 
-    def _discover_shards(self) -> list[str]:
-        pattern = str(self.root / self.split / "*.npz")
-        files = sorted(glob(pattern))
+    def _discover_shards(self) -> list[Path]:
+        """
+        Locate NPZ shards under the processed root for the requested split.
+
+        - Uses self.root (set in __init__), not a non-existent self.processed_dir.
+        - For 'val', also tries a legacy 'validation' directory.
+        """
+        base = self.root  # FIX: was self.processed_dir
+        splits_to_try = [self.split]
+        if self.split == "val":
+            splits_to_try.append("validation")  # accept legacy naming
+
+        files: list[Path] = []
+        for split_name in splits_to_try:
+            d = base / split_name
+            if d.is_dir():
+                matches = sorted(d.glob("shard_*.npz"))
+                if matches:
+                    files.extend(matches)
+
         if not files:
-            raise RuntimeError(f"[{self.split}] No NPZ shards found at {pattern}")
+            tried = ", ".join(str((base / s) / "shard_*.npz") for s in splits_to_try)
+            raise RuntimeError(f"[{self.split}] No NPZ shards found. Looked in: {tried}")
         return files
 
     def _scan_shards(self) -> dict:
@@ -601,12 +619,12 @@ class FlowMapPairsDataset(Dataset):
 
         Returns (shared_offsets=True):
             (y_i, dt_norm, y_j, g, aux, k_mask)
-        where k_mask is [B,K] boolean indicating which offsets are valid after all masking.
+        where k_mask is [B,K] boolean indicating which offsets are valid after masking.
         """
         import logging
         logger = logging.getLogger(__name__)
 
-        # Indices -> proper device, dtype
+        # ---- Indices -> proper device/dtype ----
         if not isinstance(idx_list, torch.Tensor):
             idx_list = torch.tensor(idx_list, dtype=torch.long, device=self.device)
         elif idx_list.device != self.device:
@@ -617,31 +635,42 @@ class FlowMapPairsDataset(Dataset):
         if self.index_map.device != self.device:
             self.index_map = self.index_map.to(self.device, non_blocking=True)
 
-        pair = self.index_map[idx_list]  # [B,2]
-        traj = pair[:, 0].to(torch.long)  # [B]
-        i0 = pair[:, 1].to(torch.long)  # [B]
+        # ---- Expand idx_list -> (traj_idx, anchor_i) ----
+        pair = self.index_map.index_select(0, idx_list)  # [B,2]
+        traj = pair[:, 0].to(dtype=torch.long)  # [B]
+        i0 = pair[:, 1].to(dtype=torch.long)  # [B]
         B = int(traj.shape[0])
+        K = int(K)
+        S = int(self.Y.shape[-1])
 
-        # Targets & possibly updated anchors
+        # ---- Targets & possibly updated anchors ----
         j, k_mask, i_used = self._sample_target_indices(
             i=i0,
             K=K,
             min_steps=min_steps,
             max_steps=max_steps,
             shared_offsets=shared_offsets,
-            gen=(gen or getattr(self, "_torch_gen", None)),
-        )  # j:[B,K], k_mask:[B,K] (or None), i_used:[B]
+            generator=(gen or getattr(self, "_torch_gen", None)),
+        )
+        # Defensive: ensure correct integer types
+        i_used = i_used.to(torch.long)
+        j = j.to(torch.long)
 
-        # Gather y_i, y_j, g
-        g = self.G[traj, :]  # [B,G]
-        y_i = self.Y[traj, i_used, :]  # [B,S]
-        y_j = self.Y[traj, j, :].contiguous()  # [B,K,S]
+        # ---- Gather y_i, y_j, g (avoid advanced-index broadcasting issues) ----
+        g = self.G.index_select(0, traj)  # [B,G]
+        Y_traj = self.Y.index_select(0, traj)  # [B,T,S]
 
-        # Δt in physical seconds
+        # y_i: [B,S]
+        y_i = Y_traj.gather(1, i_used.view(B, 1, 1).expand(-1, 1, S)) \
+            .squeeze(1).contiguous()
+        # y_j: [B,K,S]
+        y_j = Y_traj.gather(1, j.unsqueeze(-1).expand(-1, K, S)).contiguous()
+
+        # ---- Δt in physical seconds (use gather for both branches) ----
         if self.shared_time_grid is None:
-            row = self.time_grid_per_row[traj, :]  # [B,T]
+            row = self.time_grid_per_row.index_select(0, traj)  # [B,T]
             t_i = row.gather(1, i_used.view(B, 1)).squeeze(1)  # [B]
-            t_j = row[torch.arange(B, device=self.device).unsqueeze(1), j]  # [B,K]
+            t_j = row.gather(1, j)  # [B,K]
         else:
             vec = self.shared_time_grid  # [T]
             t_i = vec.index_select(0, i_used)  # [B]
@@ -655,7 +684,7 @@ class FlowMapPairsDataset(Dataset):
             torch.as_tensor(eps, dtype=dt_phys.dtype, device=dt_phys.device),
         )
 
-        # Normalize Δt (both pathways for one-time debug)
+        # ---- Normalize Δt (debug: time-spec; model: dt-spec) ----
         # (A) time-spec normalization (previous behavior; not used for model)
         dt_time_norm = self.norm.normalize(
             dt_phys.to(torch.float32).unsqueeze(-1),
@@ -668,7 +697,7 @@ class FlowMapPairsDataset(Dataset):
         else:
             dt_dt_norm = self.norm.normalize_dt_from_phys(dt_phys).to(torch.float32).unsqueeze(-1)  # [B,K,1]
 
-        # One-time debug print with nicer formatting
+        # ---- One-time debug print ----
         if not getattr(self, "_dt_norm_debug_logged", False):
             try:
                 ds_cfg = self.cfg.get("dataset", {}) or {}
@@ -679,7 +708,7 @@ class FlowMapPairsDataset(Dataset):
             finally:
                 self._dt_norm_debug_logged = True
 
-        # Apply physical-Δt window mask if requested
+        # ---- Optional physical-Δt window mask ----
         ds_cfg = self.cfg.get("dataset", {}) or {}
         min_dt_phys = ds_cfg.get("min_dt_phys", None)
         max_dt_phys = ds_cfg.get("max_dt_phys", None)
@@ -697,18 +726,22 @@ class FlowMapPairsDataset(Dataset):
         if shared_offsets:
             if final_mask is not None:
                 k_mask = k_mask & final_mask if k_mask is not None else final_mask
-            # Ensure a mask tensor is returned
             if k_mask is None:
                 k_mask = torch.ones((B, K), dtype=torch.bool, device=self.device)
 
-        # Prepare outputs
+        # ---- Shape guards (cheap, catch regressions early) ----
+        assert y_i.shape == (B, S), f"y_i shape {y_i.shape} != {(B, S)}"
+        assert y_j.shape == (B, K, S), f"y_j shape {y_j.shape} != {(B, K, S)}"
+        assert g.shape[0] == B, f"g batch {g.shape[0]} != {B}"
+        assert dt_dt_norm.shape == (B, K, 1), f"dt_norm {dt_dt_norm.shape} != {(B, K, 1)}"
+
+        # ---- Prepare outputs ----
         dt_norm = dt_dt_norm  # [B,K,1]
         aux = {"i": i_used, "j": j}
         if shared_offsets:
             return y_i, dt_norm, y_j, g, aux, k_mask
         else:
             return y_i, dt_norm, y_j, g, aux
-                
 
     # ------------------------------- Dataloader API ------------------------------
 

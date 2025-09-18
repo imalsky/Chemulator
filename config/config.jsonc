@@ -17,46 +17,13 @@
     "global_variables": ["P", "T"],
 
     // Name of the absolute time dataset in the raw HDF5
-    "time_variable": "t_time",
+    "time_variable": "t_time"
 
     // NOTE: species_variables are auto-detected during preprocessing
     // and then injected back into config from normalization.json.
 
-    "species_variables": ["C2H2_evolution",
-      "C2H4_evolution",
-      "CH3_evolution",
-      "CH4_evolution",
-      "CO2_evolution",
-      "CO_evolution",
-      "H2O_evolution",
-      "H2_evolution",
-      "HCN_evolution",
-      "H_evolution",
-      "N2_evolution",
-      "NH3_evolution",
-      "NO_evolution",
-      "O2_evolution",
-      "OH_evolution",
-      "O_evolution"],
-
-    "target_species": [
-      "C2H2_evolution",
-      "C2H4_evolution",
-      "CH3_evolution",
-      "CH4_evolution",
-      "CO2_evolution",
-      "CO_evolution",
-      "H2O_evolution",
-      "H2_evolution",
-      "HCN_evolution",
-      "H_evolution",
-      "N2_evolution",
-      "NH3_evolution",
-      "NO_evolution",
-      "O2_evolution",
-      "OH_evolution",
-      "O_evolution"
-    ]
+    //"species_variables": [],
+    //"target_species": []
   },
 
   // ---------- Normalization applied everywhere (preprocessor + runtime) ----------
@@ -79,7 +46,7 @@
     "min_value_threshold": 1e-30,
 
     // Trajectories per NPZ shard
-    "trajectories_per_shard": 65536,
+    "trajectories_per_shard": 1048576,
 
     // NPZ compression off for faster I/O
     "npz_compressed": false,
@@ -94,7 +61,7 @@
   // ---------- Dataset (pair sampling & loader behavior) ----------
   "dataset": {
     // for quick tests, use less of the data
-    "sample_fraction": 0.01,
+    "sample_fraction": 1.0,
 
     "min_dt_phys": 1e-3,   // seconds; null/omitted => no lower bound
     "max_dt_phys": 1e4,     // seconds; null/omitted => no upper bound
@@ -115,8 +82,8 @@
     "uniform_offset_sampling": false,
 
     // Put shards on GPU for max throughput (set false if memory is tight)
-    "preload_train_to_gpu": false, // should be true for real training
-    "preload_val_to_gpu": false, // should be true for real training
+    "preload_train_to_gpu": true, // should be true for real training
+    "preload_val_to_gpu": true, // should be true for real training
 
     // Loader knobs (ignored when GPU-resident; workers forced to 0)
     "num_workers": 0,
@@ -141,8 +108,8 @@
     "val_batch_size": 1024,
 
     // How many anchors per trajectory per epoch (controls epoch length)
-    "pairs_per_traj": 1,
-    "pairs_per_traj_val": 1,
+    "pairs_per_traj": 2,
+    "pairs_per_traj_val": 2,
 
     // Δt index bounds in steps (NOT seconds). Set max_steps = T-1.
     // If your processed grid has T=100, use 99. This must match the manifest’s grid.
@@ -174,6 +141,18 @@
 
   // ---------- Model (DeepONet) ----------
   "model": {
+    "ae": {
+      "enabled": true,               // turn AE on/off
+      "encode_inputs": true,         // encode y_i before the branch
+      "predict_in_latent": true,     // project p -> L_out, then decode to species
+      "latent_in": 128,              // dimension for input encoder
+      "latent_out": 128,             // dimension for output latent & decoder
+      "width": 256,                  // AE hidden width
+      "depth": 2,                    // AE hidden depth
+      "dropout": 0.0,                // AE dropout
+      "recon_weight": 1e-3           // optional AE reconstruction loss on y_j
+    },
+
     // Basis size (φ·ψ dimension). 512 is the sweet spot for your species count.
     "p": 512,
 
@@ -182,7 +161,7 @@
     "branch_depth": 4,
 
     // Trunk MLP (Δt̂ → ψ). Deep/wide to capture decades-wide stiffness.
-    "trunk_layers": [256, 256, 256],
+    "trunk_layers": [512, 512, 512],
 
     // Nonlinearity
     "activation": "leakyrelu",
@@ -193,7 +172,7 @@
     "trunk_dropout": 0.0,
 
     // Predict Δy and add residual; best for small-to-medium Δt
-    "predict_delta": true
+    "predict_delta": false
 
   },
 
