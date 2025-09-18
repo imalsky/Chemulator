@@ -1,66 +1,51 @@
 #!/usr/bin/env python3
 """
-Flow-map DeepONet Model Architecture
-=====================================
-Implements a DeepONet architecture for flow-map prediction with support for
-multiple target times per anchor point.
+Flow-map DeepONet Model Architecture (with optional AE bottlenecks)
+==================================================================
 
-Architecture Components:
-- Branch network: Processes state and global features to produce basis coefficients
-- Trunk network: Maps normalized time differences to temporal basis functions
-- Output layer: Combines branch and trunk outputs to predict state evolution
+Implements a DeepONet architecture for flow-map prediction with support for:
+- Multiple target times per anchor (vectorized trunk over K time offsets)
+- Delta (residual) or direct prediction modes
+- Configurable dropout and activations for branch/trunk MLPs
+- Optional trunk input de-duplication for speed (same Δt rows reused)
+- Optional **joint-trained** autoencoder:
+    * Encode input species before the branch to reduce branch input dimension
+    * Predict in a compact latent and decode back to species before loss
+    * Optional auxiliary reconstruction loss hook exposed via `compute_ae_loss`
 
-Features:
-- Supports both delta (residual) and direct prediction modes
-- Configurable dropout in branch and trunk MLPs
+The AE path is fully end-to-end (no separate pretraining). When disabled,
+the model reduces to the original DeepONet behavior.
 """
 
 from __future__ import annotations
 
-from typing import List, Sequence, Optional
+from typing import Optional, Sequence, Tuple, List
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
-# ------------------------------ Activations ----------------------------------
-
-
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
 def get_activation(name: str) -> nn.Module:
-    """
-    Create activation function from name.
-
-    Args:
-        name: Activation function name
-
-    Returns:
-        Activation module
-
-    Raises:
-        ValueError: If activation name is not supported
-    """
-    name_lower = name.lower()
-
-    activation_map = {
-        "relu": nn.ReLU(),
-        "gelu": nn.GELU(),
-        "silu": nn.SiLU(),
-        "tanh": nn.Tanh(),
-        "leakyrelu": nn.LeakyReLU(negative_slope=0.01),
-        "leaky_relu": nn.LeakyReLU(negative_slope=0.01),
-    }
-
-    if name_lower not in activation_map:
-        supported = ", ".join(sorted(activation_map.keys()))
-        raise ValueError(
-            f"Unknown activation function: '{name}'. "
-            f"Supported activations: {supported}"
-        )
-
-    return activation_map[name_lower]
-
-
-# --------------------------------- MLP ---------------------------------------
+    """Map a string to a torch activation module."""
+    key = (name or "").strip().lower()
+    if key in ("relu",):
+        return nn.ReLU(inplace=True)
+    if key in ("lrelu", "leakyrelu", "leaky-relu"):
+        return nn.LeakyReLU(negative_slope=0.01, inplace=True)
+    if key in ("silu", "swish"):
+        return nn.SiLU(inplace=True)
+    if key in ("gelu",):
+        return nn.GELU()
+    if key in ("tanh",):
+        return nn.Tanh()
+    if key in ("elu",):
+        return nn.ELU(inplace=True)
+    if key in ("identity", "linear", ""):
+        return nn.Identity()
+    raise ValueError(f"Unknown activation: {name!r}")
 
 
 def build_mlp(
@@ -73,39 +58,25 @@ def build_mlp(
 ) -> nn.Sequential:
     """
     Construct a multi-layer perceptron with optional dropout after each hidden activation.
-
-    Args:
-        input_dim:  Input feature dimension.
-        hidden_dims: List of hidden layer widths.
-        output_dim: Output feature dimension.
-        activation: Activation module instance (e.g., GELU()).
-        dropout_p:  Dropout probability in [0, 1). Applied after each hidden activation.
-
-    Returns:
-        nn.Sequential implementing: Linear -> Act -> (Dropout) x L  -> Linear_out
     """
     layers: List[nn.Module] = []
     prev = int(input_dim)
-    for h in map(int, hidden_dims):
+    for h in hidden_dims:
+        h = int(h)
         layers.append(nn.Linear(prev, h))
-        layers.append(activation)
-        if dropout_p and dropout_p > 0.0:
+        layers.append(activation.__class__() if not isinstance(activation, nn.Identity) else nn.Identity())
+        if dropout_p and dropout_p > 0:
             layers.append(nn.Dropout(p=float(dropout_p)))
-        # Use a fresh activation instance for the next block (avoids shared state)
-        activation = type(activation)()
         prev = h
     layers.append(nn.Linear(prev, int(output_dim)))
     return nn.Sequential(*layers)
 
 
-# -------------------------------- Branch -------------------------------------
-
-
+# -----------------------------------------------------------------------------
+# Branch and Trunk subnets
+# -----------------------------------------------------------------------------
 class BranchNet(nn.Module):
-    """
-    Branch network: processes concatenated [y_i, g] -> φ ∈ R^p.
-    """
-
+    """[y_i (or z_i), g] -> φ ∈ R^p"""
     def __init__(
         self,
         input_dim: int,
@@ -113,122 +84,111 @@ class BranchNet(nn.Module):
         depth: int,
         output_dim: int,
         activation: nn.Module,
-        *,
         dropout_p: float = 0.0,
     ) -> None:
-        """
-        Args:
-            input_dim:  S + G.
-            width:      Hidden width for each layer.
-            depth:      Number of hidden layers (>=1).
-            output_dim: p (basis dimension).
-            activation: Activation module (e.g., GELU()).
-            dropout_p:  Dropout prob after each hidden activation.
-        """
         super().__init__()
-        self.input_dim = int(input_dim)
-        self.width = int(width)
-        self.depth = max(1, int(depth))
-        self.output_dim = int(output_dim)
-
-        hidden_dims = [self.width] * self.depth
-        self.network = build_mlp(
-            input_dim=self.input_dim,
-            hidden_dims=hidden_dims,
-            output_dim=self.output_dim,
+        hidden = [int(width)] * int(depth)
+        self.net = build_mlp(
+            input_dim=int(input_dim),
+            hidden_dims=hidden,
+            output_dim=int(output_dim),
             activation=activation,
-            dropout_p=dropout_p,
+            dropout_p=float(dropout_p),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)  # [B, p]
-
-
-# -------------------------------- Trunk --------------------------------------
+        return self.net(x)
 
 
 class TrunkNet(nn.Module):
-    """
-    Trunk network: maps normalized time input (Δt_norm) to ψ ∈ R^p.
-    Accepts t with shapes [B], [B,1], [B,K], or [B,K,1].
-    """
-
+    """Δt̂ -> ψ ∈ R^p (applied elementwise over [B,K] grid)."""
     def __init__(
         self,
         output_dim: int,
         hidden_dims: Sequence[int],
         activation: nn.Module,
-        *,
         dropout_p: float = 0.0,
     ) -> None:
-        """
-        Args:
-            output_dim: p (basis dimension).
-            hidden_dims: list of hidden widths.
-            activation: Activation module.
-            dropout_p:  Dropout prob after each hidden activation.
-        """
         super().__init__()
         self.output_dim = int(output_dim)
-        self.hidden_dims = [int(h) for h in hidden_dims]
-        self.network = build_mlp(
-            input_dim=1,  # scalar time input
-            hidden_dims=self.hidden_dims,
+        self.net = build_mlp(
+            input_dim=1,  # scalar Δt per element
+            hidden_dims=[int(h) for h in hidden_dims],
             output_dim=self.output_dim,
             activation=activation,
-            dropout_p=dropout_p,
+            dropout_p=float(dropout_p),
         )
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        # Normalize shapes to [N,1], run MLP, then reshape back to [..., p].
-        if t.ndim == 1:          # [B]
-            B = t.shape[0]
-            out = self.network(t.view(B, 1))
-            return out.view(B, 1, self.output_dim)    # [B,1,p]
-        if t.ndim == 2:          # [B,K] or [B,1]
-            B, K = t.shape
-            out = self.network(t.view(B * K, 1))
-            return out.view(B, K, self.output_dim)    # [B,K,p]
-        if t.ndim == 3:          # [B,K,1]
-            B, K, C = t.shape
-            if C != 1:
-                raise ValueError(f"TrunkNet.forward expects last dim==1, got {t.shape}")
-            out = self.network(t.view(B * K, 1))
-            return out.view(B, K, self.output_dim)    # [B,K,p]
-        raise ValueError(f"Unsupported time tensor shape: {tuple(t.shape)}")
+    def forward(self, dt_in: torch.Tensor, *, dedup: bool = False) -> torch.Tensor:
+        """
+        Args:
+            dt_in: [B,K] or [B,K,1] normalized Δt.
+            dedup: if True, evaluate unique Δt values once and gather back.
+        Returns:
+            ψ: [B,K,p]
+        """
+        if dt_in.ndim == 3 and dt_in.shape[-1] == 1:
+            dt = dt_in.squeeze(-1)  # [B,K]
+        elif dt_in.ndim == 2:
+            dt = dt_in  # [B,K]
+        else:
+            raise ValueError(f"Trunk expects [B,K] or [B,K,1], got {tuple(dt_in.shape)}")
+
+        B, K = dt.shape
+
+        if not dedup:
+            x = dt.reshape(B * K, 1)
+            psi = self.net(x).reshape(B, K, self.output_dim)
+            return psi
+
+        # De-duplicate dt values across the batch for efficiency
+        flat = dt.reshape(-1)  # [B*K]
+        uniq, inv = torch.unique(flat, sorted=True, return_inverse=True)
+        psi_u = self.net(uniq.view(-1, 1))        # [U,p]
+        psi = psi_u.index_select(dim=0, index=inv).reshape(B, K, self.output_dim)  # [B,K,p]
+        return psi
 
 
-# ------------------------------ DeepONet Core --------------------------------
-
-
+# -----------------------------------------------------------------------------
+# FlowMapDeepONet with optional autoencoder bottlenecks
+# -----------------------------------------------------------------------------
 class FlowMapDeepONet(nn.Module):
     """
-    Flow-map DeepONet: (y_i, g, Δt_norm) -> y_j
-    - Branch takes [y_i, g]
-    - Trunk takes Δt only
-    - Supports output subset via target_idx
-    """
+    Flow-map DeepONet with optional autoencoder bottlenecks.
 
+    - Input AE (enc_in):    S_in -> L_in, reduces branch input size.
+    - Output AE (enc_out/dec_out):
+        * If predict_in_latent=True: project p -> L_out then decode to S_out.
+        * If recon_weight>0: adds auxiliary reconstruction loss hook on y_j.
+
+    Residual/add is performed in normalized species space. Shapes:
+        y_i:     [B,S_full] or [B,1,S_full]
+        dt_norm: [B,K] or [B,K,1]
+        g:       [B,G]
+        return:  [B,K,S_out] (normalized species space)
+    """
     def __init__(
-            self,
-            *,
-            state_dim_in: int,
-            state_dim_out: int,
-            global_dim: int,
-            basis_dim: int,
-            branch_width: int,
-            branch_depth: int,
-            trunk_layers: Sequence[int],
-            predict_delta: bool,
-            trunk_dedup: bool,
-            activation_name: str,
-            branch_dropout: float = 0.0,
-            trunk_dropout: float = 0.0,
-            target_idx: Optional[torch.Tensor] = None,
-            input_idx: Optional[torch.Tensor] = None,
+        self,
+        *,
+        state_dim_in: int,
+        state_dim_out: int,
+        global_dim: int,
+        basis_dim: int,
+        branch_width: int,
+        branch_depth: int,
+        trunk_layers: Sequence[int],
+        predict_delta: bool,
+        trunk_dedup: bool,
+        activation_name: str,
+        branch_dropout: float = 0.0,
+        trunk_dropout: float = 0.0,
+        target_idx: Optional[torch.Tensor] = None,
+        input_idx: Optional[torch.Tensor] = None,
+        ae_cfg: Optional[dict] = None,
     ) -> None:
         super().__init__()
 
+        # Core dims
         self.S_in = int(state_dim_in)
         self.S_out = int(state_dim_out)
         self.G = int(global_dim)
@@ -237,21 +197,63 @@ class FlowMapDeepONet(nn.Module):
         self.predict_delta = bool(predict_delta)
         self.trunk_dedup = bool(trunk_dedup)
 
-        # Indices
+        # Optional index subsets (registered as buffers to follow device moves)
         if target_idx is not None and not isinstance(target_idx, torch.Tensor):
             target_idx = torch.tensor(target_idx, dtype=torch.long)
         if input_idx is not None and not isinstance(input_idx, torch.Tensor):
             input_idx = torch.tensor(input_idx, dtype=torch.long)
-
         self.register_buffer("target_idx", target_idx if target_idx is not None else None)
-        self.register_buffer("input_idx", input_idx if input_idx is not None else None)
+        self.register_buffer("input_idx",  input_idx  if input_idx  is not None else None)
 
         # Activations
         act = get_activation(activation_name)
 
-        # Branch: [y_i_subset, g] -> φ ∈ R^p
+        # --- AE configuration ---
+        ae = dict(ae_cfg or {})
+        self.ae_enabled            = bool(ae.get("enabled", False))
+        self.ae_encode_inputs      = bool(ae.get("encode_inputs", True))
+        self.ae_predict_in_latent  = bool(ae.get("predict_in_latent", True))
+        self.ae_recon_weight       = float(ae.get("recon_weight", 0.0))
+        ae_width                   = int(ae.get("width", 256))
+        ae_depth                   = int(ae.get("depth", 2))
+        ae_dropout                 = float(ae.get("dropout", 0.0))
+        self.L_in                  = int(ae.get("latent_in",  min(self.S_in, 256)))
+        self.L_out                 = int(ae.get("latent_out", min(self.S_out, 256)))
+
+        # Encoders/decoders
+        self.enc_in: Optional[nn.Sequential] = None       # S_in -> L_in (for branch)
+        self.enc_out: Optional[nn.Sequential] = None      # S_out -> L_out (for recon/latent supervision)
+        self.dec_out: Optional[nn.Sequential] = None      # L_out -> S_out
+
+        if self.ae_enabled and self.ae_encode_inputs:
+            self.enc_in = build_mlp(
+                input_dim=self.S_in,
+                hidden_dims=[ae_width] * ae_depth,
+                output_dim=self.L_in,
+                activation=act,
+                dropout_p=ae_dropout,
+            )
+
+        if self.ae_enabled and (self.ae_predict_in_latent or self.ae_recon_weight > 0.0):
+            self.enc_out = build_mlp(
+                input_dim=self.S_out,
+                hidden_dims=[ae_width] * ae_depth,
+                output_dim=self.L_out,
+                activation=act,
+                dropout_p=ae_dropout,
+            )
+            self.dec_out = build_mlp(
+                input_dim=self.L_out,
+                hidden_dims=[ae_width] * ae_depth,
+                output_dim=self.S_out,
+                activation=act,
+                dropout_p=ae_dropout,
+            )
+
+        # Branch: [encoded_or_raw(y_i), g] -> φ ∈ R^p
+        branch_in_dim = (self.L_in if (self.ae_enabled and self.ae_encode_inputs) else self.S_in) + self.G
         self.branch = BranchNet(
-            input_dim=self.S_in + self.G,
+            input_dim=branch_in_dim,
             width=int(branch_width),
             depth=int(branch_depth),
             output_dim=self.p,
@@ -259,7 +261,7 @@ class FlowMapDeepONet(nn.Module):
             dropout_p=float(branch_dropout),
         )
 
-        # Trunk: Δt_norm -> ψ ∈ R^p
+        # Trunk: Δt̂ -> ψ ∈ R^p (elementwise over K)
         self.trunk = TrunkNet(
             output_dim=self.p,
             hidden_dims=[int(h) for h in trunk_layers],
@@ -267,88 +269,112 @@ class FlowMapDeepONet(nn.Module):
             dropout_p=float(trunk_dropout),
         )
 
-        # Projection from basis to targets
-        self.out = nn.Linear(self.p, self.S_out)
+        # Projection: p -> S_out or L_out
+        out_dim = self.L_out if (self.ae_enabled and self.ae_predict_in_latent) else self.S_out
+        self.out = nn.Linear(self.p, out_dim)
 
+    # ------------------------
+    # Forward
+    # ------------------------
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            y_i:     [B,S_full] or [B,1,S_full] current state (FULL species dimension)
+            y_i:     [B,S_full] or [B,1,S_full] current state (normalized)
             dt_norm: [B,K] or [B,K,1] normalized Δt (dt-spec)
             g:       [B,G] globals
         Returns:
-            y_pred:  [B,K,S_out]
+            y_pred:  [B,K,S_out] in normalized species space
         """
         B = y_i.shape[0]
 
-        # Normalize shapes
+        # y_i canonicalize to [B,S_full]
         if y_i.ndim == 3:
-            y_i_base = y_i[:, 0, :]  # [B,S_full]
+            y_i_base = y_i[:, 0, :]
         elif y_i.ndim == 2:
             y_i_base = y_i
         else:
             raise ValueError(f"Unexpected y_i shape {tuple(y_i.shape)}")
 
-        if dt_norm.ndim == 1:
-            dt_in = dt_norm.view(B, 1)  # [B,1]
-        elif dt_norm.ndim == 2:
-            dt_in = dt_norm  # [B,K]
-        elif dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
-            dt_in = dt_norm.squeeze(-1)  # [B,K]
-        else:
-            raise ValueError(f"Unsupported dt_norm shape {tuple(dt_norm.shape)}")
-        K = dt_in.shape[1]
-
-        # Select branch inputs
+        # Select input subset if provided
         if self.input_idx is not None:
             y_in = y_i_base.index_select(1, self.input_idx)  # [B,S_in]
         else:
             y_in = y_i_base
 
-        # Branch and trunk
+        # Optional input encoding
+        if self.ae_enabled and self.ae_encode_inputs and (self.enc_in is not None):
+            y_in = self.enc_in(y_in)  # [B,L_in]
+
+        # Branch φ
         phi = self.branch(torch.cat([y_in, g], dim=-1))  # [B,p]
-        psi = self.trunk(dt_in)  # [B,K,p]
+
+        # Trunk ψ
+        psi = self.trunk(dt_norm, dedup=self.trunk_dedup)  # [B,K,p]
 
         # Combine & project
-        combined = phi.unsqueeze(1) * psi  # [B,K,p]
-        y_pred = self.out(combined)  # [B,K,S_out]
+        combined = phi.unsqueeze(1) * psi                  # [B,K,p]
+        proj = self.out(combined)                          # [B,K,S_out] or [B,K,L_out]
 
-        # Optional residual add (still in normalized space)
+        # Decode back to species if predicting in latent
+        if self.ae_enabled and self.ae_predict_in_latent and (self.dec_out is not None):
+            y_pred = self.dec_out(proj)                    # [B,K,S_out]
+        else:
+            y_pred = proj
+
+        # Optional residual add (normalized species space)
         if self.predict_delta:
             if (self.S_out == y_i_base.shape[-1]) and (self.target_idx is None):
-                base = y_i_base.unsqueeze(1)  # [B,1,S_full] -> [B,K,S_full]
-                if base.shape[1] != K:
-                    base = base.expand(-1, K, -1)
+                base = y_i_base.unsqueeze(1)               # [B,1,S_full]
+                if base.shape[1] != y_pred.shape[1]:
+                    base = base.expand(-1, y_pred.shape[1], -1)
                 y_pred = y_pred + base
             else:
                 if self.target_idx is None:
                     raise RuntimeError("predict_delta=True requires target_idx when S_out != S_full")
                 base_subset = y_i_base.index_select(1, self.target_idx)  # [B,S_out]
-                base_subset = base_subset.unsqueeze(1)  # [B,1,S_out] -> [B,K,S_out]
-                if base_subset.shape[1] != K:
-                    base_subset = base_subset.expand(-1, K, -1)
+                base_subset = base_subset.unsqueeze(1)                    # [B,1,S_out]
+                if base_subset.shape[1] != y_pred.shape[1]:
+                    base_subset = base_subset.expand(-1, y_pred.shape[1], -1)
                 y_pred = y_pred + base_subset
 
         return y_pred
 
+    # ------------------------
+    # AE auxiliary loss hook
+    # ------------------------
+    def compute_ae_loss(self, y_i: torch.Tensor, y_j_targets: torch.Tensor) -> torch.Tensor:
+        """
+        Optional reconstruction loss on targets y_j (normalized species space).
+        Expected y_j_targets: [B,K,S_out] AFTER target slicing in the trainer.
+        """
+        if not (self.ae_enabled and self.ae_recon_weight > 0.0 and self.enc_out is not None and self.dec_out is not None):
+            # Return a scalar zero tensor on the right device/dtype
+            return y_j_targets.new_zeros(())
 
-# ------------------------------ Factory --------------------------------------
+        B, K, S = y_j_targets.shape
+        flat = y_j_targets.reshape(B * K, S)
+        z = self.enc_out(flat)           # [B*K, L_out]
+        rec = self.dec_out(z)            # [B*K, S_out]
+        mse = (rec - flat).pow(2).mean()
+        return mse * self.ae_recon_weight
 
 
+# -----------------------------------------------------------------------------
+# Factory
+# -----------------------------------------------------------------------------
 def create_model(config: dict) -> FlowMapDeepONet:
     """
-    Build FlowMapDeepONet with optional input/target subsets.
-
-    Config keys (under data):
-      - species_variables: full ordered list of species in shards (REQUIRED)
-      - global_variables : list of global variable names (may be [])
-      - input_species    : optional list of species names to FEED INTO THE BRANCH
-                           (defaults to species_variables i.e., all inputs)
-      - target_species   : optional list of species names to PREDICT
-                           (defaults to species_variables i.e., all targets)
+    Build FlowMapDeepONet with optional input/target subsets and optional AE config.
+    Expects:
+      config["data"]["species_variables"] : list[str]
+      config["data"]["global_variables"]  : list[str]
+      (optional) config["data"]["input_species"], ["target_species"]
+      config["model"] with keys:
+        - p, branch_width, branch_depth, trunk_layers, activation, predict_delta
+        - trunk_dedup (bool), branch_dropout, trunk_dropout
+        - (optional) "ae": {enabled, encode_inputs, predict_in_latent, latent_in, latent_out,
+                            width, depth, dropout, recon_weight}
     """
-    import torch
-
     data_cfg = config.get("data", {}) or {}
     model_cfg = config.get("model", {}) or {}
 
@@ -357,35 +383,33 @@ def create_model(config: dict) -> FlowMapDeepONet:
         raise KeyError("config.data.species_variables must be set and non-empty")
     global_vars = list(data_cfg.get("global_variables", []))
 
-    # Optional subsets
-    input_vars  = list(data_cfg.get("input_species")  or species_vars)
+    # Optional subsets (default to 'all')
+    input_vars = list(data_cfg.get("input_species") or species_vars)
     target_vars = list(data_cfg.get("target_species") or species_vars)
 
-    # Map names -> indices in the FULL species list
     name_to_idx = {name: i for i, name in enumerate(species_vars)}
-
     try:
-        input_idx  = [name_to_idx[name] for name in input_vars]
+        input_idx = [name_to_idx[name] for name in input_vars]
     except KeyError as e:
-        raise KeyError(f"config.data.input_species contains unknown name: {e.args[0]!r} "
-                       f"(not found in species_variables)") from None
-
+        raise KeyError(
+            f"config.data.input_species contains unknown name: {e.args[0]!r} "
+            f"(not found in species_variables)"
+        ) from None
     try:
         target_idx = [name_to_idx[name] for name in target_vars]
     except KeyError as e:
-        raise KeyError(f"config.data.target_species contains unknown name: {e.args[0]!r} "
-                       f"(not found in species_variables)") from None
+        raise KeyError(
+            f"config.data.target_species contains unknown name: {e.args[0]!r} "
+            f"(not found in species_variables)"
+        ) from None
 
-    # Dimensions
-    state_dim_in  = len(input_idx)
-    state_dim_out = len(target_idx)
-    global_dim    = len(global_vars)
+    # Defer torch import to keep module import light
+    import torch
 
-    # Build model
     return FlowMapDeepONet(
-        state_dim_in=state_dim_in,
-        state_dim_out=state_dim_out,
-        global_dim=global_dim,
+        state_dim_in=len(input_idx),
+        state_dim_out=len(target_idx),
+        global_dim=len(global_vars),
         basis_dim=int(model_cfg.get("p", 128)),
         branch_width=int(model_cfg.get("branch_width", 512)),
         branch_depth=int(model_cfg.get("branch_depth", 3)),
@@ -394,7 +418,8 @@ def create_model(config: dict) -> FlowMapDeepONet:
         trunk_dedup=bool(model_cfg.get("trunk_dedup", False)),
         activation_name=str(model_cfg.get("activation", "gelu")),
         branch_dropout=float(model_cfg.get("branch_dropout", model_cfg.get("dropout", 0.0))),
-        trunk_dropout=float(model_cfg.get("trunk_dropout",  model_cfg.get("dropout", 0.0))),
+        trunk_dropout=float(model_cfg.get("trunk_dropout", model_cfg.get("dropout", 0.0))),
         target_idx=torch.tensor(target_idx, dtype=torch.long),
         input_idx=torch.tensor(input_idx, dtype=torch.long),
+        ae_cfg=model_cfg.get("ae", None),
     )

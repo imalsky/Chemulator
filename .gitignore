@@ -24,6 +24,8 @@ old/
 tuning_results/
 test/
 
+not_done_misc/
+
 all_code_dump.txt
 
 testing.ipynb
