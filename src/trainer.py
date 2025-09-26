@@ -49,7 +49,6 @@ class AdaptiveStiffLoss(nn.Module):
     - Stabilizer: Small MSE in z-space
     - Species weights: Based on dynamic range
     - Time weights: Emphasize trajectory edges where stiff dynamics occur
-    - Optional: Total mass conservation penalty
     - Optional: Atomic conservation penalty
     """
 
@@ -60,24 +59,26 @@ class AdaptiveStiffLoss(nn.Module):
             species_log_min: torch.Tensor,
             species_log_max: torch.Tensor,
             *,
-            lambda_phys: float = 1.0,  # Weight for MAE(log10 phys)
-            lambda_z: float = 0.1,  # Small stabilizer on z-MSE
-            epsilon_phys: float = 1e-20,  # Avoid log underflow in phys
-            use_fractional: bool = False,  # Use frac-L1 in phys space instead
-            time_edge_gain: float = 2.0,  # Upweight early/late times (>=1.0)
-            cons_penalty: float = 0.0,  # Total conservation penalty weight (backward compat)
-            # New atomic conservation parameters
+            lambda_phys: float = 1.0,
+            lambda_z: float = 0.1,
+            epsilon_phys: float = 1e-20,
+            use_fractional: bool = False,
+            time_edge_gain: float = 2.0,
+            # Atomic conservation parameters
             elemental_conservation: bool = False,
-            elemental_penalty: float = 0.0,  # Elemental conservation penalty weight
+            elemental_penalty: float = 0.0,
             species_names: Optional[List[str]] = None,
             elements: Optional[List[str]] = None,
             elemental_mode: str = "relative",
             elemental_weights: Optional[Any] = "auto",
             eps_elem: float = 1e-20,
-            debug_parser: bool = False,  # Run parser self-tests
+            debug_parser: bool = False,
             device=None
     ):
         super().__init__()
+
+        # Store device for creating tensors
+        self.device = torch.device(device) if device is not None else torch.device('cpu')
 
         # Register statistics as buffers (move with model to device)
         self.register_buffer("log_means", log_means.detach().clone())
@@ -89,7 +90,7 @@ class AdaptiveStiffLoss(nn.Module):
         log_range = torch.clamp(self.log_max - self.log_min, min=1e-6)
         w = torch.sqrt(log_range)
         w = w / (w.mean() + 1e-12)
-        w = torch.clamp(w, 0.5, 2.0)  # Gentle weights to avoid instability
+        w = torch.clamp(w, 0.5, 2.0)
         self.register_buffer("w_species", w)
 
         # Store configuration
@@ -98,8 +99,7 @@ class AdaptiveStiffLoss(nn.Module):
         self.eps_phys = epsilon_phys
         self.use_fractional = use_fractional
         self.time_edge_gain = time_edge_gain
-        self.cons_penalty = cons_penalty  # Total mass conservation (backward compat)
-        self.elemental_penalty = elemental_penalty  # Atomic conservation
+        self.elemental_penalty = elemental_penalty
 
         # Setup atomic conservation if enabled
         self.elemental_conservation = elemental_conservation
@@ -126,7 +126,7 @@ class AdaptiveStiffLoss(nn.Module):
                     f"but model outputs {S_actual} species"
                 )
 
-            # Build stoichiometry matrix
+            # Build stoichiometry matrix on the correct device
             stoich_matrix = self._build_stoichiometry_matrix(species_names, elements)
             self.register_buffer("stoich_matrix", stoich_matrix)
 
@@ -134,19 +134,19 @@ class AdaptiveStiffLoss(nn.Module):
             if debug_parser:
                 self._run_parser_tests()
 
-            # Setup elemental weights
+            # Setup elemental weights on the correct device
             if elemental_weights == "auto":
                 # Will be computed on first batch
-                self.register_buffer("elem_weights", torch.ones(len(elements), device=device))
+                self.register_buffer("elem_weights", torch.ones(len(elements), dtype=torch.float32, device=self.device))
                 self._need_auto_weights = True
             elif isinstance(elemental_weights, (list, tuple)):
                 if len(elemental_weights) != len(elements):
                     raise ValueError(f"elemental_weights length {len(elemental_weights)} != {len(elements)} elements")
-                weights_tensor = torch.tensor(elemental_weights, dtype=torch.float32, device=device)
+                weights_tensor = torch.tensor(elemental_weights, dtype=torch.float32, device=self.device)
                 self.register_buffer("elem_weights", weights_tensor)
                 self._need_auto_weights = False
             else:
-                self.register_buffer("elem_weights", torch.ones(len(elements), device=device))
+                self.register_buffer("elem_weights", torch.ones(len(elements), dtype=torch.float32, device=self.device))
                 self._need_auto_weights = False
 
             self._logged_conservation = False
@@ -223,12 +223,13 @@ class AdaptiveStiffLoss(nn.Module):
             elements: List of element symbols to track
 
         Returns:
-            Stoichiometry matrix [S, E]
+            Stoichiometry matrix [S, E] on the correct device
         """
         S = len(species_names)
         E = len(elements)
 
-        stoich = torch.zeros(S, E, dtype=torch.float32)
+        # Create matrix on the correct device
+        stoich = torch.zeros(S, E, dtype=torch.float32, device=self.device)
 
         for s, species in enumerate(species_names):
             counts = self._parse_species_formula(species)
@@ -308,7 +309,7 @@ class AdaptiveStiffLoss(nn.Module):
             Scalar loss value
         """
         # MSE in z-space (stabilizer term)
-        loss_z = (pred_z - true_z) ** 2  # [B,K,S] or [B,S]
+        loss_z = (pred_z - true_z) ** 2
 
         # Convert to log10 physical space
         pred_log = self._z_to_log10(pred_z)
@@ -316,83 +317,60 @@ class AdaptiveStiffLoss(nn.Module):
 
         # Main loss term in physical space
         if self.use_fractional:
-            # Fractional L1: |10^a - 10^b| / (|10^b| + eps)
             pred_y = torch.pow(10.0, torch.clamp(pred_log, min=-45.0))
             true_y = torch.pow(10.0, torch.clamp(true_log, min=-45.0))
             loss_phys = torch.abs(pred_y - true_y) / (torch.abs(true_y) + self.eps_phys)
         else:
-            # MAE in log10 space (per-decade error)
             loss_phys = torch.abs(pred_log - true_log)
 
         # Apply species weights
-        loss_phys = loss_phys * self.w_species  # Broadcast [S] to [B,K,S]
+        loss_phys = loss_phys * self.w_species
 
         # Prepare time weights
-        # Ensure t_norm is 2D [B,K] for weight computation
         if t_norm.ndim == 3 and t_norm.shape[-1] == 1:
             t_norm = t_norm.squeeze(-1)
         elif t_norm.ndim == 1:
             t_norm = t_norm.unsqueeze(1)
 
         # Apply time weights
-        # (only for multi-time [B,K,S]; skip for single-time [B,S])
         if loss_phys.ndim == 3:
-            wt = self._time_weights(torch.clamp(t_norm, 0.0, 1.0))  # [B,K,1]
+            wt = self._time_weights(torch.clamp(t_norm, 0.0, 1.0))
             loss_phys = loss_phys * wt
             loss_z = loss_z * wt
 
         # Apply mask and compute mean
         if mask is not None:
-            # Expand mask to match loss shape for correct denominator
-            m = mask.unsqueeze(-1).to(loss_phys.dtype)  # [B,K,1]
-            m_expanded = m.expand_as(loss_phys)  # [B,K,S]
+            m = mask.unsqueeze(-1).to(loss_phys.dtype)
+            m_expanded = m.expand_as(loss_phys)
             loss_phys = loss_phys * m_expanded
             loss_z = loss_z * m_expanded
-            # Use count_nonzero for clearer denominator computation
             denom = torch.count_nonzero(m_expanded).to(loss_phys.dtype)
             denom = torch.clamp(denom, min=1.0)
         else:
             denom = float(loss_phys.numel())
 
-        # Conservation penalties (both total and elemental if configured)
-        cons_total = 0.0
+        # Atomic conservation penalty (if enabled)
         cons_elem = 0.0
 
-        # Compute physical space values once if any conservation is enabled
-        if self.cons_penalty > 0.0 or (self.elemental_conservation and self.elemental_penalty > 0.0):
+        if self.elemental_conservation and self.elemental_penalty > 0.0:
             pred_y = torch.pow(10.0, torch.clamp(pred_log, min=-45.0))
             true_y = torch.pow(10.0, torch.clamp(true_log, min=-45.0))
 
-        # Total mass conservation (backward compatibility)
-        if self.cons_penalty > 0.0:
-            # Penalize deviation in total mass/concentration
-            total_pred = pred_y.sum(dim=-1)  # [B,K] or [B]
-            total_true = true_y.sum(dim=-1)  # [B,K] or [B]
-            total_err = torch.abs(total_pred - total_true)
-
-            # Apply mask if present
-            if mask is not None:
-                total_err = total_err * mask  # mask is [B,K] or [B]
-                total_denom = torch.count_nonzero(mask).to(total_err.dtype)
-                total_denom = torch.clamp(total_denom, min=1.0)
-            else:
-                total_denom = float(total_err.numel())
-
-            cons_total = total_err.sum() / total_denom
-
-        # Atomic conservation penalty (if enabled)
-        if self.elemental_conservation and self.elemental_penalty > 0.0:
-            # Ensure 2D case is truly 2D (not masked 3D)
             if pred_y.ndim == 2:
                 assert mask is None or mask.ndim == 1, "2D predictions with 2D mask not supported"
 
-            # Compute elemental totals [B,K,E] or [B,E]
+            # Device check (only once)
+            if not hasattr(self, "_device_checked"):
+                assert self.stoich_matrix.device == pred_y.device, \
+                    f"stoich_matrix on {self.stoich_matrix.device}, predictions on {pred_y.device}"
+                self._device_checked = True
+
+            # Compute elemental totals
             if pred_y.ndim == 2:  # [B,S]
                 elem_pred = pred_y @ self.stoich_matrix  # [B,E]
                 elem_true = true_y @ self.stoich_matrix  # [B,E]
             else:  # [B,K,S]
                 B, K, S = pred_y.shape
-                # Reshape for matmul
                 pred_y_flat = pred_y.reshape(B * K, S)
                 true_y_flat = true_y.reshape(B * K, S)
                 elem_pred_flat = pred_y_flat @ self.stoich_matrix  # [B*K,E]
@@ -403,36 +381,32 @@ class AdaptiveStiffLoss(nn.Module):
             # Auto-compute weights on first batch
             if self._need_auto_weights:
                 with torch.no_grad():
-                    # Use mean element totals from true data
-                    mean_elem = elem_true.mean(dim=tuple(range(elem_true.ndim - 1)))  # Mean over all but last dim
-                    # Avoid division by zero and extreme weights
+                    mean_elem = elem_true.mean(dim=tuple(range(elem_true.ndim - 1)))
                     mean_elem = torch.clamp(mean_elem, min=self.eps_elem)
                     new_weights = 1.0 / mean_elem
-                    new_weights = new_weights / new_weights.mean()  # Normalize
-                    new_weights = torch.clamp(new_weights, min=0.1, max=10.0)  # Limit range
-                    # Update buffer in place
+                    new_weights = new_weights / new_weights.mean()
+                    new_weights = torch.clamp(new_weights, min=0.1, max=10.0)
                     self.elem_weights.copy_(new_weights)
                 self._need_auto_weights = False
 
             # Compute conservation error
             if self.elemental_mode == "relative":
                 elem_err = torch.abs(elem_pred - elem_true) / (torch.abs(elem_true) + self.eps_elem)
-            else:  # absolute
+            else:
                 elem_err = torch.abs(elem_pred - elem_true)
 
             # Apply element weights
-            elem_err = elem_err * self.elem_weights  # Broadcast weights
+            elem_err = elem_err * self.elem_weights
 
             # Apply mask if present
             if mask is not None:
-                if elem_err.ndim == 3:  # [B,K,E]
-                    mask_elem = mask.unsqueeze(-1)  # [B,K,1]
+                if elem_err.ndim == 3:
+                    mask_elem = mask.unsqueeze(-1)
                     elem_err = elem_err * mask_elem
                     elem_denom = torch.count_nonzero(mask_elem.expand_as(elem_err)).to(elem_err.dtype)
-                else:  # [B,E]
-                    # For 2D case, mask would be [B]
+                else:
                     if mask.ndim == 1:
-                        mask_elem = mask.unsqueeze(-1)  # [B,1]
+                        mask_elem = mask.unsqueeze(-1)
                         elem_err = elem_err * mask_elem
                         elem_denom = torch.count_nonzero(mask_elem.expand_as(elem_err)).to(elem_err.dtype)
                     else:
@@ -458,18 +432,14 @@ class AdaptiveStiffLoss(nn.Module):
                                             for j, e in enumerate(self.elements)])
                     logger.info(f"    {self.species_names[i]}: {stoich_str}")
                 logger.info(f"  Mean elemental error (pre penalty-weight): {cons_elem.item():.6f}")
-                if self.cons_penalty > 0:
-                    logger.info(f"  Mean total error (pre-penalty weight): {cons_total.item():.6f}")
                 self._logged_conservation = True
 
         # Combine all terms
         loss = (self.lambda_phys * loss_phys.sum() / denom +
                 self.lambda_z * loss_z.sum() / denom +
-                self.cons_penalty * cons_total +
                 self.elemental_penalty * cons_elem)
 
         return loss
-
 
 # ------------------------------- Trainer Class -------------------------------
 
@@ -637,8 +607,7 @@ class Trainer:
             # Get loss configuration
             loss_cfg = training_cfg.get("adaptive_stiff_loss", {})
 
-            # Determine if we need conservation
-            cons_penalty = float(loss_cfg.get("conservation_penalty", 0.0))
+            # Determine if we need elemental conservation
             elemental_conservation = bool(loss_cfg.get("elemental_conservation", False))
             elemental_penalty = float(loss_cfg.get("elemental_penalty", 0.0))
 
@@ -646,7 +615,7 @@ class Trainer:
             self.logger.info(f"Resolved {len(species_names)} species for loss computation")
             self.logger.info(f"  First 5: {species_names[:5]}")
 
-            # Create adaptive stiff loss
+            # Create adaptive stiff loss with device parameter
             self.criterion = AdaptiveStiffLoss(
                 log_means=torch.tensor(log_means, device=self.device),
                 log_stds=torch.tensor(log_stds, device=self.device),
@@ -657,7 +626,6 @@ class Trainer:
                 epsilon_phys=float(loss_cfg.get("epsilon_phys", 1e-20)),
                 use_fractional=bool(loss_cfg.get("use_fractional", False)),
                 time_edge_gain=float(loss_cfg.get("time_edge_gain", 2.0)),
-                cons_penalty=cons_penalty,  # Total conservation (backward compat)
                 # Atomic conservation parameters
                 elemental_conservation=elemental_conservation,
                 elemental_penalty=elemental_penalty,
@@ -669,10 +637,12 @@ class Trainer:
                 debug_parser=bool(loss_cfg.get("debug_parser", False)),
                 device=self.device
             )
+
+            # CRITICAL: Move the entire loss module to device
+            self.criterion = self.criterion.to(self.device)
+
             self.use_adaptive_stiff = True
             self.logger.info("Using AdaptiveStiffLoss with dynamic range weighting")
-            if cons_penalty > 0:
-                self.logger.info(f"  Total conservation penalty: {cons_penalty}")
             if elemental_conservation and elemental_penalty > 0:
                 self.logger.info(f"  Atomic conservation penalty: {elemental_penalty}")
 
