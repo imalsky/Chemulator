@@ -799,21 +799,38 @@ class Trainer:
                 writer.writerow(["epoch", "train_loss", "val_loss", "lr"])
 
     def _check_resume(self) -> None:
-        """Check for and load checkpoint if resuming, including scheduler state."""
-        # Check environment variable (set by main script)
-        resume = os.environ.get("RESUME", "").strip()
-        if not resume:
-            return
+        """Load a checkpoint if resuming, honoring env var RESUME, then config:
+           training.resume ('auto' | <path> | None) and training.auto_resume (bool)."""
+        tr = self.cfg.get("training", {})
+        env_resume = os.environ.get("RESUME", "").strip()
+
+        # 1) Environment variable has highest precedence (backwards compatible)
+        if env_resume:
+            resume_spec = env_resume
+            use_auto = (env_resume.lower() == "auto")
+        else:
+            # 2) Config-driven behavior
+            auto_resume = bool(tr.get("auto_resume", False))
+            resume_cfg = tr.get("resume", None)
+            if resume_cfg is None:
+                if not auto_resume:
+                    return  # nothing to do
+                # auto_resume=True with no explicit path -> auto discovery
+                resume_spec = "auto"
+                use_auto = True
+            else:
+                # explicit value in config
+                resume_spec = str(resume_cfg)
+                use_auto = (resume_spec.lower() == "auto")
 
         # Resolve checkpoint path
-        if resume.lower() == "auto":
-            # Try to find most recent checkpoint
+        if use_auto:
+            # Prefer 'last.ckpt', then 'best.ckpt', then newest *.ckpt in work_dir
             if self.last_ckpt_path.exists():
                 ckpt_path = self.last_ckpt_path
             elif self.best_ckpt_path.exists():
                 ckpt_path = self.best_ckpt_path
             else:
-                # Look for any checkpoint in work_dir
                 ckpts = sorted(
                     self.work_dir.glob("*.ckpt"),
                     key=lambda p: p.stat().st_mtime,
@@ -825,7 +842,7 @@ class Trainer:
                     self.logger.info("No checkpoint found for auto-resume")
                     return
         else:
-            ckpt_path = Path(resume).expanduser().resolve()
+            ckpt_path = Path(resume_spec).expanduser().resolve()
             if not ckpt_path.exists():
                 raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
@@ -833,25 +850,21 @@ class Trainer:
         self.logger.info(f"Resuming from checkpoint: {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
-        # Restore model state
+        # Restore model/optimizer
         self.model.load_state_dict(checkpoint["model"])
-
-        # Restore optimizer state
         self.optimizer.load_state_dict(checkpoint["optimizer"])
 
-        # Restore scheduler state if available
+        # Restore scheduler (or fast-forward if missing)
         if "scheduler" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler"])
             self.logger.info("Restored scheduler state from checkpoint")
         else:
-            # Fast-forward scheduler to correct epoch if state not saved
-            # This is needed for older checkpoints that didn't save scheduler state
             start_epoch = checkpoint.get("epoch", 0)
             for _ in range(start_epoch):
                 self.scheduler.step()
             self.logger.info(f"Fast-forwarded scheduler to epoch {start_epoch}")
 
-        # Restore scaler if using fp16
+        # Restore scaler if present/used
         if self.scaler and "scaler" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler"])
 
@@ -860,15 +873,12 @@ class Trainer:
         self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         self._current_epoch = self.start_epoch
 
-        # Restore RNG states for reproducibility
+        # Restore RNG state (optional fields guarded)
         if "rng_state" in checkpoint:
             rng_state = checkpoint["rng_state"]
-            if "python" in rng_state:
-                random.setstate(rng_state["python"])
-            if "numpy" in rng_state:
-                np.random.set_state(rng_state["numpy"])
-            if "torch" in rng_state:
-                torch.set_rng_state(rng_state["torch"])
+            if "python" in rng_state: random.setstate(rng_state["python"])
+            if "numpy" in rng_state:  np.random.set_state(rng_state["numpy"])
+            if "torch" in rng_state:  torch.set_rng_state(rng_state["torch"])
             if "cuda" in rng_state and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(rng_state["cuda"])
 
