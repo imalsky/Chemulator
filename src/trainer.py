@@ -49,6 +49,7 @@ class AdaptiveStiffLoss(nn.Module):
     - Stabilizer: Small MSE in z-space
     - Species weights: Based on dynamic range
     - Time weights: Emphasize trajectory edges where stiff dynamics occur
+    - Optional: Total mass conservation penalty
     - Optional: Atomic conservation penalty
     """
 
@@ -64,14 +65,16 @@ class AdaptiveStiffLoss(nn.Module):
             epsilon_phys: float = 1e-20,  # Avoid log underflow in phys
             use_fractional: bool = False,  # Use frac-L1 in phys space instead
             time_edge_gain: float = 2.0,  # Upweight early/late times (>=1.0)
-            cons_penalty: float = 0.0,  # Conservation penalty weight
+            cons_penalty: float = 0.0,  # Total conservation penalty weight (backward compat)
             # New atomic conservation parameters
             elemental_conservation: bool = False,
+            elemental_penalty: float = 0.0,  # Elemental conservation penalty weight
             species_names: Optional[List[str]] = None,
             elements: Optional[List[str]] = None,
             elemental_mode: str = "relative",
             elemental_weights: Optional[Any] = "auto",
             eps_elem: float = 1e-20,
+            debug_parser: bool = False,  # Run parser self-tests
             device=None
     ):
         super().__init__()
@@ -95,16 +98,17 @@ class AdaptiveStiffLoss(nn.Module):
         self.eps_phys = epsilon_phys
         self.use_fractional = use_fractional
         self.time_edge_gain = time_edge_gain
-        self.cons_penalty = cons_penalty
+        self.cons_penalty = cons_penalty  # Total mass conservation (backward compat)
+        self.elemental_penalty = elemental_penalty  # Atomic conservation
 
         # Setup atomic conservation if enabled
         self.elemental_conservation = elemental_conservation
         self.elemental_mode = elemental_mode
         self.eps_elem = eps_elem
 
-        if self.elemental_conservation:
-            if species_names is None:
-                raise ValueError("species_names required for elemental conservation")
+        if self.elemental_conservation and self.elemental_penalty > 0:
+            if species_names is None or len(species_names) == 0:
+                raise ValueError("species_names required and must be non-empty for elemental conservation")
 
             # Default to common combustion elements
             if elements is None:
@@ -113,9 +117,22 @@ class AdaptiveStiffLoss(nn.Module):
             self.elements = elements
             self.species_names = species_names
 
+            # Validate species count matches model dimension
+            S_expected = len(species_names)
+            S_actual = log_means.shape[0]
+            if S_expected != S_actual:
+                raise ValueError(
+                    f"Species count mismatch: species_names has {S_expected} entries "
+                    f"but model outputs {S_actual} species"
+                )
+
             # Build stoichiometry matrix
             stoich_matrix = self._build_stoichiometry_matrix(species_names, elements)
             self.register_buffer("stoich_matrix", stoich_matrix)
+
+            # Run parser self-tests if requested
+            if debug_parser:
+                self._run_parser_tests()
 
             # Setup elemental weights
             if elemental_weights == "auto":
@@ -125,8 +142,8 @@ class AdaptiveStiffLoss(nn.Module):
             elif isinstance(elemental_weights, (list, tuple)):
                 if len(elemental_weights) != len(elements):
                     raise ValueError(f"elemental_weights length {len(elemental_weights)} != {len(elements)} elements")
-                self.register_buffer("elem_weights",
-                                     torch.tensor(elemental_weights, dtype=torch.float32, device=device))
+                weights_tensor = torch.tensor(elemental_weights, dtype=torch.float32, device=device)
+                self.register_buffer("elem_weights", weights_tensor)
                 self._need_auto_weights = False
             else:
                 self.register_buffer("elem_weights", torch.ones(len(elements), device=device))
@@ -139,6 +156,9 @@ class AdaptiveStiffLoss(nn.Module):
         Parse a chemical formula to extract element counts.
         Handles formats like: C2H2, C2_H2, CH3OH, H2O, HCN, He, H+, OH-, M
 
+        NOTE: Parentheses are stripped but not expanded (e.g., (OH)2 → OH2).
+        This is a limitation; if parentheses are used, counts will be incorrect.
+
         Args:
             formula: Chemical formula string
 
@@ -146,26 +166,44 @@ class AdaptiveStiffLoss(nn.Module):
             Dictionary mapping element symbols to counts
         """
         # Clean the formula
+        original = formula
         formula = formula.strip()
 
         # Special cases
-        if formula in ("M", "m"):  # Third body
+        if formula.upper() in ("M",):  # Third body
             return {}
 
         # Remove charge indicators and underscores
         formula = re.sub(r'[_\+\-]', '', formula)
 
-        # Remove parentheses for simplicity (flatten them)
-        # For a more sophisticated parser, handle (OH)2 properly
-        formula = re.sub(r'[()]', '', formula)
+        # Remove parentheses (NOTE: this doesn't handle multipliers correctly)
+        # e.g., Ca(OH)2 becomes CaOH2 which is wrong
+        # For proper handling, would need a more sophisticated parser
+        if '(' in formula or ')' in formula:
+            if not hasattr(self, '_warned_parentheses'):
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f"Species formula '{original}' contains parentheses which are not properly expanded. "
+                    f"E.g., Ca(OH)2 will be parsed as CaOH2, not CaO2H2. Consider expanding formulas manually."
+                )
+                self._warned_parentheses = True
+            formula = re.sub(r'[()]', '', formula)
 
         element_counts = {}
 
         # Pattern to match element symbol followed by optional count
         # Matches two-letter elements first (He, Ne, etc.) then single letters
+        # Case-sensitive: expects proper capitalization (He not he, HE, etc.)
         pattern = r'([A-Z][a-z]?)(\d*)'
 
         matches = re.findall(pattern, formula)
+
+        if not matches and formula:
+            # No matches but formula not empty - might be lowercase or other issue
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Could not parse species formula: '{original}' (cleaned: '{formula}')")
 
         for element, count_str in matches:
             count = int(count_str) if count_str else 1
@@ -197,16 +235,37 @@ class AdaptiveStiffLoss(nn.Module):
             for e, element in enumerate(elements):
                 stoich[s, e] = float(counts.get(element, 0))
 
-        # Quick validation for known cases
-        if "C2H2" in species_names or "C2_H2" in species_names:
-            idx = species_names.index("C2H2") if "C2H2" in species_names else species_names.index("C2_H2")
-            if "C" in elements and "H" in elements:
-                c_idx = elements.index("C")
-                h_idx = elements.index("H")
-                assert abs(stoich[idx, c_idx] - 2.0) < 1e-6, f"C2H2 parsing failed: C={stoich[idx, c_idx]}"
-                assert abs(stoich[idx, h_idx] - 2.0) < 1e-6, f"C2H2 parsing failed: H={stoich[idx, h_idx]}"
-
         return stoich
+
+    def _run_parser_tests(self):
+        """Run self-tests on the parser to catch issues early."""
+        test_cases = [
+            ("C2H2", {"C": 2, "H": 2}),
+            ("C2_H2", {"C": 2, "H": 2}),
+            ("CH3OH", {"C": 1, "H": 4, "O": 1}),
+            ("H2O", {"H": 2, "O": 1}),
+            ("HCN", {"H": 1, "C": 1, "N": 1}),
+            ("He", {"He": 1}),  # He should not contribute H
+            ("CO2", {"C": 1, "O": 2}),
+            ("N2", {"N": 2}),
+            ("NH3", {"N": 1, "H": 3}),
+        ]
+
+        for formula, expected in test_cases:
+            result = self._parse_species_formula(formula)
+            # Check only tracked elements
+            for elem in ["H", "C", "N", "O"]:
+                exp_count = expected.get(elem, 0)
+                res_count = result.get(elem, 0)
+                if exp_count != res_count:
+                    raise ValueError(
+                        f"Parser test failed for '{formula}': "
+                        f"expected {elem}={exp_count}, got {elem}={res_count}"
+                    )
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("All parser self-tests passed")
 
     def _z_to_log10(self, z: torch.Tensor) -> torch.Tensor:
         """Convert from normalized z-space to log10 physical space."""
@@ -276,9 +335,11 @@ class AdaptiveStiffLoss(nn.Module):
             t_norm = t_norm.unsqueeze(1)
 
         # Apply time weights
-        wt = self._time_weights(torch.clamp(t_norm, 0.0, 1.0))  # [B,K,1]
-        loss_phys = loss_phys * wt
-        loss_z = loss_z * wt
+        # (only for multi-time [B,K,S]; skip for single-time [B,S])
+        if loss_phys.ndim == 3:
+            wt = self._time_weights(torch.clamp(t_norm, 0.0, 1.0))  # [B,K,1]
+            loss_phys = loss_phys * wt
+            loss_z = loss_z * wt
 
         # Apply mask and compute mean
         if mask is not None:
@@ -293,14 +354,39 @@ class AdaptiveStiffLoss(nn.Module):
         else:
             denom = float(loss_phys.numel())
 
-        # Atomic conservation penalty (if enabled)
-        cons = 0.0
-        if self.cons_penalty > 0.0 and self.elemental_conservation:
+        # Conservation penalties (both total and elemental if configured)
+        cons_total = 0.0
+        cons_elem = 0.0
+
+        # Compute physical space values once if any conservation is enabled
+        if self.cons_penalty > 0.0 or (self.elemental_conservation and self.elemental_penalty > 0.0):
             pred_y = torch.pow(10.0, torch.clamp(pred_log, min=-45.0))
             true_y = torch.pow(10.0, torch.clamp(true_log, min=-45.0))
 
+        # Total mass conservation (backward compatibility)
+        if self.cons_penalty > 0.0:
+            # Penalize deviation in total mass/concentration
+            total_pred = pred_y.sum(dim=-1)  # [B,K] or [B]
+            total_true = true_y.sum(dim=-1)  # [B,K] or [B]
+            total_err = torch.abs(total_pred - total_true)
+
+            # Apply mask if present
+            if mask is not None:
+                total_err = total_err * mask  # mask is [B,K] or [B]
+                total_denom = torch.count_nonzero(mask).to(total_err.dtype)
+                total_denom = torch.clamp(total_denom, min=1.0)
+            else:
+                total_denom = float(total_err.numel())
+
+            cons_total = total_err.sum() / total_denom
+
+        # Atomic conservation penalty (if enabled)
+        if self.elemental_conservation and self.elemental_penalty > 0.0:
+            # Ensure 2D case is truly 2D (not masked 3D)
+            if pred_y.ndim == 2:
+                assert mask is None or mask.ndim == 1, "2D predictions with 2D mask not supported"
+
             # Compute elemental totals [B,K,E] or [B,E]
-            # Handle both 2D and 3D cases
             if pred_y.ndim == 2:  # [B,S]
                 elem_pred = pred_y @ self.stoich_matrix  # [B,E]
                 elem_true = true_y @ self.stoich_matrix  # [B,E]
@@ -319,8 +405,13 @@ class AdaptiveStiffLoss(nn.Module):
                 with torch.no_grad():
                     # Use mean element totals from true data
                     mean_elem = elem_true.mean(dim=tuple(range(elem_true.ndim - 1)))  # Mean over all but last dim
-                    self.elem_weights = 1.0 / (mean_elem + self.eps_elem)
-                    self.elem_weights = self.elem_weights / self.elem_weights.mean()  # Normalize
+                    # Avoid division by zero and extreme weights
+                    mean_elem = torch.clamp(mean_elem, min=self.eps_elem)
+                    new_weights = 1.0 / mean_elem
+                    new_weights = new_weights / new_weights.mean()  # Normalize
+                    new_weights = torch.clamp(new_weights, min=0.1, max=10.0)  # Limit range
+                    # Update buffer in place
+                    self.elem_weights.copy_(new_weights)
                 self._need_auto_weights = False
 
             # Compute conservation error
@@ -350,7 +441,7 @@ class AdaptiveStiffLoss(nn.Module):
             else:
                 elem_denom = float(elem_err.numel())
 
-            cons = elem_err.sum() / elem_denom
+            cons_elem = elem_err.sum() / elem_denom
 
             # Log conservation info on first call
             if not self._logged_conservation:
@@ -360,18 +451,22 @@ class AdaptiveStiffLoss(nn.Module):
                 logger.info(f"  Elements: {self.elements}")
                 logger.info(f"  Mode: {self.elemental_mode}")
                 logger.info(f"  Element weights: {self.elem_weights.detach().cpu().numpy()}")
+                logger.info(f"  Species count: {len(self.species_names)}")
                 logger.info(f"  First 5 species stoichiometry:")
                 for i in range(min(5, len(self.species_names))):
                     stoich_str = ", ".join([f"{e}:{self.stoich_matrix[i, j].item():.0f}"
                                             for j, e in enumerate(self.elements)])
                     logger.info(f"    {self.species_names[i]}: {stoich_str}")
-                logger.info(f"  Mean relative elem error (first batch): {cons.item():.6f}")
+                logger.info(f"  Mean elemental error (pre penalty-weight): {cons_elem.item():.6f}")
+                if self.cons_penalty > 0:
+                    logger.info(f"  Mean total error (pre-penalty weight): {cons_total.item():.6f}")
                 self._logged_conservation = True
 
         # Combine all terms
         loss = (self.lambda_phys * loss_phys.sum() / denom +
                 self.lambda_z * loss_z.sum() / denom +
-                self.cons_penalty * cons)
+                self.cons_penalty * cons_total +
+                self.elemental_penalty * cons_elem)
 
         return loss
 
@@ -485,19 +580,54 @@ class Trainer:
             with open(manifest_path, "r") as f:
                 manifest = json.load(f)
 
-            # Get target species for loss computation
+            # Robustly resolve species names
             data_cfg = self.cfg.get("data", {})
-            species_vars = list(data_cfg.get("species_variables", []))
-            target_vars = list(data_cfg.get("target_species") or species_vars)
 
-            # Extract statistics for target species
+            # Try multiple sources for species names
+            target_vars = data_cfg.get("target_species")
+            if target_vars:
+                species_names = list(target_vars)
+            else:
+                species_vars = data_cfg.get("species_variables")
+                if species_vars:
+                    species_names = list(species_vars)
+                else:
+                    # Fall back to normalization.json meta or per_key_stats
+                    meta = manifest.get("meta", {})
+                    species_from_meta = meta.get("species_variables")
+                    if species_from_meta:
+                        species_names = list(species_from_meta)
+                    else:
+                        # Last resort: use keys from per_key_stats that are not time/globals
+                        stats = manifest["per_key_stats"]
+                        time_var = data_cfg.get("time_variable", "t_time")
+                        global_vars = set(data_cfg.get("global_variables", []))
+                        species_names = [
+                            k for k in stats.keys()
+                            if k != time_var and k not in global_vars
+                        ]
+
+            if not species_names:
+                raise ValueError(
+                    "Could not determine species names from config or normalization.json"
+                )
+
+            # If using target subset, use those for statistics
+            if target_vars:
+                stats_keys = target_vars
+            else:
+                stats_keys = species_names
+
+            # Extract statistics for loss computation species
             stats = manifest["per_key_stats"]
             log_means = []
             log_stds = []
             log_mins = []
             log_maxs = []
 
-            for name in target_vars:
+            for name in stats_keys:
+                if name not in stats:
+                    raise KeyError(f"Species '{name}' not found in normalization statistics")
                 s = stats[name]
                 log_means.append(float(s.get("log_mean", 0.0)))
                 log_stds.append(float(s.get("log_std", 1.0)))
@@ -507,11 +637,14 @@ class Trainer:
             # Get loss configuration
             loss_cfg = training_cfg.get("adaptive_stiff_loss", {})
 
-            # Prepare species names for atomic conservation
-            species_names = None
-            if loss_cfg.get("elemental_conservation", False) or loss_cfg.get("conservation_penalty", 0.0) > 0:
-                # Need species names for conservation
-                species_names = target_vars
+            # Determine if we need conservation
+            cons_penalty = float(loss_cfg.get("conservation_penalty", 0.0))
+            elemental_conservation = bool(loss_cfg.get("elemental_conservation", False))
+            elemental_penalty = float(loss_cfg.get("elemental_penalty", 0.0))
+
+            # Log resolved species for debugging
+            self.logger.info(f"Resolved {len(species_names)} species for loss computation")
+            self.logger.info(f"  First 5: {species_names[:5]}")
 
             # Create adaptive stiff loss
             self.criterion = AdaptiveStiffLoss(
@@ -524,22 +657,26 @@ class Trainer:
                 epsilon_phys=float(loss_cfg.get("epsilon_phys", 1e-20)),
                 use_fractional=bool(loss_cfg.get("use_fractional", False)),
                 time_edge_gain=float(loss_cfg.get("time_edge_gain", 2.0)),
-                cons_penalty=float(loss_cfg.get("conservation_penalty", 0.0)),
+                cons_penalty=cons_penalty,  # Total conservation (backward compat)
                 # Atomic conservation parameters
-                elemental_conservation=bool(loss_cfg.get("elemental_conservation",
-                                                         loss_cfg.get("conservation_penalty", 0.0) > 0)),
-                species_names=species_names,
+                elemental_conservation=elemental_conservation,
+                elemental_penalty=elemental_penalty,
+                species_names=species_names if (elemental_conservation and elemental_penalty > 0) else None,
                 elements=loss_cfg.get("elements", ["H", "C", "N", "O"]),
                 elemental_mode=loss_cfg.get("elemental_mode", "relative"),
                 elemental_weights=loss_cfg.get("elemental_weights", "auto"),
                 eps_elem=float(loss_cfg.get("eps_elem", 1e-20)),
+                debug_parser=bool(loss_cfg.get("debug_parser", False)),
                 device=self.device
             )
             self.use_adaptive_stiff = True
             self.logger.info("Using AdaptiveStiffLoss with dynamic range weighting")
-            if loss_cfg.get("elemental_conservation", False) or loss_cfg.get("conservation_penalty", 0.0) > 0:
-                self.logger.info(
-                    f"  Atomic conservation enabled with penalty={loss_cfg.get('conservation_penalty', 0.0)}")
+            if cons_penalty > 0:
+                self.logger.info(f"  Total conservation penalty: {cons_penalty}")
+            if elemental_conservation and elemental_penalty > 0:
+                self.logger.info(f"  Atomic conservation penalty: {elemental_penalty}")
+
+            self._need_species_validation = True
         else:
             # Use standard loss modes
             self.criterion = None
@@ -1014,6 +1151,20 @@ class Trainer:
 
             # Validate and harmonize shapes
             pred, y_j = self._harmonize_shapes(pred, y_j)
+
+            # ADD THIS:
+            # Validate species dimension on first forward
+            if hasattr(self, '_need_species_validation') and self._need_species_validation and self.use_adaptive_stiff:
+                if hasattr(self.criterion, 'species_names') and self.criterion.species_names:
+                    expected_s = len(self.criterion.species_names)
+                    actual_s = pred.shape[-1]
+                    if expected_s != actual_s:
+                        raise ValueError(
+                            f"Model output dimension mismatch: expected {expected_s} species, got {actual_s}. "
+                            f"Check target_species configuration."
+                        )
+                    self.logger.info(f"Model output validated: {actual_s} species")
+                self._need_species_validation = False
 
             # Compute loss
             if self.use_adaptive_stiff:

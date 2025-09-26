@@ -1,185 +1,238 @@
 {
-  // ---------- Paths ----------
+  // ========== PATH CONFIGURATION ==========
   "paths": {
-    // Where preprocessed shards + manifests live (normalization.json, shard_index.json, …)
+    // Directory containing preprocessed NPZ shards and normalization manifests
+    // This is created by the preprocessor and contains train/validation/test subdirs
     "processed_data_dir": "data/processed",
 
-    // Where checkpoints, logs, CSV, etc. are written
+    // Training output directory for checkpoints, logs, tensorboard, metrics
+    // Will be created if it doesn't exist
     "work_dir": "models/trained_model_optimized_v1",
 
-    // Optional: explicit list of HDF5 files. Leave [] to auto-scan data/raw/*.h5(hdf5)
+    // List of raw HDF5 files to process
+    // Leave empty [] to auto-scan data/raw/*.h5 and *.hdf5
+    // Can also specify explicit paths like ["data/raw/file1.h5", "data/raw/file2.h5"]
     "raw_data_files": []
   },
 
-  // ---------- Data schema (authoritative values are re-hydrated from normalization.json) ----------
+  // ========== DATA SCHEMA ==========
+  // Note: These values are re-hydrated from normalization.json after preprocessing
   "data": {
-    // Species variables - will be auto-detected from HDF5 if null
+    // Chemical species to predict (auto-detected from HDF5 if not specified)
+    // Example: ["H2", "O2", "H2O", "OH", "H", "O", "HO2", "H2O2"]
+    // Leave commented to auto-detect from first HDF5 file
     //"species_variables": null,
 
-    // Globals that condition the branch (constant per trajectory)
+    // Global parameters that condition the model (constant per trajectory)
+    // These become part of the branch network input
     "global_variables": ["P", "T"],
 
-    // Target species - null means predict all
+    // Subset of species to predict (null = predict all species)
+    // Useful for focusing on major species in large mechanisms
     //"target_species": null,
 
-    // Name of the absolute time dataset in the raw HDF5
+    // Name of the time array in HDF5 files
     "time_variable": "t_time"
   },
 
-  // ---------- Normalization applied everywhere (preprocessor + runtime) ----------
+  // ========== NORMALIZATION STRATEGY ==========
   "normalization": {
+    // Default normalization method for variables not explicitly specified
+    // Options: "standard", "min-max", "log-standard", "log-min-max"
     "default_method": "log-standard",
+
+    // Per-variable normalization methods
     "methods": {
-      "dt":     "log-min-max",
-      "t_time": "log-min-max",
-      "P":      "log-min-max",
-      "T":      "standard"
+      "dt":     "log-min-max",  // Time differences use log scale with min-max
+      "t_time": "log-min-max",  // Absolute time uses log scale
+      "P":      "log-min-max",  // Pressure in log scale
+      "T":      "standard"      // Temperature in linear scale with z-score
     },
-    "epsilon": 1e-30,           // More stable for float32
+
+    // Floor value for log operations to avoid log(0)
+    "epsilon": 1e-30,
+
+    // Minimum standard deviation to prevent division by zero
     "min_std": 1e-10,
-    "clamp_value": 1e10          // Reduced from 10.0 to avoid saturation
+
+    // Optional clamping of normalized values to [-clamp_value, clamp_value]
+    // Helps prevent gradient explosion in deep networks
+    "clamp_value": 1e10
   },
 
-  // ---------- Preprocessing configuration ----------
+  // ========== PREPROCESSING SETTINGS ==========
   "preprocessing": {
-    // Drop any trajectory with values below threshold
+    // Drop trajectories containing any species values below this threshold
+    // Set to 0 to keep all trajectories, or small positive value to filter negatives
     "min_value_threshold": 0,
 
-    // Trajectories per NPZ shard
+    // Number of trajectories to pack into each NPZ shard file
+    // Larger = fewer files but more memory per file
     "trajectories_per_shard": 65536,
 
-    // NPZ compression off for faster I/O
+    // Whether to compress NPZ files (false = faster I/O, larger files)
     "npz_compressed": false,
 
-    // HDF5 scanning workers if not using MPI (ignored with MPI)
+    // Number of parallel workers for scanning HDF5 files
+    // Ignored when using MPI (uses all MPI ranks instead)
     "num_workers": 50,
 
-    // 0 = auto-detect from dataset
+    // Chunk size for reading HDF5 datasets (0 = auto-detect from dataset)
+    // Can set to specific value like 1024 for consistent memory usage
     "hdf5_chunk_size": 0
   },
 
-  // ---------- Dataset (pair sampling & loader behavior) ----------
+  // ========== DATASET CONFIGURATION ==========
   "dataset": {
-    // Require dt-spec (log-min-max over Δt) in normalization.json
+    // Require dt normalization statistics in manifest
+    // Should be true for proper time difference handling
     "require_dt_stats": true,
 
-    // If all trajectories share the exact same time grid, precompute a [T,T] Δt table
+    // Build lookup table for normalized Δt values when all trajectories share same time grid
+    // Significantly speeds up training with shared grids
     "precompute_dt_table": true,
 
-    // Sample multiple target times per anchor (better coverage)
-    "multi_time_per_anchor": true,
-    "times_per_anchor": 64,           // Increased from 4 for better stiff coverage
+    // Multi-time prediction settings
+    "multi_time_per_anchor": true,  // Sample multiple future times per anchor
+    "times_per_anchor": 64,          // Number of future times to predict (K dimension)
 
-    // If grids are shared, reuse the same K offsets across the batch
-    "share_times_across_batch": false,
-    "uniform_offset_sampling": false,
+    // Offset sampling strategy
+    "share_times_across_batch": false,  // Each sample gets independent offsets
+    "uniform_offset_sampling": false,    // Use natural distribution of time pairs
 
-    "preload_train_to_gpu": true,
-    "preload_val_to_gpu": true,
+    // GPU data staging (dramatically speeds up training)
+    "preload_train_to_gpu": true,   // Load entire training set to GPU memory
+    "preload_val_to_gpu": true,     // Load entire validation set to GPU memory
 
-    // Loader knobs (ignored when GPU-resident; workers forced to 0)
-    "num_workers": 0,
-    "pin_memory": false,
-    "prefetch_factor": 2,
-    "persistent_workers": false
+    // DataLoader settings (mostly ignored when data is GPU-resident)
+    "num_workers": 0,           // CPU workers for data loading
+    "pin_memory": false,        // Pin memory for faster CPU->GPU transfer
+    "prefetch_factor": 2,       // Number of batches to prefetch per worker
+    "persistent_workers": false // Keep workers alive between epochs
   },
 
-  // ---------- Training ----------
+  // ========== TRAINING CONFIGURATION ==========
   "training": {
-    // Loss configuration
-    "loss_mode": "adaptive_stiff",    // Best for stiff systems
+    // Loss function selection
+    "loss_mode": "adaptive_stiff",  // Options: "mse", "frac_l1_phys", "mae_log_phys", "adaptive_stiff"
+
+    // Adaptive stiff loss configuration (for chemical kinetics)
     "adaptive_stiff_loss": {
-      "lambda_phys": 1.0,             // Weight for physical-space error
-      "lambda_z": 0.1,                // Stabilizer in normalized space
-      "epsilon_phys": 1e-25,          // Numerical floor
-      "use_fractional": false,        // false = MAE(log10)
-      "time_edge_gain": 2.0,          // Upweight trajectory edges
-      "conservation_penalty": 0    // Added conservation penalty
+      // Loss component weights
+      "lambda_phys": 1.0,        // Weight for error in physical (log10) space
+      "lambda_z": 0.1,           // Weight for error in normalized z-space (stabilizer)
+
+      // Numerical parameters
+      "epsilon_phys": 1e-25,     // Floor for physical values to avoid log(0)
+      "eps_elem": 1e-20,         // Floor for elemental totals in conservation
+
+      // Loss formulation
+      "use_fractional": false,   // false = MAE(log10), true = fractional error
+      "time_edge_gain": 2.0,     // Weight multiplier for t=0 and t=T (captures stiff dynamics)
+
+      // Conservation penalties
+      "conservation_penalty": 0.001,     // Total mass conservation weight
+      "elemental_conservation": true,    // Enable atomic conservation
+      "elemental_penalty": 0.001,       // Atomic conservation weight
+      "elements": ["H", "C", "N", "O"], // Elements to conserve
+      "elemental_mode": "relative",     // "relative" or "absolute" error
+      "elemental_weights": "auto",      // "auto" or list of weights per element
+      "debug_parser": false             // Run self-tests on formula parser
     },
-    "loss_epsilon": 1e-20,
-    "loss_rel_cap": 10.0,            // Cap fractional error if using frac_l1_phys
 
-    "epochs": 200,
+    // Fallback loss parameters (for non-adaptive modes)
+    "loss_epsilon": 1e-20,      // Floor value for denominators
+    "loss_rel_cap": 10.0,       // Cap relative error to avoid outliers
 
-    "val_fraction": 0.1,              // 10% for validation
-    "test_fraction": 0.1,             // 10% for test
-    "use_fraction": 1.0,              // Use all available data
+    // Training schedule
+    "epochs": 200,              // Total number of epochs
 
-    // Batch sizes
-    "batch_size": 1024,
-    "val_batch_size": 1024,
+    // Data splits
+    "val_fraction": 0.1,        // 10% of data for validation
+    "test_fraction": 0.1,       // 10% of data for testing
+    "use_fraction": 1.0,        // Fraction of available data to actually use
 
-    // Sampling parameters
-    "pairs_per_traj": 8,            
-    "pairs_per_traj_val": 8,        // Keep validation moderate
+    // Batch configuration
+    "batch_size": 1024,         // Training batch size
+    "val_batch_size": 1024,     // Validation batch size
 
-    // Δt index bounds in steps
-    "min_steps": 1,
-    "max_steps": 99,                 // Assuming T=100; adjust to T-1
+    // Trajectory sampling
+    "pairs_per_traj": 8,        // Anchor-target pairs per trajectory per epoch
+    "pairs_per_traj_val": 8,    // Validation pairs per trajectory
+
+    // Time step sampling bounds
+    "min_steps": 1,             // Minimum Δt in time steps
+    "max_steps": 99,            // Maximum Δt in time steps (set to T-1)
 
     // Optimizer settings
-    "lr": 1e-4,                      // Reduced from 5e-4
-    "min_lr": 1e-7,
-    "warmup_epochs": 10,
-    "weight_decay": 3e-5,            // Slightly increased
-    "gradient_clip": 1.0,
+    "lr": 1e-4,                 // Initial learning rate
+    "min_lr": 1e-7,             // Minimum LR for cosine annealing
+    "warmup_epochs": 10,        // Linear warmup period
+    "weight_decay": 3e-5,       // L2 regularization
+    "gradient_clip": 1.0,       // Gradient norm clipping (0 = disabled)
 
     // Performance options
-    "torch_compile": false,
-    "max_train_steps_per_epoch": 0,
-    "max_val_batches": 0,
+    "torch_compile": false,           // Use torch.compile for potential speedup
+    "max_train_steps_per_epoch": 0,  // Limit batches per epoch (0 = all)
+    "max_val_batches": 0,             // Limit validation batches (0 = all)
 
-    // Restart policy
-    "resume": null,
-    "auto_resume": true
+    // Checkpointing
+    "resume": null,             // Path to checkpoint or "auto" for latest
+    "auto_resume": true         // Auto-resume from config.training.resume if set
   },
 
-  // ---------- Model (DeepONet) ----------
+  // ========== MODEL ARCHITECTURE ==========
   "model": {
-    // Residual configuration
-    "predict_delta": false,           // Keep false when using predict_delta_log_phys
-    "predict_delta_log_phys": true,   // Correct residual in log-physical space
+    // Residual connection configuration
+    "predict_delta": false,          // Standard residual in z-space
+    "predict_delta_log_phys": true,  // Residual in log-physical space (better for stiff)
 
-    // Architecture - balanced for performance and VRAM
-    "p": 1024,                        // Increased basis dimension
-    "branch_width": 1024,             // Reduced width
-    "branch_depth": 4,               // Increased depth
-    "trunk_layers": [512, 512, 512, 512], // Added layer, reduced width
+    // DeepONet dimensions
+    "p": 1024,                       // Basis/feature dimension
 
-    // Activation
-    "activation": "leakyrelu",            // Generally more stable than 
+    // Branch network (processes initial state + globals)
+    "branch_width": 1024,            // Hidden layer width
+    "branch_depth": 4,               // Number of hidden layers
 
-    // Mild dropout
-    "dropout": 0.0,                  // Global fallback
-    "branch_dropout": 0.00,          // Reduced from 0.1
-    "trunk_dropout": 0.00,           // Reduced from 0.1
+    // Trunk network (processes time)
+    "trunk_layers": [512, 512, 512, 512],  // List of hidden widths
 
-    // Keep trunk per-time
-    "trunk_dedup": false
+    // Activation function
+    "activation": "leakyrelu",      // Options: "relu", "gelu", "silu", "leakyrelu", "tanh"
+
+    // Regularization
+    "dropout": 0.0,                 // Global dropout rate (fallback)
+    "branch_dropout": 0.0,          // Dropout in branch network
+    "trunk_dropout": 0.0,           // Dropout in trunk network
+
+    // Trunk deduplication (experimental)
+    "trunk_dedup": false            // Share trunk computation across batch
   },
 
-  // ---------- Mixed precision ----------
+  // ========== MIXED PRECISION TRAINING ==========
   "mixed_precision": {
-    // BF16 is stable on modern GPUs
+    // Precision mode: "bf16", "fp16", or "none"
+    // bf16 recommended for A100/H100, more stable than fp16
     "mode": "bf16"
   },
 
-  // ---------- System / hardware ----------
+  // ========== SYSTEM/HARDWARE SETTINGS ==========
   "system": {
+    // Random seed for reproducibility
     "seed": 42,
 
-    // Storage and runtime precision
-    "dtype": "float32",
-    "io_dtype": "float32",
+    // Data type for storage and computation
+    "dtype": "float32",        // Runtime precision
+    "io_dtype": "float32",     // File I/O precision
 
-    // CPU threading
-    "omp_threads": 8,
+    // CPU parallelization
+    "omp_threads": 8,          // OpenMP threads for CPU operations
 
     // GPU optimizations
-    "tf32": true,                   // Fast math for Ampere+
-    "cudnn_benchmark": true,         // Auto-tune convolutions
+    "tf32": true,              // TensorFloat-32 for Ampere+ GPUs (faster matmul)
+    "cudnn_benchmark": true,   // Auto-tune convolution algorithms
 
-    // Reproducibility
-    "deterministic": false           // Keep false for performance
+    // Determinism vs performance
+    "deterministic": false     // true = exact reproducibility but slower
   }
 }
