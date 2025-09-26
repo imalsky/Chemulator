@@ -19,5 +19,12 @@ old_code/
 old/*
 old/
 
+models/*
+models/
+
 tuning_results/
-test/
+test/models/
+*.pt
+*.ckpt
+*.tfevents*
+.DS_Store
