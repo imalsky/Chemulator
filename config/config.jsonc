@@ -7,7 +7,7 @@
 
     // Training output directory for checkpoints, logs, tensorboard, metrics
     // Will be created if it doesn't exist
-    "work_dir": "models/trained_model_optimized_v1",
+    "work_dir": "models/deepo",
 
     // List of raw HDF5 files to process
     // Leave empty [] to auto-scan data/raw/*.h5 and *.hdf5
@@ -120,20 +120,19 @@
     "adaptive_stiff_loss": {
       // Loss component weights
       "lambda_phys": 1.0,        // Weight for error in physical (log10) space
-      "lambda_z": 0.1,           // Weight for error in normalized z-space (stabilizer)
+      "lambda_z": 0.3,           // Weight for error in normalized z-space (stabilizer)
 
       // Numerical parameters
       "epsilon_phys": 1e-25,     // Floor for physical values to avoid log(0)
-      "eps_elem": 1e-20,         // Floor for elemental totals in conservation
+      "eps_elem": 1e-30,         // Floor for elemental totals in conservation
 
       // Loss formulation
       "use_fractional": false,   // false = MAE(log10), true = fractional error
       "time_edge_gain": 2.0,     // Weight multiplier for t=0 and t=T (captures stiff dynamics)
 
       // Conservation penalties
-      "conservation_penalty": 0.001,     // Total mass conservation weight
       "elemental_conservation": true,    // Enable atomic conservation
-      "elemental_penalty": 0.001,       // Atomic conservation weight
+      "elemental_penalty": 0.01,       // Atomic conservation weight
       "elements": ["H", "C", "N", "O"], // Elements to conserve
       "elemental_mode": "relative",     // "relative" or "absolute" error
       "elemental_weights": "auto",      // "auto" or list of weights per element
@@ -145,7 +144,7 @@
     "loss_rel_cap": 10.0,       // Cap relative error to avoid outliers
 
     // Training schedule
-    "epochs": 200,              // Total number of epochs
+    "epochs": 100,              // Total number of epochs
 
     // Data splits
     "val_fraction": 0.1,        // 10% of data for validation
@@ -157,16 +156,16 @@
     "val_batch_size": 1024,     // Validation batch size
 
     // Trajectory sampling
-    "pairs_per_traj": 8,        // Anchor-target pairs per trajectory per epoch
-    "pairs_per_traj_val": 8,    // Validation pairs per trajectory
+    "pairs_per_traj": 2,        // Anchor-target pairs per trajectory per epoch
+    "pairs_per_traj_val": 2,    // Validation pairs per trajectory
 
     // Time step sampling bounds
     "min_steps": 1,             // Minimum Δt in time steps
     "max_steps": 99,            // Maximum Δt in time steps (set to T-1)
 
     // Optimizer settings
-    "lr": 1e-4,                 // Initial learning rate
-    "min_lr": 1e-7,             // Minimum LR for cosine annealing
+    "lr": 3e-4,                 // Initial learning rate
+    "min_lr": 1e-6,             // Minimum LR for cosine annealing
     "warmup_epochs": 10,        // Linear warmup period
     "weight_decay": 3e-5,       // L2 regularization
     "gradient_clip": 1.0,       // Gradient norm clipping (0 = disabled)
@@ -191,7 +190,7 @@
     "p": 1024,                       // Basis/feature dimension
 
     // Branch network (processes initial state + globals)
-    "branch_width": 1024,            // Hidden layer width
+    "branch_width": 1536,            // Hidden layer width
     "branch_depth": 4,               // Number of hidden layers
 
     // Trunk network (processes time)

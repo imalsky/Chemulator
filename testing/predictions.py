@@ -21,7 +21,7 @@ from utils import load_json, seed_everything
 from model import create_model
 
 # Settings
-SAMPLE_IDX = 7
+SAMPLE_IDX = 0
 Q_COUNT = 100
 XMIN, XMAX = 1e-3, 1e8
 
