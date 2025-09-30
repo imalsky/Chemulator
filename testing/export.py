@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 # Configuration
-MODEL_SUBDIR = "models/trained_model_optimized_v1"
+MODEL_SUBDIR = "models/deepo_big"
 EXPORT_NAME = "export_eager.pt"
 
 # Paths

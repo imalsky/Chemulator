@@ -11,7 +11,7 @@ from matplotlib.lines import Line2D
 
 # Paths
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models/trained_model_optimized_v1"
+MODEL_DIR = REPO / "models/deepo_big"
 DATA_DIR = REPO / "data/processed"
 
 # Add src to path
@@ -21,7 +21,7 @@ from utils import load_json, seed_everything
 from model import create_model
 
 # Settings
-SAMPLE_IDX = 0
+SAMPLE_IDX = 2
 Q_COUNT = 100
 XMIN, XMAX = 1e-3, 1e8
 
