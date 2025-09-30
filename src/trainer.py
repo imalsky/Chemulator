@@ -294,8 +294,9 @@ class AdaptiveStiffLoss(nn.Module):
             pred_z: torch.Tensor,
             true_z: torch.Tensor,
             t_norm: torch.Tensor,
-            mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+            mask: Optional[torch.Tensor] = None,
+            return_components: bool = False
+    ) -> torch.Tensor | Dict[str, torch.Tensor]:
         """
         Compute adaptive loss.
 
@@ -304,9 +305,10 @@ class AdaptiveStiffLoss(nn.Module):
             true_z: Targets in z-space [B,K,S] or [B,S]
             t_norm: Normalized times [B,K] or [B,K,1] or [B]
             mask: Optional validity mask [B,K] or [B]
+            return_components: If True, return dict with component losses
 
         Returns:
-            Scalar loss value
+            Scalar loss value or dict of loss components
         """
         # MSE in z-space (stabilizer term)
         loss_z = (pred_z - true_z) ** 2
@@ -391,7 +393,8 @@ class AdaptiveStiffLoss(nn.Module):
 
             # Compute conservation error
             if self.elemental_mode == "relative":
-                elem_err = torch.abs(elem_pred - elem_true) / (torch.abs(elem_true) + self.eps_elem)
+                den = torch.abs(elem_true) + torch.abs(elem_pred) + self.eps_elem
+                elem_err = torch.abs(elem_pred - elem_true) / den
             else:
                 elem_err = torch.abs(elem_pred - elem_true)
 
@@ -434,12 +437,23 @@ class AdaptiveStiffLoss(nn.Module):
                 logger.info(f"  Mean elemental error (pre penalty-weight): {cons_elem.item():.6f}")
                 self._logged_conservation = True
 
-        # Combine all terms
-        loss = (self.lambda_phys * loss_phys.sum() / denom +
-                self.lambda_z * loss_z.sum() / denom +
-                self.elemental_penalty * cons_elem)
+        # Calculate component losses
+        phys_loss = self.lambda_phys * loss_phys.sum() / denom
+        z_loss = self.lambda_z * loss_z.sum() / denom
+        elem_loss = self.elemental_penalty * cons_elem
 
+        # Combine all terms
+        loss = phys_loss + z_loss + elem_loss
+
+        if return_components:
+            return {
+                'total': loss,
+                'phys': phys_loss,
+                'z': z_loss,
+                'elem': elem_loss if self.elemental_conservation and self.elemental_penalty > 0 else torch.tensor(0.0)
+            }
         return loss
+
 
 # ------------------------------- Trainer Class -------------------------------
 
@@ -468,14 +482,27 @@ class Trainer:
         self.cfg = cfg
         self.device = device
 
-        # Setup logger (use stdlib logging with NullHandler as fallback)
+        # Setup logger without name prefix
         if logger is None:
             self.logger = logging.getLogger("trainer")
-            if not self.logger.handlers:
-                self.logger.addHandler(logging.NullHandler())
+            self.logger.propagate = False  # Prevent name propagation
+            self.logger.handlers.clear()  # Clear any existing handlers
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s',
+                                          datefmt='%Y-%m-%d %H:%M:%S')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
         else:
             self.logger = logger
+            self.logger.propagate = False
+            # Always override formatter to ensure no name prefix
+            self.logger.handlers.clear()
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s',
+                                          datefmt='%Y-%m-%d %H:%M:%S')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
 
         # Setup working directory
         self.work_dir = Path(work_dir)
@@ -517,13 +544,16 @@ class Trainer:
             )
             self.logger.info("Model compiled with torch.compile")
 
-        # Setup logging (TensorBoard + CSV)
-        self._setup_logging()
-
         # Initialize training state
         self.start_epoch = 0
         self.best_val_loss = float("inf")
         self._current_epoch = 0  # Track current epoch for SIGTERM handler
+
+        # Initialize loss component tracking (absolute and relative)
+        self.train_loss_components = {}
+        self.val_loss_components = {}
+        self.train_rel_components = {}
+        self.val_rel_components = {}
 
         # Checkpoint paths
         self.best_model_path = self.work_dir / "best_model.pt"  # Weights only (backward compat)
@@ -533,8 +563,11 @@ class Trainer:
         # Setup SIGTERM handler for graceful cluster preemption
         self._setup_sigterm_handler()
 
-        # Setup loss function based on configuration
+        # Setup loss function BEFORE logging (FIX #1)
         self._setup_loss()
+
+        # Setup logging AFTER loss (so we know elem_enabled)
+        self._setup_logging()
 
         # Check for resume from checkpoint (must come after scheduler setup)
         self._check_resume()
@@ -611,6 +644,9 @@ class Trainer:
             elemental_conservation = bool(loss_cfg.get("elemental_conservation", False))
             elemental_penalty = float(loss_cfg.get("elemental_penalty", 0.0))
 
+            # Track if elem is enabled
+            self.elem_enabled = elemental_conservation and elemental_penalty > 0
+
             # Log resolved species for debugging
             self.logger.info(f"Resolved {len(species_names)} species for loss computation")
             self.logger.info(f"  First 5: {species_names[:5]}")
@@ -629,7 +665,7 @@ class Trainer:
                 # Atomic conservation parameters
                 elemental_conservation=elemental_conservation,
                 elemental_penalty=elemental_penalty,
-                species_names=species_names if (elemental_conservation and elemental_penalty > 0) else None,
+                species_names=species_names if self.elem_enabled else None,
                 elements=loss_cfg.get("elements", ["H", "C", "N", "O"]),
                 elemental_mode=loss_cfg.get("elemental_mode", "relative"),
                 elemental_weights=loss_cfg.get("elemental_weights", "auto"),
@@ -643,7 +679,7 @@ class Trainer:
 
             self.use_adaptive_stiff = True
             self.logger.info("Using AdaptiveStiffLoss with dynamic range weighting")
-            if elemental_conservation and elemental_penalty > 0:
+            if self.elem_enabled:
                 self.logger.info(f"  Atomic conservation penalty: {elemental_penalty}")
 
             self._need_species_validation = True
@@ -651,6 +687,7 @@ class Trainer:
             # Use standard loss modes
             self.criterion = None
             self.use_adaptive_stiff = False
+            self.elem_enabled = False
             # Store loss configuration for _compute_loss method
             self.loss_mode = loss_mode
             self.loss_epsilon = float(training_cfg.get("loss_epsilon", 1e-27))
@@ -761,12 +798,24 @@ class Trainer:
         tb_dir.mkdir(exist_ok=True)
         self.writer = SummaryWriter(log_dir=str(tb_dir))
 
-        # CSV file for simple text-based logging (backward compatibility)
+        # CSV file with complete headers (FIX #3: include val relatives)
         self.log_file = self.work_dir / "training_log.txt"
+
+        # Build headers based on loss type
+        headers = ["epoch", "train", "val", "lr"]
+        if self.use_adaptive_stiff:
+            headers.extend(["train_rel_phys", "train_rel_z"])
+            if self.elem_enabled:
+                headers.append("train_rel_elem")
+            headers.extend(["val_rel_phys", "val_rel_z"])
+            if self.elem_enabled:
+                headers.append("val_rel_elem")
+
+        # Only write header if file doesn't exist
         if not self.log_file.exists():
             with self.log_file.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["epoch", "train_loss", "val_loss", "lr"])
+                writer.writerow(headers)
 
     def _check_resume(self) -> None:
         """Load a checkpoint if resuming, honoring env var RESUME, then config:
@@ -918,18 +967,18 @@ class Trainer:
                     val_loss = self._run_epoch(train=False)
                 else:
                     val_loss = train_loss
+                    # Copy relative components when no validation
+                    self.val_rel_components = self.train_rel_components.copy()
 
                 # Step learning rate scheduler AFTER optimizer updates (epoch-level scheduling)
                 self.scheduler.step()
                 current_lr = self.optimizer.param_groups[0]["lr"]
 
-                # Save checkpoints
-                saved = False
+                # Save checkpoints (without logging saved status)
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = float(val_loss)
                     self._save_weights_only()  # For backward compatibility
                     self._save_full_checkpoint(self.best_ckpt_path, epoch)
-                    saved = True
 
                 # Always save last checkpoint for resume capability
                 self._save_full_checkpoint(self.last_ckpt_path, epoch)
@@ -939,18 +988,52 @@ class Trainer:
                 self.writer.add_scalar("loss/val", val_loss, epoch)
                 self.writer.add_scalar("lr", current_lr, epoch)
 
+                # Log absolute component losses to TensorBoard
+                if self.train_loss_components:
+                    for key, value in self.train_loss_components.items():
+                        self.writer.add_scalar(f"loss/train_{key}", value, epoch)
+                if self.val_loss_components:
+                    for key, value in self.val_loss_components.items():
+                        self.writer.add_scalar(f"loss/val_{key}", value, epoch)
+
+                # Log relative component losses to TensorBoard
+                if self.train_rel_components:
+                    for key, value in self.train_rel_components.items():
+                        self.writer.add_scalar(f"loss_rel/train_{key}", value, epoch)
+                if self.val_rel_components:
+                    for key, value in self.val_rel_components.items():
+                        self.writer.add_scalar(f"loss_rel/val_{key}", value, epoch)
+
                 # Log to CSV file
                 self._log_epoch_metrics(epoch, train_loss, val_loss, current_lr)
 
-                # Console output
+                # Console output with BOTH train and val relative components (FIX #2)
                 epoch_time = time.perf_counter() - epoch_start
+
+                # Build relative loss strings for both train and val
+                rel_train_str = ""
+                rel_val_str = ""
+                if self.use_adaptive_stiff:
+                    if self.train_rel_components:
+                        if self.elem_enabled:
+                            rel_train_str = f" | rel_train[phys/z/elem]={self.train_rel_components['phys']:.2f}/{self.train_rel_components['z']:.2f}/{self.train_rel_components['elem']:.2f}"
+                        else:
+                            rel_train_str = f" | rel_train[phys/z]={self.train_rel_components['phys']:.2f}/{self.train_rel_components['z']:.2f}"
+
+                    if self.val_rel_components:
+                        if self.elem_enabled:
+                            rel_val_str = f" | rel_val[phys/z/elem]={self.val_rel_components['phys']:.2f}/{self.val_rel_components['z']:.2f}/{self.val_rel_components['elem']:.2f}"
+                        else:
+                            rel_val_str = f" | rel_val[phys/z]={self.val_rel_components['phys']:.2f}/{self.val_rel_components['z']:.2f}"
+
                 self.logger.info(
                     f"Epoch {epoch:03d}/{self.epochs} | "
-                    f"train_loss={train_loss:.4e} | "
-                    f"val_loss={val_loss:.4e} | "
+                    f"train={train_loss:.4e} | "
+                    f"val={val_loss:.4e} | "
                     f"lr={current_lr:.2e} | "
-                    f"time={epoch_time:.1f}s | "
-                    f"saved={'yes' if saved else 'no'}"
+                    f"time={epoch_time:.1f}s"
+                    f"{rel_train_str}"
+                    f"{rel_val_str}"
                 )
 
             # Training complete
@@ -1005,9 +1088,35 @@ class Trainer:
             val_loss: float,
             lr: float
     ) -> None:
-        """Append epoch metrics to CSV log file."""
+        """Append epoch metrics to CSV log file with relative components for BOTH train and val (FIX #3)."""
+        row = [epoch, f"{train_loss:.4e}", f"{val_loss:.4e}", f"{lr:.4e}"]
+
+        if self.use_adaptive_stiff:
+            # Train relatives
+            if self.train_rel_components:
+                row.append(f"{self.train_rel_components.get('phys', 0):.4f}")
+                row.append(f"{self.train_rel_components.get('z', 0):.4f}")
+                if self.elem_enabled:
+                    row.append(f"{self.train_rel_components.get('elem', 0):.4f}")
+            else:
+                row.extend(["0.0000", "0.0000"])
+                if self.elem_enabled:
+                    row.append("0.0000")
+
+            # Val relatives
+            if self.val_rel_components:
+                row.append(f"{self.val_rel_components.get('phys', 0):.4f}")
+                row.append(f"{self.val_rel_components.get('z', 0):.4f}")
+                if self.elem_enabled:
+                    row.append(f"{self.val_rel_components.get('elem', 0):.4f}")
+            else:
+                row.extend(["0.0000", "0.0000"])
+                if self.elem_enabled:
+                    row.append("0.0000")
+
         with self.log_file.open("a", encoding="utf-8") as f:
-            f.write(f"{epoch},{train_loss:.4e},{val_loss:.4e},{lr:.4e}\n")
+            writer = csv.writer(f)
+            writer.writerow(row)
 
     def _run_epoch(self, train: bool) -> float:
         """
@@ -1044,6 +1153,11 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
 
+        # Component loss accumulators
+        total_phys = 0.0
+        total_z = 0.0
+        total_elem = 0.0
+
         # Determine max steps for this epoch
         max_steps = None
         if train and self.max_train_steps_per_epoch:
@@ -1062,9 +1176,16 @@ class Trainer:
                     break
 
                 # Process batch
-                loss = self._process_batch(batch, train, autocast_context)
+                loss_info = self._process_batch(batch, train, autocast_context)
 
-                total_loss += float(loss)
+                if isinstance(loss_info, dict):
+                    total_loss += float(loss_info['total'])
+                    total_phys += float(loss_info.get('phys', 0))
+                    total_z += float(loss_info.get('z', 0))
+                    total_elem += float(loss_info.get('elem', 0))
+                else:
+                    total_loss += float(loss_info)
+
                 num_batches += 1
 
         # Log actual batch counts when limits are active
@@ -1072,14 +1193,40 @@ class Trainer:
             mode_str = "train" if train else "val"
             self.logger.debug(f"{mode_str} epoch used {num_batches} batches (limit: {max_steps})")
 
-        return total_loss / max(1, num_batches)
+        # Calculate averages
+        avg_loss = total_loss / max(1, num_batches)
+
+        # Store absolute component averages and compute relatives
+        if num_batches > 0 and self.use_adaptive_stiff:
+            components = {
+                'phys': total_phys / num_batches,
+                'z': total_z / num_batches,
+                'elem': total_elem / num_batches
+            }
+
+            # Calculate relative components
+            total = avg_loss + 1e-12  # Guard against division by zero
+            rel_components = {
+                'phys': components['phys'] / total,
+                'z': components['z'] / total,
+                'elem': components['elem'] / total
+            }
+
+            if train:
+                self.train_loss_components = components
+                self.train_rel_components = rel_components
+            else:
+                self.val_loss_components = components
+                self.val_rel_components = rel_components
+
+        return avg_loss
 
     def _process_batch(
             self,
             batch: tuple,
             train: bool,
             autocast_context: contextlib.AbstractContextManager
-    ) -> float:
+    ) -> float | Dict[str, float]:
         """
         Process single batch with mixed precision support.
 
@@ -1089,7 +1236,7 @@ class Trainer:
             autocast_context: Context manager for mixed precision
 
         Returns:
-            Batch loss value
+            Batch loss value or dict of loss components
         """
         # Unpack batch (supports both 5 and 6 element batches)
         if len(batch) == 6:
@@ -1132,7 +1279,6 @@ class Trainer:
             # Validate and harmonize shapes
             pred, y_j = self._harmonize_shapes(pred, y_j)
 
-            # ADD THIS:
             # Validate species dimension on first forward
             if hasattr(self, '_need_species_validation') and self._need_species_validation and self.use_adaptive_stiff:
                 if hasattr(self.criterion, 'species_names') and self.criterion.species_names:
@@ -1146,11 +1292,13 @@ class Trainer:
                     self.logger.info(f"Model output validated: {actual_s} species")
                 self._need_species_validation = False
 
-            # Compute loss
+            # Compute loss with components if using adaptive stiff
             if self.use_adaptive_stiff:
-                loss = self.criterion(pred, y_j, dt_in, k_mask)
+                loss_info = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
+                loss = loss_info['total']
             else:
                 loss = self._compute_loss(pred, y_j, k_mask)
+                loss_info = loss
 
         # Backward pass and optimization (training only)
         if train:
@@ -1185,6 +1333,9 @@ class Trainer:
                 # Optimizer step
                 self.optimizer.step()
 
+        # Return loss components for adaptive stiff, scalar for others
+        if isinstance(loss_info, dict):
+            return {k: v.detach().item() for k, v in loss_info.items()}
         return loss.detach().item()
 
     def _resolve_target_indices(self):
