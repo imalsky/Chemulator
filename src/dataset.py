@@ -13,8 +13,10 @@ Flow-map DeepONet Dataset (Δt trunk input, dt-spec normalization)
   The model always receives (B).
 
 Options:
-- `uniform_offset_sampling`: unbiased offsets k = j - i ~ Uniform[min_steps, max_steps] to reduce
-  the natural triangular bias in pair counts.
+ - `uniform_offset_sampling`: for each row, sample K offsets k = j − i uniformly in
+   [min_steps, max_steps], then choose a single anchor i_used ∈ [0, T−1−o_max] so all K
+   targets fit (o_max is the row’s largest sampled offset). This removes triangular (i,j)
+   bias but induces an early-anchor skew when K or max_steps is large.
 - `share_times_across_batch`: when the physical time grid is truly shared, reuse the same offset
   set across the batch (with masks for rows that can't take all offsets).
 - `precompute_dt_table`: with a shared grid, precompute a [T, T] lookup of **dt-spec normalized**
@@ -26,7 +28,7 @@ Returned batch (matches Trainer expectations):
     y_j   : [B, K, S]      (normalized species at target)
     g     : [B, G]         (normalized globals)
     aux   : {'i':[B], 'j':[B,K]}
-    k_mask: [B, K] only when share_offsets_across_batch=True
+    k_mask: [B, K] only when share_times_across_batch=True
 
 Notes:
 - Time grids must be strictly increasing. When shared, they must be bitwise-equal across shards.
@@ -94,7 +96,7 @@ class FlowMapPairsDataset(Dataset):
     - y_j: [B, K, S]
     - g  : [B, G]
     - aux: {'i':[B], 'j':[B,K]}
-    - k_mask: [B, K] present only when `share_offsets_across_batch=True`.
+    - k_mask: [B, K] present only when `share_times_across_batch=True`.
 
     Grid assumptions
     ----------------
@@ -193,8 +195,26 @@ class FlowMapPairsDataset(Dataset):
 
         # Step bounds and length
         self.min_steps = int(min_steps)
-        self.max_steps = int(max_steps if max_steps is not None else (self.T - 1))
+
+        # When using uniform_offset_sampling with multi-time anchors, default max_steps to K
+        # to ensure anchors are uniformly distributed in [0, T-1-K] rather than concentrated
+        # at the beginning of trajectories. This gives: anchor range = [0, T-1-K], offsets = [1, K].
+        if max_steps is None:
+            if self.uniform_offset_sampling and self.multi_time:
+                # Default: max_steps = K ensures anchors ∈ [0, T−1−K] with K targets each,
+                # i.e., “latest anchor = T−1−K”. If you want longer horizons, raise max_steps.
+                self.max_steps = self.K
+                print(f"[{self.split}] uniform_offset_sampling=True: defaulting max_steps to K={self.K}")
+            else:
+                # Original behavior: allow full temporal range
+                self.max_steps = self.T - 1
+        else:
+            # Explicit override from config or function argument
+            self.max_steps = int(max_steps)
+
+        # Validate step bounds after setting defaults
         self._validate_step_bounds()
+
         self.pairs_per_traj = int(pairs_per_traj)
         self._length = int(self.N * self.pairs_per_traj)
 
@@ -403,8 +423,7 @@ class FlowMapPairsDataset(Dataset):
             dt_phys,
             torch.as_tensor(eps, dtype=dt_phys.dtype, device=dt_phys.device),
         )
-        # Helper expects last dim == len(var_list); add a singleton feature dim
-        #dt_in = dt_phys.to(torch.float32).unsqueeze(-1)                    # [T,T,1]
+        # normalize_dt_from_phys accepts a [T,T] Δt tensor; no extra feature dim required here.
         dt_norm = self.norm.normalize_dt_from_phys(dt_phys).to(torch.float32)
 
         self.dt_table = dt_norm.to(torch.float32).contiguous()
@@ -415,6 +434,11 @@ class FlowMapPairsDataset(Dataset):
         """
         Deterministically regenerate (traj_idx, anchor_i) for this epoch on device.
         Length remains N * pairs_per_traj.
+
+        Note: When uniform_offset_sampling=True, these initial anchors serve as seeds for the
+        RNG state but are replaced during _sample_target_indices with anchors that ensure all
+        K sampled offsets fit within [0, T-1]. With max_steps=K (default), the replacement
+        anchors will be in a similar range [0, T-1-K].
         """
         self.epoch = int(epoch)
         N = self.N
@@ -449,10 +473,10 @@ class FlowMapPairsDataset(Dataset):
 
         Modes
         -----
-        1) uniform_offset_sampling=True:
-        - Sample offsets o ~ Uniform{min_steps, ..., max_steps} independently for each (b, k).
-        - Choose anchors i_used per row so that all sampled offsets fit within [0, T-1].
-        - Returns dense mask==True.
+         1) uniform_offset_sampling=True (per-row uniform offsets with a shared anchor):
+         - Sample o[b,k] ~ Uniform{min_steps,…,max_steps}.
+         - Let o_max[b] = max_k o[b,k]; draw i_used[b] uniformly from [0, T−1−o_max[b]].
+         - Set j[b,k] = i_used[b] + o[b,k]. Returns dense mask==True by construction.
 
         2) uniform_offset_sampling=False:
         - Per-row windows with j_lo = i + min_steps, j_hi = min(i + max_steps, T-1).
@@ -464,6 +488,7 @@ class FlowMapPairsDataset(Dataset):
         j      : LongTensor [B, K]   (target indices)
         mask   : BoolTensor [B, K]   (True where the chosen offset is valid; all True unless shared_offsets)
         i_used : LongTensor [B]      (actual anchors used to form j)
+        When uniform_offset_sampling=True, mask is all True by construction because i_used is chosen to satisfy o_max.
         """
         if i.device != self.device:
             i = i.to(self.device, non_blocking=True)
@@ -472,14 +497,18 @@ class FlowMapPairsDataset(Dataset):
         B = int(i.shape[0])
         T = self.T
 
-        # --------- Option 1: unbiased uniform offsets across [min_steps, max_steps] ----------
+        # --------- Option 1: per-row uniform offsets (shared anchor constrained by o_max) ----------
+        # For each row, sample K offsets uniformly; compute o_max; then draw a single anchor i_used ∈ [0, T−1−o_max].
+        # This guarantees all j = i_used + o are valid. Offsets are uniform in k; anchors skew earlier as o_max grows.
         if self.uniform_offset_sampling:
             # Sample offsets uniformly for each (b,k)
             o = torch.randint(min_steps, max_steps + 1, (B, K), device=self.device, generator=generator)  # [B,K]
             # For each row, we must pick an anchor that allows the largest chosen offset
             o_max = o.max(dim=1).values                                                                     # [B]
             i_max = (T - 1 - o_max).clamp_min(0)                                                            # [B]
-            # Sample anchors uniformly in the valid range [0, i_max]
+            # Note: The latest possible anchor depends on max_steps via o_max, not K directly.
+            # With the default max_steps=K, anchors range from [0, T-1-K]. If max_steps > K is
+            # explicitly set, anchors will be more constrained (skewed toward early indices).
             u = torch.rand((B,), device=self.device, generator=generator)
             i_used = (u * (i_max + 1).to(torch.float32)).floor().to(torch.long)                             # [B]
             j = i_used.unsqueeze(1) + o                                                                     # [B,K]
@@ -555,7 +584,7 @@ class FlowMapPairsDataset(Dataset):
         - y_j: [B, K, S]
         - g  : [B, G]
         - aux: dict with 'i':[B], 'j':[B,K]
-        - k_mask: [B, K] only if `share_offsets_across_batch=True`.
+        - k_mask: [B, K] only if `share_times_across_batch=True`.
         """
         import logging
         logger = logging.getLogger(__name__)

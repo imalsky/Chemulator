@@ -94,21 +94,25 @@
 
     // Multi-time prediction settings
     "multi_time_per_anchor": true,  // Sample multiple future times per anchor
-    "times_per_anchor": 80,          // Number of future times to predict (K dimension)
+    "times_per_anchor": 64,          // Number of future times to predict (K dimension)
 
     // Offset sampling strategy
-    "share_times_across_batch": false,  // Each sample gets independent offsets
-    "uniform_offset_sampling": false,    // Use natural distribution of time pairs
+    "share_times_across_batch": true,
+    // uniform_offset_sampling: Sample K offsets uniformly from [min_steps, max_steps] per row,
+    // then choose an anchor that accommodates the largest offset (o_max). This removes the
+    // triangular (i,j) pair bias. Default behavior (max_steps=K) ensures anchors are uniformly
+    // distributed in [0, T-1-K]. If max_steps > K, anchors will skew toward early indices.
+    "uniform_offset_sampling": true,
 
     // GPU data staging (dramatically speeds up training)
     "preload_train_to_gpu": true,   // Load entire training set to GPU memory
     "preload_val_to_gpu": true,     // Load entire validation set to GPU memory
 
     // DataLoader settings (mostly ignored when data is GPU-resident)
-    "num_workers": 0,           // CPU workers for data loading
-    "pin_memory": false,        // Pin memory for faster CPU->GPU transfer
-    "prefetch_factor": 2,       // Number of batches to prefetch per worker
-    "persistent_workers": false // Keep workers alive between epochs
+    "num_workers": 48,           // CPU workers for data loading
+    "pin_memory": true,        // Pin memory for faster CPU->GPU transfer
+    "prefetch_factor": 4,       // Number of batches to prefetch per worker
+    "persistent_workers": true // Keep workers alive between epochs
   },
 
   // ========== TRAINING CONFIGURATION ==========
@@ -131,8 +135,8 @@
       "time_edge_gain": 0.5,     // Weight multiplier for t=0 and t=T (captures stiff dynamics)
 
       // Conservation penalties
-      "elemental_conservation": true,    // Enable atomic conservation
-      "elemental_penalty": 0.25,       // Atomic conservation weight
+      "elemental_conservation": false,    // Enable atomic conservation
+      "elemental_penalty": 0.05,       // Atomic conservation weight
       "elements": ["H", "C", "N", "O"], // Elements to conserve
       "elemental_mode": "relative",     // "relative" or "absolute" error
       "elemental_weights": "auto",      // "auto" or list of weights per element
@@ -144,7 +148,7 @@
     "loss_rel_cap": 10.0,       // Cap relative error to avoid outliers
 
     // Training schedule
-    "epochs": 100,              // Total number of epochs
+    "epochs": 200,              // Total number of epochs
 
     // Data splits
     "val_fraction": 0.1,        // 10% of data for validation
@@ -156,22 +160,21 @@
     "val_batch_size": 1024,     // Validation batch size
 
     // Trajectory sampling
-    "pairs_per_traj": 4,        // Anchor-target pairs per trajectory per epoch
-    "pairs_per_traj_val": 4,    // Validation pairs per trajectory
+    "pairs_per_traj": 24,        // Anchor-target pairs per trajectory per epoch
+    "pairs_per_traj_val": 24,    // Validation pairs per trajectory
 
     // Time step sampling bounds
     "min_steps": 1,             // Minimum Δt in time steps
-    "max_steps": 99,            // Maximum Δt in time steps (set to T-1)
 
     // Optimizer settings
     "lr": 1e-4,                 // Initial learning rate
     "min_lr": 1e-6,             // Minimum LR for cosine annealing
     "warmup_epochs": 10,        // Linear warmup period
     "weight_decay": 3e-5,       // L2 regularization
-    "gradient_clip": 0.8,       // Gradient norm clipping (0 = disabled)
+    "gradient_clip": 1.0,       // Gradient norm clipping (0 = disabled)
 
     // Performance options
-    "torch_compile": false,           // Use torch.compile for potential speedup
+    "torch_compile": true,           // Use torch.compile for potential speedup
     "max_train_steps_per_epoch": 0,  // Limit batches per epoch (0 = all)
     "max_val_batches": 0,             // Limit validation batches (0 = all)
 
@@ -183,14 +186,14 @@
   // ========== MODEL ARCHITECTURE ==========
   "model": {
     // Residual connection configuration
-    "predict_delta": false,          // Standard residual in z-space
-    "predict_delta_log_phys": true,  // Residual in log-physical space (better for stiff)
+    "predict_delta": true,          // Standard residual in z-space
+    "predict_delta_log_phys": false,  // Residual in log-physical space (better for stiff)
 
     // DeepONet dimensions
-    "p": 512,                       // Basis/feature dimension
+    "p": 1024,                       // Basis/feature dimension
 
     // Branch network (processes initial state + globals)
-    "branch_width": 512,            // Hidden layer width
+    "branch_width": 1024,            // Hidden layer width
     "branch_depth": 4,               // Number of hidden layers
 
     // Trunk network (processes time)
