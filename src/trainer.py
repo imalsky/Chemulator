@@ -677,6 +677,27 @@ class Trainer:
             # CRITICAL: Move the entire loss module to device
             self.criterion = self.criterion.to(self.device)
 
+            # ============ Check model/loss stat consistency ============
+            # If the model uses SoftMax head or corrected residual, verify stats match
+            model_cfg = self.cfg.get("model", {})
+            if model_cfg.get("softmax_head", False) or model_cfg.get("predict_delta_log_phys", False):
+                if hasattr(self.model, 'check_stat_consistency'):
+                    try:
+                        self.model.check_stat_consistency(
+                            self.criterion.log_means,
+                            self.criterion.log_stds
+                        )
+                        self.logger.info("Model and loss normalization statistics verified to match")
+                    except (ValueError, RuntimeError) as e:
+                        self.logger.error(f"CRITICAL: Model/loss stat mismatch: {e}")
+                        raise
+                else:
+                    self.logger.warning(
+                        "Model should have check_stat_consistency method when using "
+                        "softmax_head or predict_delta_log_phys. Skipping stat verification."
+                    )
+            # ============================================================
+
             self.use_adaptive_stiff = True
             self.logger.info("Using AdaptiveStiffLoss with dynamic range weighting")
             if self.elem_enabled:

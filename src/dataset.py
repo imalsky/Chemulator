@@ -196,9 +196,7 @@ class FlowMapPairsDataset(Dataset):
         # Step bounds and length
         self.min_steps = int(min_steps)
 
-        # When using uniform_offset_sampling with multi-time anchors, default max_steps to K
-        # to ensure anchors are uniformly distributed in [0, T-1-K] rather than concentrated
-        # at the beginning of trajectories. This gives: anchor range = [0, T-1-K], offsets = [1, K].
+        # Default max_steps behavior
         if max_steps is None:
             if self.uniform_offset_sampling and self.multi_time:
                 # Default: max_steps = K ensures anchors ∈ [0, T−1−K] with K targets each,
@@ -214,6 +212,9 @@ class FlowMapPairsDataset(Dataset):
 
         # Validate step bounds after setting defaults
         self._validate_step_bounds()
+
+        # Must set this BEFORE feasibility checks that reference it
+        self.pairs_per_traj = int(pairs_per_traj)
 
         # Ensure each anchor can have K **unique** downstream samples (no masks, no duplicates)
         if self.multi_time:
@@ -237,7 +238,6 @@ class FlowMapPairsDataset(Dataset):
             # Fallback when not multi-time; only need 1 valid j per anchor.
             self._max_anchor_for_k = self.T - 1 - self.min_steps
 
-        self.pairs_per_traj = int(pairs_per_traj)
         self._length = int(self.N * self.pairs_per_traj)
 
         # Allocate/stage tensors

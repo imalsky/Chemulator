@@ -7,7 +7,7 @@
 
     // Training output directory for checkpoints, logs, tensorboard, metrics
     // Will be created if it doesn't exist
-    "work_dir": "models/deepo",
+    "work_dir": "models/deepo-soft",
 
     // List of raw HDF5 files to process
     // Leave empty [] to auto-scan data/raw/*.h5 and *.hdf5
@@ -134,13 +134,13 @@
       "use_fractional": false,   // false = MAE(log10), true = fractional error
       "time_edge_gain": 0.5,     // Weight multiplier for t=0 and t=T (captures stiff dynamics)
 
-      // Conservation penalties
-      "elemental_conservation": false,    // Enable atomic conservation
-      "elemental_penalty": 0.05,       // Atomic conservation weight
-      "elements": ["H", "C", "N", "O"], // Elements to conserve
-      "elemental_mode": "relative",     // "relative" or "absolute" error
-      "elemental_weights": "auto",      // "auto" or list of weights per element
-      "debug_parser": false             // Run self-tests on formula parser
+      // Conservation penalties (DISABLED with SoftMax head)
+      "elemental_conservation": false,    // Disabled - SoftMax enforces sum=1
+      "elemental_penalty": 0.0,           // No penalty needed with SoftMax
+      "elements": ["H", "C", "N", "O"],   // Elements to conserve
+      "elemental_mode": "relative",       // "relative" or "absolute" error
+      "elemental_weights": "auto",        // "auto" or list of weights per element
+      "debug_parser": false                // Run self-tests on formula parser
     },
 
     // Fallback loss parameters (for non-adaptive modes)
@@ -160,12 +160,12 @@
     "val_batch_size": 1024,     // Validation batch size
 
     // Trajectory sampling
-    "pairs_per_traj": 24,        // Anchor-target pairs per trajectory per epoch
-    "pairs_per_traj_val": 24,    // Validation pairs per trajectory
+    "pairs_per_traj": 2,        // Anchor-target pairs per trajectory per epoch
+    "pairs_per_traj_val": 2,    // Validation pairs per trajectory
 
     // Time step sampling bounds
     "min_steps": 1,             // Minimum Δt in time steps
-    "max_steps": 64,               // LEAVE AS THE SAME AS "times_per_anchor"
+    "max_steps": 64,            // LEAVE AS THE SAME AS "times_per_anchor"
 
     // Optimizer settings
     "lr": 1e-4,                 // Initial learning rate
@@ -186,15 +186,19 @@
 
   // ========== MODEL ARCHITECTURE ==========
   "model": {
-    // Residual connection configuration
-    "predict_delta": true,          // Standard residual in z-space
-    "predict_delta_log_phys": false,  // Residual in log-physical space (better for stiff)
+    // SoftMax head for conservation (ENABLED)
+    "softmax_head": true,            // Enforces >=0 and sum=1 constraints
+    "allow_partial_simplex": false,  // false = error if predicting subset (physically correct)
+
+    // Residual connection configuration (MUST BE FALSE with SoftMax)
+    "predict_delta": false,          // MUST be false with softmax_head
+    "predict_delta_log_phys": false, // MUST be false with softmax_head
 
     // DeepONet dimensions
-    "p": 1024,                       // Basis/feature dimension
+    "p": 512,                       // Basis/feature dimension
 
     // Branch network (processes initial state + globals)
-    "branch_width": 1024,            // Hidden layer width
+    "branch_width": 512,            // Hidden layer width
     "branch_depth": 4,               // Number of hidden layers
 
     // Trunk network (processes time)
