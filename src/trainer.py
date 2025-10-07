@@ -480,6 +480,7 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.cfg = cfg
+        self.beta_kl = float(self.cfg.get("training", {}).get("beta_kl", 0.0))  # ADD THIS LINE
         self.device = device
 
         # Setup logger without name prefix
@@ -819,7 +820,7 @@ class Trainer:
         tb_dir.mkdir(exist_ok=True)
         self.writer = SummaryWriter(log_dir=str(tb_dir))
 
-        # CSV file with complete headers (FIX #3: include val relatives)
+        # CSV file with complete headers
         self.log_file = self.work_dir / "training_log.txt"
 
         # Build headers based on loss type
@@ -828,9 +829,13 @@ class Trainer:
             headers.extend(["train_rel_phys", "train_rel_z"])
             if self.elem_enabled:
                 headers.append("train_rel_elem")
+            if self.beta_kl > 0.0:  # ADD THIS
+                headers.append("train_rel_kl")  # ADD THIS
             headers.extend(["val_rel_phys", "val_rel_z"])
             if self.elem_enabled:
                 headers.append("val_rel_elem")
+            if self.beta_kl > 0.0:  # ADD THIS
+                headers.append("val_rel_kl")  # ADD THIS
 
         # Only write header if file doesn't exist
         if not self.log_file.exists():
@@ -1109,7 +1114,7 @@ class Trainer:
             val_loss: float,
             lr: float
     ) -> None:
-        """Append epoch metrics to CSV log file with relative components for BOTH train and val (FIX #3)."""
+        """Append epoch metrics to CSV log file with relative components."""
         row = [epoch, f"{train_loss:.4e}", f"{val_loss:.4e}", f"{lr:.4e}"]
 
         if self.use_adaptive_stiff:
@@ -1119,9 +1124,16 @@ class Trainer:
                 row.append(f"{self.train_rel_components.get('z', 0):.4f}")
                 if self.elem_enabled:
                     row.append(f"{self.train_rel_components.get('elem', 0):.4f}")
+                # ADD KL if present
+                if 'kl' in self.train_rel_components:
+                    row.append(f"{self.train_rel_components['kl']:.4f}")
+                elif self.beta_kl > 0.0:
+                    row.append("0.0000")
             else:
                 row.extend(["0.0000", "0.0000"])
                 if self.elem_enabled:
+                    row.append("0.0000")
+                if self.beta_kl > 0.0:
                     row.append("0.0000")
 
             # Val relatives
@@ -1130,9 +1142,16 @@ class Trainer:
                 row.append(f"{self.val_rel_components.get('z', 0):.4f}")
                 if self.elem_enabled:
                     row.append(f"{self.val_rel_components.get('elem', 0):.4f}")
+                # ADD KL if present
+                if 'kl' in self.val_rel_components:
+                    row.append(f"{self.val_rel_components['kl']:.4f}")
+                elif self.beta_kl > 0.0:
+                    row.append("0.0000")
             else:
                 row.extend(["0.0000", "0.0000"])
                 if self.elem_enabled:
+                    row.append("0.0000")
+                if self.beta_kl > 0.0:
                     row.append("0.0000")
 
         with self.log_file.open("a", encoding="utf-8") as f:
@@ -1178,6 +1197,7 @@ class Trainer:
         total_phys = 0.0
         total_z = 0.0
         total_elem = 0.0
+        total_kl = 0.0  # ADD THIS LINE
 
         # Determine max steps for this epoch
         max_steps = None
@@ -1204,6 +1224,7 @@ class Trainer:
                     total_phys += float(loss_info.get('phys', 0))
                     total_z += float(loss_info.get('z', 0))
                     total_elem += float(loss_info.get('elem', 0))
+                    total_kl += float(loss_info.get('kl', 0))  # ADD THIS LINE
                 else:
                     total_loss += float(loss_info)
 
@@ -1225,6 +1246,10 @@ class Trainer:
                 'elem': total_elem / num_batches
             }
 
+            # ADD KL component if present
+            if total_kl > 0.0:
+                components['kl'] = total_kl / num_batches
+
             # Calculate relative components
             total = avg_loss + 1e-12  # Guard against division by zero
             rel_components = {
@@ -1232,6 +1257,10 @@ class Trainer:
                 'z': components['z'] / total,
                 'elem': components['elem'] / total
             }
+
+            # ADD KL relative if present
+            if 'kl' in components:
+                rel_components['kl'] = components['kl'] / total
 
             if train:
                 self.train_loss_components = components
@@ -1320,6 +1349,16 @@ class Trainer:
             else:
                 loss = self._compute_loss(pred, y_j, k_mask)
                 loss_info = loss
+
+            # ADD VAE KL DIVERGENCE TERM
+            if self.beta_kl > 0.0 and getattr(self.model, "vae_mode", False):
+                kl = getattr(self.model, "kl_loss", None)
+                if kl is not None:
+                    loss = loss + self.beta_kl * kl
+                    if isinstance(loss_info, dict):
+                        loss_info["kl"] = (self.beta_kl * kl).detach()
+                    else:
+                        loss_info = {"total": loss, "kl": (self.beta_kl * kl).detach()}
 
         # Backward pass and optimization (training only)
         if train:

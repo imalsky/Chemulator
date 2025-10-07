@@ -45,7 +45,7 @@ from trainer import Trainer
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config.jsonc"
 GLOBAL_SEED = 42
-GLOBAL_WORK_DIR = REPO_ROOT / "models" / "flowmap-deeponet"
+GLOBAL_WORK_DIR = REPO_ROOT / "models" / "autoencoder-flowmap"
 
 
 # --------------------------------------------------------------------------------------
@@ -477,7 +477,7 @@ def build_model(
         logger: logging.Logger
 ) -> torch.nn.Module:
     """
-    Build and configure the Flow-map DeepONet model, then move it to the target device.
+    Build and configure the Flow-map model, then move it to the target device.
     """
     model = create_model(cfg)
     model.to(device)
@@ -497,19 +497,30 @@ def build_model(
             # Fallback if it's a plain list / numpy / CPU tensor without .detach()
             logger.info(f"Target indices: {list(map(int, ti))}")
 
-    # Existing model-architecture summary
+    # Model architecture summary - REPLACE THIS SECTION
     model_cfg = cfg.get("model", {})
-    logger.info(
-        "Model architecture: "
-        f"p={int(model_cfg.get('p', 256))}, "
-        f"branch_width={int(model_cfg.get('branch_width', 1024))}, "
-        f"branch_depth={int(model_cfg.get('branch_depth', 3))}, "
-        f"trunk_layers={list(model_cfg.get('trunk_layers', [512, 512]))}, "
-        f"predict_delta={bool(model_cfg.get('predict_delta', True))}, "
-        f"trunk_dedup={bool(model_cfg.get('trunk_dedup', False))}"
-    )
+    if "latent_dim" in model_cfg:
+        logger.info(
+            "Model architecture (AE): "
+            f"latent_dim={int(model_cfg.get('latent_dim', 32))}, "
+            f"enc={list(model_cfg.get('encoder_hidden', [256,128]))}, "
+            f"dynamics={list(model_cfg.get('dynamics_hidden', [256,256]))}, "
+            f"dec={list(model_cfg.get('decoder_hidden', [128,256]))}, "
+            f"vae_mode={bool(model_cfg.get('vae_mode', False))}, "
+            f"predict_delta={bool(model_cfg.get('predict_delta', True))}, "
+            f"delta_log_phys={bool(model_cfg.get('predict_delta_log_phys', False))}"
+        )
+    else:
+        logger.info(
+            "Model architecture (DeepONet): "
+            f"p={int(model_cfg.get('p', 256))}, "
+            f"branch_width={int(model_cfg.get('branch_width', 1024))}, "
+            f"branch_depth={int(model_cfg.get('branch_depth', 3))}, "
+            f"trunk_layers={list(model_cfg.get('trunk_layers', [512, 512]))}, "
+            f"predict_delta={bool(model_cfg.get('predict_delta', True))}, "
+            f"trunk_dedup={bool(model_cfg.get('trunk_dedup', False))}"
+        )
     return model
-
 
 # --------------------------------------------------------------------------------------
 # Resume control (NEW)

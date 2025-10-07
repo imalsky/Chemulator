@@ -1002,7 +1002,8 @@ class DataPreprocessor:
         groups_ordered = [group_chunk[i] for i in order]
 
         # Buffers for batching - use less memory by flushing more frequently
-        max_buffer_size = max(self.traj_per_shard // 4, 32)  # Flush at 1/4 of shard size
+        max_buffer_size = self.traj_per_shard
+
         buffers = {
             "train": {"x0": [], "g": [], "t": [], "y": []},
             "validation": {"x0": [], "g": [], "t": [], "y": []},
