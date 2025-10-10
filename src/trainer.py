@@ -310,17 +310,18 @@ class AdaptiveStiffLoss(nn.Module):
         Returns:
             Scalar loss value or dict of loss components
         """
-        # MSE in z-space (stabilizer term)
-        loss_z = (pred_z - true_z) ** 2
+        # MSE in z-space (stabilizer term) - compute in FP32
+        loss_z = ((pred_z - true_z) ** 2).float()
 
-        # Convert to log10 physical space
-        pred_log = self._z_to_log10(pred_z)
-        true_log = self._z_to_log10(true_z)
+        # Convert to log10 physical space in FP32
+        pred_log = self._z_to_log10(pred_z).float()
+        true_log = self._z_to_log10(true_z).float()
 
         # Main loss term in physical space
         if self.use_fractional:
-            pred_y = torch.pow(10.0, torch.clamp(pred_log, min=-45.0))
-            true_y = torch.pow(10.0, torch.clamp(true_log, min=-45.0))
+            # Clamp BOTH SIDES to avoid overflow (10**>45 explodes fp32)
+            pred_y = torch.pow(10.0, torch.clamp(pred_log, min=-45.0, max=45.0))
+            true_y = torch.pow(10.0, torch.clamp(true_log, min=-45.0, max=45.0))
             loss_phys = torch.abs(pred_y - true_y) / (torch.abs(true_y) + self.eps_phys)
         else:
             loss_phys = torch.abs(pred_log - true_log)
@@ -349,14 +350,15 @@ class AdaptiveStiffLoss(nn.Module):
             denom = torch.count_nonzero(m_expanded).to(loss_phys.dtype)
             denom = torch.clamp(denom, min=1.0)
         else:
-            denom = float(loss_phys.numel())
+            denom = torch.tensor(loss_phys.numel(), device=loss_phys.device, dtype=loss_phys.dtype)
 
         # Atomic conservation penalty (if enabled)
         cons_elem = 0.0
 
         if self.elemental_conservation and self.elemental_penalty > 0.0:
-            pred_y = torch.pow(10.0, torch.clamp(pred_log, min=-45.0))
-            true_y = torch.pow(10.0, torch.clamp(true_log, min=-45.0))
+            # Clamp BOTH SIDES to avoid overflow
+            pred_y = torch.pow(10.0, torch.clamp(pred_log, min=-45.0, max=45.0))
+            true_y = torch.pow(10.0, torch.clamp(true_log, min=-45.0, max=45.0))
 
             if pred_y.ndim == 2:
                 assert mask is None or mask.ndim == 1, "2D predictions with 2D mask not supported"
@@ -413,10 +415,10 @@ class AdaptiveStiffLoss(nn.Module):
                         elem_err = elem_err * mask_elem
                         elem_denom = torch.count_nonzero(mask_elem.expand_as(elem_err)).to(elem_err.dtype)
                     else:
-                        elem_denom = float(elem_err.numel())
+                        elem_denom = torch.tensor(elem_err.numel(), device=elem_err.device, dtype=elem_err.dtype)
                 elem_denom = torch.clamp(elem_denom, min=1.0)
             else:
-                elem_denom = float(elem_err.numel())
+                elem_denom = torch.tensor(elem_err.numel(), device=elem_err.device, dtype=elem_err.dtype)
 
             cons_elem = elem_err.sum() / elem_denom
 
@@ -437,7 +439,7 @@ class AdaptiveStiffLoss(nn.Module):
                 logger.info(f"  Mean elemental error (pre penalty-weight): {cons_elem.item():.6f}")
                 self._logged_conservation = True
 
-        # Calculate component losses
+        # Calculate component losses in FP32
         phys_loss = self.lambda_phys * loss_phys.sum() / denom
         z_loss = self.lambda_z * loss_z.sum() / denom
         elem_loss = self.elemental_penalty * cons_elem
@@ -445,14 +447,22 @@ class AdaptiveStiffLoss(nn.Module):
         # Combine all terms
         loss = phys_loss + z_loss + elem_loss
 
+        # Check for finiteness before returning
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite total loss (phys={phys_loss.item():.3e}, "
+                f"z={z_loss.item():.3e}, elem={float(elem_loss):.3e})"
+            )
+
         if return_components:
             return {
-                'total': loss,
-                'phys': phys_loss,
-                'z': z_loss,
-                'elem': elem_loss if self.elemental_conservation and self.elemental_penalty > 0 else torch.tensor(0.0)
+                'total': loss.float(),
+                'phys': phys_loss.float(),
+                'z': z_loss.float(),
+                'elem': (elem_loss if self.elemental_conservation and self.elemental_penalty > 0 else torch.tensor(0.0,
+                                                                                                                   device=loss.device)).float()
             }
-        return loss
+        return loss.float()
 
 
 # ------------------------------- Trainer Class -------------------------------
@@ -480,7 +490,7 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.cfg = cfg
-        self.beta_kl = float(self.cfg.get("training", {}).get("beta_kl", 0.0))  # ADD THIS LINE
+        self.beta_kl = float(self.cfg.get("training", {}).get("beta_kl", 0.0))
         self.device = device
 
         # Setup logger without name prefix
@@ -497,13 +507,13 @@ class Trainer:
         else:
             self.logger = logger
             self.logger.propagate = False
-            # Always override formatter to ensure no name prefix
-            self.logger.handlers.clear()
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s',
-                                          datefmt='%Y-%m-%d %H:%M:%S')
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
+            # Only override formatter if we're modifying the logger
+            if not self.logger.handlers:
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s',
+                                              datefmt='%Y-%m-%d %H:%M:%S')
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
 
         # Setup working directory
         self.work_dir = Path(work_dir)
@@ -515,6 +525,12 @@ class Trainer:
         self.base_lr = float(training_cfg.get("lr", 1e-3))
         self.weight_decay = float(training_cfg.get("weight_decay", 1e-4))
         self.grad_clip = float(training_cfg.get("gradient_clip", 0.0))
+
+        # Batch containment configuration
+        self.debug_dump_dir = Path(training_cfg.get("debug_dump_dir", self.work_dir / "debug_dumps"))
+        self.skip_bad_batches = bool(training_cfg.get("skip_bad_batches", True))
+        self.amp_backoff = float(training_cfg.get("amp_backoff", 0.5))
+        self.outlier_factor = float(training_cfg.get("outlier_factor", 20.0))
 
         # Optional step limits for debugging/quick testing
         self.max_train_steps_per_epoch = training_cfg.get("max_train_steps_per_epoch", None)
@@ -564,7 +580,7 @@ class Trainer:
         # Setup SIGTERM handler for graceful cluster preemption
         self._setup_sigterm_handler()
 
-        # Setup loss function BEFORE logging (FIX #1)
+        # Setup loss function BEFORE logging
         self._setup_loss()
 
         # Setup logging AFTER loss (so we know elem_enabled)
@@ -678,8 +694,7 @@ class Trainer:
             # CRITICAL: Move the entire loss module to device
             self.criterion = self.criterion.to(self.device)
 
-            # ============ Check model/loss stat consistency ============
-            # If the model uses SoftMax head or corrected residual, verify stats match
+            # Check model/loss stat consistency
             model_cfg = self.cfg.get("model", {})
             if model_cfg.get("softmax_head", False) or model_cfg.get("predict_delta_log_phys", False):
                 if hasattr(self.model, 'check_stat_consistency'):
@@ -697,7 +712,6 @@ class Trainer:
                         "Model should have check_stat_consistency method when using "
                         "softmax_head or predict_delta_log_phys. Skipping stat verification."
                     )
-            # ============================================================
 
             self.use_adaptive_stiff = True
             self.logger.info("Using AdaptiveStiffLoss with dynamic range weighting")
@@ -722,6 +736,11 @@ class Trainer:
             self.logger.warning("SIGTERM received: saving checkpoint and exiting")
             # Save checkpoint at current epoch
             self._save_full_checkpoint(self.last_ckpt_path, self._current_epoch)
+            # Best effort flush
+            try:
+                self.writer.flush()
+            except Exception:
+                pass
             os._exit(0)
 
         signal.signal(signal.SIGTERM, sigterm_handler)
@@ -747,7 +766,14 @@ class Trainer:
         self.use_fp16_scaler = (self.amp_mode == "fp16" and self.device.type == "cuda")
 
         if self.use_fp16_scaler:
-            self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+            # Conservative scaler initialization to avoid early overflows
+            self.scaler = torch.cuda.amp.GradScaler(
+                enabled=True,
+                init_scale=2.0 ** 10,
+                growth_factor=2.0,
+                backoff_factor=0.25,
+                growth_interval=2000
+            )
         else:
             self.scaler = None
 
@@ -829,18 +855,20 @@ class Trainer:
             headers.extend(["train_rel_phys", "train_rel_z"])
             if self.elem_enabled:
                 headers.append("train_rel_elem")
-            if self.beta_kl > 0.0:  # ADD THIS
-                headers.append("train_rel_kl")  # ADD THIS
+            if self.beta_kl > 0.0:
+                headers.append("train_rel_kl")
             headers.extend(["val_rel_phys", "val_rel_z"])
             if self.elem_enabled:
                 headers.append("val_rel_elem")
-            if self.beta_kl > 0.0:  # ADD THIS
-                headers.append("val_rel_kl")  # ADD THIS
+            if self.beta_kl > 0.0:
+                headers.append("val_rel_kl")
 
-        # Only write header if file doesn't exist
-        if not self.log_file.exists():
-            with self.log_file.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
+        # Write header only if file doesn't exist (for append on resume)
+        write_header = not self.log_file.exists()
+        mode = "w" if write_header else "a"
+        with self.log_file.open(mode, newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if write_header:
                 writer.writerow(headers)
 
     def _check_resume(self) -> None:
@@ -891,9 +919,13 @@ class Trainer:
             if not ckpt_path.exists():
                 raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-        # Load checkpoint
+        # Load checkpoint with compatibility for older PyTorch versions
         self.logger.info(f"Resuming from checkpoint: {ckpt_path}")
-        checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        try:
+            checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        except TypeError:
+            # Fallback for PyTorch < 1.13 that doesn't support weights_only
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
 
         # Restore model/optimizer
         self.model.load_state_dict(checkpoint["model"])
@@ -1033,7 +1065,7 @@ class Trainer:
                 # Log to CSV file
                 self._log_epoch_metrics(epoch, train_loss, val_loss, current_lr)
 
-                # Console output with BOTH train and val relative components (FIX #2)
+                # Console output with BOTH train and val relative components (including KL if present)
                 epoch_time = time.perf_counter() - epoch_start
 
                 # Build relative loss strings for both train and val
@@ -1041,16 +1073,32 @@ class Trainer:
                 rel_val_str = ""
                 if self.use_adaptive_stiff:
                     if self.train_rel_components:
+                        parts = [f"{self.train_rel_components['phys']:.2f}",
+                                 f"{self.train_rel_components['z']:.2f}"]
                         if self.elem_enabled:
-                            rel_train_str = f" | rel_train[phys/z/elem]={self.train_rel_components['phys']:.2f}/{self.train_rel_components['z']:.2f}/{self.train_rel_components['elem']:.2f}"
-                        else:
-                            rel_train_str = f" | rel_train[phys/z]={self.train_rel_components['phys']:.2f}/{self.train_rel_components['z']:.2f}"
+                            parts.append(f"{self.train_rel_components['elem']:.2f}")
+                        if 'kl' in self.train_rel_components:
+                            parts.append(f"{self.train_rel_components['kl']:.2f}")
+                        labels = ["phys", "z"]
+                        if self.elem_enabled:
+                            labels.append("elem")
+                        if 'kl' in self.train_rel_components:
+                            labels.append("kl")
+                        rel_train_str = f" | rel_train[{'/'.join(labels)}]={'/'.join(parts)}"
 
                     if self.val_rel_components:
+                        parts = [f"{self.val_rel_components['phys']:.2f}",
+                                 f"{self.val_rel_components['z']:.2f}"]
                         if self.elem_enabled:
-                            rel_val_str = f" | rel_val[phys/z/elem]={self.val_rel_components['phys']:.2f}/{self.val_rel_components['z']:.2f}/{self.val_rel_components['elem']:.2f}"
-                        else:
-                            rel_val_str = f" | rel_val[phys/z]={self.val_rel_components['phys']:.2f}/{self.val_rel_components['z']:.2f}"
+                            parts.append(f"{self.val_rel_components['elem']:.2f}")
+                        if 'kl' in self.val_rel_components:
+                            parts.append(f"{self.val_rel_components['kl']:.2f}")
+                        labels = ["phys", "z"]
+                        if self.elem_enabled:
+                            labels.append("elem")
+                        if 'kl' in self.val_rel_components:
+                            labels.append("kl")
+                        rel_val_str = f" | rel_val[{'/'.join(labels)}]={'/'.join(parts)}"
 
                 self.logger.info(
                     f"Epoch {epoch:03d}/{self.epochs} | "
@@ -1072,7 +1120,12 @@ class Trainer:
             # Compute final validation metric in physical units
             which = "last-epoch"
             try:
-                best_blob = torch.load(self.best_model_path, map_location=self.device)
+                # Load best model with compatibility
+                try:
+                    best_blob = torch.load(self.best_model_path, map_location=self.device, weights_only=False)
+                except TypeError:
+                    best_blob = torch.load(self.best_model_path, map_location=self.device)
+
                 best_state = best_blob.get("model") if isinstance(best_blob, dict) else None
                 if best_state:
                     self.model.load_state_dict(best_state, strict=False)
@@ -1124,11 +1177,8 @@ class Trainer:
                 row.append(f"{self.train_rel_components.get('z', 0):.4f}")
                 if self.elem_enabled:
                     row.append(f"{self.train_rel_components.get('elem', 0):.4f}")
-                # ADD KL if present
-                if 'kl' in self.train_rel_components:
-                    row.append(f"{self.train_rel_components['kl']:.4f}")
-                elif self.beta_kl > 0.0:
-                    row.append("0.0000")
+                if self.beta_kl > 0.0:
+                    row.append(f"{self.train_rel_components.get('kl', 0):.4f}")
             else:
                 row.extend(["0.0000", "0.0000"])
                 if self.elem_enabled:
@@ -1142,11 +1192,8 @@ class Trainer:
                 row.append(f"{self.val_rel_components.get('z', 0):.4f}")
                 if self.elem_enabled:
                     row.append(f"{self.val_rel_components.get('elem', 0):.4f}")
-                # ADD KL if present
-                if 'kl' in self.val_rel_components:
-                    row.append(f"{self.val_rel_components['kl']:.4f}")
-                elif self.beta_kl > 0.0:
-                    row.append("0.0000")
+                if self.beta_kl > 0.0:
+                    row.append(f"{self.val_rel_components.get('kl', 0):.4f}")
             else:
                 row.extend(["0.0000", "0.0000"])
                 if self.elem_enabled:
@@ -1197,7 +1244,7 @@ class Trainer:
         total_phys = 0.0
         total_z = 0.0
         total_elem = 0.0
-        total_kl = 0.0  # ADD THIS LINE
+        total_kl = 0.0
 
         # Determine max steps for this epoch
         max_steps = None
@@ -1217,23 +1264,30 @@ class Trainer:
                     break
 
                 # Process batch
-                loss_info = self._process_batch(batch, train, autocast_context)
+                loss_info = self._process_batch(batch, train, autocast_context, step)
 
                 if isinstance(loss_info, dict):
-                    total_loss += float(loss_info['total'])
-                    total_phys += float(loss_info.get('phys', 0))
-                    total_z += float(loss_info.get('z', 0))
-                    total_elem += float(loss_info.get('elem', 0))
-                    total_kl += float(loss_info.get('kl', 0))  # ADD THIS LINE
+                    # Skip bad batches (marked with _skip flag)
+                    if not loss_info.get('_skip', False):
+                        total_loss += float(loss_info['total'])
+                        total_phys += float(loss_info.get('phys', 0))
+                        total_z += float(loss_info.get('z', 0))
+                        total_elem += float(loss_info.get('elem', 0))
+                        total_kl += float(loss_info.get('kl', 0))
+                        num_batches += 1
                 else:
                     total_loss += float(loss_info)
-
-                num_batches += 1
+                    num_batches += 1
 
         # Log actual batch counts when limits are active
         if max_steps:
             mode_str = "train" if train else "val"
             self.logger.debug(f"{mode_str} epoch used {num_batches} batches (limit: {max_steps})")
+
+        # Guard against zero batches
+        if num_batches == 0:
+            self.logger.warning(f"{'Training' if train else 'Validation'} epoch completed with 0 valid batches")
+            return float("inf")
 
         # Calculate averages
         avg_loss = total_loss / max(1, num_batches)
@@ -1246,7 +1300,7 @@ class Trainer:
                 'elem': total_elem / num_batches
             }
 
-            # ADD KL component if present
+            # Add KL component if present
             if total_kl > 0.0:
                 components['kl'] = total_kl / num_batches
 
@@ -1258,7 +1312,7 @@ class Trainer:
                 'elem': components['elem'] / total
             }
 
-            # ADD KL relative if present
+            # Add KL relative if present
             if 'kl' in components:
                 rel_components['kl'] = components['kl'] / total
 
@@ -1275,15 +1329,17 @@ class Trainer:
             self,
             batch: tuple,
             train: bool,
-            autocast_context: contextlib.AbstractContextManager
+            autocast_context: contextlib.AbstractContextManager,
+            step_idx: int = 0
     ) -> float | Dict[str, float]:
         """
-        Process single batch with mixed precision support.
+        Process single batch with mixed precision support and numerical safety.
 
         Args:
             batch: Batch data tuple
             train: Whether to compute gradients and update weights
             autocast_context: Context manager for mixed precision
+            step_idx: Current batch index for debugging
 
         Returns:
             Batch loss value or dict of loss components
@@ -1315,87 +1371,163 @@ class Trainer:
         if train:
             self.optimizer.zero_grad(set_to_none=True)
 
-        # Forward pass with autocast
-        with autocast_context:
-            # Prepare time input (remove trailing singleton if present)
-            if dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
-                dt_in = dt_norm.squeeze(-1)
+        try:
+            # Forward pass with autocast
+            with autocast_context:
+                # Prepare time input (remove trailing singleton if present)
+                if dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
+                    dt_in = dt_norm.squeeze(-1)
+                else:
+                    dt_in = dt_norm
+
+                # Check dt_norm for finiteness
+                if not torch.isfinite(dt_in).all():
+                    raise ValueError("Non-finite dt_norm in batch")
+
+                # Forward pass
+                pred = self.model(y_i, dt_in, g)
+
+                # Validate and harmonize shapes
+                pred, y_j = self._harmonize_shapes(pred, y_j)
+
+                # Validate species dimension on first forward
+                if hasattr(self,
+                           '_need_species_validation') and self._need_species_validation and self.use_adaptive_stiff:
+                    if hasattr(self.criterion, 'species_names') and self.criterion.species_names:
+                        expected_s = len(self.criterion.species_names)
+                        actual_s = pred.shape[-1]
+                        if expected_s != actual_s:
+                            raise ValueError(
+                                f"Model output dimension mismatch: expected {expected_s} species, got {actual_s}. "
+                                f"Check target_species configuration."
+                            )
+                        self.logger.info(f"Model output validated: {actual_s} species")
+                    self._need_species_validation = False
+
+                # Compute loss with components if using adaptive stiff
+                if self.use_adaptive_stiff:
+                    loss_info = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
+                    loss = loss_info['total']
+                else:
+                    loss = self._compute_loss(pred, y_j, k_mask)
+                    loss_info = loss
+
+                # Add VAE KL DIVERGENCE TERM
+                if self.beta_kl > 0.0 and getattr(self.model, "vae_mode", False):
+                    kl = getattr(self.model, "kl_loss", None)
+                    if kl is not None:
+                        loss = loss + self.beta_kl * kl
+                        if isinstance(loss_info, dict):
+                            loss_info["kl"] = (self.beta_kl * kl).detach()
+                            loss_info["total"] = loss  # CRITICAL: Update total to include KL
+                        else:
+                            loss_info = {"total": loss, "kl": (self.beta_kl * kl).detach()}
+
+            # Finiteness + outlier tripwire BEFORE backward (TRAINING ONLY)
+            if isinstance(loss_info, dict):
+                batch_total = float(loss_info['total'])
             else:
-                dt_in = dt_norm
+                batch_total = float(loss_info)
 
-            # Forward pass
-            pred = self.model(y_i, dt_in, g)
+            if not np.isfinite(batch_total):
+                raise FloatingPointError(f"Non-finite batch loss={batch_total}")
 
-            # Validate and harmonize shapes
-            pred, y_j = self._harmonize_shapes(pred, y_j)
+            # Robust median tracker (TRAINING ONLY)
+            if train:
+                med = getattr(self, "_loss_med", None)
+                if med is None:
+                    self._loss_med = batch_total
+                else:
+                    self._loss_med = 0.9 * self._loss_med + 0.1 * batch_total
+                    if batch_total > self.outlier_factor * max(self._loss_med, 1e-8):
+                        raise RuntimeError(f"Outlier batch loss={batch_total:.3e} (>{self.outlier_factor}x median)")
 
-            # Validate species dimension on first forward
-            if hasattr(self, '_need_species_validation') and self._need_species_validation and self.use_adaptive_stiff:
-                if hasattr(self.criterion, 'species_names') and self.criterion.species_names:
-                    expected_s = len(self.criterion.species_names)
-                    actual_s = pred.shape[-1]
-                    if expected_s != actual_s:
-                        raise ValueError(
-                            f"Model output dimension mismatch: expected {expected_s} species, got {actual_s}. "
-                            f"Check target_species configuration."
+            # Backward pass and optimization (training only)
+            if train:
+                if self.use_fp16_scaler and self.scaler is not None:
+                    # Scaled backward for fp16
+                    self.scaler.scale(loss).backward()
+
+                    # Unscale before gradient clipping
+                    self.scaler.unscale_(self.optimizer)
+
+                    # Gradient clipping if configured
+                    if self.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            max_norm=self.grad_clip
                         )
-                    self.logger.info(f"Model output validated: {actual_s} species")
-                self._need_species_validation = False
 
-            # Compute loss with components if using adaptive stiff
-            if self.use_adaptive_stiff:
-                loss_info = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
-                loss = loss_info['total']
+                    # Guard grad norm
+                    gtot = 0.0
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            g = p.grad.detach().float().norm().item()
+                            gtot += g * g
+                    if not np.isfinite(gtot):
+                        raise FloatingPointError(f"Non-finite grad norm")
+
+                    # Optimizer step with scaling
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # Standard backward pass
+                    loss.backward()
+
+                    # Gradient clipping if configured
+                    if self.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            max_norm=self.grad_clip
+                        )
+
+                    # Optimizer step
+                    self.optimizer.step()
+
+        except Exception as e:
+            # Containment: zero and skip this batch (TRAINING ONLY)
+            if train and self.skip_bad_batches:
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.use_fp16_scaler and self.scaler is not None:
+                    # Reduce scale with fallback for older PyTorch
+                    current = self.scaler.get_scale()
+                    if current and np.isfinite(current):
+                        new_scale = current * self.amp_backoff
+                        try:
+                            self.scaler.update(new_scale=new_scale)
+                        except TypeError:
+                            # Fallback for older torch
+                            self.scaler._scale = self.scaler._scale * self.amp_backoff
+
+                self.logger.warning(f"Skipping bad training batch {step_idx}: {repr(e)}")
+                try:
+                    self.debug_dump_dir.mkdir(parents=True, exist_ok=True)
+                    # Dump what we have, including loss_info if it exists
+                    li = locals().get("loss_info", None)
+                    torch.save({
+                        "err": repr(e),
+                        "epoch": self._current_epoch,
+                        "step": step_idx,
+                        "y_i": y_i.detach().cpu(),
+                        "dt_norm": dt_norm.detach().cpu(),
+                        "y_j": y_j.detach().cpu(),
+                        "g": g.detach().cpu(),
+                        "k_mask": (k_mask.detach().cpu() if k_mask is not None else None),
+                        "loss_info": ({k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                                       for k, v in (li.items() if isinstance(li, dict) else {})}),
+                    }, str(self.debug_dump_dir / f"bad_batch_{self._current_epoch:03d}_{step_idx:06d}.pt"))
+                except Exception:
+                    pass  # never let the dump crash training
+
+                # Return a sentinel dict with explicit skip flag
+                return {"total": 0.0, "phys": 0.0, "z": 0.0, "elem": 0.0, "_skip": True}
             else:
-                loss = self._compute_loss(pred, y_j, k_mask)
-                loss_info = loss
-
-            # ADD VAE KL DIVERGENCE TERM
-            if self.beta_kl > 0.0 and getattr(self.model, "vae_mode", False):
-                kl = getattr(self.model, "kl_loss", None)
-                if kl is not None:
-                    loss = loss + self.beta_kl * kl
-                    if isinstance(loss_info, dict):
-                        loss_info["kl"] = (self.beta_kl * kl).detach()
-                    else:
-                        loss_info = {"total": loss, "kl": (self.beta_kl * kl).detach()}
-
-        # Backward pass and optimization (training only)
-        if train:
-            if self.use_fp16_scaler and self.scaler is not None:
-                # Scaled backward for fp16
-                self.scaler.scale(loss).backward()
-
-                # Unscale before gradient clipping
-                self.scaler.unscale_(self.optimizer)
-
-                # Gradient clipping if configured
-                if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        max_norm=self.grad_clip
-                    )
-
-                # Optimizer step with scaling
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                # Standard backward pass
-                loss.backward()
-
-                # Gradient clipping if configured
-                if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        max_norm=self.grad_clip
-                    )
-
-                # Optimizer step
-                self.optimizer.step()
+                # For validation or if not skipping, re-raise
+                raise
 
         # Return loss components for adaptive stiff, scalar for others
         if isinstance(loss_info, dict):
-            return {k: v.detach().item() for k, v in loss_info.items()}
+            return {k: v.detach().item() if torch.is_tensor(v) else v for k, v in loss_info.items()}
         return loss.detach().item()
 
     def _resolve_target_indices(self):
@@ -1540,20 +1672,20 @@ class Trainer:
         else:
             raise ValueError(f"Unknown loss_mode='{mode}'")
 
-        # Masked reduction for multi-time batches
+        # Masked reduction for multi-time batches (FIXED)
         if mask is not None:
-            if loss_elems.ndim == 3 and mask.ndim == 2:
-                # Expand mask to match loss shape
-                mask_exp = mask.unsqueeze(-1).expand_as(loss_elems)
-                # Use count_nonzero for clearer counting
-                denom = torch.count_nonzero(mask_exp).to(loss_elems.dtype)
-                denom = torch.clamp(denom, min=1.0)
-                return (loss_elems * mask_exp).sum() / denom
-            else:
-                denom = torch.count_nonzero(mask).to(loss_elems.dtype)
-                denom = torch.clamp(denom, min=1.0)
-                return (loss_elems * mask).sum() / denom
+            # Expand mask to match loss_elems' shape
+            m = mask
+            while m.ndim < loss_elems.ndim:
+                m = m.unsqueeze(-1)
+            m_expanded = m.expand_as(loss_elems)
 
+            # Count non-zero elements in the expanded mask
+            denom = torch.count_nonzero(m_expanded).to(loss_elems.dtype)
+            denom = torch.clamp(denom, min=1.0)
+            return (loss_elems * m_expanded).sum() / denom
+
+        # Unmasked case - just use mean
         return loss_elems.mean()
 
     def _ensure_norm_helper(self):

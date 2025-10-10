@@ -1,9 +1,11 @@
 #!/bin/bash
 # --- PBS ---
 #PBS -N gh200_train_job
-#PBS -q gpu_long
-#PBS -l select=1:ncpus=72:ngpus=1:model=gh200
-#PBS -l walltime=72:00:00
+#PBS -q gpu_normal
+####PBS -l select=1:ncpus=72:ngpus=1:model=gh200
+#PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
+
+#PBS -l walltime=24:00:00
 #PBS -W group_list=s2458
 #PBS -j oe
 # --- end PBS ---
@@ -137,28 +139,11 @@ PY
 echo "---------------------------------"
 nvidia-smi || true
 
-# ===== Preflight raw data =====
-echo "Preflight: verifying raw files and h5py I/O..."
-"$PY" - <<'PY'
-import os, glob, h5py
-ROOT = os.environ["ROOT"]
-raw = os.path.join(ROOT, "data", "raw")
-files = sorted(glob.glob(os.path.join(raw, "*.h5"))) + sorted(glob.glob(os.path.join(raw, "*.hdf5")))
-print("Preflight ROOT:", ROOT)
-print("Using raw dir:", raw, "| count:", len(files))
-if not files:
-    raise SystemExit("ERROR: no HDF5 files in "+raw)
-with h5py.File(files[0], "r") as h:
-    print("Opened:", files[0], "| top keys:", list(h.keys())[:5])
-PY
-
-# ===== Phase A: PREPROCESS (MPI) — skip if normalization.json exists =====
-echo "Phase A: Preprocessing with MPI (32 ranks)…"
-
-# Decide whether to skip preprocessing (print SKIP=0/1 and PROC_DIR=...)
+# ===== Decide whether to preprocess or hydrate from processed =====
+echo "Phase A: deciding preprocess vs hydrate…"
 DECISION_OUT="$("$PY" - <<'PY'
 from pathlib import Path
-import os, json
+import os
 from utils import load_json_config
 
 ROOT = Path(os.environ["ROOT"]).resolve()
@@ -174,10 +159,10 @@ print(f"Resolved processed dir: {proc_dir}")
 norm = proc_dir / "normalization.json"
 if norm.exists():
     print(f"Found {norm} — skipping preprocessing.")
-    print(f"SKIP=1")
+    print("SKIP=1")
 else:
     print("Normalization manifest not found — will run preprocessing.")
-    print(f"SKIP=0")
+    print("SKIP=0")
 print(f"PROC_DIR={proc_dir}")
 PY
 )"
@@ -185,7 +170,41 @@ PY
 echo "$DECISION_OUT"
 eval "$(echo "$DECISION_OUT" | egrep '^(SKIP|PROC_DIR)=' )"
 
+# Optional hydrate sanity (does not fail the job)
+if [ "${SKIP:-0}" -eq 1 ]; then
+  "$PY" - <<'PY' || true
+from pathlib import Path
+import os, glob
+proc_dir = Path(os.environ["PROC_DIR"])
+n_train = len(glob.glob(str(proc_dir / "train" / "*.npz")))
+n_val   = len(glob.glob(str(proc_dir / "validation" / "*.npz")))
+n_test  = len(glob.glob(str(proc_dir / "test" / "*.npz")))
+print(f"Hydrate check: train={n_train}, val={n_val}, test={n_test} under {proc_dir}")
+PY
+fi
+
+# ===== Preflight raw data (ONLY if we will preprocess) =====
 if [ "${SKIP:-0}" -eq 0 ]; then
+  echo "Preflight: verifying raw files and h5py I/O (preprocess needed)…"
+  "$PY" - <<'PY'
+import os, glob, h5py
+ROOT = os.environ["ROOT"]
+raw = os.path.join(ROOT, "data", "raw")
+files = sorted(glob.glob(os.path.join(raw, "*.h5"))) + sorted(glob.glob(os.path.join(raw, "*.hdf5")))
+print("Preflight ROOT:", ROOT)
+print("Using raw dir:", raw, "| count:", len(files))
+if not files:
+    raise SystemExit("ERROR: no HDF5 files in "+raw)
+with h5py.File(files[0], "r") as h:
+    print("Opened:", files[0], "| top keys:", list(h.keys())[:5])
+PY
+else
+  echo "Preflight: skipping raw check (found normalization.json; hydrating from processed)."
+fi
+
+# ===== Phase A: PREPROCESS (MPI) — skip if normalization.json exists =====
+if [ "${SKIP:-0}" -eq 0 ]; then
+  echo "Phase A: Preprocessing with MPI (32 ranks)…"
   # small driver script for the preprocessor
   cat > .preprocess.py <<'PY'
 from pathlib import Path
@@ -207,6 +226,8 @@ PY
 
   # unset threads for GPU phase
   unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS
+else
+  echo "Phase A: Skipped (hydrating from processed artifacts)."
 fi
 
 # ===== Phase B: TRAIN single-process on the GPU =====
