@@ -1,1788 +1,912 @@
 #!/usr/bin/env python3
 """
-Flow-map DeepONet Trainer with Restart Support
-================================================
-Training loop implementation with checkpoint/restart capabilities.
-
-Features:
-- Shape-agnostic loss computation (handles both [B,S] and [B,K,S] targets)
-- Mixed precision training with automatic mixed precision (AMP)
-- Built-in PyTorch schedulers with warmup and cosine annealing
-- Deterministic per-epoch sampling via dataset.set_epoch()
-- TensorBoard and CSV logging for training metrics
-- Full checkpoint saving/loading for restart including scheduler state
-- SIGTERM handling for cluster preemption
-- Adaptive stiff loss for chemical systems with atomic conservation
+Production Trainer for Koopman Autoencoder
+===========================================
+Optimized for autoregressive stability with stiff chemical systems.
+Includes corrected rollout, semigroup, and KL losses for temporal consistency.
+All critical stability fixes applied.
 """
-
-from __future__ import annotations
 
 import csv
 import json
 import logging
-import os
-import random
-import signal
 import time
-import contextlib
-import re
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda.amp import autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from torch.utils.tensorboard import SummaryWriter
-
-
-# ------------------------------ Loss Functions -------------------------------
+from torch.utils.data import DataLoader
 
 
 class AdaptiveStiffLoss(nn.Module):
     """
-    Composite loss for stiff chemical systems with log-normalized data.
-
-    Combines:
-    - Main term: MAE in log10 physical space (per-decade error)
-    - Stabilizer: Small MSE in z-space
-    - Species weights: Based on dynamic range
-    - Time weights: Emphasize trajectory edges where stiff dynamics occur
-    - Optional: Atomic conservation penalty
+    Adaptive loss for stiff systems: MAE in log10 space + MSE in z-space.
+    Simplified version without elemental conservation complexity.
     """
 
     def __init__(
             self,
             log_means: torch.Tensor,
             log_stds: torch.Tensor,
-            species_log_min: torch.Tensor,
-            species_log_max: torch.Tensor,
-            *,
             lambda_phys: float = 1.0,
             lambda_z: float = 0.1,
-            epsilon_phys: float = 1e-20,
-            use_fractional: bool = False,
-            time_edge_gain: float = 2.0,
-            # Atomic conservation parameters
-            elemental_conservation: bool = False,
-            elemental_penalty: float = 0.0,
-            species_names: Optional[List[str]] = None,
-            elements: Optional[List[str]] = None,
-            elemental_mode: str = "relative",
-            elemental_weights: Optional[Any] = "auto",
-            eps_elem: float = 1e-20,
-            debug_parser: bool = False,
-            device=None
+            time_weight_mode: str = "none",  # "none", "edges", "exponential"
+            device: Optional[torch.device] = None
     ):
         super().__init__()
-
-        # Store device for creating tensors
-        self.device = torch.device(device) if device is not None else torch.device('cpu')
-
-        # Register statistics as buffers (move with model to device)
         self.register_buffer("log_means", log_means.detach().clone())
         self.register_buffer("log_stds", torch.clamp(log_stds.detach().clone(), min=1e-10))
-        self.register_buffer("log_min", species_log_min.detach().clone())
-        self.register_buffer("log_max", species_log_max.detach().clone())
-
-        # Species weights: sqrt of dynamic range, normalized and clipped
-        log_range = torch.clamp(self.log_max - self.log_min, min=1e-6)
-        w = torch.sqrt(log_range)
-        w = w / (w.mean() + 1e-12)
-        w = torch.clamp(w, 0.5, 2.0)
-        self.register_buffer("w_species", w)
-
-        # Store configuration
         self.lambda_phys = lambda_phys
         self.lambda_z = lambda_z
-        self.eps_phys = epsilon_phys
-        self.use_fractional = use_fractional
-        self.time_edge_gain = time_edge_gain
-        self.elemental_penalty = elemental_penalty
-
-        # Setup atomic conservation if enabled
-        self.elemental_conservation = elemental_conservation
-        self.elemental_mode = elemental_mode
-        self.eps_elem = eps_elem
-
-        if self.elemental_conservation and self.elemental_penalty > 0:
-            if species_names is None or len(species_names) == 0:
-                raise ValueError("species_names required and must be non-empty for elemental conservation")
-
-            # Default to common combustion elements
-            if elements is None:
-                elements = ["H", "C", "N", "O"]
-
-            self.elements = elements
-            self.species_names = species_names
-
-            # Validate species count matches model dimension
-            S_expected = len(species_names)
-            S_actual = log_means.shape[0]
-            if S_expected != S_actual:
-                raise ValueError(
-                    f"Species count mismatch: species_names has {S_expected} entries "
-                    f"but model outputs {S_actual} species"
-                )
-
-            # Build stoichiometry matrix on the correct device
-            stoich_matrix = self._build_stoichiometry_matrix(species_names, elements)
-            self.register_buffer("stoich_matrix", stoich_matrix)
-
-            # Run parser self-tests if requested
-            if debug_parser:
-                self._run_parser_tests()
-
-            # Setup elemental weights on the correct device
-            if elemental_weights == "auto":
-                # Will be computed on first batch
-                self.register_buffer("elem_weights", torch.ones(len(elements), dtype=torch.float32, device=self.device))
-                self._need_auto_weights = True
-            elif isinstance(elemental_weights, (list, tuple)):
-                if len(elemental_weights) != len(elements):
-                    raise ValueError(f"elemental_weights length {len(elemental_weights)} != {len(elements)} elements")
-                weights_tensor = torch.tensor(elemental_weights, dtype=torch.float32, device=self.device)
-                self.register_buffer("elem_weights", weights_tensor)
-                self._need_auto_weights = False
-            else:
-                self.register_buffer("elem_weights", torch.ones(len(elements), dtype=torch.float32, device=self.device))
-                self._need_auto_weights = False
-
-            self._logged_conservation = False
-
-    def _parse_species_formula(self, formula: str) -> Dict[str, int]:
-        """
-        Parse a chemical formula to extract element counts.
-        Handles formats like: C2H2, C2_H2, CH3OH, H2O, HCN, He, H+, OH-, M
-
-        NOTE: Parentheses are stripped but not expanded (e.g., (OH)2 → OH2).
-        This is a limitation; if parentheses are used, counts will be incorrect.
-
-        Args:
-            formula: Chemical formula string
-
-        Returns:
-            Dictionary mapping element symbols to counts
-        """
-        # Clean the formula
-        original = formula
-        formula = formula.strip()
-
-        # Special cases
-        if formula.upper() in ("M",):  # Third body
-            return {}
-
-        # Remove charge indicators and underscores
-        formula = re.sub(r'[_\+\-]', '', formula)
-
-        # Remove parentheses (NOTE: this doesn't handle multipliers correctly)
-        # e.g., Ca(OH)2 becomes CaOH2 which is wrong
-        # For proper handling, would need a more sophisticated parser
-        if '(' in formula or ')' in formula:
-            if not hasattr(self, '_warned_parentheses'):
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(
-                    f"Species formula '{original}' contains parentheses which are not properly expanded. "
-                    f"E.g., Ca(OH)2 will be parsed as CaOH2, not CaO2H2. Consider expanding formulas manually."
-                )
-                self._warned_parentheses = True
-            formula = re.sub(r'[()]', '', formula)
-
-        element_counts = {}
-
-        # Pattern to match element symbol followed by optional count
-        # Matches two-letter elements first (He, Ne, etc.) then single letters
-        # Case-sensitive: expects proper capitalization (He not he, HE, etc.)
-        pattern = r'([A-Z][a-z]?)(\d*)'
-
-        matches = re.findall(pattern, formula)
-
-        if not matches and formula:
-            # No matches but formula not empty - might be lowercase or other issue
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(f"Could not parse species formula: '{original}' (cleaned: '{formula}')")
-
-        for element, count_str in matches:
-            count = int(count_str) if count_str else 1
-            if element in element_counts:
-                element_counts[element] += count
-            else:
-                element_counts[element] = count
-
-        return element_counts
-
-    def _build_stoichiometry_matrix(self, species_names: List[str], elements: List[str]) -> torch.Tensor:
-        """
-        Build stoichiometry matrix E where E[s,e] = number of atoms of element e in species s.
-
-        Args:
-            species_names: List of species names (formulas)
-            elements: List of element symbols to track
-
-        Returns:
-            Stoichiometry matrix [S, E] on the correct device
-        """
-        S = len(species_names)
-        E = len(elements)
-
-        # Create matrix on the correct device
-        stoich = torch.zeros(S, E, dtype=torch.float32, device=self.device)
-
-        for s, species in enumerate(species_names):
-            counts = self._parse_species_formula(species)
-            for e, element in enumerate(elements):
-                stoich[s, e] = float(counts.get(element, 0))
-
-        return stoich
-
-    def _run_parser_tests(self):
-        """Run self-tests on the parser to catch issues early."""
-        test_cases = [
-            ("C2H2", {"C": 2, "H": 2}),
-            ("C2_H2", {"C": 2, "H": 2}),
-            ("CH3OH", {"C": 1, "H": 4, "O": 1}),
-            ("H2O", {"H": 2, "O": 1}),
-            ("HCN", {"H": 1, "C": 1, "N": 1}),
-            ("He", {"He": 1}),  # He should not contribute H
-            ("CO2", {"C": 1, "O": 2}),
-            ("N2", {"N": 2}),
-            ("NH3", {"N": 1, "H": 3}),
-        ]
-
-        for formula, expected in test_cases:
-            result = self._parse_species_formula(formula)
-            # Check only tracked elements
-            for elem in ["H", "C", "N", "O"]:
-                exp_count = expected.get(elem, 0)
-                res_count = result.get(elem, 0)
-                if exp_count != res_count:
-                    raise ValueError(
-                        f"Parser test failed for '{formula}': "
-                        f"expected {elem}={exp_count}, got {elem}={res_count}"
-                    )
-
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info("All parser self-tests passed")
-
-    def _z_to_log10(self, z: torch.Tensor) -> torch.Tensor:
-        """Convert from normalized z-space to log10 physical space."""
-        return z * self.log_stds + self.log_means
-
-    def _time_weights(self, t01: torch.Tensor) -> torch.Tensor:
-        """
-        Compute time-dependent weights that emphasize trajectory edges.
-
-        Args:
-            t01: Normalized times in [0,1], shape [B,K]
-
-        Returns:
-            Weights with shape [B,K,1] for broadcasting
-        """
-        if self.time_edge_gain <= 1.0:
-            w = torch.ones_like(t01)
-        else:
-            # U-shaped weight function: peaks at t=0 and t=1
-            w = 1.0 + (self.time_edge_gain - 1.0) * (1.0 - 4.0 * t01 * (1.0 - t01))
-        return w.unsqueeze(-1)
+        self.time_weight_mode = time_weight_mode
 
     def forward(
             self,
-            pred_z: torch.Tensor,
-            true_z: torch.Tensor,
-            t_norm: torch.Tensor,
-            mask: Optional[torch.Tensor] = None,
-            return_components: bool = False
-    ) -> torch.Tensor | Dict[str, torch.Tensor]:
+            pred: torch.Tensor,
+            target: torch.Tensor,
+            dt_norm: Optional[torch.Tensor] = None,
+            mask: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
         """
-        Compute adaptive loss.
-
         Args:
-            pred_z: Predictions in z-space [B,K,S] or [B,S]
-            true_z: Targets in z-space [B,K,S] or [B,S]
-            t_norm: Normalized times [B,K] or [B,K,1] or [B]
-            mask: Optional validity mask [B,K] or [B]
-            return_components: If True, return dict with component losses
+            pred: [B,K,S] or [B,S] predictions in z-space
+            target: [B,K,S] or [B,S] targets in z-space
+            dt_norm: [B,K] normalized time steps (optional)
+            mask: [B,K] validity mask (optional)
 
         Returns:
-            Scalar loss value or dict of loss components
+            Dictionary with 'total', 'phys', 'z' losses
         """
-        # MSE in z-space (stabilizer term) - compute in FP32
-        loss_z = ((pred_z - true_z) ** 2).float()
+        # MSE in z-space (stabilizer)
+        loss_z = (pred - target) ** 2
 
-        # Convert to log10 physical space in FP32
-        pred_log = self._z_to_log10(pred_z).float()
-        true_log = self._z_to_log10(true_z).float()
+        # MAE in log10 physical space
+        pred_log = pred * self.log_stds + self.log_means
+        true_log = target * self.log_stds + self.log_means
+        loss_phys = torch.abs(pred_log - true_log)
 
-        # Main loss term in physical space
-        if self.use_fractional:
-            # Clamp BOTH SIDES to avoid overflow (10**>45 explodes fp32)
-            pred_y = torch.pow(10.0, torch.clamp(pred_log, min=-45.0, max=45.0))
-            true_y = torch.pow(10.0, torch.clamp(true_log, min=-45.0, max=45.0))
-            loss_phys = torch.abs(pred_y - true_y) / (torch.abs(true_y) + self.eps_phys)
-        else:
-            loss_phys = torch.abs(pred_log - true_log)
+        # Time weighting if requested
+        if self.time_weight_mode != "none" and dt_norm is not None:
+            if dt_norm.ndim == 3:
+                dt_norm = dt_norm.squeeze(-1)
+            weights = self._compute_time_weights(dt_norm)
+            if pred.ndim == 3:
+                weights = weights.unsqueeze(-1)  # [B,K,1] to broadcast over S
+            loss_phys = loss_phys * weights
+            loss_z = loss_z * weights
 
-        # Apply species weights
-        loss_phys = loss_phys * self.w_species
-
-        # Prepare time weights
-        if t_norm.ndim == 3 and t_norm.shape[-1] == 1:
-            t_norm = t_norm.squeeze(-1)
-        elif t_norm.ndim == 1:
-            t_norm = t_norm.unsqueeze(1)
-
-        # Apply time weights
-        if loss_phys.ndim == 3:
-            wt = self._time_weights(torch.clamp(t_norm, 0.0, 1.0))
-            loss_phys = loss_phys * wt
-            loss_z = loss_z * wt
-
-        # Apply mask and compute mean
+        # Masked averaging
         if mask is not None:
-            m = mask.unsqueeze(-1).to(loss_phys.dtype)
-            m_expanded = m.expand_as(loss_phys)
-            loss_phys = loss_phys * m_expanded
-            loss_z = loss_z * m_expanded
-            denom = torch.count_nonzero(m_expanded).to(loss_phys.dtype)
-            denom = torch.clamp(denom, min=1.0)
+            m = mask
+            if m.ndim < loss_phys.ndim:
+                m = m.unsqueeze(-1)  # [B,K,1] to broadcast over S
+            m = m.to(loss_phys.dtype)
+
+            # If mask is [B,K,1], denom must count all species too
+            if m.shape[-1] == 1 and loss_phys.ndim >= 3:
+                denom = (m.sum() * loss_phys.shape[-1]).clamp_min(1)
+            else:
+                denom = m.sum().clamp_min(1)
+
+            phys_mean = (loss_phys * m).sum() / denom
+            z_mean = (loss_z * m).sum() / denom
         else:
-            denom = torch.tensor(loss_phys.numel(), device=loss_phys.device, dtype=loss_phys.dtype)
+            # True mean over all elements when unmasked
+            phys_mean = loss_phys.mean()
+            z_mean = loss_z.mean()
 
-        # Atomic conservation penalty (if enabled)
-        cons_elem = 0.0
+        total = self.lambda_phys * phys_mean + self.lambda_z * z_mean
 
-        if self.elemental_conservation and self.elemental_penalty > 0.0:
-            # Clamp BOTH SIDES to avoid overflow
-            pred_y = torch.pow(10.0, torch.clamp(pred_log, min=-45.0, max=45.0))
-            true_y = torch.pow(10.0, torch.clamp(true_log, min=-45.0, max=45.0))
+        return {
+            'total': total,
+            'phys': phys_mean.detach(),
+            'z': z_mean.detach()
+        }
 
-            if pred_y.ndim == 2:
-                assert mask is None or mask.ndim == 1, "2D predictions with 2D mask not supported"
-
-            # Device check (only once)
-            if not hasattr(self, "_device_checked"):
-                assert self.stoich_matrix.device == pred_y.device, \
-                    f"stoich_matrix on {self.stoich_matrix.device}, predictions on {pred_y.device}"
-                self._device_checked = True
-
-            # Compute elemental totals
-            if pred_y.ndim == 2:  # [B,S]
-                elem_pred = pred_y @ self.stoich_matrix  # [B,E]
-                elem_true = true_y @ self.stoich_matrix  # [B,E]
-            else:  # [B,K,S]
-                B, K, S = pred_y.shape
-                pred_y_flat = pred_y.reshape(B * K, S)
-                true_y_flat = true_y.reshape(B * K, S)
-                elem_pred_flat = pred_y_flat @ self.stoich_matrix  # [B*K,E]
-                elem_true_flat = true_y_flat @ self.stoich_matrix  # [B*K,E]
-                elem_pred = elem_pred_flat.reshape(B, K, -1)  # [B,K,E]
-                elem_true = elem_true_flat.reshape(B, K, -1)  # [B,K,E]
-
-            # Auto-compute weights on first batch
-            if self._need_auto_weights:
-                with torch.no_grad():
-                    mean_elem = elem_true.mean(dim=tuple(range(elem_true.ndim - 1)))
-                    mean_elem = torch.clamp(mean_elem, min=self.eps_elem)
-                    new_weights = 1.0 / mean_elem
-                    new_weights = new_weights / new_weights.mean()
-                    new_weights = torch.clamp(new_weights, min=0.1, max=10.0)
-                    self.elem_weights.copy_(new_weights)
-                self._need_auto_weights = False
-
-            # Compute conservation error
-            if self.elemental_mode == "relative":
-                den = torch.abs(elem_true) + torch.abs(elem_pred) + self.eps_elem
-                elem_err = torch.abs(elem_pred - elem_true) / den
-            else:
-                elem_err = torch.abs(elem_pred - elem_true)
-
-            # Apply element weights
-            elem_err = elem_err * self.elem_weights
-
-            # Apply mask if present
-            if mask is not None:
-                if elem_err.ndim == 3:
-                    mask_elem = mask.unsqueeze(-1)
-                    elem_err = elem_err * mask_elem
-                    elem_denom = torch.count_nonzero(mask_elem.expand_as(elem_err)).to(elem_err.dtype)
-                else:
-                    if mask.ndim == 1:
-                        mask_elem = mask.unsqueeze(-1)
-                        elem_err = elem_err * mask_elem
-                        elem_denom = torch.count_nonzero(mask_elem.expand_as(elem_err)).to(elem_err.dtype)
-                    else:
-                        elem_denom = torch.tensor(elem_err.numel(), device=elem_err.device, dtype=elem_err.dtype)
-                elem_denom = torch.clamp(elem_denom, min=1.0)
-            else:
-                elem_denom = torch.tensor(elem_err.numel(), device=elem_err.device, dtype=elem_err.dtype)
-
-            cons_elem = elem_err.sum() / elem_denom
-
-            # Log conservation info on first call
-            if not self._logged_conservation:
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.info(f"Elemental conservation enabled:")
-                logger.info(f"  Elements: {self.elements}")
-                logger.info(f"  Mode: {self.elemental_mode}")
-                logger.info(f"  Element weights: {self.elem_weights.detach().cpu().numpy()}")
-                logger.info(f"  Species count: {len(self.species_names)}")
-                logger.info(f"  First 5 species stoichiometry:")
-                for i in range(min(5, len(self.species_names))):
-                    stoich_str = ", ".join([f"{e}:{self.stoich_matrix[i, j].item():.0f}"
-                                            for j, e in enumerate(self.elements)])
-                    logger.info(f"    {self.species_names[i]}: {stoich_str}")
-                logger.info(f"  Mean elemental error (pre penalty-weight): {cons_elem.item():.6f}")
-                self._logged_conservation = True
-
-        # Calculate component losses in FP32
-        phys_loss = self.lambda_phys * loss_phys.sum() / denom
-        z_loss = self.lambda_z * loss_z.sum() / denom
-        elem_loss = self.elemental_penalty * cons_elem
-
-        # Combine all terms
-        loss = phys_loss + z_loss + elem_loss
-
-        # Check for finiteness before returning
-        if not torch.isfinite(loss):
-            raise FloatingPointError(
-                f"Non-finite total loss (phys={phys_loss.item():.3e}, "
-                f"z={z_loss.item():.3e}, elem={float(elem_loss):.3e})"
-            )
-
-        if return_components:
-            return {
-                'total': loss.float(),
-                'phys': phys_loss.float(),
-                'z': z_loss.float(),
-                'elem': (elem_loss if self.elemental_conservation and self.elemental_penalty > 0 else torch.tensor(0.0,
-                                                                                                                   device=loss.device)).float()
-            }
-        return loss.float()
-
-
-# ------------------------------- Trainer Class -------------------------------
+    def _compute_time_weights(self, dt_norm: torch.Tensor) -> torch.Tensor:
+        """Compute time-dependent loss weights."""
+        if self.time_weight_mode == "edges":
+            # U-shaped: emphasize trajectory edges
+            return 1.0 + 2.0 * (1.0 - 4.0 * dt_norm * (1.0 - dt_norm))
+        elif self.time_weight_mode == "exponential":
+            # Exponential decay from start
+            return torch.exp(-2.0 * dt_norm)
+        else:
+            return torch.ones_like(dt_norm)
 
 
 class Trainer:
     """
-    Trainer for Flow-map DeepONet models with restart support.
-
-    Handles training loop, validation, checkpointing, and logging.
-    Supports both single-time (K=1) and multi-time (K>1) predictions.
+    Production trainer for Koopman autoencoder with autoregressive stability focus.
+    Named 'Trainer' for compatibility with main.py.
     """
 
     def __init__(
             self,
             model: nn.Module,
-            train_loader: torch.utils.data.DataLoader,
-            val_loader: Optional[torch.utils.data.DataLoader],
-            cfg: Dict[str, Any],
-            work_dir: Path,
+            train_loader: DataLoader,
+            val_loader: Optional[DataLoader],
+            cfg: Dict[str, Any],  # Named 'cfg' to match main.py
+            work_dir: Union[str, Path],
             device: torch.device,
-            logger: Optional[logging.Logger] = None,
+            logger: Optional[logging.Logger] = None
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.cfg = cfg
-        self.beta_kl = float(self.cfg.get("training", {}).get("beta_kl", 0.0))
         self.device = device
-
-        # Setup logger without name prefix
-        if logger is None:
-            self.logger = logging.getLogger("trainer")
-            self.logger.propagate = False  # Prevent name propagation
-            self.logger.handlers.clear()  # Clear any existing handlers
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s',
-                                          datefmt='%Y-%m-%d %H:%M:%S')
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-            self.logger.setLevel(logging.INFO)
-        else:
-            self.logger = logger
-            self.logger.propagate = False
-            # Only override formatter if we're modifying the logger
-            if not self.logger.handlers:
-                handler = logging.StreamHandler()
-                formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s',
-                                              datefmt='%Y-%m-%d %H:%M:%S')
-                handler.setFormatter(formatter)
-                self.logger.addHandler(handler)
 
         # Setup working directory
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
-        # Extract training configuration
-        training_cfg = cfg.get("training", {})
-        self.epochs = int(training_cfg.get("epochs", 100))
-        self.base_lr = float(training_cfg.get("lr", 1e-3))
-        self.weight_decay = float(training_cfg.get("weight_decay", 1e-4))
-        self.grad_clip = float(training_cfg.get("gradient_clip", 0.0))
+        # Logger
+        self.logger = logger or logging.getLogger(__name__)
 
-        # Batch containment configuration
-        self.debug_dump_dir = Path(training_cfg.get("debug_dump_dir", self.work_dir / "debug_dumps"))
-        self.skip_bad_batches = bool(training_cfg.get("skip_bad_batches", True))
-        self.amp_backoff = float(training_cfg.get("amp_backoff", 0.5))
-        self.outlier_factor = float(training_cfg.get("outlier_factor", 20.0))
+        # Extract training config
+        tcfg = cfg.get('training', {})
+        self.epochs = int(tcfg.get('epochs', 100))
+        self.lr = float(tcfg.get('lr', 1e-4))
+        self.min_lr = float(tcfg.get('min_lr', 1e-6))
+        self.weight_decay = float(tcfg.get('weight_decay', 1e-5))
+        self.grad_clip = float(tcfg.get('gradient_clip', 1.0))
+        self.warmup_epochs = int(tcfg.get('warmup_epochs', 0))
 
-        # Optional step limits for debugging/quick testing
-        self.max_train_steps_per_epoch = training_cfg.get("max_train_steps_per_epoch", None)
-        if self.max_train_steps_per_epoch == 0:
-            self.max_train_steps_per_epoch = None
-        self.max_val_batches = training_cfg.get("max_val_batches", None)
-        if self.max_val_batches == 0:
-            self.max_val_batches = None
+        # Loss mode
+        self.loss_mode = tcfg.get('loss_mode', 'adaptive_stiff')
 
-        # Torch compile option for potential speedup
-        self.use_compile = bool(training_cfg.get("torch_compile", False))
+        # Auxiliary losses config
+        aux_cfg = tcfg.get('auxiliary_losses', {})
+        self.rollout_enabled = aux_cfg.get('rollout_enabled', False)
+        self.rollout_weight = float(aux_cfg.get('rollout_weight', 0.1))
+        self.rollout_horizon = int(aux_cfg.get('rollout_horizon', 4))
+        self.semigroup_enabled = aux_cfg.get('semigroup_enabled', False)
+        self.semigroup_weight = float(aux_cfg.get('semigroup_weight', 0.1))
+        self.kl_weight = float(tcfg.get('beta_kl', 0.0))
 
-        # Setup mixed precision training
-        self._setup_mixed_precision()
+        # Teacher forcing schedule
+        tf_cfg = aux_cfg.get('rollout_teacher_forcing', {})
+        self.tf_mode = tf_cfg.get('mode', 'none')
+        self.tf_start = float(tf_cfg.get('start_p', 1.0))
+        self.tf_end = float(tf_cfg.get('end_p', 0.0))
+        self.tf_end_epoch = int(tf_cfg.get('end_epoch', 50))
 
-        # Setup optimizer with automatic fused kernels when available
-        self._setup_optimizer()
-
-        # Setup learning rate scheduler using built-in PyTorch schedulers
-        self._setup_scheduler()
-
-        # Optionally compile model for better performance
-        if self.use_compile and hasattr(torch, "compile"):
-            self.model = torch.compile(
-                self.model,
-                mode="reduce-overhead",
-                fullgraph=False
-            )
-            self.logger.info("Model compiled with torch.compile")
-
-        # Initialize training state
-        self.start_epoch = 0
-        self.best_val_loss = float("inf")
-        self._current_epoch = 0  # Track current epoch for SIGTERM handler
-
-        # Initialize loss component tracking (absolute and relative)
-        self.train_loss_components = {}
-        self.val_loss_components = {}
-        self.train_rel_components = {}
-        self.val_rel_components = {}
-
-        # Checkpoint paths
-        self.best_model_path = self.work_dir / "best_model.pt"  # Weights only (backward compat)
-        self.best_ckpt_path = self.work_dir / "best.ckpt"  # Full checkpoint
-        self.last_ckpt_path = self.work_dir / "last.ckpt"  # Full checkpoint for resume
-
-        # Setup SIGTERM handler for graceful cluster preemption
-        self._setup_sigterm_handler()
-
-        # Setup loss function BEFORE logging
+        # Setup components
         self._setup_loss()
-
-        # Setup logging AFTER loss (so we know elem_enabled)
+        self._setup_optimizer()
+        self._setup_scheduler()
         self._setup_logging()
 
-        # Check for resume from checkpoint (must come after scheduler setup)
+        # Cache dt stats to avoid I/O in hot path
+        self._cache_dt_stats()
+
+        # Mixed precision (read from top-level config)
+        mp_cfg = self.cfg.get('mixed_precision', {})
+        mode = str(mp_cfg.get('mode', 'bf16')).lower()
+        self.use_amp = torch.cuda.is_available() and mode != 'none'
+        self.amp_dtype = torch.bfloat16 if 'bf16' in mode else torch.float16
+
+        if self.use_amp and self.amp_dtype == torch.float16:
+            self.logger.warning("FP16 mode without GradScaler may be unstable. Consider using BF16.")
+
+        # State
+        self.start_epoch = 0
+        self.current_epoch = 0  # Track current epoch for rollout horizon
+        self.best_val_loss = float('inf')
+
+        # Check for resume
         self._check_resume()
 
-    def _setup_loss(self):
-        """Setup the loss function based on configuration."""
-        training_cfg = self.cfg.get("training", {})
-        loss_mode = training_cfg.get("loss_mode", "adaptive_stiff")
+    def _cache_dt_stats(self):
+        """Cache dt normalization stats to avoid I/O in rollout loss."""
+        manifest_path = Path(self.cfg['paths']['processed_data_dir']) / 'normalization.json'
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
 
-        if loss_mode == "adaptive_stiff":
-            # Load normalization manifest for statistics
-            manifest_path = Path(self.cfg["paths"]["processed_data_dir"]) / "normalization.json"
-            with open(manifest_path, "r") as f:
+        if 'dt' in manifest:
+            dt_stats = manifest['dt']
+            self.dt_log_min = torch.tensor(
+                dt_stats['log_min'],
+                device=self.device,
+                dtype=torch.float32
+            )
+            self.dt_log_max = torch.tensor(
+                dt_stats['log_max'],
+                device=self.device,
+                dtype=torch.float32
+            )
+        else:
+            raise ValueError("dt stats missing from normalization manifest")
+
+    def _setup_loss(self):
+        """Setup loss function based on configuration."""
+        if self.loss_mode == 'mse':
+            self.criterion = nn.MSELoss()
+            self.loss_returns_dict = False
+        else:  # adaptive_stiff
+            # Load normalization statistics
+            manifest_path = Path(self.cfg['paths']['processed_data_dir']) / 'normalization.json'
+            with open(manifest_path, 'r') as f:
                 manifest = json.load(f)
 
-            # Robustly resolve species names
-            data_cfg = self.cfg.get("data", {})
+            # Get target species statistics
+            data_cfg = self.cfg.get('data', {})
+            target_vars = data_cfg.get('target_species', data_cfg.get('species_variables', []))
+            if not target_vars:
+                raise ValueError("No target species specified")
 
-            # Try multiple sources for species names
-            target_vars = data_cfg.get("target_species")
-            if target_vars:
-                species_names = list(target_vars)
-            else:
-                species_vars = data_cfg.get("species_variables")
-                if species_vars:
-                    species_names = list(species_vars)
-                else:
-                    # Fall back to normalization.json meta or per_key_stats
-                    meta = manifest.get("meta", {})
-                    species_from_meta = meta.get("species_variables")
-                    if species_from_meta:
-                        species_names = list(species_from_meta)
-                    else:
-                        # Last resort: use keys from per_key_stats that are not time/globals
-                        stats = manifest["per_key_stats"]
-                        time_var = data_cfg.get("time_variable", "t_time")
-                        global_vars = set(data_cfg.get("global_variables", []))
-                        species_names = [
-                            k for k in stats.keys()
-                            if k != time_var and k not in global_vars
-                        ]
-
-            if not species_names:
-                raise ValueError(
-                    "Could not determine species names from config or normalization.json"
-                )
-
-            # If using target subset, use those for statistics
-            if target_vars:
-                stats_keys = target_vars
-            else:
-                stats_keys = species_names
-
-            # Extract statistics for loss computation species
-            stats = manifest["per_key_stats"]
+            stats = manifest['per_key_stats']
             log_means = []
             log_stds = []
-            log_mins = []
-            log_maxs = []
-
-            for name in stats_keys:
+            for name in target_vars:
                 if name not in stats:
-                    raise KeyError(f"Species '{name}' not found in normalization statistics")
+                    raise KeyError(f"Species '{name}' not found in normalization stats")
                 s = stats[name]
-                log_means.append(float(s.get("log_mean", 0.0)))
-                log_stds.append(float(s.get("log_std", 1.0)))
-                log_mins.append(float(s.get("log_min", -10.0)))
-                log_maxs.append(float(s.get("log_max", 10.0)))
+                log_means.append(float(s.get('log_mean', 0.0)))
+                log_stds.append(float(s.get('log_std', 1.0)))
 
-            # Get loss configuration
-            loss_cfg = training_cfg.get("adaptive_stiff_loss", {})
-
-            # Determine if we need elemental conservation
-            elemental_conservation = bool(loss_cfg.get("elemental_conservation", False))
-            elemental_penalty = float(loss_cfg.get("elemental_penalty", 0.0))
-
-            # Track if elem is enabled
-            self.elem_enabled = elemental_conservation and elemental_penalty > 0
-
-            # Log resolved species for debugging
-            self.logger.info(f"Resolved {len(species_names)} species for loss computation")
-            self.logger.info(f"  First 5: {species_names[:5]}")
-
-            # Create adaptive stiff loss with device parameter
+            # Create adaptive loss
+            loss_cfg = self.cfg['training'].get('adaptive_stiff_loss', {})
             self.criterion = AdaptiveStiffLoss(
                 log_means=torch.tensor(log_means, device=self.device),
                 log_stds=torch.tensor(log_stds, device=self.device),
-                species_log_min=torch.tensor(log_mins, device=self.device),
-                species_log_max=torch.tensor(log_maxs, device=self.device),
-                lambda_phys=float(loss_cfg.get("lambda_phys", 1.0)),
-                lambda_z=float(loss_cfg.get("lambda_z", 0.1)),
-                epsilon_phys=float(loss_cfg.get("epsilon_phys", 1e-20)),
-                use_fractional=bool(loss_cfg.get("use_fractional", False)),
-                time_edge_gain=float(loss_cfg.get("time_edge_gain", 2.0)),
-                # Atomic conservation parameters
-                elemental_conservation=elemental_conservation,
-                elemental_penalty=elemental_penalty,
-                species_names=species_names if self.elem_enabled else None,
-                elements=loss_cfg.get("elements", ["H", "C", "N", "O"]),
-                elemental_mode=loss_cfg.get("elemental_mode", "relative"),
-                elemental_weights=loss_cfg.get("elemental_weights", "auto"),
-                eps_elem=float(loss_cfg.get("eps_elem", 1e-20)),
-                debug_parser=bool(loss_cfg.get("debug_parser", False)),
-                device=self.device
+                lambda_phys=float(loss_cfg.get('lambda_phys', 1.0)),
+                lambda_z=float(loss_cfg.get('lambda_z', 0.1)),
+                time_weight_mode=loss_cfg.get('time_weight_mode', 'none')
             )
+            self.loss_returns_dict = True
 
-            # CRITICAL: Move the entire loss module to device
-            self.criterion = self.criterion.to(self.device)
-
-            # Check model/loss stat consistency
-            model_cfg = self.cfg.get("model", {})
-            if model_cfg.get("softmax_head", False) or model_cfg.get("predict_delta_log_phys", False):
-                if hasattr(self.model, 'check_stat_consistency'):
-                    try:
-                        self.model.check_stat_consistency(
-                            self.criterion.log_means,
-                            self.criterion.log_stds
-                        )
-                        self.logger.info("Model and loss normalization statistics verified to match")
-                    except (ValueError, RuntimeError) as e:
-                        self.logger.error(f"CRITICAL: Model/loss stat mismatch: {e}")
-                        raise
-                else:
-                    self.logger.warning(
-                        "Model should have check_stat_consistency method when using "
-                        "softmax_head or predict_delta_log_phys. Skipping stat verification."
-                    )
-
-            self.use_adaptive_stiff = True
-            self.logger.info("Using AdaptiveStiffLoss with dynamic range weighting")
-            if self.elem_enabled:
-                self.logger.info(f"  Atomic conservation penalty: {elemental_penalty}")
-
-            self._need_species_validation = True
-        else:
-            # Use standard loss modes
-            self.criterion = None
-            self.use_adaptive_stiff = False
-            self.elem_enabled = False
-            # Store loss configuration for _compute_loss method
-            self.loss_mode = loss_mode
-            self.loss_epsilon = float(training_cfg.get("loss_epsilon", 1e-27))
-            self.loss_rel_cap = training_cfg.get("loss_rel_cap", None)
-
-    def _setup_sigterm_handler(self) -> None:
-        """Setup handler for SIGTERM signal (cluster preemption)."""
-
-        def sigterm_handler(signum, frame):
-            self.logger.warning("SIGTERM received: saving checkpoint and exiting")
-            # Save checkpoint at current epoch
-            self._save_full_checkpoint(self.last_ckpt_path, self._current_epoch)
-            # Best effort flush
-            try:
-                self.writer.flush()
-            except Exception:
-                pass
-            os._exit(0)
-
-        signal.signal(signal.SIGTERM, sigterm_handler)
-
-    def _setup_mixed_precision(self) -> None:
-        """Configure mixed precision training with CPU safety guards."""
-        mixed_precision_cfg = self.cfg.get("mixed_precision", {})
-        self.amp_mode = str(mixed_precision_cfg.get("mode", "bf16")).lower()
-
-        if self.amp_mode not in ("bf16", "fp16", "none"):
-            self.amp_mode = "bf16"  # Default to bf16 on modern hardware
-
-        # Determine autocast dtype
-        if self.amp_mode == "bf16":
-            self.autocast_dtype = torch.bfloat16
-        elif self.amp_mode == "fp16":
-            self.autocast_dtype = torch.float16
-        else:
-            self.autocast_dtype = None
-
-        # GradScaler is only needed for fp16 mode on CUDA
-        # bf16 doesn't need scaling as it has better numerical range
-        self.use_fp16_scaler = (self.amp_mode == "fp16" and self.device.type == "cuda")
-
-        if self.use_fp16_scaler:
-            # Conservative scaler initialization to avoid early overflows
-            self.scaler = torch.cuda.amp.GradScaler(
-                enabled=True,
-                init_scale=2.0 ** 10,
-                growth_factor=2.0,
-                backoff_factor=0.25,
-                growth_interval=2000
-            )
-        else:
-            self.scaler = None
-
-        self.logger.info(f"Mixed precision mode: {self.amp_mode}")
-
-    def _setup_optimizer(self) -> None:
-        """Initialize optimizer with automatic fused kernel detection."""
-        # Try to use fused AdamW for better performance on modern GPUs
-        # PyTorch will automatically fall back if not supported
+    def _setup_optimizer(self):
+        """Setup AdamW optimizer with optional fused kernels."""
         try:
             self.optimizer = AdamW(
                 self.model.parameters(),
-                lr=self.base_lr,
+                lr=self.lr,
                 weight_decay=self.weight_decay,
-                fused=True,  # Use fused kernels when available
+                fused=torch.cuda.is_available()
             )
-            self.logger.info("Using fused AdamW optimizer")
         except (TypeError, RuntimeError):
-            # Fallback to standard AdamW if fused not supported
             self.optimizer = AdamW(
                 self.model.parameters(),
-                lr=self.base_lr,
-                weight_decay=self.weight_decay,
+                lr=self.lr,
+                weight_decay=self.weight_decay
             )
-            self.logger.info("Using standard AdamW optimizer")
 
-    def _setup_scheduler(self) -> None:
-        """Setup learning rate scheduler using PyTorch's built-in schedulers."""
-        training_cfg = self.cfg.get("training", {})
-        warmup_epochs = int(training_cfg.get("warmup_epochs", 0))
-        min_lr = float(training_cfg.get("min_lr", 1e-6))
-
-        if warmup_epochs > 0:
-            # Linear warmup from small factor to full learning rate
-            warmup_scheduler = LinearLR(
+    def _setup_scheduler(self):
+        """Setup learning rate scheduler with optional warmup."""
+        if self.warmup_epochs > 0:
+            warmup = LinearLR(
                 self.optimizer,
-                start_factor=0.001,  # Start at 0.1% of base lr for smoother warmup
+                start_factor=0.01,
                 end_factor=1.0,
-                total_iters=warmup_epochs
+                total_iters=self.warmup_epochs
             )
-
-            # Cosine annealing for remaining epochs
-            cosine_epochs = max(self.epochs - warmup_epochs, 1)
-            cosine_scheduler = CosineAnnealingLR(
+            cosine = CosineAnnealingLR(
                 self.optimizer,
-                T_max=cosine_epochs,
-                eta_min=min_lr
+                T_max=max(1, self.epochs - self.warmup_epochs),
+                eta_min=self.min_lr
             )
-
-            # Combine schedulers sequentially
             self.scheduler = SequentialLR(
                 self.optimizer,
-                schedulers=[warmup_scheduler, cosine_scheduler],
-                milestones=[warmup_epochs]
+                schedulers=[warmup, cosine],
+                milestones=[self.warmup_epochs]
             )
-            self.logger.info(f"LR schedule: {warmup_epochs} warmup + cosine annealing to {min_lr:.2e}")
         else:
-            # Just cosine annealing without warmup
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
                 T_max=self.epochs,
-                eta_min=min_lr
+                eta_min=self.min_lr
             )
-            self.logger.info(f"LR schedule: cosine annealing to {min_lr:.2e}")
 
-    def _setup_logging(self) -> None:
-        """Initialize TensorBoard and CSV logging."""
-        # TensorBoard writer for rich visualization
-        tb_dir = self.work_dir / "tensorboard"
-        tb_dir.mkdir(exist_ok=True)
-        self.writer = SummaryWriter(log_dir=str(tb_dir))
-
-        # CSV file with complete headers
-        self.log_file = self.work_dir / "training_log.txt"
-
-        # Build headers based on loss type
-        headers = ["epoch", "train", "val", "lr"]
-        if self.use_adaptive_stiff:
-            headers.extend(["train_rel_phys", "train_rel_z"])
-            if self.elem_enabled:
-                headers.append("train_rel_elem")
-            if self.beta_kl > 0.0:
-                headers.append("train_rel_kl")
-            headers.extend(["val_rel_phys", "val_rel_z"])
-            if self.elem_enabled:
-                headers.append("val_rel_elem")
-            if self.beta_kl > 0.0:
-                headers.append("val_rel_kl")
-
-        # Write header only if file doesn't exist (for append on resume)
-        write_header = not self.log_file.exists()
-        mode = "w" if write_header else "a"
-        with self.log_file.open(mode, newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            if write_header:
+    def _setup_logging(self):
+        """Setup CSV logging."""
+        self.log_file = self.work_dir / 'training_log.csv'
+        if not self.log_file.exists():
+            with open(self.log_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                headers = ['epoch', 'train_loss', 'val_loss', 'lr', 'time']
+                if self.loss_returns_dict:
+                    headers.extend(['train_phys', 'train_z', 'val_phys', 'val_z'])
+                if self.rollout_enabled:
+                    headers.append('rollout_loss')
+                if self.semigroup_enabled:
+                    headers.append('semigroup_loss')
+                if self.kl_weight > 0:
+                    headers.append('kl_loss')
                 writer.writerow(headers)
 
-    def _check_resume(self) -> None:
-        """Load a checkpoint if resuming, honoring env var RESUME, then config:
-           training.resume ('auto' | <path> | None) and training.auto_resume (bool)."""
-        tr = self.cfg.get("training", {})
-        env_resume = os.environ.get("RESUME", "").strip()
+    def _check_resume(self):
+        """Check for checkpoint to resume from."""
+        resume = self.cfg.get('training', {}).get('resume', None)
 
-        # 1) Environment variable has highest precedence (backwards compatible)
-        if env_resume:
-            resume_spec = env_resume
-            use_auto = (env_resume.lower() == "auto")
-        else:
-            # 2) Config-driven behavior
-            auto_resume = bool(tr.get("auto_resume", False))
-            resume_cfg = tr.get("resume", None)
-            if resume_cfg is None:
-                if not auto_resume:
-                    return  # nothing to do
-                # auto_resume=True with no explicit path -> auto discovery
-                resume_spec = "auto"
-                use_auto = True
+        if resume == 'auto':
+            # Prefer best_model.pt if it exists, otherwise latest by mtime
+            best_path = self.work_dir / 'best_model.pt'
+            if best_path.exists():
+                resume = best_path
             else:
-                # explicit value in config
-                resume_spec = str(resume_cfg)
-                use_auto = (resume_spec.lower() == "auto")
-
-        # Resolve checkpoint path
-        if use_auto:
-            # Prefer 'last.ckpt', then 'best.ckpt', then newest *.ckpt in work_dir
-            if self.last_ckpt_path.exists():
-                ckpt_path = self.last_ckpt_path
-            elif self.best_ckpt_path.exists():
-                ckpt_path = self.best_ckpt_path
-            else:
-                ckpts = sorted(
-                    self.work_dir.glob("*.ckpt"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True
-                )
-                if ckpts:
-                    ckpt_path = ckpts[0]
+                checkpoints = list(self.work_dir.glob('*.pt'))
+                if checkpoints:
+                    resume = max(checkpoints, key=lambda p: p.stat().st_mtime)
                 else:
-                    self.logger.info("No checkpoint found for auto-resume")
                     return
+        elif resume and Path(resume).exists():
+            resume = Path(resume)
         else:
-            ckpt_path = Path(resume_spec).expanduser().resolve()
-            if not ckpt_path.exists():
-                raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+            return
 
-        # Load checkpoint with compatibility for older PyTorch versions
-        self.logger.info(f"Resuming from checkpoint: {ckpt_path}")
-        try:
-            checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        except TypeError:
-            # Fallback for PyTorch < 1.13 that doesn't support weights_only
-            checkpoint = torch.load(ckpt_path, map_location=self.device)
+        self.logger.info(f"Resuming from {resume}")
+        checkpoint = torch.load(resume, map_location=self.device)
 
-        # Restore model/optimizer
-        self.model.load_state_dict(checkpoint["model"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.model.load_state_dict(checkpoint['model'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        self.start_epoch = checkpoint.get('epoch', 0)
+        self.current_epoch = self.start_epoch
+        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
 
-        # Restore scheduler (or fast-forward if missing)
-        if "scheduler" in checkpoint:
-            self.scheduler.load_state_dict(checkpoint["scheduler"])
-            self.logger.info("Restored scheduler state from checkpoint")
+    def _get_teacher_forcing_prob(self, epoch: int) -> float:
+        """Get teacher forcing probability for current epoch."""
+        if self.tf_mode == 'none':
+            return 0.0
+        elif self.tf_mode == 'constant':
+            return self.tf_start
+        elif self.tf_mode == 'linear':
+            if epoch >= self.tf_end_epoch:
+                return self.tf_end
+            t = epoch / max(1, self.tf_end_epoch)
+            return self.tf_start + (self.tf_end - self.tf_start) * t
+        elif self.tf_mode == 'cosine_ramp':
+            if epoch >= self.tf_end_epoch:
+                return self.tf_end
+            t = epoch / max(1, self.tf_end_epoch)
+            cos_t = 0.5 * (1.0 + np.cos(np.pi * t))
+            return self.tf_end + (self.tf_start - self.tf_end) * cos_t
         else:
-            start_epoch = checkpoint.get("epoch", 0)
-            for _ in range(start_epoch):
-                self.scheduler.step()
-            self.logger.info(f"Fast-forwarded scheduler to epoch {start_epoch}")
+            return 0.0
 
-        # Restore scaler if present/used
-        if self.scaler and "scaler" in checkpoint:
-            self.scaler.load_state_dict(checkpoint["scaler"])
+    def _compute_rollout_loss(
+            self,
+            y_i: torch.Tensor,
+            dt: torch.Tensor,
+            y_j: torch.Tensor,
+            g: torch.Tensor,
+            mask: Optional[torch.Tensor],
+            tf_prob: float
+    ) -> Optional[torch.Tensor]:
+        """
+        Multi-step rollout loss with truncated BPTT (1-step gradients only).
+        Uses the SAME loss criterion as main training.
+        Computes Δt mapping in FP32 to avoid AMP precision issues.
+        """
+        if dt.shape[1] < 2:
+            return None
 
-        # Restore training state
-        self.start_epoch = checkpoint.get("epoch", 0)
-        self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-        self._current_epoch = self.start_epoch
+        # Normalize mask shape if needed
+        if mask is not None and mask.ndim == 3 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
 
-        # Restore RNG state (optional fields guarded)
-        if "rng_state" in checkpoint:
-            rng_state = checkpoint["rng_state"]
-            if "python" in rng_state: random.setstate(rng_state["python"])
-            if "numpy" in rng_state:  np.random.set_state(rng_state["numpy"])
-            if "torch" in rng_state:  torch.set_rng_state(rng_state["torch"])
-            if "cuda" in rng_state and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(rng_state["cuda"])
+        # Process dt shape
+        if dt.ndim == 3 and dt.shape[-1] == 1:
+            dt = dt.squeeze(-1)
 
-        self.logger.info(f"Resumed from epoch {self.start_epoch}, best_val_loss={self.best_val_loss:.4e}")
+        B, K = dt.shape
 
-    def _save_full_checkpoint(self, path: Path, epoch: int) -> None:
-        """Save full checkpoint for restart with atomic write, including scheduler."""
-        checkpoint = {
-            "epoch": epoch,
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),  # Save scheduler state
-            "best_val_loss": self.best_val_loss,
-            "config": self.cfg,
-            "rng_state": {
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-                "torch": torch.get_rng_state(),
-            }
-        }
+        # Sort by time to ensure proper ordering
+        dt_sorted, sort_idx = torch.sort(dt, dim=1)
 
-        if torch.cuda.is_available():
-            checkpoint["rng_state"]["cuda"] = torch.cuda.get_rng_state_all()
+        # ---- Δt mapping done in FP32 (independent of outer autocast) ----
+        dt_log32 = (self.dt_log_min + dt_sorted.float() * (self.dt_log_max - self.dt_log_min)).float()
+        dt_phys32 = (10.0 ** dt_log32).clamp_min(1e-30)
 
-        if self.scaler:
-            checkpoint["scaler"] = self.scaler.state_dict()
+        # Incremental physical Δt
+        dt_incr_phys32 = torch.empty_like(dt_phys32)
+        dt_incr_phys32[:, 0] = dt_phys32[:, 0]
+        if K > 1:
+            incr32 = dt_phys32[:, 1:] - dt_phys32[:, :-1]
+            eps32 = (10.0 ** self.dt_log_min.item()) * 1e-6  # floor relative to min scale
+            dt_incr_phys32[:, 1:] = incr32.clamp_min(eps32)
 
-        # Atomic write: save to temp file then rename
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        torch.save(checkpoint, tmp_path)
-        os.replace(str(tmp_path), str(path))
+        # Re-normalize increments using SAME stats
+        dt_incr_log32 = torch.log10(dt_incr_phys32)
+        rng32 = (self.dt_log_max - self.dt_log_min).clamp_min(1e-12)
+        dt_incr_norm = ((dt_incr_log32 - self.dt_log_min) / rng32).clamp(0.0, 1.0).to(y_i.dtype)
 
-    def _save_weights_only(self) -> None:
-        """Save model weights only for inference and backward compatibility."""
-        checkpoint = {
-            "model": self.model.state_dict(),
-            "config": self.cfg,
-            "best_val_loss": self.best_val_loss,
-        }
-        torch.save(checkpoint, self.best_model_path)
+        # Sort targets/masks to match time ordering
+        y_j_sorted = torch.gather(
+            y_j, dim=1,
+            index=sort_idx.unsqueeze(-1).expand(-1, -1, y_j.shape[-1])
+        )
+        mask_sorted = torch.gather(mask, dim=1, index=sort_idx) if mask is not None else None
+
+        # Horizon schedule (grows with epoch)
+        if self.current_epoch < 10:
+            max_allowed_horizon = 2
+        elif self.current_epoch < 20:
+            max_allowed_horizon = 4
+        elif self.current_epoch < 40:
+            max_allowed_horizon = 6
+        else:
+            max_allowed_horizon = self.rollout_horizon
+
+        max_h = min(max_allowed_horizon, K)
+        horizon = int(torch.randint(1, max_h + 1, (), device=self.device).item())
+
+        rollout_losses = []
+        y_curr = y_i
+
+        # Subset info
+        S_in = getattr(self.model, 'S_in', None)
+        S_out = getattr(self.model, 'S_out', None)
+        target_idx = getattr(self.model, 'target_idx', None)
+
+        for t in range(horizon):
+            # Predict with incremental normalized dt
+            y_pred = self.model(y_curr, dt_incr_norm[:, t:t + 1], g)
+            if y_pred.ndim == 3 and y_pred.shape[1] == 1:
+                y_pred = y_pred.squeeze(1)
+            y_true = y_j_sorted[:, t]
+
+            # Non-finite guard
+            if not torch.isfinite(y_pred).all():
+                self.logger.warning(f"Non-finite y_pred at rollout step {t}; skipping rollout loss")
+                return None
+
+            # Same loss as main training
+            if self.loss_returns_dict:
+                dt_single = dt_incr_norm[:, t:t + 1]
+                mask_single = mask_sorted[:, t:t + 1] if mask_sorted is not None else None
+                loss_dict = self.criterion(y_pred.unsqueeze(1), y_true.unsqueeze(1), dt_single, mask_single)
+                step_loss = loss_dict['total']
+            else:
+                if mask_sorted is not None:
+                    m = mask_sorted[:, t].to(y_pred.dtype)  # [B]
+                    l_elm = F.mse_loss(y_pred, y_true, reduction='none')  # [B,S]
+                    l_sample = l_elm.mean(-1)  # [B]
+                    step_loss = (l_sample * m).sum() / m.sum().clamp_min(1)
+                else:
+                    step_loss = F.mse_loss(y_pred, y_true)
+
+            rollout_losses.append(step_loss)
+
+            # Truncated BPTT (detach for next step)
+            y_pred_det = y_pred.detach()
+            y_true_det = y_true.detach()
+
+            # Teacher forcing mask
+            tf_vec = (torch.rand(B, 1, device=self.device) < tf_prob).to(y_pred.dtype)
+            if mask_sorted is not None:
+                tf_vec = tf_vec * mask_sorted[:, t:t + 1].to(tf_vec.dtype)
+
+            mixed_next = tf_vec * y_true_det + (1.0 - tf_vec) * y_pred_det
+
+            # Subset-aware state update
+            if (S_in is not None) and (S_out is not None) and (S_in != S_out):
+                if target_idx is None:
+                    raise RuntimeError("Subset rollout requires model.target_idx")
+                assert mixed_next.shape[-1] == len(target_idx)
+                y_upd = y_curr.detach().clone()
+                y_upd[:, target_idx] = mixed_next
+                y_curr = y_upd
+            else:
+                y_curr = mixed_next
+
+        return torch.stack(rollout_losses).mean() if rollout_losses else None
+
+    def _compute_semigroup_loss(
+            self,
+            y_i: torch.Tensor,
+            g: torch.Tensor
+    ) -> torch.Tensor:
+        """Semigroup property: f(t1+t2) = f(t2) ∘ f(t1)."""
+        B = y_i.shape[0]
+
+        # Sample random time steps in [0, 0.5] normalized space
+        t1 = torch.rand(B, 1, device=self.device) * 0.5
+        t2 = torch.rand(B, 1, device=self.device) * 0.5
+        t_sum = t1 + t2
+
+        # Direct path
+        y_direct = self.model(y_i, t_sum, g).squeeze(1)
+
+        # Composed path
+        with torch.no_grad():
+            y_mid = self.model(y_i, t1, g).squeeze(1)
+        y_composed = self.model(y_mid, t2, g).squeeze(1)
+
+        return F.mse_loss(y_direct, y_composed)
+
+    def _compute_auxiliary_losses(
+            self,
+            y_i: torch.Tensor,
+            dt: torch.Tensor,
+            y_j: torch.Tensor,
+            g: torch.Tensor,
+            mask: Optional[torch.Tensor],
+            epoch: int,
+            tf_prob: float
+    ) -> Dict[str, torch.Tensor]:
+        """Compute auxiliary losses for temporal consistency."""
+        aux_losses = {}
+
+        # KL loss from VAE
+        if self.kl_weight > 0 and hasattr(self.model, 'kl_loss') and self.model.kl_loss is not None:
+            aux_losses['kl'] = self.kl_weight * self.model.kl_loss
+
+        # Rollout loss
+        if self.rollout_enabled and self.rollout_weight > 0:
+            rollout_loss = self._compute_rollout_loss(
+                y_i, dt, y_j, g, mask, tf_prob
+            )
+            if rollout_loss is not None:
+                aux_losses['rollout'] = self.rollout_weight * rollout_loss
+
+        # Semigroup loss
+        if self.semigroup_enabled and self.semigroup_weight > 0:
+            semigroup_loss = self._compute_semigroup_loss(y_i, g)
+            aux_losses['semigroup'] = self.semigroup_weight * semigroup_loss
+
+        return aux_losses
 
     def train(self) -> float:
-        """
-        Execute training loop.
+        """Main training loop."""
+        start_time = time.time()
 
-        Returns:
-            Best validation loss achieved during training
-        """
-        start_time = time.perf_counter()
+        for epoch in range(self.start_epoch + 1, self.epochs + 1):
+            self.current_epoch = epoch  # Track current epoch for rollout horizon
+            epoch_start = time.time()
 
-        try:
-            for epoch in range(self.start_epoch + 1, self.epochs + 1):
-                # Track current epoch for SIGTERM handler
-                self._current_epoch = epoch
+            # Set dataset epoch for deterministic sampling
+            if hasattr(self.train_loader.dataset, 'set_epoch'):
+                self.train_loader.dataset.set_epoch(epoch)
 
-                # Set epoch for datasets that support deterministic sampling
-                # This is the primary mechanism for deterministic per-epoch sampling
-                self._set_dataset_epoch(epoch)
+            # Training
+            train_metrics = self._train_epoch(epoch)
 
-                epoch_start = time.perf_counter()
+            # Validation
+            if self.val_loader is not None:
+                val_metrics = self._validate()
+            else:
+                val_metrics = {'loss': train_metrics['loss']}
 
-                # Training epoch
-                train_loss = self._run_epoch(train=True)
+            # Update scheduler
+            self.scheduler.step()
 
-                # Validation epoch
-                if self.val_loader is not None:
-                    val_loss = self._run_epoch(train=False)
-                else:
-                    val_loss = train_loss
-                    # Copy relative components when no validation
-                    self.val_rel_components = self.train_rel_components.copy()
+            # Save checkpoint
+            if val_metrics['loss'] < self.best_val_loss:
+                self.best_val_loss = val_metrics['loss']
+                self._save_checkpoint(epoch, is_best=True)
 
-                # Step learning rate scheduler AFTER optimizer updates (epoch-level scheduling)
-                self.scheduler.step()
-                current_lr = self.optimizer.param_groups[0]["lr"]
+            # Always save last checkpoint
+            self._save_checkpoint(epoch, is_best=False)
 
-                # Save checkpoints (without logging saved status)
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = float(val_loss)
-                    self._save_weights_only()  # For backward compatibility
-                    self._save_full_checkpoint(self.best_ckpt_path, epoch)
+            # Log to CSV
+            self._log_metrics(epoch, train_metrics, val_metrics, epoch_start)
 
-                # Always save last checkpoint for resume capability
-                self._save_full_checkpoint(self.last_ckpt_path, epoch)
-
-                # Log metrics to TensorBoard
-                self.writer.add_scalar("loss/train", train_loss, epoch)
-                self.writer.add_scalar("loss/val", val_loss, epoch)
-                self.writer.add_scalar("lr", current_lr, epoch)
-
-                # Log absolute component losses to TensorBoard
-                if self.train_loss_components:
-                    for key, value in self.train_loss_components.items():
-                        self.writer.add_scalar(f"loss/train_{key}", value, epoch)
-                if self.val_loss_components:
-                    for key, value in self.val_loss_components.items():
-                        self.writer.add_scalar(f"loss/val_{key}", value, epoch)
-
-                # Log relative component losses to TensorBoard
-                if self.train_rel_components:
-                    for key, value in self.train_rel_components.items():
-                        self.writer.add_scalar(f"loss_rel/train_{key}", value, epoch)
-                if self.val_rel_components:
-                    for key, value in self.val_rel_components.items():
-                        self.writer.add_scalar(f"loss_rel/val_{key}", value, epoch)
-
-                # Log to CSV file
-                self._log_epoch_metrics(epoch, train_loss, val_loss, current_lr)
-
-                # Console output with BOTH train and val relative components (including KL if present)
-                epoch_time = time.perf_counter() - epoch_start
-
-                # Build relative loss strings for both train and val
-                rel_train_str = ""
-                rel_val_str = ""
-                if self.use_adaptive_stiff:
-                    if self.train_rel_components:
-                        parts = [f"{self.train_rel_components['phys']:.2f}",
-                                 f"{self.train_rel_components['z']:.2f}"]
-                        if self.elem_enabled:
-                            parts.append(f"{self.train_rel_components['elem']:.2f}")
-                        if 'kl' in self.train_rel_components:
-                            parts.append(f"{self.train_rel_components['kl']:.2f}")
-                        labels = ["phys", "z"]
-                        if self.elem_enabled:
-                            labels.append("elem")
-                        if 'kl' in self.train_rel_components:
-                            labels.append("kl")
-                        rel_train_str = f" | rel_train[{'/'.join(labels)}]={'/'.join(parts)}"
-
-                    if self.val_rel_components:
-                        parts = [f"{self.val_rel_components['phys']:.2f}",
-                                 f"{self.val_rel_components['z']:.2f}"]
-                        if self.elem_enabled:
-                            parts.append(f"{self.val_rel_components['elem']:.2f}")
-                        if 'kl' in self.val_rel_components:
-                            parts.append(f"{self.val_rel_components['kl']:.2f}")
-                        labels = ["phys", "z"]
-                        if self.elem_enabled:
-                            labels.append("elem")
-                        if 'kl' in self.val_rel_components:
-                            labels.append("kl")
-                        rel_val_str = f" | rel_val[{'/'.join(labels)}]={'/'.join(parts)}"
-
-                self.logger.info(
-                    f"Epoch {epoch:03d}/{self.epochs} | "
-                    f"train={train_loss:.4e} | "
-                    f"val={val_loss:.4e} | "
-                    f"lr={current_lr:.2e} | "
-                    f"time={epoch_time:.1f}s"
-                    f"{rel_train_str}"
-                    f"{rel_val_str}"
-                )
-
-            # Training complete
-            total_time = time.perf_counter() - start_time
+            # Console output
+            lr = self.optimizer.param_groups[0]['lr']
             self.logger.info(
-                f"Training completed in {total_time / 3600:.2f} hours. "
-                f"Best validation loss: {self.best_val_loss:.4e}"
+                f"Epoch {epoch:3d}/{self.epochs} | "
+                f"train={train_metrics['loss']:.4e} | "
+                f"val={val_metrics['loss']:.4e} | "
+                f"lr={lr:.2e} | "
+                f"time={time.time() - epoch_start:.1f}s"
             )
 
-            # Compute final validation metric in physical units
-            which = "last-epoch"
-            try:
-                # Load best model with compatibility
-                try:
-                    best_blob = torch.load(self.best_model_path, map_location=self.device, weights_only=False)
-                except TypeError:
-                    best_blob = torch.load(self.best_model_path, map_location=self.device)
-
-                best_state = best_blob.get("model") if isinstance(best_blob, dict) else None
-                if best_state:
-                    self.model.load_state_dict(best_state, strict=False)
-                    which = "best_model.pt"
-            except Exception:
-                pass
-
-            final_frac = self.evaluate_frac_l1_phys(self.val_loader)
-            self.logger.info(f"Final validation fractional L1 (physical) [{which}]: {final_frac:.6e}")
-
-            # Save final metrics for downstream analysis
-            try:
-                with open(self.work_dir / "final_metrics.json", "w", encoding="utf-8") as f:
-                    json.dump({"val_frac_l1_phys_mean": final_frac, "which": which}, f, indent=2)
-            except Exception:
-                pass
-
-        finally:
-            # Always close TensorBoard writer, even if training is interrupted
-            self.writer.close()
-
+        total_time = time.time() - start_time
+        self.logger.info(f"Training completed in {total_time / 3600:.2f} hours")
         return self.best_val_loss
 
-    def _set_dataset_epoch(self, epoch: int) -> None:
-        """Set epoch for datasets that support deterministic sampling."""
-        for loader in (self.train_loader, self.val_loader):
-            if loader is not None:
-                dataset = getattr(loader, "dataset", None)
-                if dataset is not None and hasattr(dataset, "set_epoch"):
-                    try:
-                        dataset.set_epoch(epoch)
-                    except Exception:
-                        pass
+    # === Trainer._train_epoch ===
+    def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        """Single training epoch with non-finite guard before backward."""
+        self.model.train()
 
-    def _log_epoch_metrics(
-            self,
-            epoch: int,
-            train_loss: float,
-            val_loss: float,
-            lr: float
-    ) -> None:
-        """Append epoch metrics to CSV log file with relative components."""
-        row = [epoch, f"{train_loss:.4e}", f"{val_loss:.4e}", f"{lr:.4e}"]
+        metrics = {
+            'loss': 0.0, 'phys': 0.0, 'z': 0.0,
+            'rollout': 0.0, 'semigroup': 0.0, 'kl': 0.0,
+            'count': 0
+        }
 
-        if self.use_adaptive_stiff:
-            # Train relatives
-            if self.train_rel_components:
-                row.append(f"{self.train_rel_components.get('phys', 0):.4f}")
-                row.append(f"{self.train_rel_components.get('z', 0):.4f}")
-                if self.elem_enabled:
-                    row.append(f"{self.train_rel_components.get('elem', 0):.4f}")
-                if self.beta_kl > 0.0:
-                    row.append(f"{self.train_rel_components.get('kl', 0):.4f}")
-            else:
-                row.extend(["0.0000", "0.0000"])
-                if self.elem_enabled:
-                    row.append("0.0000")
-                if self.beta_kl > 0.0:
-                    row.append("0.0000")
+        tf_prob = self._get_teacher_forcing_prob(epoch)
 
-            # Val relatives
-            if self.val_rel_components:
-                row.append(f"{self.val_rel_components.get('phys', 0):.4f}")
-                row.append(f"{self.val_rel_components.get('z', 0):.4f}")
-                if self.elem_enabled:
-                    row.append(f"{self.val_rel_components.get('elem', 0):.4f}")
-                if self.beta_kl > 0.0:
-                    row.append(f"{self.val_rel_components.get('kl', 0):.4f}")
-            else:
-                row.extend(["0.0000", "0.0000"])
-                if self.elem_enabled:
-                    row.append("0.0000")
-                if self.beta_kl > 0.0:
-                    row.append("0.0000")
-
-        with self.log_file.open("a", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
-
-    def _run_epoch(self, train: bool) -> float:
-        """
-        Run single training or validation epoch.
-
-        Args:
-            train: Whether to run training (True) or validation (False)
-
-        Returns:
-            Average loss for the epoch
-        """
-        # Select appropriate loader
-        loader = self.train_loader if train else self.val_loader
-        if loader is None:
-            return float("nan")
-
-        # Set model mode
-        self.model.train(mode=train)
-
-        # Setup autocast context for mixed precision with CPU safety
-        if self.autocast_dtype is not None:
-            # Only enable autocast for CUDA or if explicitly using bf16 on CPU
-            enable_amp = (self.device.type == "cuda" or
-                          (self.device.type == "cpu" and self.amp_mode == "bf16"))
-            autocast_context = torch.autocast(
-                device_type=self.device.type,
-                dtype=self.autocast_dtype,
-                enabled=enable_amp
-            )
-        else:
-            autocast_context = contextlib.nullcontext()
-
-        # Epoch statistics
-        total_loss = 0.0
-        num_batches = 0
-
-        # Component loss accumulators
-        total_phys = 0.0
-        total_z = 0.0
-        total_elem = 0.0
-        total_kl = 0.0
-
-        # Determine max steps for this epoch
-        max_steps = None
-        if train and self.max_train_steps_per_epoch:
-            max_steps = self.max_train_steps_per_epoch
-        elif not train and self.max_val_batches:
-            max_steps = self.max_val_batches
-
-        # Use inference mode for validation (disables autograd)
-        outer_ctx = torch.inference_mode() if not train else contextlib.nullcontext()
-
-        with outer_ctx:
-            # Process batches
-            for step, batch in enumerate(loader, 1):
-                # Check step limit
-                if max_steps and step > max_steps:
-                    break
-
-                # Process batch
-                loss_info = self._process_batch(batch, train, autocast_context, step)
-
-                if isinstance(loss_info, dict):
-                    # Skip bad batches (marked with _skip flag)
-                    if not loss_info.get('_skip', False):
-                        total_loss += float(loss_info['total'])
-                        total_phys += float(loss_info.get('phys', 0))
-                        total_z += float(loss_info.get('z', 0))
-                        total_elem += float(loss_info.get('elem', 0))
-                        total_kl += float(loss_info.get('kl', 0))
-                        num_batches += 1
-                else:
-                    total_loss += float(loss_info)
-                    num_batches += 1
-
-        # Log actual batch counts when limits are active
-        if max_steps:
-            mode_str = "train" if train else "val"
-            self.logger.debug(f"{mode_str} epoch used {num_batches} batches (limit: {max_steps})")
-
-        # Guard against zero batches
-        if num_batches == 0:
-            self.logger.warning(f"{'Training' if train else 'Validation'} epoch completed with 0 valid batches")
-            return float("inf")
-
-        # Calculate averages
-        avg_loss = total_loss / max(1, num_batches)
-
-        # Store absolute component averages and compute relatives
-        if num_batches > 0 and self.use_adaptive_stiff:
-            components = {
-                'phys': total_phys / num_batches,
-                'z': total_z / num_batches,
-                'elem': total_elem / num_batches
-            }
-
-            # Add KL component if present
-            if total_kl > 0.0:
-                components['kl'] = total_kl / num_batches
-
-            # Calculate relative components
-            total = avg_loss + 1e-12  # Guard against division by zero
-            rel_components = {
-                'phys': components['phys'] / total,
-                'z': components['z'] / total,
-                'elem': components['elem'] / total
-            }
-
-            # Add KL relative if present
-            if 'kl' in components:
-                rel_components['kl'] = components['kl'] / total
-
-            if train:
-                self.train_loss_components = components
-                self.train_rel_components = rel_components
-            else:
-                self.val_loss_components = components
-                self.val_rel_components = rel_components
-
-        return avg_loss
-
-    def _process_batch(
-            self,
-            batch: tuple,
-            train: bool,
-            autocast_context: contextlib.AbstractContextManager,
-            step_idx: int = 0
-    ) -> float | Dict[str, float]:
-        """
-        Process single batch with mixed precision support and numerical safety.
-
-        Args:
-            batch: Batch data tuple
-            train: Whether to compute gradients and update weights
-            autocast_context: Context manager for mixed precision
-            step_idx: Current batch index for debugging
-
-        Returns:
-            Batch loss value or dict of loss components
-        """
-        # Unpack batch (supports both 5 and 6 element batches)
-        if len(batch) == 6:
-            y_i, dt_norm, y_j, g, ij, k_mask = batch
-        else:
-            y_i, dt_norm, y_j, g, ij = batch
-            k_mask = None
-
-        # Move to device efficiently
-        y_i = y_i.to(self.device, non_blocking=True)
-        dt_norm = dt_norm.to(self.device, non_blocking=True)
-        y_j = y_j.to(self.device, non_blocking=True)
-        g = g.to(self.device, non_blocking=True)
-        if k_mask is not None:
-            k_mask = k_mask.to(self.device, non_blocking=True)
-
-        # Lazily resolve target indices for species subset
-        if not hasattr(self, "_target_idx"):
-            self._resolve_target_indices()
-
-        # Slice targets to match model's output dimension
-        if self._target_idx is not None:
-            y_j = y_j.index_select(dim=-1, index=self._target_idx)
-
-        # Zero gradients efficiently
-        if train:
-            self.optimizer.zero_grad(set_to_none=True)
-
-        try:
-            # Forward pass with autocast
-            with autocast_context:
-                # Prepare time input (remove trailing singleton if present)
-                if dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
-                    dt_in = dt_norm.squeeze(-1)
-                else:
-                    dt_in = dt_norm
-
-                # Check dt_norm for finiteness
-                if not torch.isfinite(dt_in).all():
-                    raise ValueError("Non-finite dt_norm in batch")
-
-                # Forward pass
-                pred = self.model(y_i, dt_in, g)
-
-                # Validate and harmonize shapes
-                pred, y_j = self._harmonize_shapes(pred, y_j)
-
-                # Validate species dimension on first forward
-                if hasattr(self,
-                           '_need_species_validation') and self._need_species_validation and self.use_adaptive_stiff:
-                    if hasattr(self.criterion, 'species_names') and self.criterion.species_names:
-                        expected_s = len(self.criterion.species_names)
-                        actual_s = pred.shape[-1]
-                        if expected_s != actual_s:
-                            raise ValueError(
-                                f"Model output dimension mismatch: expected {expected_s} species, got {actual_s}. "
-                                f"Check target_species configuration."
-                            )
-                        self.logger.info(f"Model output validated: {actual_s} species")
-                    self._need_species_validation = False
-
-                # Compute loss with components if using adaptive stiff
-                if self.use_adaptive_stiff:
-                    loss_info = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
-                    loss = loss_info['total']
-                else:
-                    loss = self._compute_loss(pred, y_j, k_mask)
-                    loss_info = loss
-
-                # Add VAE KL DIVERGENCE TERM
-                if self.beta_kl > 0.0 and getattr(self.model, "vae_mode", False):
-                    kl = getattr(self.model, "kl_loss", None)
-                    if kl is not None:
-                        loss = loss + self.beta_kl * kl
-                        if isinstance(loss_info, dict):
-                            loss_info["kl"] = (self.beta_kl * kl).detach()
-                            loss_info["total"] = loss  # CRITICAL: Update total to include KL
-                        else:
-                            loss_info = {"total": loss, "kl": (self.beta_kl * kl).detach()}
-
-            # Finiteness + outlier tripwire BEFORE backward (TRAINING ONLY)
-            if isinstance(loss_info, dict):
-                batch_total = float(loss_info['total'])
-            else:
-                batch_total = float(loss_info)
-
-            if not np.isfinite(batch_total):
-                raise FloatingPointError(f"Non-finite batch loss={batch_total}")
-
-            # Robust median tracker (TRAINING ONLY)
-            if train:
-                med = getattr(self, "_loss_med", None)
-                if med is None:
-                    self._loss_med = batch_total
-                else:
-                    self._loss_med = 0.9 * self._loss_med + 0.1 * batch_total
-                    if batch_total > self.outlier_factor * max(self._loss_med, 1e-8):
-                        raise RuntimeError(f"Outlier batch loss={batch_total:.3e} (>{self.outlier_factor}x median)")
-
-            # Backward pass and optimization (training only)
-            if train:
-                if self.use_fp16_scaler and self.scaler is not None:
-                    # Scaled backward for fp16
-                    self.scaler.scale(loss).backward()
-
-                    # Unscale before gradient clipping
-                    self.scaler.unscale_(self.optimizer)
-
-                    # Gradient clipping if configured
-                    if self.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            max_norm=self.grad_clip
-                        )
-
-                    # Guard grad norm
-                    gtot = 0.0
-                    for p in self.model.parameters():
-                        if p.grad is not None:
-                            g = p.grad.detach().float().norm().item()
-                            gtot += g * g
-                    if not np.isfinite(gtot):
-                        raise FloatingPointError(f"Non-finite grad norm")
-
-                    # Optimizer step with scaling
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    # Standard backward pass
-                    loss.backward()
-
-                    # Gradient clipping if configured
-                    if self.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            max_norm=self.grad_clip
-                        )
-
-                    # Optimizer step
-                    self.optimizer.step()
-
-        except Exception as e:
-            # Containment: zero and skip this batch (TRAINING ONLY)
-            if train and self.skip_bad_batches:
-                self.optimizer.zero_grad(set_to_none=True)
-                if self.use_fp16_scaler and self.scaler is not None:
-                    # Reduce scale with fallback for older PyTorch
-                    current = self.scaler.get_scale()
-                    if current and np.isfinite(current):
-                        new_scale = current * self.amp_backoff
-                        try:
-                            self.scaler.update(new_scale=new_scale)
-                        except TypeError:
-                            # Fallback for older torch
-                            self.scaler._scale = self.scaler._scale * self.amp_backoff
-
-                self.logger.warning(f"Skipping bad training batch {step_idx}: {repr(e)}")
-                try:
-                    self.debug_dump_dir.mkdir(parents=True, exist_ok=True)
-                    # Dump what we have, including loss_info if it exists
-                    li = locals().get("loss_info", None)
-                    torch.save({
-                        "err": repr(e),
-                        "epoch": self._current_epoch,
-                        "step": step_idx,
-                        "y_i": y_i.detach().cpu(),
-                        "dt_norm": dt_norm.detach().cpu(),
-                        "y_j": y_j.detach().cpu(),
-                        "g": g.detach().cpu(),
-                        "k_mask": (k_mask.detach().cpu() if k_mask is not None else None),
-                        "loss_info": ({k: (v.detach().cpu() if torch.is_tensor(v) else v)
-                                       for k, v in (li.items() if isinstance(li, dict) else {})}),
-                    }, str(self.debug_dump_dir / f"bad_batch_{self._current_epoch:03d}_{step_idx:06d}.pt"))
-                except Exception:
-                    pass  # never let the dump crash training
-
-                # Return a sentinel dict with explicit skip flag
-                return {"total": 0.0, "phys": 0.0, "z": 0.0, "elem": 0.0, "_skip": True}
-            else:
-                # For validation or if not skipping, re-raise
-                raise
-
-        # Return loss components for adaptive stiff, scalar for others
-        if isinstance(loss_info, dict):
-            return {k: v.detach().item() if torch.is_tensor(v) else v for k, v in loss_info.items()}
-        return loss.detach().item()
-
-    def _resolve_target_indices(self):
-        """Resolve target species indices from configuration."""
-        data_cfg = self.cfg.get("data", {})
-        species_vars = list(data_cfg.get("species_variables") or [])
-        target_vars = list(data_cfg.get("target_species") or species_vars)
-
-        if target_vars != species_vars:
-            name_to_idx = {n: i for i, n in enumerate(species_vars)}
+        for batch in self.train_loader:
             try:
-                idx_list = [name_to_idx[n] for n in target_vars]
-            except KeyError as e:
-                raise KeyError(f"target_species contains unknown name: {e.args[0]!r}")
-            self._target_idx = torch.tensor(idx_list, dtype=torch.long, device=self.device)
-        else:
-            self._target_idx = None
+                # Unpack
+                if len(batch) == 6:
+                    y_i, dt, y_j, g, _, mask = batch
+                else:
+                    y_i, dt, y_j, g, _ = batch
+                    mask = None
 
-    def _harmonize_shapes(
-            self,
-            pred: torch.Tensor,
-            target: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Validate and ensure prediction and target have compatible shapes.
+                # To device
+                y_i = y_i.to(self.device, non_blocking=True)
+                dt = dt.to(self.device, non_blocking=True)
+                y_j = y_j.to(self.device, non_blocking=True)
+                g = g.to(self.device, non_blocking=True)
+                if mask is not None:
+                    mask = mask.to(self.device, non_blocking=True)
 
-        Args:
-            pred: Model predictions
-            target: Target values
+                if dt.ndim == 3 and dt.shape[-1] == 1:
+                    dt = dt.squeeze(-1)
 
-        Returns:
-            Tuple of (pred, target) with compatible shapes
+                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                    # Forward
+                    pred = self.model(y_i, dt, g)
 
-        Raises:
-            RuntimeError: If shapes are incompatible
-        """
-        # Check for shape mismatches and provide helpful error messages
-        if pred.ndim == 2 and target.ndim == 3:
-            B_pred, S_pred = pred.shape
-            B_target, K_target, S_target = target.shape
-            raise RuntimeError(
-                f"Shape mismatch: Model returned predictions with shape {tuple(pred.shape)} "
-                f"but target has shape {tuple(target.shape)}. "
-                f"The model should return [B, K, S] when K={K_target} times are requested."
-            )
+                    # Main loss
+                    if self.loss_returns_dict:
+                        loss_dict = self.criterion(pred, y_j, dt, mask)
+                        main_loss = loss_dict['total']
+                        metrics['phys'] += loss_dict['phys'].item()
+                        metrics['z'] += loss_dict['z'].item()
+                    else:
+                        if mask is not None and pred.ndim == 3:
+                            l_elm = F.mse_loss(pred, y_j, reduction='none')  # [B,K,S]
+                            m = mask.unsqueeze(-1).to(l_elm.dtype)  # [B,K,1]
+                            denom = (m.sum() * l_elm.shape[-1]).clamp_min(1)
+                            main_loss = (l_elm * m).sum() / denom
+                        else:
+                            main_loss = self.criterion(pred, y_j)
 
-        elif pred.ndim == 3 and target.ndim == 2:
-            B_pred, K_pred, S_pred = pred.shape
-            B_target, S_target = target.shape
-            raise RuntimeError(
-                f"Shape mismatch: Model returned predictions with shape {tuple(pred.shape)} "
-                f"but target has shape {tuple(target.shape)}."
-            )
+                    # Aux losses
+                    aux_losses = self._compute_auxiliary_losses(y_i, dt, y_j, g, mask, epoch, tf_prob)
+                    total_loss = main_loss
+                    for key, value in aux_losses.items():
+                        total_loss = total_loss + value
+                        metrics[key] += value.item()
 
-        elif pred.ndim == 3 and target.ndim == 3:
-            B_pred, K_pred, S_pred = pred.shape
-            B_target, K_target, S_target = target.shape
-            if K_pred != K_target:
-                raise RuntimeError(f"Shape mismatch in time dimension")
-            if B_pred != B_target:
-                raise RuntimeError("Batch size mismatch")
-            if S_pred != S_target:
-                raise RuntimeError("State dimension mismatch")
+                # ---- Non-finite guard before backward ----
+                if not torch.isfinite(total_loss):
+                    self.logger.warning("Non-finite total_loss; skipping batch.")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
 
-        elif pred.ndim == 2 and target.ndim == 2:
-            B_pred, S_pred = pred.shape
-            B_target, S_target = target.shape
-            if B_pred != B_target:
-                raise RuntimeError("Batch size mismatch")
-            if S_pred != S_target:
-                raise RuntimeError("State dimension mismatch")
+                # Backward & step
+                self.optimizer.zero_grad(set_to_none=True)
+                total_loss.backward()
+                if self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                self.optimizer.step()
 
-        else:
-            raise RuntimeError("Unexpected tensor dimensions")
+                metrics['loss'] += total_loss.item()
+                metrics['count'] += 1
 
-        return pred, target
+            except Exception as e:
+                self.logger.warning(f"Skipping bad batch: {e}")
+                continue
 
-    def _compute_loss(
-            self,
-            pred: torch.Tensor,
-            target: torch.Tensor,
-            mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """
-        Compute loss using standard loss modes.
+        for k in metrics:
+            if k != 'count':
+                metrics[k] /= max(1, metrics['count'])
+        return metrics
 
-        Supports:
-        - 'mse': Mean squared error in normalized space
-        - 'frac_l1_phys': Fractional L1 in physical space
-        - 'mae_log_phys': MAE in log10 physical space
-        """
-        # Get loss configuration
-        tr_cfg = self.cfg.get("training", {})
-        mode = getattr(self, "loss_mode", tr_cfg.get("loss_mode", "mse"))
-        eps = float(getattr(self, "loss_epsilon", tr_cfg.get("loss_epsilon", 1e-27)))
-        rel_cap = getattr(self, "loss_rel_cap", tr_cfg.get("loss_rel_cap", None))
-
-        if mode == "mse":
-            loss_elems = (pred - target) ** 2
-
-        elif mode in ("frac_l1_phys", "mae_log_phys"):
-            # Lazy-load normalization helper on first use
-            if not hasattr(self, "_norm_helper"):
-                from normalizer import NormalizationHelper
-
-                manifest_path = Path(self.cfg["paths"]["processed_data_dir"]) / "normalization.json"
-                with open(manifest_path, "r") as f:
-                    manifest = json.load(f)
-                self._norm_helper = NormalizationHelper(manifest, device=pred.device)
-
-                data_cfg = self.cfg.get("data", {})
-                self._species_keys = list(
-                    data_cfg.get("target_species") or data_cfg.get("species_variables")
-                )
-
-            # Denormalize to physical units
-            y_pred = self._norm_helper.denormalize(pred, self._species_keys)
-            y_true = self._norm_helper.denormalize(target, self._species_keys)
-
-            if mode == "frac_l1_phys":
-                # Fractional absolute error: |pred - true| / (|true| + eps)
-                denom = y_true.abs() + eps
-                rel = (y_pred - y_true).abs() / denom
-                if rel_cap is not None:
-                    rel = torch.clamp(rel, max=float(rel_cap))
-                loss_elems = rel
-
-            else:  # 'mae_log_phys'
-                # MAE in log10 space (smoother proxy for fractional error)
-                y_pred = torch.clamp(y_pred, min=eps)
-                y_true = torch.clamp(y_true, min=eps)
-                loss_elems = (torch.log10(y_pred) - torch.log10(y_true)).abs()
-
-            # Optional per-species weights (if configured)
-            w = getattr(self, "loss_weights", None)
-            if w is not None:
-                w = w.to(loss_elems.device, dtype=loss_elems.dtype)
-                while w.ndim < loss_elems.ndim:
-                    w = w.unsqueeze(0)
-                loss_elems = loss_elems * w
-
-        else:
-            raise ValueError(f"Unknown loss_mode='{mode}'")
-
-        # Masked reduction for multi-time batches (FIXED)
-        if mask is not None:
-            # Expand mask to match loss_elems' shape
-            m = mask
-            while m.ndim < loss_elems.ndim:
-                m = m.unsqueeze(-1)
-            m_expanded = m.expand_as(loss_elems)
-
-            # Count non-zero elements in the expanded mask
-            denom = torch.count_nonzero(m_expanded).to(loss_elems.dtype)
-            denom = torch.clamp(denom, min=1.0)
-            return (loss_elems * m_expanded).sum() / denom
-
-        # Unmasked case - just use mean
-        return loss_elems.mean()
-
-    def _ensure_norm_helper(self):
-        """
-        Lazily load NormalizationHelper and resolve the correct species list.
-        Used for evaluation metrics.
-        """
-        if not hasattr(self, "_norm_helper"):
-            from normalizer import NormalizationHelper
-
-            manifest_path = Path(self.cfg["paths"]["processed_data_dir"]) / "normalization.json"
-            with open(manifest_path, "r") as f:
-                manifest = json.load(f)
-            self._norm_helper = NormalizationHelper(manifest, device=self.device)
-
-            data_cfg = self.cfg.get("data", {})
-            self._species_keys = list(
-                data_cfg.get("target_species") or data_cfg.get("species_variables")
-            )
-        return self._norm_helper, self._species_keys
-
-    @torch.inference_mode()
-    def evaluate_frac_l1_phys(
-            self,
-            loader: Optional[torch.utils.data.DataLoader] = None,
-            max_batches: Optional[int] = None
-    ) -> float:
-        """
-        Compute mean fractional absolute error in PHYSICAL units.
-
-        This is the true evaluation metric: mean(|y_pred - y_true| / (|y_true| + eps))
-
-        Args:
-            loader: DataLoader to evaluate on (defaults to validation loader)
-            max_batches: Maximum number of batches to evaluate
-
-        Returns:
-            Mean fractional L1 error in physical space
-        """
-        loader = loader or self.val_loader
-        if loader is None:
-            return float("nan")
-
+    @torch.no_grad()
+    def _validate(self) -> Dict[str, float]:
+        """Validation epoch."""
         self.model.eval()
-        eps = float(self.cfg.get("training", {}).get("loss_epsilon", 1e-27))
-        norm, species_keys = self._ensure_norm_helper()
 
-        # Accumulate statistics using tensors for consistency
-        total = torch.tensor(0.0, device=self.device, dtype=torch.float32)
-        count = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        metrics = {
+            'loss': 0.0,
+            'phys': 0.0,
+            'z': 0.0,
+            'count': 0
+        }
 
-        # Ensure we have target index mapping
-        if not hasattr(self, "_target_idx"):
-            self._resolve_target_indices()
-
-        for step, batch in enumerate(loader, 1):
-            if max_batches and step > max_batches:
-                break
-
-            # Unpack batch
+        for batch in self.val_loader:
+            # Unpack
             if len(batch) == 6:
-                y_i, dt_norm, y_j, g, ij, k_mask = batch
+                y_i, dt, y_j, g, _, mask = batch
             else:
-                y_i, dt_norm, y_j, g, ij = batch
-                k_mask = None
+                y_i, dt, y_j, g, _ = batch
+                mask = None
 
             # Move to device
             y_i = y_i.to(self.device, non_blocking=True)
-            dt = dt_norm.to(self.device, non_blocking=True)
+            dt = dt.to(self.device, non_blocking=True)
             y_j = y_j.to(self.device, non_blocking=True)
             g = g.to(self.device, non_blocking=True)
-            if k_mask is not None:
-                k_mask = k_mask.to(self.device, non_blocking=True)
+            if mask is not None:
+                mask = mask.to(self.device, non_blocking=True)
 
-            # Slice targets if needed
-            if self._target_idx is not None:
-                y_j = y_j.index_select(dim=-1, index=self._target_idx)
+            if dt.ndim == 3 and dt.shape[-1] == 1:
+                dt = dt.squeeze(-1)
 
-            # Forward pass (match training path)
-            dt_in = dt.squeeze(-1) if (dt.ndim == 3 and dt.shape[-1] == 1) else dt
-            pred = self.model(y_i, dt_in, g)
-            pred, tgt = self._harmonize_shapes(pred, y_j)
+            # Forward
+            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                pred = self.model(y_i, dt, g)
 
-            # Denormalize to physical units
-            y_pred = norm.denormalize(pred, species_keys)
-            y_true = norm.denormalize(tgt, species_keys)
+                if self.loss_returns_dict:
+                    loss_dict = self.criterion(pred, y_j, dt, mask)
+                    metrics['loss'] += loss_dict['total'].item()
+                    metrics['phys'] += loss_dict['phys'].item()
+                    metrics['z'] += loss_dict['z'].item()
+                else:
+                    if mask is not None and pred.ndim == 3:
+                        loss_elm = F.mse_loss(pred, y_j, reduction='none')
+                        m = mask.unsqueeze(-1).to(loss_elm.dtype)
+                        denom = (m.sum() * loss_elm.shape[-1]).clamp_min(1)
+                        loss = (loss_elm * m).sum() / denom
+                    else:
+                        loss = self.criterion(pred, y_j)
+                    metrics['loss'] += loss.item()
 
-            # Compute fractional L1 error
-            rel = (y_pred - y_true).abs() / (y_true.abs() + eps)
+            metrics['count'] += 1
 
-            # Apply mask if present
-            if k_mask is not None and rel.ndim == 3 and k_mask.ndim == 2:
-                w = k_mask.unsqueeze(-1).expand_as(rel)  # [B,K,S]
-                total += (rel * w).sum()
-                count += torch.count_nonzero(w).to(total.dtype)
-            else:
-                total += rel.sum()
-                count += torch.tensor(rel.numel(), device=self.device, dtype=total.dtype)
+        # Average
+        for key in metrics:
+            if key != 'count':
+                metrics[key] /= max(1, metrics['count'])
 
-        return (total / count).item() if count.item() > 0 else float("nan")
+        return metrics
+
+    def _save_checkpoint(self, epoch: int, is_best: bool = False):
+        """Save checkpoint with legacy naming for compatibility."""
+        checkpoint = {
+            'epoch': epoch,
+            'model': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'best_val_loss': self.best_val_loss,
+            'config': self.cfg
+        }
+
+        # Use legacy names for compatibility with existing pipeline
+        path = self.work_dir / ('best_model.pt' if is_best else 'last_model.pt')
+        torch.save(checkpoint, path)
+
+    def _log_metrics(
+            self,
+            epoch: int,
+            train_metrics: Dict[str, float],
+            val_metrics: Dict[str, float],
+            epoch_start: float
+    ):
+        """Log metrics to CSV."""
+        row = [
+            epoch,
+            f"{train_metrics['loss']:.6e}",
+            f"{val_metrics['loss']:.6e}",
+            f"{self.optimizer.param_groups[0]['lr']:.2e}",
+            f"{time.time() - epoch_start:.1f}"
+        ]
+
+        if self.loss_returns_dict:
+            row.extend([
+                f"{train_metrics.get('phys', 0):.6e}",
+                f"{train_metrics.get('z', 0):.6e}",
+                f"{val_metrics.get('phys', 0):.6e}",
+                f"{val_metrics.get('z', 0):.6e}"
+            ])
+
+        if self.rollout_enabled:
+            row.append(f"{train_metrics.get('rollout', 0):.6e}")
+
+        if self.semigroup_enabled:
+            row.append(f"{train_metrics.get('semigroup', 0):.6e}")
+
+        if self.kl_weight > 0:
+            row.append(f"{train_metrics.get('kl', 0):.6e}")
+
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+
+    @torch.no_grad()
+    def evaluate_rollout(
+            self,
+            num_steps: int = 100,
+            dt_value: float = 0.01,  # Note: this is normalized dt
+            batch_size: int = 16
+    ) -> Dict[str, float]:
+        """
+        Evaluate autoregressive rollout stability.
+
+        Args:
+            num_steps: Number of rollout steps
+            dt_value: Normalized time step (0.01 is near minimum dt)
+            batch_size: Batch size for meaningful variance computation
+
+        Returns:
+            Dictionary of rollout metrics
+        """
+        self.model.eval()
+
+        # Get batch for evaluation
+        batch = next(iter(self.val_loader or self.train_loader))
+        y_i, _, _, g = batch[:4]
+
+        # Use small batch for meaningful variance
+        B = min(batch_size, y_i.shape[0])
+        y_i = y_i[:B].to(self.device)
+        g = g[:B].to(self.device)
+        dt_step = torch.tensor([dt_value], device=self.device)
+
+        # Rollout
+        if hasattr(self.model, 'rollout'):
+            trajectory = self.model.rollout(y_i, g, dt_step, num_steps)
+        else:
+            trajectory = []
+            y_curr = y_i
+            for _ in range(num_steps):
+                y_next = self.model(y_curr, dt_step.unsqueeze(0).expand(B, -1), g)
+                if y_next.ndim == 3:
+                    y_next = y_next.squeeze(1)
+                trajectory.append(y_next)
+                y_curr = y_next
+            trajectory = torch.stack(trajectory, dim=1)
+
+        # Compute metrics
+        metrics = {}
+
+        # Check for NaN/Inf
+        metrics['has_nan'] = torch.isnan(trajectory).any().item()
+        metrics['has_inf'] = torch.isinf(trajectory).any().item()
+
+        # Variance across species dimension (meaningful with batch > 1)
+        var_initial = trajectory[:, 0, :].var(dim=0, unbiased=False).mean().item()
+        var_final = trajectory[:, -1, :].var(dim=0, unbiased=False).mean().item()
+        metrics['variance_ratio'] = var_final / (var_initial + 1e-8)
+
+        # Mean drift
+        mean_initial = trajectory[:, 0].mean().item()
+        mean_final = trajectory[:, -1].mean().item()
+        metrics['mean_drift'] = abs(mean_final - mean_initial)
+
+        # Check simplex constraint if using softmax (only for full species)
+        if getattr(self.model, 'softmax_head', False):
+            full_simplex = (getattr(self.model, 'S_out', None) == getattr(self.model, 'S_in', None))
+            has_stats = (getattr(self.model, 'log_mean', None) is not None) and (
+                    getattr(self.model, 'log_std', None) is not None)
+            if full_simplex and has_stats:
+                # Convert to physical space and check sum using model stats
+                mu = self.model.log_mean.to(trajectory.dtype).view(1, 1, -1)
+                sig = self.model.log_std.to(trajectory.dtype).view(1, 1, -1)
+                traj_log10 = trajectory * sig + mu
+                traj_phys = torch.pow(10.0, traj_log10)
+                sums = traj_phys.sum(dim=-1)
+                metrics['max_simplex_error'] = (sums - 1.0).abs().max().item()
+                metrics['mean_simplex_error'] = (sums - 1.0).abs().mean().item()
+
+        return metrics
+
+    def check_model_health(self) -> dict:
+        """Check model parameters and gradients for issues."""
+        health = {
+            'has_nan_params': False,
+            'has_inf_params': False,
+            'max_param': 0.0,
+            'max_grad': 0.0,
+            'problem_layers': []
+        }
+
+        for name, param in self.model.named_parameters():
+            # Check parameters
+            if torch.isnan(param).any():
+                health['has_nan_params'] = True
+                health['problem_layers'].append(f"{name} (NaN param)")
+            if torch.isinf(param).any():
+                health['has_inf_params'] = True
+                health['problem_layers'].append(f"{name} (Inf param)")
+
+            param_max = param.abs().max().item()
+            health['max_param'] = max(health['max_param'], param_max)
+
+            # Check gradients
+            if param.grad is not None:
+                if torch.isnan(param.grad).any():
+                    health['problem_layers'].append(f"{name} (NaN grad)")
+                if torch.isinf(param.grad).any():
+                    health['problem_layers'].append(f"{name} (Inf grad)")
+
+                grad_max = param.grad.abs().max().item()
+                health['max_grad'] = max(health['max_grad'], grad_max)
+
+        return health

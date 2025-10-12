@@ -21,7 +21,7 @@ import torch
 
 # ------------------------- SETTINGS -------------------------------------------
 
-MODEL_NAME: str = "v4_2"
+MODEL_NAME: str = "koopman-v1"
 
 MODEL_DIR      = Path("../models") / MODEL_NAME
 GPU_BASENAME   = "export_k1_gpu.pt2"

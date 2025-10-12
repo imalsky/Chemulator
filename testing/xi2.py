@@ -33,7 +33,7 @@ SRC  = ROOT / "src"                         # to import normalizer.py
 
 # Exact files to use
 NORM_PATH   = ROOT / "data" / "processed" / "normalization.json"
-MODEL_PATH  = ROOT / "models" / "v4_2" / "export_k1_cpu.pt2"   # ← pick the exact model here
+MODEL_PATH  = ROOT / "models" / "koopman-v1" / "export_k1_cpu.pt2"   # ← pick the exact model here
 VULCAN_PATH = Path("/Users/imalsky/Desktop/Chemistry_Project/Vulcan/0D_full_NCHO/solar/vul-T1000KlogP3.0-NCHO-solar_hot_ini.vul")
 
 # Physical globals for this run (units must match your training setup)
@@ -41,7 +41,7 @@ T_K  = 1000.0   # Kelvin
 P_Pa = 100.0    # Pascals
 
 # Time window drawn from the VULCAN profile
-T0      = 1.0e0     # start time [s]
+T0      = 1.0e6     # start time [s]
 T_FINAL = 1e11     # end time [s]
 
 # Plot controls

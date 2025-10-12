@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 # ========================== CONFIG ============================================
 
-MODEL_NAME: str = "v4_4"   # folder under ./models/
+MODEL_NAME: str = "koopman-v1"   # folder under ./models/
 OUT_CPU: str   = "export_k1_cpu.pt2"
 OUT_GPU: str   = "export_k1_gpu.pt2"      # written only if a GPU backend exists
 WRITE_META: bool = True                   # write a .meta.json next to each artifact

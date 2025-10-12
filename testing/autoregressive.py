@@ -43,7 +43,7 @@ def _find_repo(start: Path) -> Path:
     return start.resolve().parent.parent  # fallback
 
 REPO = _find_repo(Path(__file__).resolve())
-MODEL_DIR = REPO / "models/v4_2"   # <- adjust if needed
+MODEL_DIR = REPO / "models/koopman-v1"   # <- adjust if needed
 
 # Artifact names
 GPU_BASENAME = "export_k1_gpu.pt2"

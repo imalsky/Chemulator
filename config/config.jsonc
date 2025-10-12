@@ -1,150 +1,190 @@
 {
-  // ========== PATH CONFIGURATION ==========
+  // ========================================
+  // PATH CONFIGURATION
+  // ========================================
   "paths": {
-    "processed_data_dir": "data/processed",
-    "work_dir": "models/v4",
-    "raw_data_files": []
+    "processed_data_dir": "data/processed",     // Normalized data location
+    "work_dir": "models/koopman-v1",           // Model checkpoints and logs
+    "raw_data_files": []                       // Auto-detects from data/raw if empty
   },
 
-  // ========== DATA SCHEMA ==========
+  // ========================================
+  // DATA SCHEMA
+  // ========================================
   "data": {
-    "global_variables": ["P", "T"],
-    "time_variable": "t_time"
+    "global_variables": ["P", "T"],            // Global features (pressure, temperature)
+    "time_variable": "t_time"                 // Time column name in raw data
+    // species_variables: auto-detected from raw data
+    // target_species: defaults to all species (set to subset if needed)
+    // If using subset, set model.allow_partial_simplex: true
   },
 
-  // ========== NORMALIZATION STRATEGY ==========
+  // ========================================
+  // NORMALIZATION STRATEGY (DO NOT CHANGE)
+  // Critical for stiff systems - log transforms handle 10+ order magnitude ranges
+  // ========================================
   "normalization": {
-    "default_method": "log-standard",
+    "default_method": "log-standard",          // Default for species: log10 then z-score
     "methods": {
-      "dt":     "log-min-max",
-      "t_time": "log-min-max",
-      "P":      "log-min-max",
-      "T":      "standard"
+      "dt":     "log-min-max",                // Time steps: log-normalized to [0,1]
+      "t_time": "log-min-max",                // Absolute time: log-normalized
+      "P":      "log-min-max",                // Pressure: log-normalized
+      "T":      "standard"                    // Temperature: linear z-score
     },
-    "epsilon": 1e-30,
-    "min_std": 1e-10,
-    "clamp_value": 1e10
+    "epsilon": 1e-30,                         // Floor value before log transform
+    "min_std": 1e-10,                        // Minimum std to prevent division issues
+    "clamp_value": 1e10                      // Max value to prevent overflow
   },
 
-  // ========== PREPROCESSING SETTINGS ==========
+  // ========================================
+  // PREPROCESSING SETTINGS (DO NOT CHANGE)
+  // Optimized for large-scale chemical datasets
+  // ========================================
   "preprocessing": {
-    "min_value_threshold": 0,
-    "trajectories_per_shard": 32768,
-    "npz_compressed": false,
-    "num_workers": 48,
-    "hdf5_chunk_size": 0
+    "min_value_threshold": 0,                 // Keep all positive values
+    "trajectories_per_shard": 32768,         // Shard size for parallel processing
+    "npz_compressed": false,                  // Uncompressed for faster loading
+    "num_workers": 48,                        // Parallel preprocessing threads
+    "hdf5_chunk_size": 0                     // 0 = use NPZ format instead
   },
 
-  // ========== DATASET CONFIGURATION ==========
+  // ========================================
+  // DATASET CONFIGURATION
+  // Multi-time sampling for temporal consistency
+  // ========================================
   "dataset": {
-    "require_dt_stats": true,
-    "precompute_dt_table": true,
-    "multi_time_per_anchor": true,
-    "times_per_anchor": 8,
-    "share_times_across_batch": false,
-    "uniform_offset_sampling": false,
-    "preload_train_to_gpu": false,
-    "preload_val_to_gpu": false,
-    "num_workers": 24,
-    "pin_memory": true,
-    "prefetch_factor": 2,
-    "persistent_workers": true
+    // Time sampling strategy
+    "require_dt_stats": true,                 // Compute dt statistics for model
+    "precompute_dt_table": true,             // Cache all possible dt values
+    "multi_time_per_anchor": true,           // Sample multiple future times per anchor
+    "times_per_anchor": 6,                  // Number of future times per anchor point
+    "share_times_across_batch": false,       // Independent time sampling per trajectory
+    "uniform_offset_sampling": false,        // Use trajectory's natural distribution
+
+    // DataLoader settings
+    "preload_train_to_gpu": false,           // Set true if dataset fits in VRAM
+    "preload_val_to_gpu": false,             // Set true for faster validation
+    "num_workers": 48,                        // 0 when using GPU-resident data
+    "pin_memory": true,                      // Faster GPU transfer
+    "prefetch_factor": 4,                    // Prefetch batches
+    "persistent_workers": true,              // Keep workers alive between epochs
+    "storage_dtype": "float32"               // Full precision for accuracy
   },
 
-  // ========== TRAINING CONFIGURATION ==========
+  // ========================================
+  // TRAINING CONFIGURATION
+  // ========================================
   "training": {
-    "loss_mode": "adaptive_stiff",
+    // ---------- Loss Configuration ----------
+    "loss_mode": "adaptive_stiff",           // Use adaptive loss for stiff systems
 
     "adaptive_stiff_loss": {
-      "lambda_phys": 1.0,
-      "lambda_z": 1.0,
-      "epsilon_phys": 1e-20,
-      "eps_elem": 1e-12,
-      "use_fractional": false,
-      "time_edge_gain": 1.0,
-      "elemental_conservation": false,
-      "elemental_penalty": 0.01,
-      "elements": ["H", "C", "N", "O"],
-      "elemental_mode": "relative",
-      "elemental_weights": "auto",
-      "debug_parser": false
+      "lambda_phys": 1.0,                   // Weight for MAE in log10 physical space
+      "lambda_z": 1.0,                     // Weight for MSE in z-space (stabilizer)
+      "time_weight_mode": "none"            // Options: "none", "edges", "exponential"
     },
 
-    "loss_epsilon": 1e-20,
-    "loss_rel_cap": 10.0,
+    // ---------- Auxiliary Losses ----------
+    // Critical for autoregressive stability
+    "auxiliary_losses": {
+      // Rollout loss: multi-step consistency
+      "rollout_enabled": true,              // Essential for AR stability
+      "rollout_weight": 0.05,                // Increase if AR diverges
+      "rollout_horizon": 4,                 // Maximum rollout steps
 
-    // Training schedule
-    "epochs": 100,
-    "val_fraction": 0.1,
-    "test_fraction": 0.1,
-    "use_fraction": 1.0,
+      // Teacher forcing schedule
+      "rollout_teacher_forcing": {
+        "mode": "cosine_ramp",              // Smooth transition from TF to AR
+        "start_p": 1.0,                    // 100% teacher forcing initially
+        "end_p": 0.1,                      // Keep 10% TF for stability
+        "end_epoch": 50                    // Ramp down over 80 epochs
+      },
 
-    // Batch configuration
-    "batch_size": 16384,
-    "val_batch_size": 65536,
-    "pairs_per_traj": 48,
-    "pairs_per_traj_val": 1,
-    "min_steps": 1,
-    "max_steps": 99,
+      // Semigroup loss: composition consistency f(t1+t2) = f(t2)∘f(t1)
+      "semigroup_enabled": false,           // Enforce temporal consistency
+      "semigroup_weight": 0.1             // Small weight to avoid over-regularization
+    },
 
-    // Optimizer settings
-    "lr": 2e-4,
-    "min_lr": 1e-6,
-    "warmup_epochs": 10,
-    "weight_decay": 1e-5,
-    "gradient_clip": 0.5,
+    // ---------- Training Schedule ----------
+    "epochs": 100,                         // Total training epochs
+    "val_fraction": 0.1,                  // 10% of data for validation
+    "test_fraction": 0.1,                 // 10% of data for testing
+    "use_fraction": 1.0,                  // Use full dataset (reduce for debugging)
 
-    // VAE KL divergence weight (NEW - required for VAE mode)
-    "beta_kl": 0.01,
+    // ---------- Batch Configuration ----------
+    "batch_size": 4096,                   // Reduced for stability with aux losses
+    "val_batch_size": 4096,              // Larger batch for validation
+    "pairs_per_traj": 8,                 // Anchor-target pairs per trajectory
+    "pairs_per_traj_val": 2,              // Single pair for validation
+    "min_steps": 1,                       // Minimum trajectory length
+    "max_steps": 99,                      // Maximum trajectory length
 
-    // Performance options
-    "torch_compile": true,
-    "max_train_steps_per_epoch": 0,
-    "max_val_batches": 0,
+    // ---------- Optimizer Settings ----------
+    "lr": 1e-4,                           // Initial learning rate
+    "min_lr": 1e-6,                      // Minimum LR for cosine schedule
+    "warmup_epochs": 10,                   // Linear warmup period
+    "weight_decay": 1e-5,                 // L2 regularization
+    "gradient_clip": 0.5,                 // Gradient norm clipping
 
-    // Checkpointing
-    "resume": null,
-    "auto_resume": false
+    // ---------- VAE Regularization ----------
+    "beta_kl": 0.00,                    // KL divergence weight (small for stability)
+
+    // ---------- Checkpointing ----------
+    "resume": "auto"                     // "auto" finds latest checkpoint
   },
 
-  // ========== MODEL ARCHITECTURE (AUTOENCODER) ==========
+  // ========================================
+  // KOOPMAN MODEL ARCHITECTURE
+  // ========================================
   "model": {
-    // Latent space configuration
-    "latent_dim": 512,
-    "encoder_hidden": [512, 512, 512, 512],
-    "dynamics_hidden": [512, 512, 512, 512],
-    "decoder_hidden": [512, 512, 512, 512],
+    // ---------- Latent Space ----------
+    "latent_dim": 128,                    // Latent dimension (balance expressiveness/stability)
 
-    // VAE mode (set true to enable KL regularization)
-    "vae_mode": true,
+    // ---------- Encoder/Decoder ----------
+    "encoder_hidden": [256, 256, 256, 256], // Deep encoder for complex chemistry
+    "decoder_hidden": [256, 256, 256, 256], // Symmetric decoder architecture
 
-    // Dynamics residual connection
-    "dynamics_residual": true,
+    // ---------- Koopman Dynamics ----------
+    "koopman": {
+      "bias_hidden": 256,                 // Hidden dim for bias network
+      "use_dt_gate": true,               // Gate updates based on dt
+      "gate_type": "scalar",            // "scalar" or "vector" gating
+      "lambda_depends_on_dt": false      // Adaptive rates for variable stiffness
+    },
 
-    // Output head configuration
-    "softmax_head": false,
-    "allow_partial_simplex": false,
-    "predict_delta": true,
-    "predict_delta_log_phys": false,
+    // ---------- VAE Configuration ----------
+    "vae_mode": false,                    // VAE regularization (deterministic at eval)
 
-    // Regularization
-    "activation": "leakyrelu",
-    "dropout": 0.0
+    // ---------- Output Head ----------
+    "predict_delta": false,               // Residual connection helps identity mapping
+    "predict_delta_log_phys": false,    // Don't use (softmax handles it)
+    "softmax_head": true,               // Enforce simplex constraint for mole fractions
+    "allow_partial_simplex": false,     // Set true only if using species subset
+
+    // ---------- Activation ----------
+    "activation": "silu",                // Smooth activation for gradients
+    "dropout": 0.0                      // No dropout (VAE provides regularization)
   },
 
-  // ========== MIXED PRECISION TRAINING ==========
+  // ========================================
+  // MIXED PRECISION TRAINING
+  // ========================================
   "mixed_precision": {
-    "mode": "bf16"
+    "mode": "bf16"                       // BF16 recommended (FP16 less stable)
+    // Options: "none", "fp16", "bf16"
+    // BF16 maintains FP32 range with reduced precision
   },
 
-  // ========== SYSTEM/HARDWARE SETTINGS ==========
+  // ========================================
+  // SYSTEM/HARDWARE SETTINGS
+  // ========================================
   "system": {
-    "seed": 42,
-    "dtype": "float32",
-    "io_dtype": "float32",
-    "omp_threads": 8,
-    "tf32": true,
-    "cudnn_benchmark": true,
-    "deterministic": false
+    "seed": 42,                         // Random seed for reproducibility
+    "dtype": "float32",                 // Default tensor dtype
+    "io_dtype": "float32",              // I/O precision
+    "omp_threads": 8,                   // OpenMP threads for CPU ops
+    "tf32": true,                       // Enable TF32 on Ampere+ GPUs
+    "cudnn_benchmark": true,            // Auto-tune convolution algorithms
+    "deterministic": false              // True for exact reproducibility (slower)
   }
 }

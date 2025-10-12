@@ -12,7 +12,7 @@ from matplotlib.lines import Line2D
 # --------------------------- Paths & Imports ---------------------------------
 
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models/v4_2"   # <- change if needed
+MODEL_DIR = REPO / "models/koopman-v1"   # <- change if needed
 EP_FILENAME = "export_k1_cpu.pt2"                     # required by your request
 
 # Add src to path
