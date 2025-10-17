@@ -14,7 +14,7 @@ Pipeline:
    - If not, run the preprocessor, then re-hydrate from the newly written artifacts
 4) Build datasets and dataloaders (optionally GPU-resident for throughput)
 5) Create model
-6) Train with the shape-agnostic Trainer
+6) Train with the shape-agnostic Trainer (now using PyTorch Lightning)
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from hardware import setup_device, optimize_hardware
 from preprocessor import DataPreprocessor
 from dataset import FlowMapPairsDataset, create_dataloader
 from model import create_model
-from trainer import Trainer
+from trainer import Trainer  # Now using PyTorch Lightning version
 
 # --------------------------------------------------------------------------------------
 # Configuration constants
@@ -483,10 +483,10 @@ def build_model(
     model.to(device)
 
     # --- I/O dimension + target-index diagnostics (robust to old/new model variants) ---
-    S_in  = getattr(model, "S_in", getattr(model, "S", None))
+    S_in = getattr(model, "S_in", getattr(model, "S", None))
     S_out = getattr(model, "S_out", getattr(model, "S", None))
-    G     = getattr(model, "G", "?")
-    p     = getattr(model, "p", "?")
+    G = getattr(model, "G", "?")
+    p = getattr(model, "p", "?")
     logger.info(f"Model dims: S_in={S_in}, S_out={S_out}, G={G}, p={p}")
 
     ti = getattr(model, "target_idx", None)
@@ -496,34 +496,11 @@ def build_model(
         except Exception:
             # Fallback if it's a plain list / numpy / CPU tensor without .detach()
             logger.info(f"Target indices: {list(map(int, ti))}")
-
-    # Model architecture summary - REPLACE THIS SECTION
-    model_cfg = cfg.get("model", {})
-    if "latent_dim" in model_cfg:
-        logger.info(
-            "Model architecture (AE): "
-            f"latent_dim={int(model_cfg.get('latent_dim', 32))}, "
-            f"enc={list(model_cfg.get('encoder_hidden', [256,128]))}, "
-            f"dynamics={list(model_cfg.get('dynamics_hidden', [256,256]))}, "
-            f"dec={list(model_cfg.get('decoder_hidden', [128,256]))}, "
-            f"vae_mode={bool(model_cfg.get('vae_mode', False))}, "
-            f"predict_delta={bool(model_cfg.get('predict_delta', True))}, "
-            f"delta_log_phys={bool(model_cfg.get('predict_delta_log_phys', False))}"
-        )
-    else:
-        logger.info(
-            "Model architecture (DeepONet): "
-            f"p={int(model_cfg.get('p', 256))}, "
-            f"branch_width={int(model_cfg.get('branch_width', 1024))}, "
-            f"branch_depth={int(model_cfg.get('branch_depth', 3))}, "
-            f"trunk_layers={list(model_cfg.get('trunk_layers', [512, 512]))}, "
-            f"predict_delta={bool(model_cfg.get('predict_delta', True))}, "
-            f"trunk_dedup={bool(model_cfg.get('trunk_dedup', False))}"
-        )
     return model
 
+
 # --------------------------------------------------------------------------------------
-# Resume control (NEW)
+# Resume control
 # --------------------------------------------------------------------------------------
 
 def apply_resume_overrides(cfg: Dict[str, Any], cli_resume: Optional[str], logger: logging.Logger) -> None:
@@ -575,7 +552,7 @@ def main() -> None:
     """
     Full training pipeline orchestration.
     """
-    # Parse command line arguments (NEW)
+    # Parse command line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH,
                         help="Path to config file")
@@ -591,15 +568,17 @@ def main() -> None:
     cfg = load_json_config(str(args.config))
 
     # Set/ensure common run-time parameters
-    #cfg.setdefault("paths", {})["work_dir"] = str(GLOBAL_WORK_DIR)
     cfg.setdefault("system", {})["seed"] = GLOBAL_SEED
 
-    # Apply resume overrides (NEW)
+    # Apply resume overrides
     apply_resume_overrides(cfg, args.resume, logger)
 
-    # Prepare work directory and persist the config used to launch this run
-    work_dir = Path(cfg["paths"]["work_dir"]).expanduser().resolve()
+    # Fix: Ensure work_dir exists in config with fallback
+    paths = cfg.setdefault("paths", {})
+    work_dir = Path(paths.get("work_dir", GLOBAL_WORK_DIR)).expanduser().resolve()
+    paths["work_dir"] = str(work_dir)  # Normalize back into cfg
     work_dir.mkdir(parents=True, exist_ok=True)
+
     config_save_path = work_dir / "config.json"
     dump_json(config_save_path, cfg)
     logger.info(f"Saved training configuration to {config_save_path}")
@@ -631,7 +610,7 @@ def main() -> None:
     # Build model
     model = build_model(cfg, device, logger)
 
-    # Initialize trainer and train
+    # Initialize trainer and train (now uses PyTorch Lightning internally)
     trainer = Trainer(
         model=model,
         train_loader=train_loader,

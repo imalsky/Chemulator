@@ -43,7 +43,7 @@ def _find_repo(start: Path) -> Path:
     return start.resolve().parent.parent  # fallback
 
 REPO = _find_repo(Path(__file__).resolve())
-MODEL_DIR = REPO / "models/koopman-v1"   # <- adjust if needed
+MODEL_DIR = REPO / "models/koopman-v2"   # <- adjust if needed
 
 # Artifact names
 GPU_BASENAME = "export_k1_gpu.pt2"
@@ -63,7 +63,7 @@ except Exception:
 # =============================================================================
 
 # Trajectory to visualize
-SAMPLE_IDX: int = 5
+SAMPLE_IDX: int = 2
 
 # Prediction mode
 PLOT_MODE: Literal["full_direct", "const_direct", "profile_autoreg"] = "profile_autoreg"

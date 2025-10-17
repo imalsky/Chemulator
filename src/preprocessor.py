@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Data Preprocessing Module
-=========================
+Data Preprocessing Module (FIXED FOR FEWER SHARDS)
+===================================================
 Converts HDF5 trajectory data to NPZ shards with normalization statistics.
+
+Key fix: Now buffers trajectories across multiple files to create fewer,
+larger shards rather than many small ones.
 
 This module handles the complete preprocessing pipeline:
 1. Scans HDF5 files to identify valid trajectories
@@ -225,6 +228,7 @@ class DataPreprocessor:
     """
     Main preprocessing pipeline for converting HDF5 to NPZ shards.
     Uses MPI for parallel processing on HPC systems.
+    FIXED: Now creates fewer, larger shards by buffering across files.
     """
 
     def __init__(
@@ -330,14 +334,17 @@ class DataPreprocessor:
         self.min_std = float(load_config_value(norm_cfg, ["min_std"], required=True))
         self.clamp_value = float(load_config_value(norm_cfg, ["clamp_value"], required=True))
 
-        # Preprocessing
+        # Preprocessing - with better defaults for fewer shards
         preproc_cfg = self.cfg.get("preprocessing", {})
         self.npz_compressed = bool(load_config_value(
             preproc_cfg, ["npz_compressed"], required=True
         ))
+
+        # CHANGED: Default to 4096 trajectories per shard for much fewer files
         self.traj_per_shard = int(load_config_value(
-            preproc_cfg, ["trajectories_per_shard"], required=True
+            preproc_cfg, ["trajectories_per_shard"], default=4096
         ))
+
         self.hdf5_chunk_size = int(load_config_value(
             preproc_cfg, ["hdf5_chunk_size"], default=DEFAULT_HDF5_CHUNK_SIZE
         ))
@@ -362,6 +369,7 @@ class DataPreprocessor:
                 self.logger.info(f"Using MPI with {self.size} ranks")
             else:
                 self.logger.info("Serial mode (MPI disabled)")
+            self.logger.info(f"Trajectories per shard: {self.traj_per_shard}")
 
         # Training configuration
         train_cfg = self.cfg.get("training", {})
@@ -752,7 +760,7 @@ class DataPreprocessor:
 
     def _write_shards_and_collect_stats_parallel(self) -> Dict[str, RunningStatistics]:
         """
-        Write NPZ shards and collect training statistics using MPI parallelization.
+        FIXED: Write NPZ shards with global buffers across files to create fewer shards.
 
         Returns:
             Dictionary of statistics for each variable (aggregated across all ranks)
@@ -790,16 +798,23 @@ class DataPreprocessor:
         if self.comm:
             self.comm.Barrier()
 
+        # FIXED: Global buffers that persist across all files
+        global_buffers = {
+            "train": {"x0": [], "g": [], "t": [], "y": []},
+            "validation": {"x0": [], "g": [], "t": [], "y": []},
+            "test": {"x0": [], "g": [], "t": [], "y": []},
+        }
+
+        # Use a consistent file tag for mixed trajectories
+        filetag = f"mix_r{self.rank}"
+
         # Distribute work across ranks
         work_items = []
         for path_str in self.raw_files:
             valid_groups = self._valid_group_names.get(str(path_str), [])
             if valid_groups:
-                # Create chunks of groups for better load balancing
-                chunk_size = max(100, len(valid_groups) // (self.size * 4))  # Aim for 4 chunks per rank
-                for i in range(0, len(valid_groups), chunk_size):
-                    chunk = valid_groups[i:i + chunk_size]
-                    work_items.append((path_str, chunk))
+                # CHANGED: Don't chunk within files - process all groups at once
+                work_items.append((path_str, valid_groups))
 
         # Distribute work items across ranks
         if self.comm:
@@ -815,21 +830,68 @@ class DataPreprocessor:
         # Use a rank-specific shard counter to avoid collisions
         shard_counter = self.rank * 100000  # Each rank gets a range of 100k shard numbers
 
+        # Function to flush a buffer when it's full
+        def flush_buffer_if_full(split_name):
+            nonlocal shard_counter
+            buffer = global_buffers[split_name]
+            if len(buffer["x0"]) >= self.traj_per_shard:
+                self._write_shard(
+                    self.processed_dir / split_name,
+                    buffer,
+                    filetag,
+                    split_name,
+                    shard_counter
+                )
+                local_shards_metadata[split_name].append({
+                    "filename": f"shard_{split_name}_{filetag}_{shard_counter:05d}.npz",
+                    "n_trajectories": len(buffer["x0"])
+                })
+                shard_counter += 1
+                # Clear the buffer
+                for key in buffer:
+                    buffer[key].clear()
+
         # Progress tracking
         if self.rank == 0:
             total_work = len(work_items)
-            self.logger.info(f"Processing {total_work} work chunks across all ranks")
+            self.logger.info(f"Processing {total_work} files across all ranks")
 
-        for work_idx, (path_str, group_chunk) in enumerate(my_work):
+        for work_idx, (path_str, groups) in enumerate(my_work):
             if self.rank == 0 and work_idx % 10 == 0:
-                self.logger.info(f"Rank 0 processing chunk {work_idx + 1}/{len(my_work)}")
+                self.logger.info(f"Rank 0 processing file {work_idx + 1}/{len(my_work)}")
 
-            shard_counter = self._process_chunk_to_shards(
-                Path(path_str), group_chunk, seed,
-                local_split_counts, local_shards_metadata,
-                local_train_stats, shard_counter
+            # Process this file's groups into global buffers
+            self._add_file_to_buffers(
+                Path(path_str), groups, seed,
+                global_buffers, local_split_counts,
+                local_train_stats, flush_buffer_if_full
             )
-            # shard_counter now reflects how many shards were actually written
+
+        # FIXED: Final flush of any remaining trajectories
+        for split_name in ("train", "validation", "test"):
+            buffer = global_buffers[split_name]
+            if buffer["x0"]:  # If there's anything left
+                self._write_shard(
+                    self.processed_dir / split_name,
+                    buffer,
+                    filetag,
+                    split_name,
+                    shard_counter
+                )
+                local_shards_metadata[split_name].append({
+                    "filename": f"shard_{split_name}_{filetag}_{shard_counter:05d}.npz",
+                    "n_trajectories": len(buffer["x0"])
+                })
+                shard_counter += 1
+
+        # Log shard statistics for this rank
+        if self.rank == 0 or not self.comm:
+            self.logger.info(
+                f"Rank {self.rank} created shards: "
+                f"train={len(local_shards_metadata['train'])}, "
+                f"val={len(local_shards_metadata['validation'])}, "
+                f"test={len(local_shards_metadata['test'])}"
+            )
 
         # Aggregate statistics across all ranks
         if self.comm:
@@ -859,7 +921,12 @@ class DataPreprocessor:
                 self._write_preprocessing_summary(merged_split_counts)
 
                 self.logger.info(
-                    f"Wrote shards - train: {merged_split_counts['train']}, "
+                    f"Created shards - train: {len(merged_shards_metadata['train'])}, "
+                    f"validation: {len(merged_shards_metadata['validation'])}, "
+                    f"test: {len(merged_shards_metadata['test'])}"
+                )
+                self.logger.info(
+                    f"Total trajectories - train: {merged_split_counts['train']}, "
                     f"validation: {merged_split_counts['validation']}, "
                     f"test: {merged_split_counts['test']}"
                 )
@@ -872,143 +939,37 @@ class DataPreprocessor:
             self._write_shard_index(local_shards_metadata)
             self._write_preprocessing_summary(local_split_counts)
             self.logger.info(
-                f"Wrote shards - train: {local_split_counts['train']}, "
+                f"Created shards - train: {len(local_shards_metadata['train'])}, "
+                f"validation: {len(local_shards_metadata['validation'])}, "
+                f"test: {len(local_shards_metadata['test'])}"
+            )
+            self.logger.info(
+                f"Total trajectories - train: {local_split_counts['train']}, "
                 f"validation: {local_split_counts['validation']}, "
                 f"test: {local_split_counts['test']}"
             )
             return local_train_stats
 
-    def _merge_statistics(self, all_stats: List[Dict[str, RunningStatistics]]) -> Dict[str, RunningStatistics]:
-        """
-        Merge statistics from multiple ranks using Welford's algorithm.
-
-        Args:
-            all_stats: List of statistics dictionaries from each rank
-
-        Returns:
-            Merged statistics dictionary
-        """
-        if not all_stats:
-            return {}
-
-        # Initialize with first rank's stats structure
-        merged = {}
-        all_keys = all_stats[0].keys()
-
-        for key in all_keys:
-            # Get configuration from first rank
-            first_stat = all_stats[0][key]
-            merged_stat = RunningStatistics(
-                need_mean_std=first_stat.need_mean_std,
-                need_min_max=first_stat.need_min_max,
-                need_log=first_stat.need_log,
-                epsilon=first_stat.epsilon
-            )
-
-            # Merge raw statistics
-            if first_stat.need_mean_std or first_stat.need_min_max:
-                total_count = 0
-                total_mean = 0.0
-                total_M2 = 0.0
-                global_min = math.inf
-                global_max = -math.inf
-
-                for rank_stats in all_stats:
-                    stat = rank_stats[key]
-                    if stat.raw and stat.raw.count > 0:
-                        # Merge using parallel Welford's algorithm
-                        rank_count = stat.raw.count
-                        rank_mean = stat.raw.mean
-                        rank_M2 = stat.raw.M2
-
-                        delta = rank_mean - total_mean
-                        new_count = total_count + rank_count
-                        new_mean = total_mean + delta * (rank_count / new_count) if new_count > 0 else 0
-                        new_M2 = total_M2 + rank_M2 + delta * delta * (
-                                    total_count * rank_count / new_count) if new_count > 0 else 0
-
-                        total_count = new_count
-                        total_mean = new_mean
-                        total_M2 = new_M2
-                        global_min = min(global_min, stat.raw.min_val)
-                        global_max = max(global_max, stat.raw.max_val)
-
-                if total_count > 0:
-                    merged_stat.raw = WelfordAccumulator()
-                    merged_stat.raw.count = total_count
-                    merged_stat.raw.mean = total_mean
-                    merged_stat.raw.M2 = total_M2
-                    merged_stat.raw.min_val = global_min
-                    merged_stat.raw.max_val = global_max
-
-            # Merge log statistics
-            if first_stat.need_log:
-                total_count = 0
-                total_mean = 0.0
-                total_M2 = 0.0
-                global_min = math.inf
-                global_max = -math.inf
-
-                for rank_stats in all_stats:
-                    stat = rank_stats[key]
-                    if stat.log and stat.log.count > 0:
-                        rank_count = stat.log.count
-                        rank_mean = stat.log.mean
-                        rank_M2 = stat.log.M2
-
-                        delta = rank_mean - total_mean
-                        new_count = total_count + rank_count
-                        new_mean = total_mean + delta * (rank_count / new_count) if new_count > 0 else 0
-                        new_M2 = total_M2 + rank_M2 + delta * delta * (
-                                    total_count * rank_count / new_count) if new_count > 0 else 0
-
-                        total_count = new_count
-                        total_mean = new_mean
-                        total_M2 = new_M2
-                        global_min = min(global_min, stat.log.min_val)
-                        global_max = max(global_max, stat.log.max_val)
-
-                if total_count > 0:
-                    merged_stat.log = WelfordAccumulator()
-                    merged_stat.log.count = total_count
-                    merged_stat.log.mean = total_mean
-                    merged_stat.log.M2 = total_M2
-                    merged_stat.log.min_val = global_min
-                    merged_stat.log.max_val = global_max
-
-            merged[key] = merged_stat
-
-        return merged
-
-    def _process_chunk_to_shards(
+    def _add_file_to_buffers(
             self,
             path: Path,
-            group_chunk: List[str],
+            groups: List[str],
             seed: int,
+            global_buffers: Dict[str, Dict[str, List]],
             split_counts: Dict[str, int],
-            shards_metadata: Dict[str, List],
             train_stats: Dict[str, RunningStatistics],
-            shard_counter: int
-    ) -> int:
-        """Process a chunk of groups from a single HDF5 file and write to shards.
+            flush_callback
+    ) -> None:
+        """
+        Add a file's trajectories to global buffers.
 
-        Returns:
-            Updated shard_counter after writing any shards from this chunk.
+        This replaces the old _process_chunk_to_shards method.
         """
         # Deterministic shuffling using deterministic_hash for reproducibility
         file_hash_seed = int(deterministic_hash(path.name, seed) * 2 ** 32)
         rng = np.random.default_rng(seed ^ file_hash_seed)
-        order = rng.permutation(len(group_chunk))
-        groups_ordered = [group_chunk[i] for i in order]
-
-        # Buffers for batching - use less memory by flushing more frequently
-        max_buffer_size = self.traj_per_shard
-
-        buffers = {
-            "train": {"x0": [], "g": [], "t": [], "y": []},
-            "validation": {"x0": [], "g": [], "t": [], "y": []},
-            "test": {"x0": [], "g": [], "t": [], "y": []},
-        }
+        order = rng.permutation(len(groups))
+        groups_ordered = [groups[i] for i in order]
 
         with h5py.File(path, "r") as hdf:
             for group_name in groups_ordered:
@@ -1060,11 +1021,12 @@ class DataPreprocessor:
                 # Initial condition
                 x0 = species_matrix[0, :].astype(self.storage_dtype, copy=False)
 
-                # Add to buffer
-                buffers[split]["x0"].append(x0)
-                buffers[split]["g"].append(global_values.astype(self.storage_dtype, copy=False))
-                buffers[split]["t"].append(time_data.astype(self.storage_dtype, copy=False))
-                buffers[split]["y"].append(species_matrix.astype(self.storage_dtype, copy=False))
+                # Add to global buffer
+                buffer = global_buffers[split]
+                buffer["x0"].append(x0)
+                buffer["g"].append(global_values.astype(self.storage_dtype, copy=False))
+                buffer["t"].append(time_data.astype(np.float64, copy=False))
+                buffer["y"].append(species_matrix.astype(self.storage_dtype, copy=False))
                 split_counts[split] += 1
 
                 # Update training statistics
@@ -1073,45 +1035,110 @@ class DataPreprocessor:
                         train_stats, time_data, global_values, species_matrix
                     )
 
-                # Flush buffers if they exceed max_buffer_size
-                for split_name in ("train", "validation", "test"):
-                    buffer = buffers[split_name]
-                    if len(buffer["x0"]) >= max_buffer_size:
-                        self._write_shard(
-                            self.processed_dir / split_name,
-                            buffer,
-                            f"{path.stem[:20]}_r{self.rank}",
-                            split_name,
-                            shard_counter
-                        )
-                        shards_metadata[split_name].append({
-                            "filename": f"shard_{split_name}_{path.stem[:20]}_r{self.rank}_{shard_counter:05d}.npz",
-                            "n_trajectories": len(buffer["x0"])
-                        })
-                        shard_counter += 1
-                        for key in buffer.keys():
-                            buffer[key].clear()
+                # Flush buffer if it's full
+                flush_callback(split)
 
-        # Flush remaining buffers
-        for split_name in ("train", "validation", "test"):
-            buffer = buffers[split_name]
-            if buffer["x0"]:
-                self._write_shard(
-                    self.processed_dir / split_name,
-                    buffer,
-                    f"{path.stem[:20]}_r{self.rank}",
-                    split_name,
-                    shard_counter
-                )
-                shards_metadata[split_name].append({
-                    "filename": f"shard_{split_name}_{path.stem[:20]}_r{self.rank}_{shard_counter:05d}.npz",
-                    "n_trajectories": len(buffer["x0"])
-                })
-                shard_counter += 1
-                for key in buffer.keys():
-                    buffer[key].clear()
+    def _merge_statistics(self, all_stats: List[Dict[str, RunningStatistics]]) -> Dict[str, RunningStatistics]:
+        """
+        Merge statistics from multiple ranks using Welford's algorithm.
 
-        return shard_counter
+        Args:
+            all_stats: List of statistics dictionaries from each rank
+
+        Returns:
+            Merged statistics dictionary
+        """
+        if not all_stats:
+            return {}
+
+        # Initialize with first rank's stats structure
+        merged = {}
+        all_keys = all_stats[0].keys()
+
+        for key in all_keys:
+            # Get configuration from first rank
+            first_stat = all_stats[0][key]
+            merged_stat = RunningStatistics(
+                need_mean_std=first_stat.need_mean_std,
+                need_min_max=first_stat.need_min_max,
+                need_log=first_stat.need_log,
+                epsilon=first_stat.epsilon
+            )
+
+            # Merge raw statistics
+            if first_stat.need_mean_std or first_stat.need_min_max:
+                total_count = 0
+                total_mean = 0.0
+                total_M2 = 0.0
+                global_min = math.inf
+                global_max = -math.inf
+
+                for rank_stats in all_stats:
+                    stat = rank_stats[key]
+                    if stat.raw and stat.raw.count > 0:
+                        # Merge using parallel Welford's algorithm
+                        rank_count = stat.raw.count
+                        rank_mean = stat.raw.mean
+                        rank_M2 = stat.raw.M2
+
+                        delta = rank_mean - total_mean
+                        new_count = total_count + rank_count
+                        new_mean = total_mean + delta * (rank_count / new_count) if new_count > 0 else 0
+                        new_M2 = total_M2 + rank_M2 + delta * delta * (
+                                total_count * rank_count / new_count) if new_count > 0 else 0
+
+                        total_count = new_count
+                        total_mean = new_mean
+                        total_M2 = new_M2
+                        global_min = min(global_min, stat.raw.min_val)
+                        global_max = max(global_max, stat.raw.max_val)
+
+                if total_count > 0:
+                    merged_stat.raw = WelfordAccumulator()
+                    merged_stat.raw.count = total_count
+                    merged_stat.raw.mean = total_mean
+                    merged_stat.raw.M2 = total_M2
+                    merged_stat.raw.min_val = global_min
+                    merged_stat.raw.max_val = global_max
+
+            # Merge log statistics
+            if first_stat.need_log:
+                total_count = 0
+                total_mean = 0.0
+                total_M2 = 0.0
+                global_min = math.inf
+                global_max = -math.inf
+
+                for rank_stats in all_stats:
+                    stat = rank_stats[key]
+                    if stat.log and stat.log.count > 0:
+                        rank_count = stat.log.count
+                        rank_mean = stat.log.mean
+                        rank_M2 = stat.log.M2
+
+                        delta = rank_mean - total_mean
+                        new_count = total_count + rank_count
+                        new_mean = total_mean + delta * (rank_count / new_count) if new_count > 0 else 0
+                        new_M2 = total_M2 + rank_M2 + delta * delta * (
+                                total_count * rank_count / new_count) if new_count > 0 else 0
+
+                        total_count = new_count
+                        total_mean = new_mean
+                        total_M2 = new_M2
+                        global_min = min(global_min, stat.log.min_val)
+                        global_max = max(global_max, stat.log.max_val)
+
+                if total_count > 0:
+                    merged_stat.log = WelfordAccumulator()
+                    merged_stat.log.count = total_count
+                    merged_stat.log.mean = total_mean
+                    merged_stat.log.M2 = total_M2
+                    merged_stat.log.min_val = global_min
+                    merged_stat.log.max_val = global_max
+
+            merged[key] = merged_stat
+
+        return merged
 
     def _read_species_matrix(self, group, T: int) -> np.ndarray:
         """Read species data into matrix form."""

@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-Production Trainer for Koopman Autoencoder
-===========================================
+Production Trainer for Koopman Autoencoder (PyTorch Lightning Version)
+======================================================================
 Optimized for autoregressive stability with stiff chemical systems.
-Includes corrected rollout, semigroup, and KL losses for temporal consistency.
-All critical stability fixes applied.
+Uses adaptive stiff loss with configurable lambda_phys and lambda_z weights.
 """
 
-import csv
 import json
 import logging
-import time
+import os
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, Union
+from typing import Dict, Any, Optional, Union, List
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
+import pytorch_lightning as pl
+from pytorch_lightning import Trainer as LightningTrainer, LightningModule
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
+from pytorch_lightning.loggers import CSVLogger
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -26,8 +27,8 @@ from torch.utils.data import DataLoader
 
 class AdaptiveStiffLoss(nn.Module):
     """
-    Adaptive loss for stiff systems: MAE in log10 space + MSE in z-space.
-    Simplified version without elemental conservation complexity.
+    Adaptive loss for stiff systems.
+    Combines MAE in log10 physical space with MSE in normalized space for stability.
     """
 
     def __init__(
@@ -35,9 +36,8 @@ class AdaptiveStiffLoss(nn.Module):
             log_means: torch.Tensor,
             log_stds: torch.Tensor,
             lambda_phys: float = 1.0,
-            lambda_z: float = 0.1,
-            time_weight_mode: str = "none",  # "none", "edges", "exponential"
-            device: Optional[torch.device] = None
+            lambda_z: float = 1.0,
+            time_weight_mode: str = "none"
     ):
         super().__init__()
         self.register_buffer("log_means", log_means.detach().clone())
@@ -55,15 +55,15 @@ class AdaptiveStiffLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
-            pred: [B,K,S] or [B,S] predictions in z-space
-            target: [B,K,S] or [B,S] targets in z-space
-            dt_norm: [B,K] normalized time steps (optional)
+            pred: [B,K,S] predictions in normalized target space
+            target: [B,K,S] targets in normalized target space
+            dt_norm: [B,K] normalized time steps (optional, for time weighting)
             mask: [B,K] validity mask (optional)
 
         Returns:
             Dictionary with 'total', 'phys', 'z' losses
         """
-        # MSE in z-space (stabilizer)
+        # MSE in normalized space (stabilizer)
         loss_z = (pred - target) ** 2
 
         # MAE in log10 physical space
@@ -76,8 +76,9 @@ class AdaptiveStiffLoss(nn.Module):
             if dt_norm.ndim == 3:
                 dt_norm = dt_norm.squeeze(-1)
             weights = self._compute_time_weights(dt_norm)
-            if pred.ndim == 3:
-                weights = weights.unsqueeze(-1)  # [B,K,1] to broadcast over S
+            # Ensure weights broadcast correctly
+            while weights.ndim < pred.ndim:
+                weights = weights.unsqueeze(-1)
             loss_phys = loss_phys * weights
             loss_z = loss_z * weights
 
@@ -85,10 +86,9 @@ class AdaptiveStiffLoss(nn.Module):
         if mask is not None:
             m = mask
             if m.ndim < loss_phys.ndim:
-                m = m.unsqueeze(-1)  # [B,K,1] to broadcast over S
+                m = m.unsqueeze(-1)
             m = m.to(loss_phys.dtype)
 
-            # If mask is [B,K,1], denom must count all species too
             if m.shape[-1] == 1 and loss_phys.ndim >= 3:
                 denom = (m.sum() * loss_phys.shape[-1]).clamp_min(1)
             else:
@@ -97,7 +97,6 @@ class AdaptiveStiffLoss(nn.Module):
             phys_mean = (loss_phys * m).sum() / denom
             z_mean = (loss_z * m).sum() / denom
         else:
-            # True mean over all elements when unmasked
             phys_mean = loss_phys.mean()
             z_mean = loss_z.mean()
 
@@ -121,236 +120,180 @@ class AdaptiveStiffLoss(nn.Module):
             return torch.ones_like(dt_norm)
 
 
-class Trainer:
+class EpochSetterCallback(Callback):
+    """Callback to set epoch on dataset for deterministic sampling."""
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        """Robustly find and set epoch on dataset."""
+        epoch = trainer.current_epoch
+        p = pl_module._get_teacher_forcing_prob(epoch)
+        H = pl_module._get_rollout_horizon(epoch)
+        pl_module.log('tf_p', p, on_step=False, on_epoch=True, prog_bar=False)
+        pl_module.log('rollout_H', H, on_step=False, on_epoch=True, prog_bar=False)
+
+        dl = getattr(trainer, "train_dataloader", None)
+
+        # Handle callable dataloaders (PL 2.0+)
+        if callable(dl):
+            dl = dl()
+
+        # Handle list of dataloaders
+        if isinstance(dl, (list, tuple)):
+            ds = getattr(dl[0], "dataset", None) if dl else None
+        else:
+            ds = getattr(dl, "dataset", None) if dl else None
+
+        if hasattr(ds, "set_epoch"):
+            ds.set_epoch(epoch)
+
+class KoopmanLightning(LightningModule):
     """
-    Production trainer for Koopman autoencoder with autoregressive stability focus.
-    Named 'Trainer' for compatibility with main.py.
+    Lightning wrapper for Koopman autoencoder training.
     """
 
     def __init__(
             self,
             model: nn.Module,
-            train_loader: DataLoader,
-            val_loader: Optional[DataLoader],
-            cfg: Dict[str, Any],  # Named 'cfg' to match main.py
-            work_dir: Union[str, Path],
-            device: torch.device,
-            logger: Optional[logging.Logger] = None
+            cfg: Dict[str, Any],
+            work_dir: Union[str, Path]
     ):
-        self.model = model.to(device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
+        super().__init__()
+
+        # Save hyperparameters (excluding model to avoid duplication)
+        self.save_hyperparameters(ignore=['model'])
+
+        # Core model
+        self.model = model
         self.cfg = cfg
-        self.device = device
-
-        # Setup working directory
         self.work_dir = Path(work_dir)
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-
-        # Logger
-        self.logger = logger or logging.getLogger(__name__)
 
         # Extract training config
         tcfg = cfg.get('training', {})
-        self.epochs = int(tcfg.get('epochs', 100))
-        self.lr = float(tcfg.get('lr', 1e-4))
+        self.learning_rate = float(tcfg.get('lr', 3e-4))
         self.min_lr = float(tcfg.get('min_lr', 1e-6))
-        self.weight_decay = float(tcfg.get('weight_decay', 1e-5))
+        self.weight_decay = float(tcfg.get('weight_decay', 1e-4))
         self.grad_clip = float(tcfg.get('gradient_clip', 1.0))
-        self.warmup_epochs = int(tcfg.get('warmup_epochs', 0))
-
-        # Loss mode
-        self.loss_mode = tcfg.get('loss_mode', 'adaptive_stiff')
+        self.warmup_epochs = int(tcfg.get('warmup_epochs', 10))
+        self.epochs = int(tcfg.get('epochs', 150))
 
         # Auxiliary losses config
         aux_cfg = tcfg.get('auxiliary_losses', {})
-        self.rollout_enabled = aux_cfg.get('rollout_enabled', False)
-        self.rollout_weight = float(aux_cfg.get('rollout_weight', 0.1))
-        self.rollout_horizon = int(aux_cfg.get('rollout_horizon', 4))
-        self.semigroup_enabled = aux_cfg.get('semigroup_enabled', False)
-        self.semigroup_weight = float(aux_cfg.get('semigroup_weight', 0.1))
-        self.kl_weight = float(tcfg.get('beta_kl', 0.0))
+
+        # Rollout loss
+        self.rollout_enabled = aux_cfg.get('rollout_enabled', True)
+        self.rollout_weight = float(aux_cfg.get('rollout_weight', 0.5))
+        self.max_rollout_horizon = int(aux_cfg.get('rollout_horizon', 12))
+
+        # Semigroup loss
+        self.semigroup_enabled = aux_cfg.get('semigroup_enabled', True)
+        self.semigroup_weight = float(aux_cfg.get('semigroup_weight', 0.2))
 
         # Teacher forcing schedule
         tf_cfg = aux_cfg.get('rollout_teacher_forcing', {})
-        self.tf_mode = tf_cfg.get('mode', 'none')
-        self.tf_start = float(tf_cfg.get('start_p', 1.0))
+        self.tf_mode = tf_cfg.get('mode', 'linear')
+        self.tf_start = float(tf_cfg.get('start_p', 0.8))
         self.tf_end = float(tf_cfg.get('end_p', 0.0))
-        self.tf_end_epoch = int(tf_cfg.get('end_epoch', 50))
+        self.tf_end_epoch = int(tf_cfg.get('end_epoch', 60))
 
-        # Setup components
+        # Setup loss function
         self._setup_loss()
-        self._setup_optimizer()
-        self._setup_scheduler()
-        self._setup_logging()
-
-        # Cache dt stats to avoid I/O in hot path
         self._cache_dt_stats()
 
-        # Mixed precision (read from top-level config)
-        mp_cfg = self.cfg.get('mixed_precision', {})
-        mode = str(mp_cfg.get('mode', 'bf16')).lower()
-        self.use_amp = torch.cuda.is_available() and mode != 'none'
-        self.amp_dtype = torch.bfloat16 if 'bf16' in mode else torch.float16
-
-        if self.use_amp and self.amp_dtype == torch.float16:
-            self.logger.warning("FP16 mode without GradScaler may be unstable. Consider using BF16.")
-
-        # State
-        self.start_epoch = 0
-        self.current_epoch = 0  # Track current epoch for rollout horizon
+        # Best validation loss tracking
         self.best_val_loss = float('inf')
 
-        # Check for resume
-        self._check_resume()
+        # Automatic optimization settings
+        self.automatic_optimization = True
 
-    def _cache_dt_stats(self):
-        """Cache dt normalization stats to avoid I/O in rollout loss."""
+    def _setup_loss(self):
+        """Setup adaptive stiff loss."""
+        # Load normalization statistics
         manifest_path = Path(self.cfg['paths']['processed_data_dir']) / 'normalization.json'
         with open(manifest_path, 'r') as f:
             manifest = json.load(f)
 
-        if 'dt' in manifest:
-            dt_stats = manifest['dt']
-            self.dt_log_min = torch.tensor(
-                dt_stats['log_min'],
-                device=self.device,
-                dtype=torch.float32
-            )
-            self.dt_log_max = torch.tensor(
-                dt_stats['log_max'],
-                device=self.device,
-                dtype=torch.float32
-            )
-        else:
+        # Get target species statistics
+        data_cfg = self.cfg.get('data', {})
+        target_vars = data_cfg.get('species_variables', [])
+        if not target_vars:
+            raise ValueError("No species specified")
+
+        stats = manifest['per_key_stats']
+        log_means = []
+        log_stds = []
+        for name in target_vars:
+            if name not in stats:
+                raise KeyError(f"Species '{name}' not found in normalization stats")
+            s = stats[name]
+            log_means.append(float(s.get('log_mean', 0.0)))
+            log_stds.append(float(s.get('log_std', 1.0)))
+
+        # Get loss configuration
+        loss_cfg = self.cfg['training'].get('adaptive_stiff_loss', {})
+
+        # Ensure float32 for loss buffers to avoid dtype issues
+        self.criterion = AdaptiveStiffLoss(
+            log_means=torch.tensor(log_means, dtype=torch.float32),
+            log_stds=torch.tensor(log_stds, dtype=torch.float32),
+            lambda_phys=float(loss_cfg.get('lambda_phys', 1.0)),
+            lambda_z=float(loss_cfg.get('lambda_z', 1.0)),
+            time_weight_mode=loss_cfg.get('time_weight_mode', 'none')
+        )
+
+    def _cache_dt_stats(self):
+        """Cache dt normalization stats."""
+        manifest_path = Path(self.cfg['paths']['processed_data_dir']) / 'normalization.json'
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
+
+        if 'dt' not in manifest:
             raise ValueError("dt stats missing from normalization manifest")
 
-    def _setup_loss(self):
-        """Setup loss function based on configuration."""
-        if self.loss_mode == 'mse':
-            self.criterion = nn.MSELoss()
-            self.loss_returns_dict = False
-        else:  # adaptive_stiff
-            # Load normalization statistics
-            manifest_path = Path(self.cfg['paths']['processed_data_dir']) / 'normalization.json'
-            with open(manifest_path, 'r') as f:
-                manifest = json.load(f)
+        dt_stats = manifest['dt']
+        self.register_buffer('dt_log_min', torch.tensor(dt_stats['log_min'], dtype=torch.float32))
+        self.register_buffer('dt_log_max', torch.tensor(dt_stats['log_max'], dtype=torch.float32))
 
-            # Get target species statistics
-            data_cfg = self.cfg.get('data', {})
-            target_vars = data_cfg.get('target_species', data_cfg.get('species_variables', []))
-            if not target_vars:
-                raise ValueError("No target species specified")
+    def configure_optimizers(self):
+        """Configure optimizer and scheduler."""
+        optimizer = AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
 
-            stats = manifest['per_key_stats']
-            log_means = []
-            log_stds = []
-            for name in target_vars:
-                if name not in stats:
-                    raise KeyError(f"Species '{name}' not found in normalization stats")
-                s = stats[name]
-                log_means.append(float(s.get('log_mean', 0.0)))
-                log_stds.append(float(s.get('log_std', 1.0)))
-
-            # Create adaptive loss
-            loss_cfg = self.cfg['training'].get('adaptive_stiff_loss', {})
-            self.criterion = AdaptiveStiffLoss(
-                log_means=torch.tensor(log_means, device=self.device),
-                log_stds=torch.tensor(log_stds, device=self.device),
-                lambda_phys=float(loss_cfg.get('lambda_phys', 1.0)),
-                lambda_z=float(loss_cfg.get('lambda_z', 0.1)),
-                time_weight_mode=loss_cfg.get('time_weight_mode', 'none')
-            )
-            self.loss_returns_dict = True
-
-    def _setup_optimizer(self):
-        """Setup AdamW optimizer with optional fused kernels."""
-        try:
-            self.optimizer = AdamW(
-                self.model.parameters(),
-                lr=self.lr,
-                weight_decay=self.weight_decay,
-                fused=torch.cuda.is_available()
-            )
-        except (TypeError, RuntimeError):
-            self.optimizer = AdamW(
-                self.model.parameters(),
-                lr=self.lr,
-                weight_decay=self.weight_decay
-            )
-
-    def _setup_scheduler(self):
-        """Setup learning rate scheduler with optional warmup."""
+        # Setup scheduler with warmup (portable across PyTorch versions)
         if self.warmup_epochs > 0:
+            # Use only start_factor and total_iters for compatibility
             warmup = LinearLR(
-                self.optimizer,
+                optimizer,
                 start_factor=0.01,
-                end_factor=1.0,
                 total_iters=self.warmup_epochs
             )
             cosine = CosineAnnealingLR(
-                self.optimizer,
+                optimizer,
                 T_max=max(1, self.epochs - self.warmup_epochs),
                 eta_min=self.min_lr
             )
-            self.scheduler = SequentialLR(
-                self.optimizer,
+            scheduler = SequentialLR(
+                optimizer,
                 schedulers=[warmup, cosine],
                 milestones=[self.warmup_epochs]
             )
         else:
-            self.scheduler = CosineAnnealingLR(
-                self.optimizer,
+            scheduler = CosineAnnealingLR(
+                optimizer,
                 T_max=self.epochs,
                 eta_min=self.min_lr
             )
 
-    def _setup_logging(self):
-        """Setup CSV logging."""
-        self.log_file = self.work_dir / 'training_log.csv'
-        if not self.log_file.exists():
-            with open(self.log_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                headers = ['epoch', 'train_loss', 'val_loss', 'lr', 'time']
-                if self.loss_returns_dict:
-                    headers.extend(['train_phys', 'train_z', 'val_phys', 'val_z'])
-                if self.rollout_enabled:
-                    headers.append('rollout_loss')
-                if self.semigroup_enabled:
-                    headers.append('semigroup_loss')
-                if self.kl_weight > 0:
-                    headers.append('kl_loss')
-                writer.writerow(headers)
-
-    def _check_resume(self):
-        """Check for checkpoint to resume from."""
-        resume = self.cfg.get('training', {}).get('resume', None)
-
-        if resume == 'auto':
-            # Prefer best_model.pt if it exists, otherwise latest by mtime
-            best_path = self.work_dir / 'best_model.pt'
-            if best_path.exists():
-                resume = best_path
-            else:
-                checkpoints = list(self.work_dir.glob('*.pt'))
-                if checkpoints:
-                    resume = max(checkpoints, key=lambda p: p.stat().st_mtime)
-                else:
-                    return
-        elif resume and Path(resume).exists():
-            resume = Path(resume)
-        else:
-            return
-
-        self.logger.info(f"Resuming from {resume}")
-        checkpoint = torch.load(resume, map_location=self.device)
-
-        self.model.load_state_dict(checkpoint['model'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
-        self.start_epoch = checkpoint.get('epoch', 0)
-        self.current_epoch = self.start_epoch
-        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'epoch',
+                'frequency': 1
+            }
+        }
 
     def _get_teacher_forcing_prob(self, epoch: int) -> float:
         """Get teacher forcing probability for current epoch."""
@@ -372,6 +315,17 @@ class Trainer:
         else:
             return 0.0
 
+    def _get_rollout_horizon(self, epoch: int) -> int:
+        """Progressive horizon schedule for rollout."""
+        if epoch < 5:
+            return min(2, self.max_rollout_horizon)
+        elif epoch < 10:
+            return min(4, self.max_rollout_horizon)
+        elif epoch < 15:
+            return min(8, self.max_rollout_horizon)
+        else:
+            return self.max_rollout_horizon
+
     def _compute_rollout_loss(
             self,
             y_i: torch.Tensor,
@@ -379,124 +333,53 @@ class Trainer:
             y_j: torch.Tensor,
             g: torch.Tensor,
             mask: Optional[torch.Tensor],
-            tf_prob: float
+            epoch: int
     ) -> Optional[torch.Tensor]:
-        """
-        Multi-step rollout loss with truncated BPTT (1-step gradients only).
-        Uses the SAME loss criterion as main training.
-        Computes Δt mapping in FP32 to avoid AMP precision issues.
-        """
+        """Multi-step rollout loss with teacher forcing."""
         if dt.shape[1] < 2:
             return None
 
-        # Normalize mask shape if needed
         if mask is not None and mask.ndim == 3 and mask.shape[-1] == 1:
             mask = mask.squeeze(-1)
 
-        # Process dt shape
         if dt.ndim == 3 and dt.shape[-1] == 1:
             dt = dt.squeeze(-1)
 
         B, K = dt.shape
-
-        # Sort by time to ensure proper ordering
-        dt_sorted, sort_idx = torch.sort(dt, dim=1)
-
-        # ---- Δt mapping done in FP32 (independent of outer autocast) ----
-        dt_log32 = (self.dt_log_min + dt_sorted.float() * (self.dt_log_max - self.dt_log_min)).float()
-        dt_phys32 = (10.0 ** dt_log32).clamp_min(1e-30)
-
-        # Incremental physical Δt
-        dt_incr_phys32 = torch.empty_like(dt_phys32)
-        dt_incr_phys32[:, 0] = dt_phys32[:, 0]
-        if K > 1:
-            incr32 = dt_phys32[:, 1:] - dt_phys32[:, :-1]
-            eps32 = (10.0 ** self.dt_log_min.item()) * 1e-6  # floor relative to min scale
-            dt_incr_phys32[:, 1:] = incr32.clamp_min(eps32)
-
-        # Re-normalize increments using SAME stats
-        dt_incr_log32 = torch.log10(dt_incr_phys32)
-        rng32 = (self.dt_log_max - self.dt_log_min).clamp_min(1e-12)
-        dt_incr_norm = ((dt_incr_log32 - self.dt_log_min) / rng32).clamp(0.0, 1.0).to(y_i.dtype)
-
-        # Sort targets/masks to match time ordering
-        y_j_sorted = torch.gather(
-            y_j, dim=1,
-            index=sort_idx.unsqueeze(-1).expand(-1, -1, y_j.shape[-1])
-        )
-        mask_sorted = torch.gather(mask, dim=1, index=sort_idx) if mask is not None else None
-
-        # Horizon schedule (grows with epoch)
-        if self.current_epoch < 10:
-            max_allowed_horizon = 2
-        elif self.current_epoch < 20:
-            max_allowed_horizon = 4
-        elif self.current_epoch < 40:
-            max_allowed_horizon = 6
-        else:
-            max_allowed_horizon = self.rollout_horizon
-
-        max_h = min(max_allowed_horizon, K)
-        horizon = int(torch.randint(1, max_h + 1, (), device=self.device).item())
+        horizon = min(self._get_rollout_horizon(epoch), K)
+        tf_prob = self._get_teacher_forcing_prob(epoch)
 
         rollout_losses = []
         y_curr = y_i
 
-        # Subset info
-        S_in = getattr(self.model, 'S_in', None)
-        S_out = getattr(self.model, 'S_out', None)
-        target_idx = getattr(self.model, 'target_idx', None)
-
         for t in range(horizon):
-            # Predict with incremental normalized dt
-            y_pred = self.model(y_curr, dt_incr_norm[:, t:t + 1], g)
+            # Single step prediction
+            dt_step = dt[:, t:t + 1]
+            if dt_step.ndim == 2:
+                dt_step = dt_step.unsqueeze(-1)
+
+            y_pred = self.model(y_curr, dt_step, g)
             if y_pred.ndim == 3 and y_pred.shape[1] == 1:
                 y_pred = y_pred.squeeze(1)
-            y_true = y_j_sorted[:, t]
 
-            # Non-finite guard
-            if not torch.isfinite(y_pred).all():
-                self.logger.warning(f"Non-finite y_pred at rollout step {t}; skipping rollout loss")
-                return None
+            y_true = y_j[:, t]
 
-            # Same loss as main training
-            if self.loss_returns_dict:
-                dt_single = dt_incr_norm[:, t:t + 1]
-                mask_single = mask_sorted[:, t:t + 1] if mask_sorted is not None else None
-                loss_dict = self.criterion(y_pred.unsqueeze(1), y_true.unsqueeze(1), dt_single, mask_single)
-                step_loss = loss_dict['total']
-            else:
-                if mask_sorted is not None:
-                    m = mask_sorted[:, t].to(y_pred.dtype)  # [B]
-                    l_elm = F.mse_loss(y_pred, y_true, reduction='none')  # [B,S]
-                    l_sample = l_elm.mean(-1)  # [B]
-                    step_loss = (l_sample * m).sum() / m.sum().clamp_min(1)
-                else:
-                    step_loss = F.mse_loss(y_pred, y_true)
+            # Compute loss for this step
+            mask_t = mask[:, t:t + 1] if mask is not None else None
+            loss_dict = self.criterion(
+                y_pred.unsqueeze(1),
+                y_true.unsqueeze(1),
+                dt_step[:, :, 0] if dt_step.ndim == 3 else dt_step,
+                mask_t
+            )
+            rollout_losses.append(loss_dict['total'])
 
-            rollout_losses.append(step_loss)
-
-            # Truncated BPTT (detach for next step)
-            y_pred_det = y_pred.detach()
-            y_true_det = y_true.detach()
-
-            # Teacher forcing mask
-            tf_vec = (torch.rand(B, 1, device=self.device) < tf_prob).to(y_pred.dtype)
-            if mask_sorted is not None:
-                tf_vec = tf_vec * mask_sorted[:, t:t + 1].to(tf_vec.dtype)
-
-            mixed_next = tf_vec * y_true_det + (1.0 - tf_vec) * y_pred_det
-
-            # Subset-aware state update
-            if (S_in is not None) and (S_out is not None) and (S_in != S_out):
-                if target_idx is None:
-                    raise RuntimeError("Subset rollout requires model.target_idx")
-                assert mixed_next.shape[-1] == len(target_idx)
-                y_upd = y_curr.detach().clone()
-                y_upd[:, target_idx] = mixed_next
-                y_curr = y_upd
-            else:
-                y_curr = mixed_next
+            # Teacher forcing for next step
+            if t < horizon - 1:
+                tf_mask = (torch.rand(B, 1, device=self.device) < tf_prob).float()
+                if mask is not None:
+                    tf_mask = tf_mask * mask[:, t:t + 1].float()
+                y_curr = tf_mask * y_true + (1 - tf_mask) * y_pred.detach()
 
         return torch.stack(rollout_losses).mean() if rollout_losses else None
 
@@ -505,343 +388,165 @@ class Trainer:
             y_i: torch.Tensor,
             g: torch.Tensor
     ) -> torch.Tensor:
-        """Semigroup property: f(t1+t2) = f(t2) ∘ f(t1)."""
+        """Semigroup property over full dt range [0,1]."""
         B = y_i.shape[0]
 
-        # Sample random time steps in [0, 0.5] normalized space
-        t1 = torch.rand(B, 1, device=self.device) * 0.5
-        t2 = torch.rand(B, 1, device=self.device) * 0.5
-        t_sum = t1 + t2
+        # Sample across FULL normalized dt range
+        t1 = torch.rand(B, 1, device=self.device)
+        t2 = torch.rand(B, 1, device=self.device)
+        t_sum = torch.clamp(t1 + t2, max=1.0)
 
         # Direct path
         y_direct = self.model(y_i, t_sum, g).squeeze(1)
 
-        # Composed path
-        with torch.no_grad():
-            y_mid = self.model(y_i, t1, g).squeeze(1)
+        # Composed path (no detach - both steps learn composition)
+        y_mid = self.model(y_i, t1, g).squeeze(1)
         y_composed = self.model(y_mid, t2, g).squeeze(1)
 
-        return F.mse_loss(y_direct, y_composed)
+        return F.l1_loss(y_direct, y_composed)
 
-    def _compute_auxiliary_losses(
-            self,
-            y_i: torch.Tensor,
-            dt: torch.Tensor,
-            y_j: torch.Tensor,
-            g: torch.Tensor,
-            mask: Optional[torch.Tensor],
-            epoch: int,
-            tf_prob: float
-    ) -> Dict[str, torch.Tensor]:
-        """Compute auxiliary losses for temporal consistency."""
-        aux_losses = {}
+    def _process_batch(self, batch):
+        """Common batch processing for training and validation."""
+        # Unpack batch
+        if len(batch) == 6:
+            y_i, dt, y_j, g, _, mask = batch
+        else:
+            y_i, dt, y_j, g, _ = batch
+            mask = None
 
-        # KL loss from VAE
-        if self.kl_weight > 0 and hasattr(self.model, 'kl_loss') and self.model.kl_loss is not None:
-            aux_losses['kl'] = self.kl_weight * self.model.kl_loss
+        # Handle dt dimensions
+        if dt.ndim == 3 and dt.shape[-1] == 1:
+            dt = dt.squeeze(-1)
+
+        return y_i, dt, y_j, g, mask
+
+    def training_step(self, batch, batch_idx):
+        """Training step."""
+        opt = self.trainer.optimizers[0]
+        lr = opt.param_groups[0]['lr']
+        self.log('lr', lr, on_step=False, on_epoch=True, prog_bar=True)
+
+        y_i, dt, y_j, g, mask = self._process_batch(batch)
+
+        # Main prediction loss
+        pred = self.model(y_i, dt, g)
+        loss_dict = self.criterion(pred, y_j, dt, mask)
+        main_loss = loss_dict['total']
+
+        # Initialize total loss and metrics
+        total_loss = main_loss
+
+        # Log main loss components
+        self.log('train_loss', main_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_phys', loss_dict['phys'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log('train_z', loss_dict['z'], on_step=False, on_epoch=True, prog_bar=False)
+
+        # Auxiliary losses
+        rollout_loss = torch.tensor(0.0, device=self.device)
+        semigroup_loss = torch.tensor(0.0, device=self.device)
 
         # Rollout loss
-        if self.rollout_enabled and self.rollout_weight > 0:
-            rollout_loss = self._compute_rollout_loss(
-                y_i, dt, y_j, g, mask, tf_prob
+        if self.rollout_enabled:
+            rl = self._compute_rollout_loss(
+                y_i, dt, y_j, g, mask, self.current_epoch
             )
-            if rollout_loss is not None:
-                aux_losses['rollout'] = self.rollout_weight * rollout_loss
+            if rl is not None:
+                total_loss = total_loss + self.rollout_weight * rl
+                rollout_loss = rl
 
         # Semigroup loss
-        if self.semigroup_enabled and self.semigroup_weight > 0:
-            semigroup_loss = self._compute_semigroup_loss(y_i, g)
-            aux_losses['semigroup'] = self.semigroup_weight * semigroup_loss
-
-        return aux_losses
-
-    def train(self) -> float:
-        """Main training loop."""
-        start_time = time.time()
-
-        for epoch in range(self.start_epoch + 1, self.epochs + 1):
-            self.current_epoch = epoch  # Track current epoch for rollout horizon
-            epoch_start = time.time()
-
-            # Set dataset epoch for deterministic sampling
-            if hasattr(self.train_loader.dataset, 'set_epoch'):
-                self.train_loader.dataset.set_epoch(epoch)
-
-            # Training
-            train_metrics = self._train_epoch(epoch)
-
-            # Validation
-            if self.val_loader is not None:
-                val_metrics = self._validate()
-            else:
-                val_metrics = {'loss': train_metrics['loss']}
-
-            # Update scheduler
-            self.scheduler.step()
-
-            # Save checkpoint
-            if val_metrics['loss'] < self.best_val_loss:
-                self.best_val_loss = val_metrics['loss']
-                self._save_checkpoint(epoch, is_best=True)
-
-            # Always save last checkpoint
-            self._save_checkpoint(epoch, is_best=False)
-
-            # Log to CSV
-            self._log_metrics(epoch, train_metrics, val_metrics, epoch_start)
-
-            # Console output
-            lr = self.optimizer.param_groups[0]['lr']
-            self.logger.info(
-                f"Epoch {epoch:3d}/{self.epochs} | "
-                f"train={train_metrics['loss']:.4e} | "
-                f"val={val_metrics['loss']:.4e} | "
-                f"lr={lr:.2e} | "
-                f"time={time.time() - epoch_start:.1f}s"
-            )
-
-        total_time = time.time() - start_time
-        self.logger.info(f"Training completed in {total_time / 3600:.2f} hours")
-        return self.best_val_loss
-
-    # === Trainer._train_epoch ===
-    def _train_epoch(self, epoch: int) -> Dict[str, float]:
-        """Single training epoch with non-finite guard before backward."""
-        self.model.train()
-
-        metrics = {
-            'loss': 0.0, 'phys': 0.0, 'z': 0.0,
-            'rollout': 0.0, 'semigroup': 0.0, 'kl': 0.0,
-            'count': 0
-        }
-
-        tf_prob = self._get_teacher_forcing_prob(epoch)
-
-        for batch in self.train_loader:
-            try:
-                # Unpack
-                if len(batch) == 6:
-                    y_i, dt, y_j, g, _, mask = batch
-                else:
-                    y_i, dt, y_j, g, _ = batch
-                    mask = None
-
-                # To device
-                y_i = y_i.to(self.device, non_blocking=True)
-                dt = dt.to(self.device, non_blocking=True)
-                y_j = y_j.to(self.device, non_blocking=True)
-                g = g.to(self.device, non_blocking=True)
-                if mask is not None:
-                    mask = mask.to(self.device, non_blocking=True)
-
-                if dt.ndim == 3 and dt.shape[-1] == 1:
-                    dt = dt.squeeze(-1)
-
-                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                    # Forward
-                    pred = self.model(y_i, dt, g)
-
-                    # Main loss
-                    if self.loss_returns_dict:
-                        loss_dict = self.criterion(pred, y_j, dt, mask)
-                        main_loss = loss_dict['total']
-                        metrics['phys'] += loss_dict['phys'].item()
-                        metrics['z'] += loss_dict['z'].item()
-                    else:
-                        if mask is not None and pred.ndim == 3:
-                            l_elm = F.mse_loss(pred, y_j, reduction='none')  # [B,K,S]
-                            m = mask.unsqueeze(-1).to(l_elm.dtype)  # [B,K,1]
-                            denom = (m.sum() * l_elm.shape[-1]).clamp_min(1)
-                            main_loss = (l_elm * m).sum() / denom
-                        else:
-                            main_loss = self.criterion(pred, y_j)
-
-                    # Aux losses
-                    aux_losses = self._compute_auxiliary_losses(y_i, dt, y_j, g, mask, epoch, tf_prob)
-                    total_loss = main_loss
-                    for key, value in aux_losses.items():
-                        total_loss = total_loss + value
-                        metrics[key] += value.item()
-
-                # ---- Non-finite guard before backward ----
-                if not torch.isfinite(total_loss):
-                    self.logger.warning("Non-finite total_loss; skipping batch.")
-                    self.optimizer.zero_grad(set_to_none=True)
-                    continue
-
-                # Backward & step
-                self.optimizer.zero_grad(set_to_none=True)
-                total_loss.backward()
-                if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.optimizer.step()
-
-                metrics['loss'] += total_loss.item()
-                metrics['count'] += 1
-
-            except Exception as e:
-                self.logger.warning(f"Skipping bad batch: {e}")
-                continue
-
-        for k in metrics:
-            if k != 'count':
-                metrics[k] /= max(1, metrics['count'])
-        return metrics
-
-    @torch.no_grad()
-    def _validate(self) -> Dict[str, float]:
-        """Validation epoch."""
-        self.model.eval()
-
-        metrics = {
-            'loss': 0.0,
-            'phys': 0.0,
-            'z': 0.0,
-            'count': 0
-        }
-
-        for batch in self.val_loader:
-            # Unpack
-            if len(batch) == 6:
-                y_i, dt, y_j, g, _, mask = batch
-            else:
-                y_i, dt, y_j, g, _ = batch
-                mask = None
-
-            # Move to device
-            y_i = y_i.to(self.device, non_blocking=True)
-            dt = dt.to(self.device, non_blocking=True)
-            y_j = y_j.to(self.device, non_blocking=True)
-            g = g.to(self.device, non_blocking=True)
-            if mask is not None:
-                mask = mask.to(self.device, non_blocking=True)
-
-            if dt.ndim == 3 and dt.shape[-1] == 1:
-                dt = dt.squeeze(-1)
-
-            # Forward
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                pred = self.model(y_i, dt, g)
-
-                if self.loss_returns_dict:
-                    loss_dict = self.criterion(pred, y_j, dt, mask)
-                    metrics['loss'] += loss_dict['total'].item()
-                    metrics['phys'] += loss_dict['phys'].item()
-                    metrics['z'] += loss_dict['z'].item()
-                else:
-                    if mask is not None and pred.ndim == 3:
-                        loss_elm = F.mse_loss(pred, y_j, reduction='none')
-                        m = mask.unsqueeze(-1).to(loss_elm.dtype)
-                        denom = (m.sum() * loss_elm.shape[-1]).clamp_min(1)
-                        loss = (loss_elm * m).sum() / denom
-                    else:
-                        loss = self.criterion(pred, y_j)
-                    metrics['loss'] += loss.item()
-
-            metrics['count'] += 1
-
-        # Average
-        for key in metrics:
-            if key != 'count':
-                metrics[key] /= max(1, metrics['count'])
-
-        return metrics
-
-    def _save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Save checkpoint with legacy naming for compatibility."""
-        checkpoint = {
-            'epoch': epoch,
-            'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-            'best_val_loss': self.best_val_loss,
-            'config': self.cfg
-        }
-
-        # Use legacy names for compatibility with existing pipeline
-        path = self.work_dir / ('best_model.pt' if is_best else 'last_model.pt')
-        torch.save(checkpoint, path)
-
-    def _log_metrics(
-            self,
-            epoch: int,
-            train_metrics: Dict[str, float],
-            val_metrics: Dict[str, float],
-            epoch_start: float
-    ):
-        """Log metrics to CSV."""
-        row = [
-            epoch,
-            f"{train_metrics['loss']:.6e}",
-            f"{val_metrics['loss']:.6e}",
-            f"{self.optimizer.param_groups[0]['lr']:.2e}",
-            f"{time.time() - epoch_start:.1f}"
-        ]
-
-        if self.loss_returns_dict:
-            row.extend([
-                f"{train_metrics.get('phys', 0):.6e}",
-                f"{train_metrics.get('z', 0):.6e}",
-                f"{val_metrics.get('phys', 0):.6e}",
-                f"{val_metrics.get('z', 0):.6e}"
-            ])
-
-        if self.rollout_enabled:
-            row.append(f"{train_metrics.get('rollout', 0):.6e}")
-
         if self.semigroup_enabled:
-            row.append(f"{train_metrics.get('semigroup', 0):.6e}")
+            sl = self._compute_semigroup_loss(y_i, g)
+            total_loss = total_loss + self.semigroup_weight * sl
+            semigroup_loss = sl
 
-        if self.kl_weight > 0:
-            row.append(f"{train_metrics.get('kl', 0):.6e}")
+        # Log auxiliary losses
+        self.log('rollout_loss', rollout_loss, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('semigroup_loss', semigroup_loss, on_step=False, on_epoch=True, prog_bar=False)
 
-        with open(self.log_file, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
+        # Check for NaN - return zero loss that keeps graph valid
+        if not torch.isfinite(total_loss):
+            self.log('train_loss_nan', 1.0, on_step=True, prog_bar=True)
+            # Return a zero loss with gradient enabled to avoid Lightning errors
+            return torch.zeros((), device=self.device, requires_grad=True)
+
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        """Validation step."""
+        y_i, dt, y_j, g, mask = self._process_batch(batch)
+
+        # Forward pass
+        pred = self.model(y_i, dt, g)
+        loss_dict = self.criterion(pred, y_j, dt, mask)
+
+        # Log metrics
+        self.log('val_loss', loss_dict['total'], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val_phys', loss_dict['phys'], on_step=False, on_epoch=True, prog_bar=False)
+        self.log('val_z', loss_dict['z'], on_step=False, on_epoch=True, prog_bar=False)
+
+        return loss_dict['total']
+
+    def on_validation_epoch_end(self):
+        """Track best validation loss - properly handle tensor to float conversion."""
+        val_loss = self.trainer.callback_metrics.get('val_loss')
+        if val_loss is not None:
+            # Convert tensor to float properly
+            val_loss_float = float(val_loss.detach().cpu())
+            if val_loss_float < self.best_val_loss:
+                self.best_val_loss = val_loss_float
 
     @torch.no_grad()
     def evaluate_rollout(
             self,
             num_steps: int = 100,
-            dt_value: float = 0.01,  # Note: this is normalized dt
-            batch_size: int = 16
+            dt_value: float = 0.01,
+            batch_size: int = 16,
+            loader: Optional[DataLoader] = None
     ) -> Dict[str, float]:
         """
         Evaluate autoregressive rollout stability.
 
         Args:
             num_steps: Number of rollout steps
-            dt_value: Normalized time step (0.01 is near minimum dt)
-            batch_size: Batch size for meaningful variance computation
+            dt_value: Normalized dt in [0,1]
+            batch_size: Batch size for evaluation
+            loader: DataLoader to use (defaults to val or train)
 
         Returns:
             Dictionary of rollout metrics
         """
-        self.model.eval()
+        self.eval()
 
-        # Get batch for evaluation
-        batch = next(iter(self.val_loader or self.train_loader))
+        # Ensure dt_value is properly normalized
+        dt_value = float(max(0.0, min(1.0, dt_value)))
+
+        # Robustly get dataloader
+        if loader is None:
+            # Try validation dataloaders first
+            dl = getattr(self.trainer, "val_dataloaders", None)
+            if isinstance(dl, (list, tuple)) and dl:
+                loader = dl[0]
+            elif dl is not None:
+                loader = dl
+            else:
+                # Fall back to train dataloader
+                dl = getattr(self.trainer, "train_dataloader", None)
+                loader = dl() if callable(dl) else dl
+
+        if loader is None:
+            raise ValueError("No dataloader available for rollout evaluation")
+
+        batch = next(iter(loader))
         y_i, _, _, g = batch[:4]
 
-        # Use small batch for meaningful variance
         B = min(batch_size, y_i.shape[0])
         y_i = y_i[:B].to(self.device)
         g = g[:B].to(self.device)
-        dt_step = torch.tensor([dt_value], device=self.device)
+        dt_step = torch.tensor([[dt_value]], device=self.device)
 
         # Rollout
-        if hasattr(self.model, 'rollout'):
-            trajectory = self.model.rollout(y_i, g, dt_step, num_steps)
-        else:
-            trajectory = []
-            y_curr = y_i
-            for _ in range(num_steps):
-                y_next = self.model(y_curr, dt_step.unsqueeze(0).expand(B, -1), g)
-                if y_next.ndim == 3:
-                    y_next = y_next.squeeze(1)
-                trajectory.append(y_next)
-                y_curr = y_next
-            trajectory = torch.stack(trajectory, dim=1)
+        trajectory = self.model.rollout(y_i, g, dt_step, num_steps)
 
         # Compute metrics
         metrics = {}
@@ -850,7 +555,7 @@ class Trainer:
         metrics['has_nan'] = torch.isnan(trajectory).any().item()
         metrics['has_inf'] = torch.isinf(trajectory).any().item()
 
-        # Variance across species dimension (meaningful with batch > 1)
+        # Variance evolution
         var_initial = trajectory[:, 0, :].var(dim=0, unbiased=False).mean().item()
         var_final = trajectory[:, -1, :].var(dim=0, unbiased=False).mean().item()
         metrics['variance_ratio'] = var_final / (var_initial + 1e-8)
@@ -860,53 +565,179 @@ class Trainer:
         mean_final = trajectory[:, -1].mean().item()
         metrics['mean_drift'] = abs(mean_final - mean_initial)
 
-        # Check simplex constraint if using softmax (only for full species)
-        if getattr(self.model, 'softmax_head', False):
-            full_simplex = (getattr(self.model, 'S_out', None) == getattr(self.model, 'S_in', None))
-            has_stats = (getattr(self.model, 'log_mean', None) is not None) and (
-                    getattr(self.model, 'log_std', None) is not None)
-            if full_simplex and has_stats:
-                # Convert to physical space and check sum using model stats
-                mu = self.model.log_mean.to(trajectory.dtype).view(1, 1, -1)
-                sig = self.model.log_std.to(trajectory.dtype).view(1, 1, -1)
-                traj_log10 = trajectory * sig + mu
-                traj_phys = torch.pow(10.0, traj_log10)
-                sums = traj_phys.sum(dim=-1)
-                metrics['max_simplex_error'] = (sums - 1.0).abs().max().item()
-                metrics['mean_simplex_error'] = (sums - 1.0).abs().mean().item()
-
         return metrics
 
-    def check_model_health(self) -> dict:
-        """Check model parameters and gradients for issues."""
-        health = {
-            'has_nan_params': False,
-            'has_inf_params': False,
-            'max_param': 0.0,
-            'max_grad': 0.0,
-            'problem_layers': []
-        }
 
-        for name, param in self.model.named_parameters():
-            # Check parameters
-            if torch.isnan(param).any():
-                health['has_nan_params'] = True
-                health['problem_layers'].append(f"{name} (NaN param)")
-            if torch.isinf(param).any():
-                health['has_inf_params'] = True
-                health['problem_layers'].append(f"{name} (Inf param)")
+# Compatibility class that mimics the original Trainer interface
+class Trainer:
+    """
+    Wrapper class that provides the same interface as the original Trainer
+    but uses PyTorch Lightning internally.
+    """
 
-            param_max = param.abs().max().item()
-            health['max_param'] = max(health['max_param'], param_max)
+    def __init__(
+            self,
+            model: nn.Module,
+            train_loader: DataLoader,
+            val_loader: Optional[DataLoader],
+            cfg: Dict[str, Any],
+            work_dir: Union[str, Path],
+            device: torch.device,
+            logger: Optional[logging.Logger] = None
+    ):
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.cfg = cfg
+        self.work_dir = Path(work_dir)
+        self.device = device
+        self.logger = logger or logging.getLogger(__name__)
 
-            # Check gradients
-            if param.grad is not None:
-                if torch.isnan(param.grad).any():
-                    health['problem_layers'].append(f"{name} (NaN grad)")
-                if torch.isinf(param.grad).any():
-                    health['problem_layers'].append(f"{name} (Inf grad)")
+    def train(self) -> float:
+        """Train the model using PyTorch Lightning."""
+        work_dir = self.work_dir
+        work_dir.mkdir(parents=True, exist_ok=True)
 
-                grad_max = param.grad.abs().max().item()
-                health['max_grad'] = max(health['max_grad'], grad_max)
+        # Wrap model in Lightning module
+        lightning_model = KoopmanLightning(self.model, self.cfg, work_dir)
 
-        return health
+        # Training configuration
+        tcfg = self.cfg.get('training', {})
+        epochs = int(tcfg.get('epochs', 150))
+        grad_clip = float(tcfg.get('gradient_clip', 1.0))
+
+        # Mixed precision config
+        mp_cfg = self.cfg.get('mixed_precision', {})
+        mode = str(mp_cfg.get('mode', 'bf16')).lower()
+        precision = '32-true'  # Default
+        if torch.cuda.is_available() and mode != 'none':
+            if 'bf16' in mode:
+                precision = 'bf16-mixed'
+            elif 'fp16' in mode or mode == '16':
+                precision = '16-mixed'
+
+        # Setup callbacks
+        callbacks = []
+
+        # Checkpoint callback with explicit filename
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=work_dir,
+            filename='best_model',
+            auto_insert_metric_name=False,  # Ensure exact filename
+            monitor='val_loss',
+            mode='min',
+            save_last=True,
+            save_top_k=1,
+            save_weights_only=False,
+            verbose=True
+        )
+        callbacks.append(checkpoint_callback)
+
+        # LR monitor
+        lr_monitor = LearningRateMonitor(logging_interval='epoch')
+        callbacks.append(lr_monitor)
+
+        # Epoch setter for dataset
+        callbacks.append(EpochSetterCallback())
+
+        # CSV logger with safe settings
+        csv_logger = CSVLogger(save_dir=str(work_dir), name=".", version=None)
+
+        # Check for resume
+        resume_path = None
+        resume_cfg = tcfg.get('resume', 'auto')
+
+        # Check environment variable for resume override
+        env_resume = os.environ.get('RESUME')
+        if env_resume:
+            resume_cfg = env_resume
+
+        if resume_cfg == 'auto':
+            best_path = work_dir / 'best_model.ckpt'
+            last_path = work_dir / 'last.ckpt'
+            best_pt = work_dir / 'best_model.pt'
+            last_pt = work_dir / 'last_model.pt'
+
+            # Check Lightning checkpoints first
+            if best_path.exists():
+                resume_path = best_path
+            elif last_path.exists():
+                resume_path = last_path
+            # Also check old .pt files for compatibility
+            elif best_pt.exists():
+                self.logger.info(f"Found old .pt checkpoint, converting: {best_pt}")
+                # Load old checkpoint and save model state for Lightning
+                old_ckpt = torch.load(best_pt, map_location=self.device)
+                self.model.load_state_dict(old_ckpt['model'])
+            elif last_pt.exists():
+                self.logger.info(f"Found old .pt checkpoint, converting: {last_pt}")
+                old_ckpt = torch.load(last_pt, map_location=self.device)
+                self.model.load_state_dict(old_ckpt['model'])
+        elif resume_cfg and Path(resume_cfg).exists():
+            resume_path = Path(resume_cfg)
+
+        if resume_path and self.logger:
+            self.logger.info(f"Resuming from {resume_path}")
+
+        # Create Lightning trainer with safe gradient clipping
+        trainer = LightningTrainer(
+            max_epochs=epochs,
+            accelerator='auto',
+            devices=1,
+            precision=precision,
+            gradient_clip_val=float(max(0.0, grad_clip)),  # Ensure float
+            gradient_clip_algorithm='norm',
+            callbacks=callbacks,
+            logger=csv_logger,
+            default_root_dir=work_dir,
+            enable_checkpointing=True,
+            enable_progress_bar=True,
+            enable_model_summary=True,
+            deterministic=False,  # Set to True for reproducibility (slower)
+            benchmark=True,  # Enable cuDNN benchmark
+            log_every_n_steps=50,
+            val_check_interval=1.0,
+            check_val_every_n_epoch=1,
+            num_sanity_val_steps=0,  # Disable sanity check
+        )
+
+        # Train
+        trainer.fit(
+            lightning_model,
+            train_dataloaders=self.train_loader,
+            val_dataloaders=self.val_loader,
+            ckpt_path=resume_path
+        )
+
+        # Properly retrieve best validation loss
+        best_val = None
+
+        # Try to get from checkpoint callback first
+        if checkpoint_callback.best_model_score is not None:
+            best_val = float(checkpoint_callback.best_model_score.detach().cpu())
+        elif 'val_loss' in trainer.callback_metrics:
+            best_val = float(trainer.callback_metrics['val_loss'].detach().cpu())
+        else:
+            best_val = float(lightning_model.best_val_loss)
+
+        # Optional: Save legacy .pt format for compatibility
+        if checkpoint_callback.best_model_path:
+            try:
+                state = torch.load(checkpoint_callback.best_model_path, map_location=self.device)
+                sd = state.get('state_dict', {})
+
+                # Keep only model.* keys and strip the prefix
+                model_state = {k[len('model.'):]: v for k, v in sd.items() if k.startswith('model.')}
+
+                # Save in old format
+                torch.save({
+                    'model': model_state,
+                    'epoch': state.get('epoch', 0),
+                    'best_val_loss': best_val,
+                    'config': self.cfg
+                }, self.work_dir / 'best_model.pt')
+                self.logger.info("Saved legacy best_model.pt for compatibility")
+            except Exception as e:
+                self.logger.warning(f"Could not save legacy .pt file: {e}")
+
+        return best_val if best_val is not None else float('inf')

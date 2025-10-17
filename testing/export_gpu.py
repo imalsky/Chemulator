@@ -2,7 +2,7 @@
 """
 Benchmark torch.export artifacts on BOTH GPU (CUDA or MPS) and CPU.
 
-Looks for:
+Artifacts expected:
   models/<MODEL_NAME>/export_k1_gpu.pt2[.meta.json]
   models/<MODEL_NAME>/export_k1_cpu.pt2[.meta.json]
 
@@ -15,13 +15,13 @@ import os
 import json
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable
 
 import torch
 
 # ------------------------- SETTINGS -------------------------------------------
 
-MODEL_NAME: str = "koopman-v1"
+MODEL_NAME: str = "koopman-v2"
 
 MODEL_DIR      = Path("../models") / MODEL_NAME
 GPU_BASENAME   = "export_k1_gpu.pt2"
@@ -46,11 +46,10 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 def _load_meta(path: Path, default_device: str, default_dtype: str = "float32",
                default_S_in: int = 12, default_G: int = 2) -> dict:
-    """Load .meta.json if present, else return reasonable defaults."""
+    """Load .meta.json if present; otherwise return defaults."""
     if path.exists():
         with path.open("r", encoding="utf-8") as f:
             m = json.load(f)
-        # Fill any missing fields with defaults
         m.setdefault("device", default_device)
         m.setdefault("dtype", default_dtype)
         m.setdefault("S_in", default_S_in)
@@ -62,22 +61,42 @@ def _dtype_from_str(s: str) -> torch.dtype:
     s = s.lower()
     if s in ("float16", "half", "fp16"):  return torch.float16
     if s in ("bfloat16", "bf16"):         return torch.bfloat16
+    if s in ("float64", "double", "fp64"):return torch.float64
     if s in ("float32", "fp32", "float"): return torch.float32
     raise ValueError(f"Unsupported dtype in meta: {s}")
 
 def _device_from_meta(meta_dev: str) -> torch.device:
-    meta_dev = meta_dev.lower()
-    if meta_dev == "cuda":
+    d = meta_dev.lower()
+    if d.startswith("cuda"):
         if not torch.cuda.is_available():
             raise SystemExit("Meta expects CUDA, but CUDA is not available.")
         return torch.device("cuda")
-    if meta_dev == "mps":
+    if d == "mps":
         if not torch.backends.mps.is_available():
             raise SystemExit("Meta expects MPS, but MPS is not available.")
         return torch.device("mps")
-    if meta_dev == "cpu":
+    if d == "cpu":
         return torch.device("cpu")
     raise SystemExit(f"Unsupported meta device: {meta_dev}")
+
+def _enforce_mps_dtype_policy(device: torch.device, dtype: torch.dtype, where: str) -> bool:
+    """
+    On MPS, disallow fp16/bf16 for exported graphs (MPS NDArray matmul asserts).
+    Returns True if allowed to proceed, else False.
+    """
+    if device.type != "mps":
+        return True
+    if dtype in (torch.float16, torch.bfloat16):
+        print(f"[{where}] MPS backend: fp16/bf16 exports are not supported for NDArray matmul.")
+        print("       Action: re-export your MPS artifact in float32 and set dtype:'float32' in the .meta.json.")
+        return False
+    return True
+
+def _sync(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 def _bench(module: torch.nn.Module, device: torch.device, dtype: torch.dtype,
            S_in: int, G: int, label: str) -> None:
@@ -97,19 +116,13 @@ def _bench(module: torch.nn.Module, device: torch.device, dtype: torch.dtype,
                 # Warmups
                 for _ in range(N_WARMUP):
                     _ = module(y, dt, g)
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                elif device.type == "mps":
-                    torch.mps.synchronize()
+                _sync(device)
 
                 # Timed
                 t0 = time.perf_counter()
                 for _ in range(N_ITERS):
                     _ = module(y, dt, g)
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                elif device.type == "mps":
-                    torch.mps.synchronize()
+                _sync(device)
                 t1 = time.perf_counter()
 
                 ms_per_iter = (t1 - t0) * 1e3 / N_ITERS
@@ -121,64 +134,75 @@ def _bench(module: torch.nn.Module, device: torch.device, dtype: torch.dtype,
                 msg = str(e).lower()
                 if "out of memory" in msg or "resource" in msg:
                     print(f"{B}\tOOM")
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    elif device.type == "mps":
+                        try:
+                            torch.mps.empty_cache()
+                        except Exception:
+                            pass
                     break
                 raise
 
-def _run_cpu() -> Optional[dict]:
+def _run_cpu() -> bool:
     if not CPU_EXPORT_PATH.exists():
         print(f"[CPU] Missing artifact: {CPU_EXPORT_PATH}")
-        return None
+        return False
+
     meta = _load_meta(CPU_META_PATH, default_device="cpu")
-    device = _device_from_meta(meta["device"])  # should be cpu
-    if device.type != "cpu":
-        print(f"[CPU] Warning: meta device is '{meta['device']}', forcing CPU anyway.")
-        device = torch.device("cpu")
+    device = torch.device("cpu")
     dtype  = _dtype_from_str(meta["dtype"])
-    if dtype not in (torch.float32,):
-        # Exported CPU path is almost always fp32; if meta says otherwise, try but warn.
-        print(f"[CPU] Note: dtype in meta is '{meta['dtype']}', proceeding.")
 
     ep = torch.export.load(str(CPU_EXPORT_PATH))
-    mod = ep.module()  # executable
+    mod = ep.module()
     _bench(mod, device, dtype, int(meta["S_in"]), int(meta["G"]), label="CPU bench")
-    return meta
+    return True
 
-def _run_gpu() -> Optional[dict]:
+def _run_gpu() -> bool:
     if not GPU_EXPORT_PATH.exists():
         print(f"[GPU] Missing artifact: {GPU_EXPORT_PATH}")
-        return None
-    meta = _load_meta(GPU_META_PATH, default_device=("cuda" if torch.cuda.is_available() else "mps"))
-    device = _device_from_meta(meta["device"])
+        return False
+
+    # Prefer CUDA if available, else MPS
+    default_dev = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cuda")
+    meta = _load_meta(GPU_META_PATH, default_device=default_dev)
+
+    # Resolve/validate device from meta
+    try:
+        device = _device_from_meta(meta["device"])
+    except SystemExit as e:
+        print(f"[GPU] Skipped: {e}")
+        return False
+
     dtype  = _dtype_from_str(meta["dtype"])
+
+    # Enforce MPS 16-bit policy
+    if not _enforce_mps_dtype_policy(device, dtype, where="GPU bench"):
+        print("[GPU] Skipping run. Re-export in float32 for MPS.")
+        return False
 
     ep = torch.export.load(str(GPU_EXPORT_PATH))
     mod = ep.module()
     _bench(mod, device, dtype, int(meta["S_in"]), int(meta["G"]), label="GPU bench")
-    return meta
+    return True
 
 def main():
     any_run = False
 
-    # GPU first (if present)
+    # GPU first
     try:
-        meta_gpu = _run_gpu()
-        any_run = any_run or (meta_gpu is not None)
-    except SystemExit as e:
-        print(f"[GPU] Skipped: {e}")
+        any_run |= _run_gpu()
     except Exception as e:
         print(f"[GPU] Error: {e}")
 
     # CPU next
     try:
-        meta_cpu = _run_cpu()
-        any_run = any_run or (meta_cpu is not None)
-    except SystemExit as e:
-        print(f"[CPU] Skipped: {e}")
+        any_run |= _run_cpu()
     except Exception as e:
         print(f"[CPU] Error: {e}")
 
     if not any_run:
-        raise SystemExit("No artifacts found to benchmark. Export CPU/GPU artifacts first.")
+        raise SystemExit("No artifacts benchmarked. Export CPU/GPU artifacts first (and use float32 on MPS).")
 
 if __name__ == "__main__":
     main()
