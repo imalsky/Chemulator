@@ -657,7 +657,7 @@ def main() -> None:
 
     # Determine runtime dtype for staged tensors (dataset storage)
     storage_dtype_str = str(cfg.get("dataset", {}).get("storage_dtype", "float32")).lower()
-    if storage_dtype_str == "bf16":
+    if storage_dtype_str in ("bf16", "bfloat16"):
         runtime_dtype = torch.bfloat16
     elif storage_dtype_str in ("fp16", "float16", "half"):
         runtime_dtype = torch.float16

@@ -23,7 +23,7 @@
   "dataset": {
     // Multi-time sampling per anchor
     "multi_time_per_anchor": true,
-    "times_per_anchor": 16,
+    "times_per_anchor": 4,
     "share_times_across_batch": true,
 
     // Log-uniform dt sampling
@@ -42,7 +42,7 @@
     "require_dt_stats": false,
 
     // Storage dtype for staged tensors
-    "storage_dtype": "float32",
+    "storage_dtype": "32",
 
     // DataLoader settings
     "preload_train_to_gpu": false,
@@ -63,54 +63,61 @@
   // MODEL (Stable LPV Koopman AE)
   // ===============================
   "model": {
-    "latent_dim": 64,
-    "encoder_hidden": [512, 512, 512],
-    "decoder_hidden": [512, 512, 512],
+    // === Core architecture ===
+    "latent_dim": 16,                 // reduced from 64
+    "encoder_hidden": [128, 128],     // reduced from [256,256,256]
+    "decoder_hidden": [128, 128],     // reduced from [256,256,256]
     "activation": "silu",
     "dropout": 0.0,
 
-    // Decoder output options
-    "softmax_head": false,
-    "predict_delta": true,
-    "z_std_clip": 10.0,
+    // === Decoder behavior ===
+    "softmax_head": false,            // raw head; targets already normalized
+    "predict_delta": true,            // outputs Δy; final = y_i + Δy
+    "z_std_clip": 10.0,               // clamp decoder outputs
 
-    // LPV dynamics conditioning
-    "cond_hidden": [64, 64],
-    "rank_l": 12,
-    "use_S": false,
-    "gamma": 0.10
+    // === LPV dynamics conditioning ===
+    "cond_hidden": [32, 32],
+    "rank_l": 8,                      // reduced from 32
+    "use_S": false,                   // keep symmetric, faster & safer
+    "gamma": 0.50,                    // increased from 0.10 (more damping)
+
+    // === Stability extras (new) ===
+    "s_bound": 2.0,                   // max singular value scale for L (s ∈ [0, s_bound])
+    "L_fro_factor": 0.5,              // cap ||L||_F ≤ gamma * Z * L_fro_factor
+    "spectral_norm_cond": false,       // spectral normalization on cond MLP
+    "basis": "dct",                   // basis for base_U: "dct" | "identity" | "qr"
+    "stability_projection_eps": null  // e.g., 0.05 to force extra stability; null = off
   },
-
   // ===============================
   // TRAINING
   // ===============================
   "training": {
-    // Batch sizes (must be explicit integers)
-    "batch_size": 2048,
-    "val_batch_size": 4096,
+    // Batch sizes
+    "batch_size": 512,  // REDUCED from 2048
+    "val_batch_size": 1024,  // REDUCED from 2048
 
     // Trajectory pair sampling
-    "pairs_per_traj": 16,
-    "pairs_per_traj_val": 4,
-    "min_steps": 1,
-    "max_steps": 99,
+    "pairs_per_traj": 4,
+    "pairs_per_traj_val": 1,
 
-    // Dataset splits (used by preprocessor)
+    // CRITICAL FIX: Reduce max_steps to limit dt range
+    "min_steps": 1,
+    "max_steps": 99,  // CRITICAL: REDUCED from 99
+
+    // Dataset splits
     "val_fraction": 0.1,
     "test_fraction": 0.1,
-
-    // Use only a fraction of data (helpful for debugging with smaller datasets)
     "use_fraction": 1.0,
 
-    // Optimizer hyperparameters
-    "lr": 1.0e-4,
-    "min_lr": 1.0e-6,
-    "weight_decay": 1.0e-3,
-    "warmup_epochs": 10,
+    // CRITICAL: Lower learning rate for stability
+    "lr": 5.0e-5,  // REDUCED from 1e-4
+    "min_lr": 1.0e-7,  // REDUCED from 1e-6
+    "weight_decay": 1.0e-4,  // REDUCED from 1e-3
+    "warmup_epochs": 20,  // INCREASED from 10
     "epochs": 100,
 
-    // Gradient clipping (0.0 = disabled)
-    "gradient_clip": 1.0,
+    // CRITICAL: Tighter gradient clipping
+    "gradient_clip": 0.5,  // REDUCED from 1.0
 
     "loss": {
       "tail_huber": {
@@ -119,23 +126,19 @@
         "z_threshold": -1.0
       },
       "fractional": {
-        "weight": 0.1,
+        "weight": 0.0,  // DISABLED initially
         "eps": 1e-8
       }
     },
 
-    // Auxiliary losses
+    // Auxiliary losses - DISABLED initially for stability
     "auxiliary_losses": {
-      // Rollout loss (autoregressive stability)
-      "rollout_enabled": true,
+      "rollout_enabled": false,
       "rollout_weight": 0.5,
       "rollout_horizon": 4,
       "rollout_warmup_epochs": 10,
-      // false = autoregressive (re-encodes each step, slower but safer)
-      // true  = cached (encode once, faster, assumes model handles it)
-      "rollout_use_cached_encoding": false,
+      "rollout_use_cached_encoding": true,
 
-      // Teacher forcing schedule for rollout
       "rollout_teacher_forcing": {
         "mode": "linear",
         "start_p": 1.0,
@@ -143,17 +146,13 @@
         "end_epoch": 60
       },
 
-      // Semigroup consistency loss
-      "semigroup_enabled": true,
+      "semigroup_enabled": false,
       "semigroup_weight": 0.005,
       "semigroup_warmup_epochs": 10
     },
 
-    // Resume controls (used by main.py)
     "resume": null,
     "auto_resume": false,
-
-    // Debug short run
     "fast_dev_run": false
   },
 
@@ -161,18 +160,12 @@
   // LIGHTNING RUNTIME
   // ===============================
   "lightning": {
-    // Hardware
     "accelerator": "auto",
     "devices": 1,
-    "precision": "bf16-mixed",
-
-    // Training settings
+    // CRITICAL: Start with FP32 for stability
+    "precision": "32",  // CHANGED from bf16-mixed
     "accumulate_grad_batches": 1,
-
-    // Strategy for multi-GPU (if devices > 1)
     "strategy": "auto",
-
-    // Debugging flags
     "num_sanity_val_steps": 0
   },
 
