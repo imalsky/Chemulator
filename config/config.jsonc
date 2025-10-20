@@ -22,7 +22,7 @@
   // ===============================
   "dataset": {
     "multi_time_per_anchor": true,
-    "times_per_anchor": 4,
+    "times_per_anchor": 16,
     "share_times_across_batch": true,
 
     "log_dt_sampling": true,
@@ -59,7 +59,7 @@
   // ===============================
   "model": {
     "type": "stable_lpv_koopman",
-    "latent_dim": 32,
+    "latent_dim": 64,
     "encoder_hidden": [512, 512, 512],
     "decoder_hidden": [512, 512, 512],
     "activation": "silu",
@@ -70,7 +70,7 @@
 
     // LPV conditioning head
     "cond_hidden": [64, 64],
-    "rank_l": 8,
+    "rank_l": 12,
     "use_S": false,
     "gamma": 0.10
   },
@@ -84,7 +84,7 @@
     "val_batch_size": "auto",
 
     // Trajectory pair sampling (used by dataset + preprocessor)
-    "pairs_per_traj": 4,
+    "pairs_per_traj": 16,
     "pairs_per_traj_val": 4,
     "min_steps": 1,
     "max_steps": 99,
@@ -94,7 +94,7 @@
     "test_fraction": 0.1,
 
     // Optimization
-    "lr": 1.0e-5,
+    "lr": 1.0e-4,
     "min_lr": 1.0e-6,
     "weight_decay": 1.0e-3,
     "gradient_clip": 0.0,      // Lightning reads this via Trainer wrapper
@@ -103,11 +103,11 @@
     // Losses
     "loss": {
       "tail_huber": {
-        "weight": 0.1,
+        "weight": 0.0,
         "delta": 0.02,
         "z_threshold": -1.0
       },
-      "time_weight_mode": "sqrt"
+      "time_weight_mode": "none"
     },
 
     // Aux losses
@@ -152,7 +152,7 @@
   // SCHEDULER (used by trainer)
   // ===============================
   "scheduler": {
-    "use_plateau_fallback": false,
+    "use_plateau_fallback": true,
     "plateau_patience": 10,
     "plateau_factor": 0.5
   },
@@ -163,7 +163,7 @@
   "lightning": {
     "accelerator": "auto",
     "devices": 1,
-    "precision": "bf16-mixed",
+    "precision": "32", //"bf16-mixed"
     "accumulate_grad_batches": 1,
 
     // Cap auto BSize to avoid ridiculous values
@@ -183,16 +183,17 @@
     "val_batch_size_multiplier": 2.0,
 
     // Optional extras used by trainer.py (kept off by default)
-    "auto_lr_find": false,     // if true, runs LR finder after BSize tuning
-    "lr_find_min": 1e-6,
+    "auto_lr_find": true,     // if true, runs LR finder after BSize tuning
+    "lr_find_min": 1e-7,
     "lr_find_max": 3e-4,
-    "lr_find_steps": 96,
+    "lr_find_steps": 50,
 
     // If auto_lr_find=false, we linearly scale LR using this base
     "lr_base_batch_size": 8192,
 
     // Safe/cheap compile: encoder+decoder only
     "torch_compile": false,
+    "matrix_exp_bs_cap": 8192,
 
     // Profiler & sanity steps
     "profile": false,

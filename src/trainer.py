@@ -11,6 +11,7 @@ import logging
 import time
 import math
 import contextlib
+import copy, gc
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -35,10 +36,11 @@ except Exception:
         from lightning.pytorch.tuner.tuning import Tuner as _PLTuner
         _TUNER_AVAILABLE = True
     except Exception:
-        _PLTUNER_AVAILABLE = False   # backward alias
         _PLTuner = None
         _TUNER_AVAILABLE = False
 
+# Back-compat alias so older call-sites using `_PLTUNER` won't crash
+_PLTUNER = _PLTuner
 
 # --------------------------------------------------------------------------------------
 # Loss: Combined (MSE in normalized space) + optional Tail-Huber
@@ -274,28 +276,78 @@ class GradNormLogger(Callback):
 
 
 class NonFiniteParamGuard(Callback):
-    """Detect and loudly log the first time parameters become non-finite."""
+    """Detect and loudly log non-finite parameters AND gradients."""
 
     def __init__(self, py_logger: Optional[logging.Logger] = None):
         super().__init__()
-        self._tripped = False
+        self._param_tripped = False
+        self._grad_tripped = False  # ← NEW
         self.py_logger = py_logger or logging.getLogger("trainer")
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if self._tripped:
+    def on_after_backward(self, trainer, pl_module):  # ← NEW METHOD
+        """Check gradients immediately after backward pass."""
+        if self._grad_tripped:
             return
+
+        try:
+            with torch.no_grad():
+                for name, p in pl_module.model.named_parameters():
+                    if p.grad is not None:
+                        if not torch.isfinite(p.grad).all():
+                            self._grad_tripped = True
+                            self.py_logger.error(
+                                f"[GRAD GUARD] Epoch {trainer.current_epoch}, "
+                                f"Batch {trainer.global_step}: "
+                                f"First non-finite GRADIENT: {name}"
+                            )
+                            pl_module.log("grad_nonfinite_detected", 1.0,
+                                          on_step=True, on_epoch=True, prog_bar=True)
+
+                            # Log gradient statistics for debugging
+                            try:
+                                g = p.grad.detach().float()
+                                n_nan = torch.isnan(g).sum().item()
+                                n_inf = torch.isinf(g).sum().item()
+                                self.py_logger.error(
+                                    f"  → Gradient stats: {n_nan} NaNs, {n_inf} Infs"
+                                )
+                            except Exception:
+                                pass
+                            break
+        except Exception as e:
+            self.py_logger.warning(f"[GUARD] Gradient check failed: {e}")
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Check parameters after optimizer step."""
+        if self._param_tripped:
+            return
+
         try:
             with torch.no_grad():
                 for name, p in pl_module.model.named_parameters():
                     if p is not None:
-                        finite = torch.isfinite(p).all()
-                        if not bool(finite):
-                            self._tripped = True
-                            self.py_logger.error(f"[NonFiniteParamGuard] First non-finite param: {name}")
-                            pl_module.log("param_nonfinite", 1.0, on_step=True, on_epoch=True, prog_bar=True)
+                        if not torch.isfinite(p).all():
+                            self._param_tripped = True
+                            self.py_logger.error(
+                                f"[PARAM GUARD] Epoch {trainer.current_epoch}, "
+                                f"Batch {batch_idx}: "
+                                f"First non-finite PARAMETER: {name}"
+                            )
+                            pl_module.log("param_nonfinite", 1.0,
+                                          on_step=True, on_epoch=True, prog_bar=True)
+
+                            # Log parameter statistics
+                            try:
+                                n_nan = torch.isnan(p).sum().item()
+                                n_inf = torch.isinf(p).sum().item()
+                                self.py_logger.error(
+                                    f"  → Param stats: {n_nan} NaNs, {n_inf} Infs"
+                                )
+                            except Exception:
+                                pass
                             break
-        except Exception:
-            pass
+        except Exception as e:
+            self.py_logger.warning(f"[GUARD] Parameter check failed: {e}")
 
 
 class SimpleStatsCallback(Callback):
@@ -321,40 +373,56 @@ class SimpleStatsCallback(Callback):
             pass
 
     def on_train_epoch_end(self, trainer, pl_module):
-        elapsed = time.time() - (self._epoch_start_time or time.time())
-        throughput = (self._n_samples / elapsed) if elapsed > 0 else 0.0
+        # ---- Throughput ----
+        now = time.time()
+        start = self._epoch_start_time or now
+        elapsed = max(now - start, 1e-12)
+        throughput = float(self._n_samples) / elapsed
 
-        # Parameter and gradient norms summary (grads may be zeroed by then; kept for continuity)
+        # ---- Parameter norm (safe, finite-masked) ----
         with torch.no_grad():
             device = pl_module.device
             p_sq = torch.tensor(0.0, device=device)
-            g_sq = torch.tensor(0.0, device=device)
-
             for p in pl_module.model.parameters():
                 if p is None:
                     continue
                 p32 = p.detach().float()
-                # mask non-finite before squaring to avoid NaN explosions
                 p32 = torch.where(torch.isfinite(p32), p32, torch.zeros_like(p32))
                 p_sq += (p32 * p32).sum()
+            p_norm = float(torch.sqrt(p_sq).detach().cpu())
 
-                if p.grad is not None:
-                    g32 = p.grad.detach().float()
-                    g32 = torch.where(torch.isfinite(g32), g32, torch.zeros_like(g32))
-                    g_sq += (g32 * g32).sum()
+        # ---- Gradient norm: use aggregated metric from GradNormLogger ----
+        cm = trainer.callback_metrics
+        g_norm_val = cm.get("grad_norm", None)
+        if isinstance(g_norm_val, torch.Tensor):
+            try:
+                g_norm = float(g_norm_val.detach().cpu())
+            except Exception:
+                g_norm = float("nan")
+        elif g_norm_val is None:
+            # No epoch aggregation available (e.g., no backward ran); avoid misleading zeros.
+            g_norm = float("nan")
+        else:
+            g_norm = float(g_norm_val)
 
-            p_norm = float(torch.sqrt(p_sq).cpu())
-            g_norm = float(torch.sqrt(g_sq).cpu())
+        # ---- LR & memory ----
+        try:
+            lr = float(trainer.optimizers[0].param_groups[0]["lr"])
+        except Exception:
+            lr = float("nan")
 
         max_mem = 0.0
         if torch.cuda.is_available():
-            max_mem = torch.cuda.max_memory_reserved() / (1024 ** 3)
+            try:
+                max_mem = torch.cuda.max_memory_reserved() / (1024 ** 3)
+            except Exception:
+                max_mem = 0.0
 
-        lr = trainer.optimizers[0].param_groups[0]["lr"]
-        cm = trainer.callback_metrics
-        train_loss = float(cm.get('train_loss', float('nan')))
-        val_loss = float(cm.get('val_loss', float('nan')))
+        # ---- Losses from callback metrics (already reduced by Lightning) ----
+        train_loss = float(cm.get("train_loss", float("nan")))
+        val_loss = float(cm.get("val_loss", float("nan")))
 
+        # ---- Log line ----
         self.py_logger.info(
             f"Epoch {trainer.current_epoch:3d} | "
             f"train={train_loss:.3e} val={val_loss:.3e} | "
@@ -364,6 +432,7 @@ class SimpleStatsCallback(Callback):
             f"GPU {max_mem:.1f}GB"
         )
 
+        # ---- Metrics to Logger ----
         pl_module.log("throughput", throughput, on_epoch=True, prog_bar=False)
         pl_module.log("param_norm", p_norm, on_epoch=True, prog_bar=False)
         pl_module.log("grad_norm_epoch_end", g_norm, on_epoch=True, prog_bar=False)
@@ -494,6 +563,48 @@ class AutoEncoderModule(LightningModule):
             "optimizer": opt,
             "lr_scheduler": scheduler_config,
         }
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+        """
+        Run Lightning's closure to compute loss+backward, then guard and step.
+        If any gradient is non-finite, skip the optimizer step.
+        """
+        # 1) ALWAYS execute the closure Lightning gives us (does backward())
+        loss = None
+        if optimizer_closure is not None:
+            loss = optimizer_closure()
+
+        # 2) Inspect gradients AFTER backward
+        bad_name = None
+        max_grad = 0.0
+        for name, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+            if not torch.isfinite(p.grad).all():
+                bad_name = name
+                break
+            try:
+                max_grad = max(max_grad, float(p.grad.abs().max().item()))
+            except Exception:
+                pass
+
+        # 3) If bad grads, skip the step
+        if bad_name is not None:
+            self.py_logger.error(
+                f"[GRAD GUARD] Epoch {epoch}, Batch {batch_idx}: "
+                f"Non-finite gradient in '{bad_name}'. Skipping optimizer step."
+            )
+            self.log("grad_nonfinite", 1.0, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            optimizer.zero_grad(set_to_none=True)
+            return
+
+        # (Optional) lightweight telemetry
+        if batch_idx % 100 == 0:
+            self.log("max_grad_magnitude", max_grad, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+
+        # 4) Now do the step (closure already executed above)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
     def _get_teacher_forcing_prob(self, epoch: int) -> float:
         if self.tf_mode == "none":
@@ -674,6 +785,23 @@ class AutoEncoderModule(LightningModule):
 
             return {"loss": torch.zeros((), device=self.device, requires_grad=True)}
 
+        if total.requires_grad and torch.isfinite(total):
+            loss_value = float(total.item())
+            if loss_value > 1e6:
+                self.py_logger.warning(
+                    f"[LOSS GUARD] Batch {batch_idx}: Loss extremely large ({loss_value:.3e}). "
+                    f"May cause gradient overflow in backward pass."
+                )
+                self.log("loss_overflow_risk", 1.0, on_step=True, on_epoch=False, prog_bar=True)
+
+            # Optional: Cap loss to prevent gradient explosion
+            if loss_value > 1e8:
+                self.py_logger.error(
+                    f"[LOSS GUARD] Batch {batch_idx}: Loss={loss_value:.3e} exceeds safe threshold. "
+                    f"Capping to 1e8."
+                )
+                total = total.clamp(max=1e8)
+
         # Normal logging
         self.log("train_loss", total, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         if should_log_batch:
@@ -774,7 +902,6 @@ class AutoEncoderModule(LightningModule):
 
                 dt_phys_a = (10.0 ** (log_min + dt_a * rng)).clamp_min(1e-30)
                 dt_phys_b = (10.0 ** (log_min + dt_b * rng)).clamp_min(1e-30)
-
                 dt_phys_ab = dt_phys_a + dt_phys_b
 
                 dt_ab = (torch.log10(dt_phys_ab) - log_min) / rng
@@ -782,8 +909,11 @@ class AutoEncoderModule(LightningModule):
             else:
                 dt_ab = (dt_a + dt_b).clamp(0.0, 1.0)
 
-            y_ab = self.model.step(self.model.step(y_i, dt_a, g), dt_b, g)
-            y_combined = self.model.step(y_i, dt_ab, g)
+            # Use public forward(): expects [B] or [B,1], returns [B,1,S]
+            y_a = self.model(y_i, dt_a.unsqueeze(1), g)[:, 0]  # y(t+dt_a)
+            y_ab = self.model(y_a, dt_b.unsqueeze(1), g)[:, 0]  # y(t+dt_a+dt_b) via two steps
+            y_combined = self.model(y_i, dt_ab.unsqueeze(1), g)[:, 0]  # y(t+dt_a+dt_b) via combined dt
+
             return F.mse_loss(y_ab, y_combined)
         except Exception:
             return None
@@ -884,12 +1014,18 @@ class AutoEncoderModule(LightningModule):
         y_i, dt, y_j, g, mask = self._process_batch(batch)
         if dt.ndim == 3 and dt.shape[-1] == 1:
             dt = dt.squeeze(-1)
-        steps = min(steps, dt.shape[1])
-        out = self.model.rollout(y_i, g, dt[:, 0], steps=steps)
+        if dt.ndim == 1:
+            dt0 = dt
+            steps = min(steps, 1)
+        elif dt.ndim == 2:
+            dt0 = dt[:, 0]
+            steps = min(steps, dt.shape[1])
+        else:
+            raise ValueError(f"dt must be [B] or [B,K]; got {tuple(dt.shape)}")
+        out = self.model.rollout(y_i, g, dt0, steps=steps)
         drift = (out[:, 1:] - out[:, :-1]).abs().mean().item()
         var = out.var(dim=1).mean().item()
         return {"rollout_drift": float(drift), "rollout_var": float(var)}
-
 
 # --------------------------------------------------------------------------------------
 # DataModule wrapper
@@ -900,8 +1036,15 @@ class FlexibleDataModule(pl.LightningDataModule):
         super().__init__()
         self._train_loader = train_loader
         self._val_loader = val_loader
-        self.batch_size = getattr(train_loader, "batch_size", None) or 32
-        self.val_batch_size = getattr(val_loader, "batch_size", None) or self.batch_size
+
+        # Private storages with properties below
+        self._batch_size = getattr(train_loader, "batch_size", None) or 32
+        self._val_batch_size = getattr(val_loader, "batch_size", None) or self._batch_size
+
+        # Cap enforcement (used during tuning)
+        self._enforce_cap = False
+        self._hard_cap = None
+
         self._train_kwargs = dict(
             num_workers=train_loader.num_workers,
             pin_memory=getattr(train_loader, "pin_memory", False),
@@ -919,12 +1062,54 @@ class FlexibleDataModule(pl.LightningDataModule):
             drop_last=getattr(val_loader, "drop_last", False),
         )
 
+    # ----------------
+    # Public controls
+    # ----------------
+    def enable_cap_enforcement(self, hard_cap: int):
+        """Enable a hard upper bound for batch_size (used during tuner)."""
+        self._hard_cap = int(hard_cap)
+        self._enforce_cap = True
+
+    def disable_cap_enforcement(self):
+        self._enforce_cap = False
+        self._hard_cap = None
+
+    # ----------------
+    # Properties
+    # ----------------
+    @property
+    def batch_size(self) -> int:
+        return int(self._batch_size)
+
+    @batch_size.setter
+    def batch_size(self, v: int):
+        v = int(v)
+        if self._enforce_cap and self._hard_cap is not None and v > self._hard_cap:
+            # Make the tuner bail out immediately instead of “trying 16384”
+            raise RuntimeError(f"Requested train batch_size {v} exceeds hard cap {self._hard_cap}.")
+        self._batch_size = max(1, v)
+
+    @property
+    def val_batch_size(self) -> int:
+        return int(self._val_batch_size)
+
+    @val_batch_size.setter
+    def val_batch_size(self, v: int):
+        v = int(v)
+        if self._enforce_cap and self._hard_cap is not None and v > self._hard_cap:
+            # Validation should also respect cap if tuner messes with it
+            raise RuntimeError(f"Requested val batch_size {v} exceeds hard cap {self._hard_cap}.")
+        self._val_batch_size = max(1, v)
+
+    # ----------------
+    # Dataloaders
+    # ----------------
     def train_dataloader(self):
         ds = self._train_loader.dataset
         return DataLoader(
             ds,
             batch_size=int(self.batch_size),
-            shuffle=False,
+            shuffle=True,  # TRAIN MUST SHUFFLE
             **{k: v for k, v in self._train_kwargs.items() if v is not None}
         )
 
@@ -973,70 +1158,67 @@ class Trainer:
             if self.logger:
                 self.logger.warning(f"Failed to write {path.name}: {e}")
 
-    def _maybe_tune_batch_size(self, module: AutoEncoderModule, datamodule: FlexibleDataModule) -> Tuple[int, int]:
+    def _maybe_tune_batch_size(
+            self,
+            module: AutoEncoderModule,  # ignored; we don't mutate it
+            datamodule: FlexibleDataModule,
+    ) -> Tuple[int, int]:
         """
-        Decide/auto-tune batch sizes.
-        - Honors explicit training.batch_size / training.val_batch_size when not "auto".
-        - Otherwise runs Lightning's batch-size tuner with hard caps and safe settings.
-        - Mirrors tuned train batch size to val (× val_batch_size_multiplier) when val is "auto".
+        Decide/auto-tune batch sizes without touching CUDA.
         Returns: (final_train_bs, final_val_bs)
         """
-        # ---- resolve requested values ----
+        lcfg = self.cfg.get("lightning", {}) or {}
         tcfg = self.cfg.get("training", {}) or {}
+
         bs = tcfg.get("batch_size", getattr(self.train_loader, "batch_size", None))
         vbs = tcfg.get("val_batch_size", getattr(self.val_loader, "batch_size", None))
-        if isinstance(bs, str):
-            bs = bs.lower()
-        if isinstance(vbs, str):
-            vbs = vbs.lower()
+        if isinstance(bs, str):  bs = bs.lower()
+        if isinstance(vbs, str): vbs = vbs.lower()
 
-        # If both are fixed, just return them
-        if bs != "auto" and vbs != "auto":
-            final_train_bs = int(bs or datamodule.batch_size)
-            final_val_bs = int(vbs or datamodule.val_batch_size)
-            datamodule.batch_size = final_train_bs
-            datamodule.val_batch_size = final_val_bs
-            if self.logger:
-                self.logger.info("Batch sizes (explicit): train=%d, val=%d", final_train_bs, final_val_bs)
-            return final_train_bs, final_val_bs
+        # Hard cap from config limits
+        user_cap = int(lcfg.get("auto_bs_user_cap", 32768))
+        exp_bs_cap = int(lcfg.get("exp_batch_cap_for_matrix_exp", 8192))
+        hard_cap = max(1, min(user_cap, exp_bs_cap))
 
-        # ---- tuning settings & caps ----
-        lcfg = self.cfg.get("lightning", {}) or {}
-        hard_cap = int(lcfg.get("max_auto_batch_size", 16384))
         val_multiplier = float(lcfg.get("val_batch_size_multiplier", 2.0))
-
-        # Initial guess: default to current datamodule batch size
-        initial_guess = int(lcfg.get("initial_batch_size_guess", datamodule.batch_size))
+        initial_guess = int(lcfg.get("initial_batch_size_guess", datamodule.batch_size or 512))
         initial_guess = max(1, min(initial_guess, hard_cap))
 
-        # Mode: force binsearch (safe); ignore "power" even if configured
+        # If both fixed, just set and return
+        if bs != "auto" and vbs != "auto":
+            datamodule.batch_size = int(bs or datamodule.batch_size or 512)
+            datamodule.val_batch_size = int(vbs or datamodule.val_batch_size or datamodule.batch_size * 2)
+            return int(datamodule.batch_size), int(datamodule.val_batch_size)
+
         mode = str(lcfg.get("auto_scale_batch_size", "binsearch")).lower()
         if mode != "binsearch":
             if self.logger:
                 self.logger.info("Overriding auto_scale_batch_size=%s → binsearch (safety).", mode)
             mode = "binsearch"
 
-        # Trial budget: never exceed the cap even if doubling
-        import math
-        max_trials_user = int(lcfg.get("auto_bs_max_trials", 6))
         ratio = max(1.0, float(hard_cap) / float(initial_guess))
-        max_trials_cap = 1 + int(math.floor(math.log2(ratio)))
+        max_trials_user = int(lcfg.get("auto_bs_max_trials", 6))
+        max_trials_cap = 1 + int(math.floor(math.log2(ratio)))  # includes the doubling steps
         max_trials = max(1, min(max_trials_user, max_trials_cap))
 
-        # If train bs is fixed numeric (rare with this codepath), set it before tuning
+        # Seed datamodule batch size
         if isinstance(bs, int) and bs > 0:
             datamodule.batch_size = min(int(bs), hard_cap)
         elif bs == "auto":
-            datamodule.batch_size = initial_guess  # seed the tuner
+            datamodule.batch_size = initial_guess
 
-        # ---- run tuner (if available) ----
         tuned_train_bs = int(datamodule.batch_size)
-        if "_TUNER_AVAILABLE" in globals() and _TUNER_AVAILABLE:
+
+        # Enforce cap during tuner: any attempt > hard_cap raises and stops the doubling
+        datamodule.enable_cap_enforcement(hard_cap)
+
+        if _TUNER_AVAILABLE and _PLTUNER is not None and bs == "auto":
             try:
+                tmp_module = AutoEncoderModule(copy.deepcopy(self.model), self.cfg, self.work_dir).cpu()
                 tmp_trainer = LightningTrainer(
-                    accelerator=lcfg.get("accelerator", "auto"),
-                    devices=lcfg.get("devices", 1),
-                    precision=lcfg.get("precision", "bf16-mixed"),
+                    accelerator="cpu",
+                    devices=1,
+                    precision="32",
                     max_epochs=1,
                     limit_train_batches=2,
                     limit_val_batches=1,
@@ -1044,100 +1226,115 @@ class Trainer:
                     logger=CSVLogger(save_dir=str(self.work_dir), name=".bs_tune"),
                     enable_model_summary=False,
                     detect_anomaly=False,
+                    num_sanity_val_steps=0,
+                    enable_progress_bar=False,
                 )
-                tuner = _PLTuner(tmp_trainer)
+                tuner = _PLTUNER(tmp_trainer)
                 tuned = tuner.scale_batch_size(
-                    module,
+                    tmp_module,
                     datamodule=datamodule,
                     mode=mode,
                     steps_per_trial=1,
                     init_val=datamodule.batch_size,
                     max_trials=max_trials,
                 )
-                tuned_train_bs = int(tuned)
-                if self.logger:
-                    self.logger.info(
-                        "Auto batch-size tuned (mode=%s, trials≤%d): proposal train=%d",
-                        mode, max_trials, tuned_train_bs
-                    )
+                if isinstance(tuned, int) and tuned > 0:
+                    tuned_train_bs = max(1, min(int(tuned), hard_cap))
+                    if self.logger:
+                        self.logger.info("Auto BS (CPU tuner): init=%d → tuned=%d (cap=%d, trials=%d)",
+                                         initial_guess, tuned_train_bs, hard_cap, max_trials)
             except Exception as e:
+                # Expect a RuntimeError once tuner tries > hard_cap; that is by design to stop it
                 if self.logger:
-                    self.logger.warning(
-                        "Auto batch-size tuning failed (%s); keeping current sizes.", str(e)
-                    )
+                    self.logger.info("Batch-size tuner stopped at cap %d (reason: %s).", hard_cap, e)
+            finally:
+                datamodule.disable_cap_enforcement()
+                try:
+                    del tmp_trainer, tmp_module
+                except Exception:
+                    pass
+                gc.collect()
         else:
+            datamodule.disable_cap_enforcement()
             if self.logger:
-                self.logger.warning("Lightning Tuner not available; skipping auto batch-size.")
+                self.logger.info("Lightning Tuner unavailable or BS not 'auto'; using %d.", tuned_train_bs)
 
-        # ---- clamp to cap and mirror to val if requested ----
-        final_train_bs = max(1, min(tuned_train_bs, hard_cap))
+        final_train_bs = max(1, min(int(tuned_train_bs), hard_cap))
         datamodule.batch_size = final_train_bs
 
         if vbs == "auto":
             final_val_bs = int(final_train_bs * val_multiplier)
         else:
-            # numeric or None → use provided or current
-            final_val_bs = int(vbs or datamodule.val_batch_size)
+            final_val_bs = int(vbs or datamodule.val_batch_size or final_train_bs * val_multiplier)
         final_val_bs = max(1, min(int(final_val_bs), hard_cap))
         datamodule.val_batch_size = final_val_bs
 
         if self.logger:
-            self.logger.info(
-                "Batch sizes: train=%d, val=%d (cap=%d, init=%d, mode=%s, val×=%.2f)",
-                final_train_bs, final_val_bs, hard_cap, initial_guess, mode, val_multiplier
-            )
-
+            self.logger.info("Batch sizes: train=%d, val=%d (cap=%d, init=%d)",
+                             final_train_bs, final_val_bs, hard_cap, initial_guess)
         return final_train_bs, final_val_bs
 
-    def _maybe_tune_lr(self, module: AutoEncoderModule, datamodule: FlexibleDataModule, train_bs: int) -> float:
-        """Either run Lightning's LR finder (if enabled), or linearly scale LR by batch size."""
+    def _maybe_tune_lr(
+            self,
+            module: AutoEncoderModule,  # ignored; we return a float
+            datamodule: FlexibleDataModule,
+            train_bs: int
+    ) -> float:
         lcfg = self.cfg.get("lightning", {}) or {}
+        tcfg = self.cfg.get("training", {}) or {}
         auto_lr = bool(lcfg.get("auto_lr_find", False))
 
-        # If lr-finder disabled, do simple linear scaling vs. a base batch size
+        default_lr = float(tcfg.get("lr", 1e-4))
+        min_lr_cfg = float(tcfg.get("min_lr", 1e-6))
+
         if not auto_lr:
             base_bs = int(lcfg.get("lr_base_batch_size", 8192))
-            base_lr = float(self.cfg.get("training", {}).get("lr", module.learning_rate))
+            base_lr = default_lr
             scaled = base_lr * max(1, int(train_bs)) / max(1, base_bs)
-            module.learning_rate = max(module.min_lr, float(scaled))
+            lr = max(min_lr_cfg, float(scaled))
             self._save_json(self.work_dir / "lr_find.json", {
                 "mode": "linear_scale",
                 "base_batch_size": base_bs,
                 "train_batch_size": train_bs,
                 "base_lr": base_lr,
-                "chosen_lr": module.learning_rate
+                "chosen_lr": lr
             })
             if self.logger:
-                self.logger.info(
-                    f"LR scaled linearly: {base_lr:.2e} → {module.learning_rate:.2e} (bs {train_bs}/{base_bs})")
-            return module.learning_rate
+                self.logger.info("LR (linear scale): base %.2e @%d → %.2e @%d", base_lr, base_bs, lr, train_bs)
+            return lr
 
-        # LR finder path
-        if not _TUNER_AVAILABLE:
+        # Auto LR finder — CPU-only
+        min_lr = float(lcfg.get("lr_find_min", 3e-6))
+        max_lr = float(lcfg.get("lr_find_max", 2e-4))
+        steps = int(lcfg.get("lr_find_steps", 50))
+        train_limit = max(steps, 20)
+
+        if not (_TUNER_AVAILABLE and _PLTUNER is not None):
             if self.logger:
-                self.logger.warning("Lightning Tuner not available; skipping LR finder.")
-            return module.learning_rate
+                self.logger.info("PL Tuner not available; falling back to default LR %.2e.", default_lr)
+            return default_lr
 
-        min_lr = float(lcfg.get("lr_find_min", 1e-6))
-        max_lr = float(lcfg.get("lr_find_max", 3e-4))
-        steps = int(lcfg.get("lr_find_steps", 96))
-
+        tmp_module = AutoEncoderModule(copy.deepcopy(self.model), self.cfg, self.work_dir).cpu()
         tmp_trainer = LightningTrainer(
-            accelerator=self.cfg.get("lightning", {}).get("accelerator", "auto"),
-            devices=self.cfg.get("lightning", {}).get("devices", 1),
-            precision=self.cfg.get("lightning", {}).get("precision", "bf16-mixed"),
+            accelerator="cpu",
+            devices=1,
+            precision="32",
             max_epochs=1,
-            limit_train_batches=5,  # short sweep
+            limit_train_batches=train_limit,
             limit_val_batches=1,
             enable_checkpointing=False,
             logger=CSVLogger(save_dir=str(self.work_dir), name=".lr_tune"),
             enable_model_summary=False,
+            detect_anomaly=False,
+            num_sanity_val_steps=0,
+            enable_progress_bar=False,
         )
 
-        tuner = _PLTuner(tmp_trainer)
+        tuner = _PLTUNER(tmp_trainer)
+        suggestion = None
         try:
             lr_finder = tuner.lr_find(
-                module,
+                tmp_module,
                 datamodule=datamodule,
                 min_lr=min_lr,
                 max_lr=max_lr,
@@ -1145,26 +1342,42 @@ class Trainer:
                 mode="exponential",
             )
             suggestion = lr_finder.suggestion()
-            if suggestion is not None and math.isfinite(float(suggestion)):
-                module.learning_rate = max(module.min_lr, float(suggestion))
-                if self.logger:
-                    self.logger.info(f"LR finder suggestion: {float(suggestion):.2e} → using {module.learning_rate:.2e}")
+            lr = float(suggestion) if suggestion is not None else default_lr
+            lr = max(min_lr_cfg, lr)
             self._save_json(self.work_dir / "lr_find.json", {
                 "mode": "lr_finder",
                 "min_lr": min_lr, "max_lr": max_lr, "steps": steps,
                 "suggestion": (None if suggestion is None else float(suggestion)),
-                "chosen_lr": module.learning_rate
+                "chosen_lr": lr,
             })
+            if self.logger:
+                self.logger.info("LR finder (CPU): suggestion=%s → using %.2e",
+                                 (None if suggestion is None else f"{float(suggestion):.2e}"), lr)
+            return lr
         except Exception as e:
             if self.logger:
-                self.logger.warning(f"LR finder failed ({e}); keeping LR={module.learning_rate:.2e}")
-        return module.learning_rate
+                self.logger.warning("LR finder failed on CPU; falling back to default. Reason: %s", e)
+            return default_lr
+        finally:
+            try:
+                del tmp_trainer, tmp_module
+            except Exception:
+                pass
+            gc.collect()
 
     def train(self) -> float:
         """Execute full training loop with optional batch-size and LR tuning."""
-        module = AutoEncoderModule(self.model, self.cfg, self.work_dir)
+        dm = FlexibleDataModule(self.train_loader, self.val_loader)
 
-        # ---- minimal torch.compile hook (optional, controlled by config) ----
+        # Tuning (CPU-only clones)
+        train_bs, val_bs = self._maybe_tune_batch_size(module=None, datamodule=dm)
+        lr = self._maybe_tune_lr(module=None, datamodule=dm, train_bs=train_bs)
+
+        # Real module (fresh) — now we can go CUDA
+        module = AutoEncoderModule(self.model, self.cfg, self.work_dir)
+        module.learning_rate = float(lr)
+
+        # ---- compile ONLY AFTER tuning (so tuners never see a compiled/bf16 graph) ----
         tc = self.cfg.get("lightning", {}).get("torch_compile", False)
         if tc:
             try:
@@ -1175,14 +1388,8 @@ class Trainer:
             except Exception as e:
                 if self.logger:
                     self.logger.warning(f"torch.compile failed; continuing uncompiled. Reason: {e}")
-        # --------------------------------------------------------------------
 
-        dm = FlexibleDataModule(self.train_loader, self.val_loader)
-        train_bs, val_bs = self._maybe_tune_batch_size(module, dm)
-
-        # Optionally tune or scale LR now that train_bs is known
-        self._maybe_tune_lr(module, dm, train_bs)
-
+        # ---- Main Trainer config ----
         lcfg = self.cfg.get("lightning", {}) or {}
         precision = lcfg.get("precision", "bf16-mixed")
         devices = lcfg.get("devices", 1)
@@ -1211,7 +1418,7 @@ class Trainer:
             if self.logger:
                 self.logger.info(f"Validation will use {limit_val * 100:.1f}% of data")
 
-        # Callbacks
+        # ---- Callbacks ----
         ckpt_cb = ModelCheckpoint(
             dirpath=str(self.work_dir),
             filename="model-{epoch:03d}-{val_loss:.6f}",
@@ -1265,7 +1472,7 @@ class Trainer:
 
         trainer.fit(module, datamodule=dm)
 
-        # Extract best validation loss
+        # ---- Extract best validation loss ----
         best_val = None
         if ckpt_cb.best_model_score is not None:
             best_val = float(ckpt_cb.best_model_score.cpu().item())
@@ -1275,7 +1482,7 @@ class Trainer:
             except Exception:
                 best_val = None
 
-        # Legacy .pt export (PyTorch >=2.6 safe)
+        # ---- Legacy .pt export ----
         try:
             if ckpt_cb.best_model_path:
                 from pathlib import PosixPath

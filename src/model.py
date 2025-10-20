@@ -261,22 +261,31 @@ class LPVDynamics(nn.Module):
     def _build_A(self, pt: torch.Tensor) -> tuple[torch.Tensor, dict]:
         """
         Build A(g): S - L L^T - γ I
-        Single sanitize at input; one construction pass; no repeated to()/nan_to_num() churn.
+
+        Returns:
+          A:   [B, Z, Z] tensor (same device/dtype as pt)
+          aux: dict with lightweight diagnostics (guarded to avoid Dynamo graph breaks)
         """
         B = pt.shape[0]
+        # Sanitize inputs early
         pt = torch.nan_to_num(pt, nan=0.0, posinf=0.0, neginf=0.0)
 
-        h = self.cond(pt)  # [B, r + (z*z if use_S)]
+        # Conditioning MLP
+        h = self.cond(pt)  # [B, r + (z*z if use_S else 0)]
         if self.use_S:
             s, m_head = torch.split(h, [self.r, self.z * self.z], dim=-1)
         else:
             s, m_head = h, None
 
-        s = F.softplus(s)  # [B,r]  (positive)
-        U = self.base_U    # [z,r]
-        L = U.unsqueeze(0) * s.unsqueeze(1)  # [B,z,r]
-        LLt = torch.matmul(L, L.transpose(1, 2))  # [B,z,z], PSD
+        # Positive singular values
+        s = F.softplus(s)  # [B, r] ≥ 0
 
+        # Low-rank factor L = U * diag(s) with fixed orthonormal base U
+        U = self.base_U  # [z, r]
+        L = U.unsqueeze(0) * s.unsqueeze(1)  # [B, z, r]
+        LLt = torch.matmul(L, L.transpose(1, 2))  # [B, z, z], PSD
+
+        # Optional skew-symmetric S
         if self.use_S:
             M = m_head.reshape(B, self.z, self.z)
             S = 0.5 * (M - M.transpose(1, 2))  # skew
@@ -284,13 +293,30 @@ class LPVDynamics(nn.Module):
         else:
             S = torch.zeros(B, self.z, self.z, device=pt.device, dtype=pt.dtype)
 
+        # A = S - L L^T - γ I
         A = S - LLt - self.gamma * self.I.to(device=pt.device, dtype=pt.dtype).expand(B, -1, -1)
-        A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)  # final guard
-        aux = {
-            "damp_mean": float(s.mean().detach().cpu()),
-            "gamma": self.gamma,
-            "smax": float(self.timewarp.smax.detach().cpu()),
-        }
+
+        # Final guards
+        A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Keep exact symmetry when S==0 (helps eigh stability if used in eval)
+        if not self.use_S:
+            A = 0.5 * (A + A.transpose(1, 2))
+
+        # Lightweight aux metrics; avoid Dynamo graph breaks from .item()/.cpu() during compile
+        aux = {}
+        try:
+            import torch._dynamo as _dynamo  # type: ignore
+            compiling = getattr(_dynamo, "is_compiling", None)
+            if compiling is None or not compiling():
+                aux = {
+                    "damp_mean": float(s.mean().detach().cpu()),
+                    "gamma": self.gamma,
+                    "smax": float(getattr(self.timewarp, "smax", torch.tensor(0.0)).detach().cpu()),
+                }
+        except Exception:
+            pass
+
         return A, aux
 
     @property
@@ -299,15 +325,24 @@ class LPVDynamics(nn.Module):
 
     def _denorm_dt(self, dt_norm: torch.Tensor) -> torch.Tensor:
         """
-        Map normalized dt in [0,1] to physical seconds using stored log10 range.
-        Guard against NaN/Inf before clamping; cap log10(dt) to 38 (~1e38).
+        Map normalized dt in [0,1] -> physical seconds using stored log10 range.
+        - Work in float64 to avoid overflow.
+        - Respect manifest bounds; no arbitrary 1e38 caps.
+        Accepts [B] or [B,K]; returns same shape.
         """
-        dt_norm = torch.nan_to_num(dt_norm, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        log_dt = self.dt_log_min + dt_norm * self._dt_range_scalar
-        log_dt = torch.clamp(log_dt, max=38.0)  # ~1e38 cap
-        dt_phys = torch.exp(log_dt * math.log(10.0))
-        dt_phys = torch.nan_to_num(dt_phys, nan=1e-30, posinf=1e38, neginf=1e-30).clamp_min(1e-30)
-        return dt_phys
+        # sanitize & clamp normalized dt
+        dt_norm = torch.nan_to_num(dt_norm, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+
+        # log10(dt_phys) = log_min + dt_norm * (log_max - log_min)
+        log_min = self.dt_log_min.to(torch.float64)
+        log_max = self.dt_log_max.to(torch.float64)
+        rng = (log_max - log_min).clamp(min=1e-12)
+        log_dt = log_min + dt_norm.to(torch.float64) * rng
+
+        # 10**log_dt in fp64, then clamp to tiny floor; cast back
+        dt_phys = torch.pow(torch.tensor(10.0, dtype=torch.float64, device=log_dt.device), log_dt)
+        dt_phys = dt_phys.clamp_(min=1e-30)
+        return dt_phys.to(torch.float32)
 
     def step(self, z: torch.Tensor, dt_step_norm: torch.Tensor | float, pt: torch.Tensor) -> torch.Tensor:
         """
@@ -326,20 +361,33 @@ class LPVDynamics(nn.Module):
 
     def step_phys(self, z: torch.Tensor, dt_phys: torch.Tensor, pt: torch.Tensor) -> torch.Tensor:
         """
-        Latent step with physical Δt provided (skips per-step denorm).
-          z: [B,Z], dt_phys: [B], pt: [B,G]
-        Uses fp32 matrix_exp for stable, differentiable propagation.
+        z: [B,Z], dt_phys: [B], pt: [B,G]
+        Chunked matrix_exp over the batch to keep memory bounded.
         """
         B, Z = z.shape
         if dt_phys.ndim != 1 or dt_phys.shape[0] != B:
             raise ValueError(f"dt_phys must be [B]; got {tuple(dt_phys.shape)} vs B={B}")
 
         with torch.amp.autocast("cuda", enabled=False):
-            A, _ = self._build_A(pt)
-            A32 = A.float()  # [B,Z,Z]
-            dt32 = torch.nan_to_num(dt_phys.float(), nan=1e-30, posinf=1e38, neginf=1e-30).clamp_min(0.0).view(B, 1, 1)
-            Phi = torch.matrix_exp(A32 * dt32)  # [B,Z,Z]
-            z_next32 = torch.bmm(Phi, z.float().unsqueeze(-1)).squeeze(-1)
+            A, _ = self._build_A(pt)  # [B,Z,Z]
+            A32 = A.float()
+            zcol = z.float().unsqueeze(-1)  # [B,Z,1]
+            dt32 = torch.nan_to_num(dt_phys.float(), nan=1e-30, posinf=1e30, neginf=1e-30).clamp_min_(0.0)
+
+            # Heuristic: target ~300MB workspace for Phi
+            bytes_per_mat = (Z * Z) * 4  # fp32
+            target_bytes = 300 * 1024 ** 2
+            chunk_B = max(1, min(B, target_bytes // max(1, bytes_per_mat)))
+
+            outs = []
+            for i in range(0, B, chunk_B):
+                Ai = A32[i:i + chunk_B]  # [b,Z,Z]
+                dti = dt32[i:i + chunk_B].view(-1, 1, 1)  # [b,1,1]
+                Phi = torch.matrix_exp(Ai * dti)  # [b,Z,Z]
+                zi = torch.bmm(Phi, zcol[i:i + chunk_B]).squeeze(-1)
+                outs.append(zi)
+
+            z_next32 = torch.cat(outs, dim=0)
 
         z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
         return z_next32.to(z.dtype)
@@ -421,12 +469,13 @@ class StableLPVKoopmanAE(nn.Module):
     # ---- Trainer API: multi-time forward ----
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
-        Efficient multi-time prediction.
-          y_i: [B,S], dt_norm: [B] or [B,K], g: [B,G]  →  [B,K,S]
-        Encodes once, propagates all K steps in latent space, decodes once (batched).
-        For predict_delta=True, returns y_i + Δy_k for each k (anchor-relative).
+        y_i: [B,S], dt_norm: [B] or [B,K], g: [B,G]  →  [B,K,S]
+        TRAIN: chunked matrix_exp (stable gradients even with repeated eigenvalues)
+        EVAL/NO-GRAD: optional eigh fast path when use_S=False.
         """
         B, S = y_i.shape
+
+        # Normalize dt to [B,K]
         if dt_norm.ndim == 1:
             if dt_norm.shape[0] != B:
                 raise ValueError(f"dt_norm shape mismatch: got {tuple(dt_norm.shape)}, expected [{B}] or [{B},K]")
@@ -436,55 +485,52 @@ class StableLPVKoopmanAE(nn.Module):
                 raise ValueError(f"dt_norm batch mismatch: got {tuple(dt_norm.shape)}, expected [{B},K]")
         else:
             raise ValueError(f"dt_norm must be [B] or [B,K], got {tuple(dt_norm.shape)}")
-        K = dt_norm.shape[1]
+        K = int(dt_norm.shape[1])
 
-        # Single sanitize at the boundary
+        # Boundary sanitization
         y_i = torch.nan_to_num(y_i, nan=0.0, posinf=0.0, neginf=0.0)
         g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Encode once
+        # Encode & build A(g)
         z0 = self.encoder(y_i, g)  # [B,Z]
-
-        # Build A(g) once
         A, _ = self.dynamics._build_A(g)  # [B,Z,Z]
+        dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()  # [B,K]
 
-        # Vectorized propagation for all K steps
-        try:
-            if not self.use_S:
-                # Eigh path for symmetric A (fast). Operate in fp32.
-                eigvals32, eigvecs32 = torch.linalg.eigh(A.float())  # [B,Z], [B,Z,Z]
-                z0_eig32 = torch.bmm(eigvecs32.transpose(-2, -1), z0.float().unsqueeze(-1)).squeeze(-1)  # [B,Z]
-                dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()  # [B,K]
-                lam_dt = eigvals32.unsqueeze(1) * dt_phys32.unsqueeze(-1)  # [B,K,Z]
-                lam_dt = lam_dt.clamp_(-LAMDT_MAX_ABS, LAMDT_MAX_ABS)
-                exp_lam_dt = torch.exp(lam_dt)  # [B,K,Z]
-                z_eig_next = z0_eig32.unsqueeze(1) * exp_lam_dt  # [B,K,Z]
-                z_next32 = torch.einsum('bij,bkj->bki', eigvecs32, z_eig_next)  # [B,K,Z]
-                z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
-                z_next = z_next32.to(z0.dtype)
-            else:
-                # Generic matrix_exp path in fp32
-                dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()  # [B,K]
+        # ---- Choose propagation path ----
+        use_fast_eigh = (not self.use_S) and (not torch.is_grad_enabled())  # eval-only
+        if use_fast_eigh:
+            with torch.amp.autocast("cuda", enabled=False):
+                A32 = A.float()
+                A32 = 0.5 * (A32 + A32.transpose(1, 2))  # ensure exact symmetry
+                lam, U = torch.linalg.eigh(A32)  # lam:[B,Z], U:[B,Z,Z]
+
+                v = torch.matmul(U.transpose(1, 2), z0.float().unsqueeze(-1)).squeeze(-1)  # [B,Z]
+                lam = torch.nan_to_num(lam, nan=0.0, posinf=0.0, neginf=0.0).unsqueeze(1)  # [B,1,Z]
+                dt = dt_phys32.unsqueeze(-1)  # [B,K,1]
+                lamdt = (lam * dt).clamp_(-LAMDT_MAX_ABS, LAMDT_MAX_ABS)  # [B,K,Z]
+                expfac = torch.exp(lamdt)  # [B,K,Z]
+                w = expfac * v.unsqueeze(1)  # [B,K,Z]
+                z_next32 = torch.matmul(U, w.transpose(1, 2)).transpose(1, 2)  # [B,K,Z]
+        else:
+            # TRAIN (and general case): chunked matrix_exp over K
+            with torch.amp.autocast("cuda", enabled=False):
                 A32 = A.float().unsqueeze(1)  # [B,1,Z,Z]
-                Phi32 = torch.matrix_exp(A32 * dt_phys32.reshape(B, K, 1, 1))  # [B,K,Z,Z]
-                z0_32 = z0.float().reshape(B, 1, self.Z, 1)  # [B,1,Z,1]
-                z_next32 = torch.matmul(Phi32, z0_32).squeeze(-1)  # [B,K,Z]
-                z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
-                z_next = z_next32.to(z0.dtype)
-        except RuntimeError:
-            # Fallback to matrix_exp if eigh path fails numerically
-            dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()  # [B,K]
-            A32 = A.float().unsqueeze(1)  # [B,1,Z,Z]
-            Phi32 = torch.matrix_exp(A32 * dt_phys32.reshape(B, K, 1, 1))  # [B,K,Z,Z]
-            z0_32 = z0.float().reshape(B, 1, self.Z, 1)  # [B,1,Z,1]
-            z_next32 = torch.matmul(Phi32, z0_32).squeeze(-1)  # [B,K,Z]
-            z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
-            z_next = z_next32.to(z0.dtype)
+                z0_32 = z0.float().view(B, 1, self.Z, 1)  # [B,1,Z,1]
 
-        # Single batched decode for all K latents
-        z_next = z_next.clamp_(-Z_CLAMP, Z_CLAMP)
-        y_out = self.decoder(z_next.reshape(B * K, self.Z)).reshape(B, K, S)  # [B,K,S]
+                chunks = []
+                CHUNK = 4  # tune if desired
+                for k0 in range(0, K, CHUNK):
+                    k1 = min(K, k0 + CHUNK)
+                    dt32 = dt_phys32[:, k0:k1].reshape(B, k1 - k0, 1, 1)  # [B,c,1,1]
+                    Phi = torch.matrix_exp(A32 * dt32)  # [B,c,Z,Z]
+                    chunks.append(torch.matmul(Phi, z0_32).squeeze(-1))  # [B,c,Z]
+                z_next32 = torch.cat(chunks, dim=1)  # [B,K,Z]
 
+        z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
+        z_next = z_next32.to(z0.dtype).clamp_(-Z_CLAMP, Z_CLAMP)
+
+        # Decode batched
+        y_out = self.decoder(z_next.reshape(B * K, self.Z)).reshape(B, K, S)
         if self.predict_delta:
             y_out = y_i.unsqueeze(1) + y_out
         return y_out
