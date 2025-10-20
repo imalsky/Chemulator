@@ -4,18 +4,15 @@ Stable LPV Koopman Autoencoder (trainer-compatible, hardened)
 =============================================================
 
 Key points:
-- forward(y_i, dt_norm, g) returns [B, K, S] for multi-time prediction (K can be 1).
-- Encoder/Decoder do a single sanitize at their boundaries (avoid repeated nan_to_num in hot loops).
-- Decoder is numerically hardened:
-  * Stats sanitized
-  * Optional temperature with bounds
-  * Logits clamped pre-softmax for bf16 stability
-  * Output clamp applied both for softmax_head=True (standardized log space) and False (raw head)
-  * Small-init on final decoder linear to keep early logits tame
-- Stable LPV dynamics A(P,T) = S - L L^T - γ I, optional skew S
-- Δt is denormalized from [0,1] using manifest log-space stats, with overflow guards
-- predict_delta: if True, model predicts Δy in normalized space and returns y_i + Δy
-- Latent propagation clamps λ·Δt to prevent exp overflow/underflow
+- forward(y_i, dt_norm, g) → [B, K, S] multi-time prediction.
+- Encoder/Decoder sanitize only at boundaries (avoid repeated nan_to_num in hot loops).
+- Decoder hardened for bf16: small-init, clamp logits, optional temperature.
+- Stable LPV dynamics A(P,T) = S - L L^T - γ I, optional skew S.
+- Δt is denormalized from [0,1] using manifest log-space stats (log10).
+- predict_delta=True now returns cumulative deltas across K:
+    y_pred[:, t] = y_i + sum_{j<=t} Δy_j
+- Latent propagation clamps λ·Δt for exp stability.
+- Eigh fast path is used only in eval/no-grad when use_S=False (safe gradients).
 """
 
 from __future__ import annotations
@@ -157,7 +154,6 @@ class Decoder(nn.Module):
             if log_stats is None:
                 raise ValueError("softmax_head=True requires (log_mean, log_std) per species.")
             log_mean, log_std = log_stats
-            # sanitize stats aggressively
             log_mean = torch.nan_to_num(log_mean.detach().clone(), nan=0.0, neginf=-60.0, posinf=60.0)
             log_std = torch.nan_to_num(log_std.detach().clone(), nan=1.0, neginf=1.0, posinf=1.0).clamp(min=LOG_STD_MIN)
             self.register_buffer("log_mean", log_mean)
@@ -177,7 +173,7 @@ class Decoder(nn.Module):
             if isinstance(m, nn.Linear):
                 head = m
         if head is not None:
-            nn.init.normal_(head.weight, mean=0.0, std=1e-4)  # tighter for bf16 stability
+            nn.init.normal_(head.weight, mean=0.0, std=1e-4)
             nn.init.zeros_(head.bias)
 
     def _temperature(self) -> torch.Tensor:
@@ -188,7 +184,6 @@ class Decoder(nn.Module):
         return self.temp_fixed.clamp(self.tmin, self.tmax)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # Sanitize latent before first Linear to avoid Addmm NaN in backward
         z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-Z_CLAMP, Z_CLAMP)
         logits = self.net(z)
 
@@ -198,9 +193,8 @@ class Decoder(nn.Module):
                 out = out.clamp_(-self.z_std_clip, self.z_std_clip)
             return out
 
-        # softmax path
         t = torch.nan_to_num(self._temperature(), nan=float(TEMP_MIN_DEFAULT)).clamp(TEMP_MIN_DEFAULT, TEMP_MAX_DEFAULT)
-        x = torch.nan_to_num(logits / t).clamp_(-LOGIT_CLAMP, LOGIT_CLAMP)  # clamp for stability
+        x = torch.nan_to_num(logits / t).clamp_(-LOGIT_CLAMP, LOGIT_CLAMP)
         log10e = 1.0 / math.log(10.0)
         log10_p = F.log_softmax(x, dim=-1) * log10e
         log10_p = torch.nan_to_num(log10_p, nan=-1e6, neginf=-1e6, posinf=1e6)
@@ -264,46 +258,36 @@ class LPVDynamics(nn.Module):
 
         Returns:
           A:   [B, Z, Z] tensor (same device/dtype as pt)
-          aux: dict with lightweight diagnostics (guarded to avoid Dynamo graph breaks)
+          aux: dict with lightweight diagnostics
         """
         B = pt.shape[0]
-        # Sanitize inputs early
         pt = torch.nan_to_num(pt, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Conditioning MLP
         h = self.cond(pt)  # [B, r + (z*z if use_S else 0)]
         if self.use_S:
             s, m_head = torch.split(h, [self.r, self.z * self.z], dim=-1)
         else:
             s, m_head = h, None
 
-        # Positive singular values
         s = F.softplus(s)  # [B, r] ≥ 0
 
-        # Low-rank factor L = U * diag(s) with fixed orthonormal base U
         U = self.base_U  # [z, r]
         L = U.unsqueeze(0) * s.unsqueeze(1)  # [B, z, r]
-        LLt = torch.matmul(L, L.transpose(1, 2))  # [B, z, z], PSD
+        LLt = torch.matmul(L, L.transpose(1, 2))  # [B, z, z]
 
-        # Optional skew-symmetric S
         if self.use_S:
             M = m_head.reshape(B, self.z, self.z)
-            S = 0.5 * (M - M.transpose(1, 2))  # skew
+            S = 0.5 * (M - M.transpose(1, 2))
             S = torch.tanh(self.scale_S) * S
         else:
             S = torch.zeros(B, self.z, self.z, device=pt.device, dtype=pt.dtype)
 
-        # A = S - L L^T - γ I
         A = S - LLt - self.gamma * self.I.to(device=pt.device, dtype=pt.dtype).expand(B, -1, -1)
-
-        # Final guards
         A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Keep exact symmetry when S==0 (helps eigh stability if used in eval)
         if not self.use_S:
-            A = 0.5 * (A + A.transpose(1, 2))
+            A = 0.5 * (A + A.transpose(1, 2))  # keep exact symmetry
 
-        # Lightweight aux metrics; avoid Dynamo graph breaks from .item()/.cpu() during compile
         aux = {}
         try:
             import torch._dynamo as _dynamo  # type: ignore
@@ -326,28 +310,66 @@ class LPVDynamics(nn.Module):
     def _denorm_dt(self, dt_norm: torch.Tensor) -> torch.Tensor:
         """
         Map normalized dt in [0,1] -> physical seconds using stored log10 range.
-        - Work in float64 to avoid overflow.
-        - Respect manifest bounds; no arbitrary 1e38 caps.
-        Accepts [B] or [B,K]; returns same shape.
+        Accepts [B] or [B,K]; returns same shape (fp32).
         """
-        # sanitize & clamp normalized dt
         dt_norm = torch.nan_to_num(dt_norm, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
 
-        # log10(dt_phys) = log_min + dt_norm * (log_max - log_min)
         log_min = self.dt_log_min.to(torch.float64)
         log_max = self.dt_log_max.to(torch.float64)
         rng = (log_max - log_min).clamp(min=1e-12)
         log_dt = log_min + dt_norm.to(torch.float64) * rng
 
-        # 10**log_dt in fp64, then clamp to tiny floor; cast back
         dt_phys = torch.pow(torch.tensor(10.0, dtype=torch.float64, device=log_dt.device), log_dt)
         dt_phys = dt_phys.clamp_(min=1e-30)
         return dt_phys.to(torch.float32)
 
+    # -------------------------- matrix exp helper ---------------------------
+
+    @staticmethod
+    def _apply_matrix_exp_bcast(A32: torch.Tensor, dt_phys32: torch.Tensor,
+                                z0_32: Optional[torch.Tensor] = None,
+                                target_mb: int = 300) -> torch.Tensor:
+        """
+        Compute exp(A*dt) (and optionally * z0) with adaptive chunking over the combined batch.
+
+        A32:        [B, Z, Z]
+        dt_phys32:  [B, K]
+        z0_32:      [B, Z, 1] or None
+        Returns:
+          if z0_32 is None: [B, K, Z, Z]
+          else            : [B, K, Z]   (result of Phi @ z0)
+        """
+        B, Z, _ = A32.shape
+        K = int(dt_phys32.shape[1])
+
+        # Work in blocks over K to keep memory bounded
+        # bytes per (B, k, Z, Z) fp32 tensor:
+        def bytes_for(b: int, k: int, z: int) -> int:
+            return b * k * z * z * 4
+
+        mb_limit = max(1, int(target_mb)) * 1024 * 1024
+        # choose kchunk so that B * kchunk * Z * Z * 4 <= mb_limit
+        kchunk = max(1, min(K, mb_limit // max(1, bytes_for(B, 1, Z))))
+
+        outs = []
+        for k0 in range(0, K, kchunk):
+            k1 = min(K, k0 + kchunk)
+            dt32 = dt_phys32[:, k0:k1].reshape(B, k1 - k0, 1, 1)  # [B, kc, 1, 1]
+            Phi = torch.matrix_exp(A32.unsqueeze(1) * dt32)  # [B, kc, Z, Z]
+            if z0_32 is None:
+                outs.append(Phi)
+            else:
+                kc = k1 - k0
+                # Expand z0 across the kc dimension so the matmul is well-defined
+                zcol = z0_32.unsqueeze(1).expand(B, kc, Z, 1)  # [B, kc, Z, 1]
+                outs.append(torch.matmul(Phi, zcol).squeeze(-1))  # [B, kc, Z]
+        return torch.cat(outs, dim=1)
+
+    # ------------------------------- stepping --------------------------------
+
     def step(self, z: torch.Tensor, dt_step_norm: torch.Tensor | float, pt: torch.Tensor) -> torch.Tensor:
         """
-        Backward-compatible latent step with normalized Δt.
-        Converts to physical seconds and calls step_phys (no eigh here).
+        Latent step with normalized Δt → physical seconds.
         """
         if not torch.is_tensor(dt_step_norm):
             dt_step_norm = torch.as_tensor(dt_step_norm, device=z.device, dtype=torch.float32)
@@ -374,8 +396,8 @@ class LPVDynamics(nn.Module):
             zcol = z.float().unsqueeze(-1)  # [B,Z,1]
             dt32 = torch.nan_to_num(dt_phys.float(), nan=1e-30, posinf=1e30, neginf=1e-30).clamp_min_(0.0)
 
-            # Heuristic: target ~300MB workspace for Phi
-            bytes_per_mat = (Z * Z) * 4  # fp32
+            # Adaptive chunk over B for ~300MB target
+            bytes_per_mat = (Z * Z) * 4
             target_bytes = 300 * 1024 ** 2
             chunk_B = max(1, min(B, target_bytes // max(1, bytes_per_mat)))
 
@@ -402,6 +424,12 @@ class StableLPVKoopmanAE(nn.Module):
 
     forward(y_i, dt_norm, g):
       y_i: [B,S], dt_norm: [B] or [B,K], g: [B,G]  →  [B,K,S]
+
+    Notes:
+    - Main forward does parallel propagation from the single encoding z0 at K offsets.
+      (Matches multi-time dataset targets relative to anchor.)
+    - For trainer rollouts, call .step() sequentially or use the helper in the trainer
+      to cache A and z0 to avoid re-encoding.
     """
     def __init__(
         self,
@@ -470,8 +498,8 @@ class StableLPVKoopmanAE(nn.Module):
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
         y_i: [B,S], dt_norm: [B] or [B,K], g: [B,G]  →  [B,K,S]
-        TRAIN: chunked matrix_exp (stable gradients even with repeated eigenvalues)
-        EVAL/NO-GRAD: optional eigh fast path when use_S=False.
+        TRAIN: matrix_exp path (fp32 inside autocast-disabled block), chunked adaptively over K.
+        EVAL/NO-GRAD: eigh fast path when use_S=False (safer numerics, faster).
         """
         B, S = y_i.shape
 
@@ -496,12 +524,11 @@ class StableLPVKoopmanAE(nn.Module):
         A, _ = self.dynamics._build_A(g)  # [B,Z,Z]
         dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()  # [B,K]
 
-        # ---- Choose propagation path ----
         use_fast_eigh = (not self.use_S) and (not torch.is_grad_enabled())  # eval-only
         if use_fast_eigh:
             with torch.amp.autocast("cuda", enabled=False):
                 A32 = A.float()
-                A32 = 0.5 * (A32 + A32.transpose(1, 2))  # ensure exact symmetry
+                A32 = 0.5 * (A32 + A32.transpose(1, 2))  # ensure symmetry
                 lam, U = torch.linalg.eigh(A32)  # lam:[B,Z], U:[B,Z,Z]
 
                 v = torch.matmul(U.transpose(1, 2), z0.float().unsqueeze(-1)).squeeze(-1)  # [B,Z]
@@ -512,30 +539,26 @@ class StableLPVKoopmanAE(nn.Module):
                 w = expfac * v.unsqueeze(1)  # [B,K,Z]
                 z_next32 = torch.matmul(U, w.transpose(1, 2)).transpose(1, 2)  # [B,K,Z]
         else:
-            # TRAIN (and general case): chunked matrix_exp over K
             with torch.amp.autocast("cuda", enabled=False):
-                A32 = A.float().unsqueeze(1)  # [B,1,Z,Z]
-                z0_32 = z0.float().view(B, 1, self.Z, 1)  # [B,1,Z,1]
-
-                chunks = []
-                CHUNK = 4  # tune if desired
-                for k0 in range(0, K, CHUNK):
-                    k1 = min(K, k0 + CHUNK)
-                    dt32 = dt_phys32[:, k0:k1].reshape(B, k1 - k0, 1, 1)  # [B,c,1,1]
-                    Phi = torch.matrix_exp(A32 * dt32)  # [B,c,Z,Z]
-                    chunks.append(torch.matmul(Phi, z0_32).squeeze(-1))  # [B,c,Z]
-                z_next32 = torch.cat(chunks, dim=1)  # [B,K,Z]
+                A32 = A.float()                          # [B,Z,Z]
+                z0_32 = z0.float().view(B, self.Z, 1)    # [B,Z,1]
+                z_next32 = self.dynamics._apply_matrix_exp_bcast(A32, dt_phys32, z0_32, target_mb=300)  # [B,K,Z]
 
         z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
         z_next = z_next32.to(z0.dtype).clamp_(-Z_CLAMP, Z_CLAMP)
 
         # Decode batched
         y_out = self.decoder(z_next.reshape(B * K, self.Z)).reshape(B, K, S)
+
+        # --- FIX: cumulative deltas for multi-step when predict_delta is True ---
         if self.predict_delta:
-            y_out = y_i.unsqueeze(1) + y_out
+            # Each step's decoder output is Δy_t. Use cumulative sum over K.
+            # y[:, t] = y_i + sum_{j<=t} Δy_j
+            y_out = y_i.unsqueeze(1) + torch.cumsum(y_out, dim=1)
+
         return y_out
 
-    # ---- Convenience single-step (kept for callers that need it) ----
+    # ---- Convenience single-step ----
     def step(self, y: torch.Tensor, dt_step_norm: torch.Tensor | float, g: torch.Tensor) -> torch.Tensor:
         z = self.encoder(y, g)
         z_next = self.dynamics.step(z, dt_step_norm, g)
@@ -547,7 +570,7 @@ class StableLPVKoopmanAE(nn.Module):
     @torch.no_grad()
     def rollout(self, y0: torch.Tensor, g: torch.Tensor, dt_step_norm: torch.Tensor | float, steps: int) -> torch.Tensor:
         """
-        Returns [B, steps, S] (does NOT include y0).
+        Returns [B, steps, S] (does NOT include y0). Uses single-step path.
         """
         B, _ = y0.shape
         y_t = y0

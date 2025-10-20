@@ -68,7 +68,7 @@ GLOBAL_WORK_DIR = REPO_ROOT / "models" / "autoencoder-flowmap"
 
 
 # --------------------------------------------------------------------------------------
-# Small helpers (robust "auto" handling, device-aware defaults)
+# Small helpers
 # --------------------------------------------------------------------------------------
 
 def _parse_int_or_auto(val: Any, default_if_auto: int) -> int:
@@ -432,28 +432,11 @@ torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
         seed=base_seed + 1337,
     )
 
-    # --- Batch sizes: preserve "auto" in cfg so Lightning tuner can see it ---
-    bs_raw = training_cfg.get("batch_size", 512)
-    vbs_raw = training_cfg.get("val_batch_size", bs_raw)
-
-    # Use a safe placeholder integer for initial DataLoader construction.
-    # Lightning's tuner will rescale via cfg['training'] == "auto".
-    initial_guess = int(cfg.get("lightning", {}).get("initial_batch_size_guess", 64))
-
-    if isinstance(bs_raw, str) and bs_raw.lower() == "auto":
-        batch_size_train = initial_guess
-        logger.info(f"[batch] train batch_size = {batch_size_train} (placeholder for Lightning auto-tuning)")
-    else:
-        batch_size_train = int(bs_raw)
-        logger.info(f"[batch] train batch_size = {batch_size_train} (from config)")
-
-    if isinstance(vbs_raw, str) and vbs_raw.lower() == "auto":
-        val_multiplier = float(cfg.get("lightning", {}).get("val_batch_size_multiplier", 2.0))
-        batch_size_val = int(initial_guess * val_multiplier)
-        logger.info(f"[batch] validation batch_size = {batch_size_val} (placeholder, {val_multiplier}× train)")
-    else:
-        batch_size_val = int(vbs_raw)
-        logger.info(f"[batch] validation batch_size = {batch_size_val} (from config)")
+    # Batch sizes (must be explicit integers in config)
+    batch_size_train = int(training_cfg.get("batch_size", 512))
+    batch_size_val = int(training_cfg.get("val_batch_size", batch_size_train))
+    logger.info(f"[batch] train batch_size = {batch_size_train}")
+    logger.info(f"[batch] validation batch_size = {batch_size_val}")
 
     # DataLoader worker/threading defaults (support "auto")
     nw_raw = dataset_cfg.get("num_workers", "auto")
@@ -462,7 +445,7 @@ torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     num_workers_val = _parse_int_or_auto(nw_val_raw, num_workers)
     logger.info(f"[loader] num_workers train/val = {num_workers}/{num_workers_val}")
 
-    # Prefetch factors (no "auto" here—keep your existing defaults)
+    # Prefetch factors
     prefetch_train = int(dataset_cfg.get("prefetch_factor", 2))
     prefetch_val = int(dataset_cfg.get("prefetch_factor_val", prefetch_train))
 
@@ -561,7 +544,7 @@ def build_model(
     model = create_model(cfg)
     model.to(device)
 
-    # --- I/O dimension + target-index diagnostics (robust to old/new model variants) ---
+    # --- I/O dimension diagnostics ---
     S_in = getattr(model, "S_in", getattr(model, "S", None))
     S_out = getattr(model, "S_out", getattr(model, "S", None))
     G = getattr(model, "G", "?")
@@ -573,7 +556,6 @@ def build_model(
         try:
             logger.info(f"Target indices: {ti.detach().cpu().tolist()}")
         except Exception:
-            # Fallback if it's a plain list / numpy / CPU tensor without .detach()
             try:
                 logger.info(f"Target indices: {list(map(int, ti))}")
             except Exception:
@@ -658,10 +640,10 @@ def main() -> None:
     # Apply resume overrides
     apply_resume_overrides(cfg, args.resume, logger)
 
-    # Fix: Ensure work_dir exists in config with fallback
+    # Ensure work_dir exists in config with fallback
     paths = cfg.setdefault("paths", {})
     work_dir = Path(paths.get("work_dir", GLOBAL_WORK_DIR)).expanduser().resolve()
-    paths["work_dir"] = str(work_dir)  # Normalize back into cfg
+    paths["work_dir"] = str(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     config_save_path = work_dir / "config.json"
@@ -695,7 +677,7 @@ def main() -> None:
     # Build model
     model = build_model(cfg, device, logger)
 
-    # (Optional) resolve "auto" for gradient accumulation here, so Lightning gets clean ints
+    # Resolve gradient accumulation (support "auto" with sensible default)
     tr_cfg = cfg.setdefault("training", {})
     accum_raw = tr_cfg.get("accumulate_grad_batches", 1)
     default_accum = 1 if len(
@@ -703,9 +685,9 @@ def main() -> None:
     accum_value = _parse_int_or_auto(accum_raw, default_accum)
     tr_cfg["accumulate_grad_batches"] = accum_value
     cfg.setdefault("lightning", {})["accumulate_grad_batches"] = accum_value
-    logger.info(f"[batch] accumulate_grad_batches = {tr_cfg['accumulate_grad_batches']} (raw={accum_raw!r})")
+    logger.info(f"[batch] accumulate_grad_batches = {accum_value}")
 
-    # Fast dev run toggle can be passed through to the wrapper (which should map to Lightning)
+    # Fast dev run toggle
     if args.fast_dev_run:
         tr_cfg["fast_dev_run"] = True
         logger.info("Fast dev run enabled (trainer will limit steps/epochs).")

@@ -9,7 +9,7 @@
   },
 
   // ===============================
-  // DATA SCHEMA  (no splits here)
+  // DATA SCHEMA
   // ===============================
   "data": {
     "species_variables": [],
@@ -21,25 +21,30 @@
   // DATASET / DATALOADER
   // ===============================
   "dataset": {
+    // Multi-time sampling per anchor
     "multi_time_per_anchor": true,
     "times_per_anchor": 16,
     "share_times_across_batch": true,
 
+    // Log-uniform dt sampling
     "log_dt_sampling": true,
     "precompute_dt_table": true,
 
+    // Grid validation (can skip for speed if data is trusted)
     "uniform_grid_rtol": 1e-6,
     "uniform_grid_atol": 1e-12,
     "snap_shared_grid": true,
     "assume_shared_grid": true,
-
     "skip_scan": true,
     "skip_validate_grids": true,
 
-    // runtime dtype for staged tensors (used by main.py for dataset tensors)
+    // Require dt stats in normalization manifest (fail if missing)
+    "require_dt_stats": false,
+
+    // Storage dtype for staged tensors
     "storage_dtype": "float32",
 
-    // DataLoader knobs
+    // DataLoader settings
     "preload_train_to_gpu": false,
     "preload_val_to_gpu": false,
     "num_workers": 8,
@@ -58,17 +63,18 @@
   // MODEL (Stable LPV Koopman AE)
   // ===============================
   "model": {
-    "type": "stable_lpv_koopman",
     "latent_dim": 64,
     "encoder_hidden": [512, 512, 512],
     "decoder_hidden": [512, 512, 512],
     "activation": "silu",
     "dropout": 0.0,
+
+    // Decoder output options
     "softmax_head": false,
     "predict_delta": true,
     "z_std_clip": 10.0,
 
-    // LPV conditioning head
+    // LPV dynamics conditioning
     "cond_hidden": [64, 64],
     "rank_l": 12,
     "use_S": false,
@@ -76,48 +82,60 @@
   },
 
   // ===============================
-  // TRAINING (splits & sampling live here)
+  // TRAINING
   // ===============================
   "training": {
-    // Batches: main.py will placeholder these for auto-scaling
-    "batch_size": "auto",
-    "val_batch_size": "auto",
+    // Batch sizes (must be explicit integers)
+    "batch_size": 2048,
+    "val_batch_size": 4096,
 
-    // Trajectory pair sampling (used by dataset + preprocessor)
+    // Trajectory pair sampling
     "pairs_per_traj": 16,
     "pairs_per_traj_val": 4,
     "min_steps": 1,
     "max_steps": 99,
 
-    // Splits REQUIRED by preprocessor
+    // Dataset splits (used by preprocessor)
     "val_fraction": 0.1,
     "test_fraction": 0.1,
 
-    // Optimization
+    // Use only a fraction of data (helpful for debugging with smaller datasets)
+    "use_fraction": 1.0,
+
+    // Optimizer hyperparameters
     "lr": 1.0e-4,
     "min_lr": 1.0e-6,
     "weight_decay": 1.0e-3,
-    "gradient_clip": 0.0,      // Lightning reads this via Trainer wrapper
     "warmup_epochs": 10,
     "epochs": 100,
-    // Losses
+
+    // Gradient clipping (0.0 = disabled)
+    "gradient_clip": 1.0,
+
     "loss": {
       "tail_huber": {
         "weight": 0.0,
         "delta": 0.02,
         "z_threshold": -1.0
       },
-      "time_weight_mode": "none"
+      "fractional": {
+        "weight": 0.1,
+        "eps": 1e-8
+      }
     },
 
-    // Aux losses
+    // Auxiliary losses
     "auxiliary_losses": {
+      // Rollout loss (autoregressive stability)
       "rollout_enabled": true,
       "rollout_weight": 0.5,
       "rollout_horizon": 4,
       "rollout_warmup_epochs": 10,
-      "rollout_fp32_epochs": 2,
+      // false = autoregressive (re-encodes each step, slower but safer)
+      // true  = cached (encode once, faster, assumes model handles it)
+      "rollout_use_cached_encoding": false,
 
+      // Teacher forcing schedule for rollout
       "rollout_teacher_forcing": {
         "mode": "linear",
         "start_p": 1.0,
@@ -125,19 +143,10 @@
         "end_epoch": 60
       },
 
-    "semigroup_enabled": true,
-    "semigroup_weight": 0.005,
-    "semigroup_warmup_epochs": 10
-    },
-
-    // Time-warp regularization
-    "timewarp": {
-      "l1_weight": 0.0,
-      "smax_anneal": {
-        "start": 0.1,
-        "end": 1.0,
-        "end_epoch": 60
-      }
+      // Semigroup consistency loss
+      "semigroup_enabled": true,
+      "semigroup_weight": 0.005,
+      "semigroup_warmup_epochs": 10
     },
 
     // Resume controls (used by main.py)
@@ -149,80 +158,37 @@
   },
 
   // ===============================
-  // SCHEDULER (used by trainer)
-  // ===============================
-  "scheduler": {
-    "use_plateau_fallback": true,
-    "plateau_patience": 10,
-    "plateau_factor": 0.5
-  },
-
-  // ===============================
   // LIGHTNING RUNTIME
   // ===============================
   "lightning": {
+    // Hardware
     "accelerator": "auto",
     "devices": 1,
-    "precision": "32", //"bf16-mixed"
+    "precision": "bf16-mixed",
+
+    // Training settings
     "accumulate_grad_batches": 1,
 
-    // Cap auto BSize to avoid ridiculous values
-    "max_auto_batch_size": 8192,
+    // Strategy for multi-GPU (if devices > 1)
+    "strategy": "auto",
 
-    "deterministic": false,   // Trainer flag
-    "benchmark": false,        // cudnn benchmark at Trainer level
-    "detect_anomaly": false,   // enable while chasing NaNs; turn off later
-    "max_epochs": 100,
-
-    // Only validate on a fraction of val set each epoch
-    "val_limit_fraction": 1.0,
-
-    // Auto batch-size tuning
-    "auto_scale_batch_size": "binsearch",
-    "initial_batch_size_guess": 2048,
-    "val_batch_size_multiplier": 2.0,
-
-    // Optional extras used by trainer.py (kept off by default)
-    "auto_lr_find": true,     // if true, runs LR finder after BSize tuning
-    "lr_find_min": 1e-7,
-    "lr_find_max": 3e-4,
-    "lr_find_steps": 50,
-
-    // If auto_lr_find=false, we linearly scale LR using this base
-    "lr_base_batch_size": 8192,
-
-    // Safe/cheap compile: encoder+decoder only
-    "torch_compile": false,
-    "matrix_exp_bs_cap": 8192,
-
-    // Profiler & sanity steps
-    "profile": false,
-    "num_sanity_val_steps": 2
+    // Debugging flags
+    "num_sanity_val_steps": 0
   },
 
   // ===============================
-  // LOGGING (only keys the code reads)
-  // ===============================
-  "logging": {
-    "log_every_n_batches": 100
-  },
-
-  // ===============================
-  // PREPROCESSING (used by preprocessor.py)
+  // PREPROCESSING
   // ===============================
   "preprocessing": {
     "trajectories_per_shard": 4096,
     "npz_compressed": false,
-
-    // Dropping very small profiles is fine!
     "min_value_threshold": 1e-30,
-
     "hdf5_chunk_size": 0,
     "num_workers": 0
   },
 
   // ===============================
-  // NORMALIZATION (manifest expectations)
+  // NORMALIZATION
   // ===============================
   "normalization": {
     "default_method": "log-standard",
@@ -243,6 +209,9 @@
   "system": {
     "seed": 42,
     "tf32": true,
+    "cudnn_benchmark": true,
+    "deterministic": false,
+    "linalg_library": null,
     "omp_threads": null,
     "io_dtype": "float32"
   }
