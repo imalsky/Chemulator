@@ -1,20 +1,39 @@
 #!/usr/bin/env python3
 """
-Flow-map DeepONet Training Pipeline
-====================================
+Flow-map DeepONet Training Pipeline - Main Entry Point
+======================================================
 
-Main entry point for training Flow-map DeepONet with multi-time-per-anchor support.
+OVERVIEW
+--------
+Orchestrates the complete training workflow from configuration to model deployment:
+  1. Load and validate configuration (config.jsonc)
+  2. Initialize hardware (GPU, TF32, cuDNN, threading)
+  3. Ensure preprocessed data exists (run preprocessor if needed)
+  4. Hydrate config from processed artifacts (species, dt stats, etc.)
+  5. Build datasets and dataloaders (GPU-resident for throughput)
+  6. Construct model (with normalization stats from manifest)
+  7. Train via Lightning-backed Trainer wrapper
+  8. Export best checkpoint
 
-Pipeline:
-1) Load configuration from config/config.jsonc
-2) Initialize logging and hardware (device, TF32, cuDNN autotuner, seeds)
-3) Ensure preprocessed data exists:
-   - If processed artifacts already exist, re-hydrate cfg.data.* from that folder
-     (species_variables, global_variables, time_variable, dt-spec presence)
-   - If not, run the preprocessor, then re-hydrate from the newly written artifacts
-4) Build datasets and dataloaders (optionally GPU-resident for throughput)
-5) Create model
-6) Train with the shape-agnostic Trainer (now using PyTorch Lightning)
+Objective
+---------
+Train a *simple, numerically stable autoencoder* that can make **autoregressive**
+predictions for a **stiff chemical system**.
+
+Design principles:
+- Work entirely in **normalized standardized log10 space**; targets are standardized,
+  predictions are compared in that same space.
+- Normalize Δt using **log-min–max**; the model denormalizes internally only to
+  construct dynamics features. Keep Δt_norm ∈ [0,1].
+- Favor **stability first** (no NaNs, bounded updates, gradient clipping) and **accuracy**
+  second. Start near-identity; expand capacity only if needed.
+- Use a **short→long rollout** curriculum with **teacher forcing**; optionally add a
+  light **semigroup consistency** loss.
+- A lightweight **time-warp** scales effective step size for stiffness; **smax** is
+  annealed during training.
+
+Inputs: hydrated config + normalization manifest (species stats, dt log_min/log_max).
+Outputs: best Lightning checkpoint and a legacy `best_model.pt` (state_dict + metadata).
 """
 
 from __future__ import annotations
@@ -36,7 +55,7 @@ from hardware import setup_device, optimize_hardware
 from preprocessor import DataPreprocessor
 from dataset import FlowMapPairsDataset, create_dataloader
 from model import create_model
-from trainer import Trainer  # Now using PyTorch Lightning version
+from trainer import Trainer  # Lightning-backed wrapper
 
 # --------------------------------------------------------------------------------------
 # Configuration constants
@@ -46,6 +65,36 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config.jsonc"
 GLOBAL_SEED = 42
 GLOBAL_WORK_DIR = REPO_ROOT / "models" / "autoencoder-flowmap"
+
+
+# --------------------------------------------------------------------------------------
+# Small helpers (robust "auto" handling, device-aware defaults)
+# --------------------------------------------------------------------------------------
+
+def _parse_int_or_auto(val: Any, default_if_auto: int) -> int:
+    """
+    Return int(val) unless val is 'auto'/'none'/''/None -> default.
+    """
+    if val is None:
+        return int(default_if_auto)
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip().lower()
+    if s in ("auto", "none", "null", ""):
+        return int(default_if_auto)
+    return int(s)
+
+
+def _auto_num_workers(default_if_auto: int = 0) -> int:
+    """
+    Reasonable default for DataLoader workers. If you are preloading to GPU, keep low.
+    """
+    try:
+        cpu = os.cpu_count() or default_if_auto
+    except Exception:
+        cpu = default_if_auto
+    # Favor low workers when tensors are GPU-resident already
+    return max(0, min(8, cpu // 8))
 
 
 # --------------------------------------------------------------------------------------
@@ -383,18 +432,48 @@ torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
         seed=base_seed + 1337,
     )
 
-    # Batch sizes
-    batch_size_train = int(training_cfg.get("batch_size", 512))
-    batch_size_val = int(training_cfg.get("val_batch_size", batch_size_train))
+    # --- Batch sizes: preserve "auto" in cfg so Lightning tuner can see it ---
+    bs_raw = training_cfg.get("batch_size", 512)
+    vbs_raw = training_cfg.get("val_batch_size", bs_raw)
+
+    # Use a safe placeholder integer for initial DataLoader construction.
+    # Lightning's tuner will rescale via cfg['training'] == "auto".
+    initial_guess = int(cfg.get("lightning", {}).get("initial_batch_size_guess", 64))
+
+    if isinstance(bs_raw, str) and bs_raw.lower() == "auto":
+        batch_size_train = initial_guess
+        logger.info(f"[batch] train batch_size = {batch_size_train} (placeholder for Lightning auto-tuning)")
+    else:
+        batch_size_train = int(bs_raw)
+        logger.info(f"[batch] train batch_size = {batch_size_train} (from config)")
+
+    if isinstance(vbs_raw, str) and vbs_raw.lower() == "auto":
+        val_multiplier = float(cfg.get("lightning", {}).get("val_batch_size_multiplier", 2.0))
+        batch_size_val = int(initial_guess * val_multiplier)
+        logger.info(f"[batch] validation batch_size = {batch_size_val} (placeholder, {val_multiplier}× train)")
+    else:
+        batch_size_val = int(vbs_raw)
+        logger.info(f"[batch] validation batch_size = {batch_size_val} (from config)")
+
+    # DataLoader worker/threading defaults (support "auto")
+    nw_raw = dataset_cfg.get("num_workers", "auto")
+    nw_val_raw = dataset_cfg.get("num_workers_val", nw_raw)
+    num_workers = _parse_int_or_auto(nw_raw, _auto_num_workers(0))
+    num_workers_val = _parse_int_or_auto(nw_val_raw, num_workers)
+    logger.info(f"[loader] num_workers train/val = {num_workers}/{num_workers_val}")
+
+    # Prefetch factors (no "auto" here—keep your existing defaults)
+    prefetch_train = int(dataset_cfg.get("prefetch_factor", 2))
+    prefetch_val = int(dataset_cfg.get("prefetch_factor_val", prefetch_train))
 
     # DataLoaders (workers typically 0 when data are GPU-resident)
     train_loader = create_dataloader(
         dataset=train_dataset,
         batch_size=batch_size_train,
         shuffle=False,
-        num_workers=int(dataset_cfg.get("num_workers", 0)),
+        num_workers=num_workers,
         pin_memory=bool(dataset_cfg.get("pin_memory", False)),
-        prefetch_factor=int(dataset_cfg.get("prefetch_factor", 2)),
+        prefetch_factor=prefetch_train,
         persistent_workers=bool(dataset_cfg.get("persistent_workers", False)),
     )
 
@@ -402,9 +481,9 @@ torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
         dataset=val_dataset,
         batch_size=batch_size_val,
         shuffle=False,
-        num_workers=int(dataset_cfg.get("num_workers_val", dataset_cfg.get("num_workers", 0))),
+        num_workers=num_workers_val,
         pin_memory=bool(dataset_cfg.get("pin_memory_val", dataset_cfg.get("pin_memory", False))),
-        prefetch_factor=int(dataset_cfg.get("prefetch_factor_val", dataset_cfg.get("prefetch_factor", 2))),
+        prefetch_factor=prefetch_val,
         persistent_workers=bool(
             dataset_cfg.get("persistent_workers_val", dataset_cfg.get("persistent_workers", False))),
     )
@@ -495,7 +574,11 @@ def build_model(
             logger.info(f"Target indices: {ti.detach().cpu().tolist()}")
         except Exception:
             # Fallback if it's a plain list / numpy / CPU tensor without .detach()
-            logger.info(f"Target indices: {list(map(int, ti))}")
+            try:
+                logger.info(f"Target indices: {list(map(int, ti))}")
+            except Exception:
+                logger.info("Target indices: <unavailable>")
+
     return model
 
 
@@ -555,9 +638,11 @@ def main() -> None:
     # Parse command line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH,
-                        help="Path to config file")
+                        help="Path to config file (JSON/JSONC)")
     parser.add_argument("--resume", type=str, default=None,
                         help='Resume from checkpoint ("auto" or path)')
+    parser.add_argument("--fast_dev_run", action="store_true",
+                        help="Enable very short dev run for wiring checks")
     args = parser.parse_args()
 
     # Initialize logging first so subsequent steps are visible
@@ -588,7 +673,7 @@ def main() -> None:
     device = setup_device()
     optimize_hardware(cfg.get("system", {}), device)
 
-    # Determine runtime dtype for staged tensors
+    # Determine runtime dtype for staged tensors (dataset storage)
     storage_dtype_str = str(cfg.get("dataset", {}).get("storage_dtype", "float32")).lower()
     if storage_dtype_str == "bf16":
         runtime_dtype = torch.bfloat16
@@ -610,7 +695,22 @@ def main() -> None:
     # Build model
     model = build_model(cfg, device, logger)
 
-    # Initialize trainer and train (now uses PyTorch Lightning internally)
+    # (Optional) resolve "auto" for gradient accumulation here, so Lightning gets clean ints
+    tr_cfg = cfg.setdefault("training", {})
+    accum_raw = tr_cfg.get("accumulate_grad_batches", 1)
+    default_accum = 1 if len(
+        train_loader) == 0 or train_loader.batch_size is None or train_loader.batch_size >= 1024 else 2
+    accum_value = _parse_int_or_auto(accum_raw, default_accum)
+    tr_cfg["accumulate_grad_batches"] = accum_value
+    cfg.setdefault("lightning", {})["accumulate_grad_batches"] = accum_value
+    logger.info(f"[batch] accumulate_grad_batches = {tr_cfg['accumulate_grad_batches']} (raw={accum_raw!r})")
+
+    # Fast dev run toggle can be passed through to the wrapper (which should map to Lightning)
+    if args.fast_dev_run:
+        tr_cfg["fast_dev_run"] = True
+        logger.info("Fast dev run enabled (trainer will limit steps/epochs).")
+
+    # Initialize trainer (Lightning-backed) and train
     trainer = Trainer(
         model=model,
         train_loader=train_loader,

@@ -1,186 +1,248 @@
 {
-  // ========================================
-  // PATH CONFIGURATION
-  // ========================================
+  // ===============================
+  // PATHS
+  // ===============================
   "paths": {
     "processed_data_dir": "data/processed",
-    "work_dir": "models/koopman-stable1",
+    "work_dir": "models/stable-lpv-koopman",
     "raw_data_files": []
   },
 
-  // ========================================
-  // DATA SCHEMA
-  // ========================================
+  // ===============================
+  // DATA SCHEMA  (no splits here)
+  // ===============================
   "data": {
     "species_variables": [],
     "global_variables": ["P", "T"],
     "time_variable": "t_time"
   },
 
-  // ========================================
-  // NORMALIZATION (CRITICAL - DO NOT CHANGE)
-  // ========================================
+  // ===============================
+  // DATASET / DATALOADER
+  // ===============================
+  "dataset": {
+    "multi_time_per_anchor": true,
+    "times_per_anchor": 4,
+    "share_times_across_batch": true,
+
+    "log_dt_sampling": true,
+    "precompute_dt_table": true,
+
+    "uniform_grid_rtol": 1e-6,
+    "uniform_grid_atol": 1e-12,
+    "snap_shared_grid": true,
+    "assume_shared_grid": true,
+
+    "skip_scan": true,
+    "skip_validate_grids": true,
+
+    // runtime dtype for staged tensors (used by main.py for dataset tensors)
+    "storage_dtype": "float32",
+
+    // DataLoader knobs
+    "preload_train_to_gpu": false,
+    "preload_val_to_gpu": false,
+    "num_workers": 8,
+    "num_workers_val": 8,
+    "pin_memory": true,
+    "pin_memory_val": true,
+    "prefetch_factor": 2,
+    "prefetch_factor_val": 2,
+    "persistent_workers": true,
+    "persistent_workers_val": true,
+
+    "log_every_files": 1000
+  },
+
+  // ===============================
+  // MODEL (Stable LPV Koopman AE)
+  // ===============================
+  "model": {
+    "type": "stable_lpv_koopman",
+    "latent_dim": 32,
+    "encoder_hidden": [512, 512, 512],
+    "decoder_hidden": [512, 512, 512],
+    "activation": "silu",
+    "dropout": 0.0,
+    "softmax_head": false,
+    "predict_delta": true,
+    "z_std_clip": 10.0,
+
+    // LPV conditioning head
+    "cond_hidden": [64, 64],
+    "rank_l": 8,
+    "use_S": false,
+    "gamma": 0.10
+  },
+
+  // ===============================
+  // TRAINING (splits & sampling live here)
+  // ===============================
+  "training": {
+    // Batches: main.py will placeholder these for auto-scaling
+    "batch_size": "auto",
+    "val_batch_size": "auto",
+
+    // Trajectory pair sampling (used by dataset + preprocessor)
+    "pairs_per_traj": 4,
+    "pairs_per_traj_val": 4,
+    "min_steps": 1,
+    "max_steps": 99,
+
+    // Splits REQUIRED by preprocessor
+    "val_fraction": 0.1,
+    "test_fraction": 0.1,
+
+    // Optimization
+    "lr": 1.0e-5,
+    "min_lr": 1.0e-6,
+    "weight_decay": 1.0e-3,
+    "gradient_clip": 0.0,      // Lightning reads this via Trainer wrapper
+    "warmup_epochs": 10,
+    "epochs": 100,
+    // Losses
+    "loss": {
+      "tail_huber": {
+        "weight": 0.1,
+        "delta": 0.02,
+        "z_threshold": -1.0
+      },
+      "time_weight_mode": "sqrt"
+    },
+
+    // Aux losses
+    "auxiliary_losses": {
+      "rollout_enabled": true,
+      "rollout_weight": 0.5,
+      "rollout_horizon": 4,
+      "rollout_warmup_epochs": 10,
+      "rollout_fp32_epochs": 2,
+
+      "rollout_teacher_forcing": {
+        "mode": "linear",
+        "start_p": 1.0,
+        "end_p": 0.2,
+        "end_epoch": 60
+      },
+
+    "semigroup_enabled": true,
+    "semigroup_weight": 0.005,
+    "semigroup_warmup_epochs": 10
+    },
+
+    // Time-warp regularization
+    "timewarp": {
+      "l1_weight": 0.0,
+      "smax_anneal": {
+        "start": 0.1,
+        "end": 1.0,
+        "end_epoch": 60
+      }
+    },
+
+    // Resume controls (used by main.py)
+    "resume": null,
+    "auto_resume": false,
+
+    // Debug short run
+    "fast_dev_run": false
+  },
+
+  // ===============================
+  // SCHEDULER (used by trainer)
+  // ===============================
+  "scheduler": {
+    "use_plateau_fallback": false,
+    "plateau_patience": 10,
+    "plateau_factor": 0.5
+  },
+
+  // ===============================
+  // LIGHTNING RUNTIME
+  // ===============================
+  "lightning": {
+    "accelerator": "auto",
+    "devices": 1,
+    "precision": "bf16-mixed",
+    "accumulate_grad_batches": 1,
+
+    // Cap auto BSize to avoid ridiculous values
+    "max_auto_batch_size": 8192,
+
+    "deterministic": false,   // Trainer flag
+    "benchmark": false,        // cudnn benchmark at Trainer level
+    "detect_anomaly": false,   // enable while chasing NaNs; turn off later
+    "max_epochs": 100,
+
+    // Only validate on a fraction of val set each epoch
+    "val_limit_fraction": 1.0,
+
+    // Auto batch-size tuning
+    "auto_scale_batch_size": "binsearch",
+    "initial_batch_size_guess": 2048,
+    "val_batch_size_multiplier": 2.0,
+
+    // Optional extras used by trainer.py (kept off by default)
+    "auto_lr_find": false,     // if true, runs LR finder after BSize tuning
+    "lr_find_min": 1e-6,
+    "lr_find_max": 3e-4,
+    "lr_find_steps": 96,
+
+    // If auto_lr_find=false, we linearly scale LR using this base
+    "lr_base_batch_size": 8192,
+
+    // Safe/cheap compile: encoder+decoder only
+    "torch_compile": false,
+
+    // Profiler & sanity steps
+    "profile": false,
+    "num_sanity_val_steps": 2
+  },
+
+  // ===============================
+  // LOGGING (only keys the code reads)
+  // ===============================
+  "logging": {
+    "log_every_n_batches": 100
+  },
+
+  // ===============================
+  // PREPROCESSING (used by preprocessor.py)
+  // ===============================
+  "preprocessing": {
+    "trajectories_per_shard": 4096,
+    "npz_compressed": false,
+
+    // Dropping very small profiles is fine!
+    "min_value_threshold": 1e-30,
+
+    "hdf5_chunk_size": 0,
+    "num_workers": 0
+  },
+
+  // ===============================
+  // NORMALIZATION (manifest expectations)
+  // ===============================
   "normalization": {
     "default_method": "log-standard",
     "methods": {
-      "dt": "log-min-max",
       "t_time": "log-min-max",
-      "P": "log-min-max",
-      "T": "standard"
+      "dt": "log-min-max",
+      "T": "standard",
+      "P": "log-standard"
     },
     "epsilon": 1e-30,
     "min_std": 1e-10,
     "clamp_value": 1e-30
   },
 
-  // ========================================
-  // PREPROCESSING
-  // ========================================
-  "preprocessing": {
-    "min_value_threshold": 0,
-    "trajectories_per_shard": 32768,
-    "npz_compressed": false,
-    "num_workers": 48
-  },
-
-  // ========================================
-  // DATASET CONFIGURATION (FAST MODE ENABLED)
-  // ========================================
-  "dataset": {
-    // FAST MODE FLAGS - SKIP EXPENSIVE OPERATIONS
-    "skip_scan": true,                          // Skip shard scanning entirely
-    "skip_validate_grids": true,                // Skip time grid validation
-    "assume_shared_grid": true,                 // Assume all trajectories share time grid
-
-    // Core settings
-    "multi_time_per_anchor": true,
-    "times_per_anchor": 6,
-    "share_times_across_batch": true,
-    "log_dt_sampling": true,
-    "precompute_dt_table": true,
-
-    // Grid tolerances (not used when skip_validate_grids=true)
-    "uniform_grid_rtol": 1e-3,
-    "uniform_grid_atol": 1e-6,
-    "snap_shared_grid": true,
-
-    // DataLoader settings
-    "preload_train_to_gpu": false,
-    "preload_val_to_gpu": false,
-    "num_workers": 0,
-    "pin_memory": false,
-    "prefetch_factor": 2,
-    "persistent_workers": false,
-    "storage_dtype": "float32",
-
-    // Speed up file listing too
-    "log_every_files": 10000                    // Reduce logging frequency
-  },
-
-  // ========================================
-  // TRAINING CONFIGURATION
-  // ========================================
-  "training": {
-    // Core Training
-    "epochs": 150,
-    "lr": 3e-4,
-    "min_lr": 1e-6,
-    "warmup_epochs": 10,
-    "weight_decay": 1e-4,
-    "gradient_clip": 1.0,
-
-    // Batch Configuration
-    "batch_size": 10000,
-    "val_batch_size": 10000,
-    "pairs_per_traj": 8,
-    "min_steps": 1,
-    "max_steps": 64,
-
-    // Data Splits
-    "val_fraction": 0.1,
-    "test_fraction": 0.1,
-    "use_fraction": 1.0,
-
-    // Loss Configuration
-    "adaptive_stiff_loss": {
-      "lambda_phys": 1.0,
-      "lambda_z": 0.5,
-      "time_weight_mode": "none"
-    },
-
-    // Auxiliary Losses
-    "auxiliary_losses": {
-      "rollout_enabled": true,
-      "rollout_weight": 0.5,
-      "rollout_horizon": 8,
-
-      "rollout_teacher_forcing": {
-        "mode": "linear",
-        "start_p": 0.8,
-        "end_p": 0.0,
-        "end_epoch": 60
-      },
-
-      "semigroup_enabled": true,
-      "semigroup_weight": 0.2
-    },
-
-    // Checkpointing
-    "resume": "auto"
-  },
-
-  // ========================================
-  // MODEL ARCHITECTURE
-  // ========================================
-  "model": {
-    "latent_dim": 16,
-    "encoder_hidden": [512, 512, 512],
-    "decoder_hidden": [512, 512, 512],
-
-    "koopman": {
-      "rank": 6,
-      "bias_hidden": 256,
-      "use_phi1_residual": false
-    },
-
-    "softmax_head": true,
-    "activation": "silu",
-    "dropout": 0.0
-  },
-
-  // ========================================
-  // MIXED PRECISION
-  // ========================================
-  "mixed_precision": {
-    "mode": "bf16"
-  },
-
-  // ========================================
-  // SYSTEM SETTINGS
-  // ========================================
+  // ===============================
+  // SYSTEM / HARDWARE
+  // ===============================
   "system": {
     "seed": 42,
-    "dtype": "float32",
-    "io_dtype": "float32",
-    "omp_threads": 8,
     "tf32": true,
-    "cudnn_benchmark": true,
-    "deterministic": false
-  },
-
-  // ========================================
-  // LOGGING & MONITORING
-  // ========================================
-  "logging": {
-    "level": "INFO",
-    "log_every_n_batches": 100,
-    "save_checkpoint_every": 5,
-    "eval_every": 5,
-    "wandb": {
-      "enabled": false,
-      "project": "koopman-chemistry",
-      "entity": null,
-      "tags": ["stable", "non-uniform", "fast-mode"]
-    }
+    "omp_threads": null,
+    "io_dtype": "float32"
   }
 }

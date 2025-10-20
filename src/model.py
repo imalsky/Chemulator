@@ -1,513 +1,359 @@
 #!/usr/bin/env python3
 """
-Flow-map Koopman Autoencoder with Stable Coupled Dynamics (PATCHED)
-===================================================================
-This version applies targeted correctness fixes and low-effort speed/robustness
-improvements suggested in review:
-- Fix mask shape bug: avoid squeezing `inv`; use boolean mask directly
-- Fix broadcasting with unique-Δt scaling without `.item()` host sync
-- Bucket on dt_norm (exact duplicates) and map uniques to physical once
-- Fallback to full-batch path when bucketing brings no savings
-- Reuse buffers per step to reduce allocations
-- Add `step_with_K` to reuse cached K in rollout; actually use it
-- Simpler decoder call in rollout; keep zero-step identity and φ₁ integration
-- Log first dt clamp once (already wired)
+Stable LPV Koopman Autoencoder (trainer-compatible, hardened)
+=============================================================
 
-Notes:
-- Assumes `dt_norm` is in [0,1] from a log-min-max normalization of physical Δt.
-- Uses diagonal damping to ensure stability: K = S - L L^T - γ I with γ>0.
+Key points:
+- forward(y_i, dt_norm, g) returns [B, K, S] for multi-time prediction (K can be 1).
+- Decoder is numerically hardened:
+  * Stats sanitized
+  * Output clamp applied both for softmax_head=True (standardized log space) and False (raw head)
+  * Small-init on final decoder linear to keep early logits tame
+- Stable LPV dynamics A(P,T) = S - L L^T - γ I, optional skew S
+- Δt is denormalized from [0,1] using manifest log-space stats, with overflow guards
+- Optional predict_delta: if True, model predicts Δy in normalized space and returns y_i + Δy
+
+Config knobs (under "model"):
+  - latent_dim, encoder_hidden, decoder_hidden, activation, dropout
+  - softmax_head (bool), z_std_clip (float), predict_delta (bool)
+  - cond_hidden, rank_l, use_S, gamma
 """
 
 from __future__ import annotations
 
 import json
-import logging
 import math
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------- Utilities --------------------------------------
+# ---------------------------- Constants / Utils -------------------------------
 
-def get_activation(name: str) -> nn.Module:
-    name = (name or "silu").lower()
-    activations = {
-        "relu": nn.ReLU(),
-        "gelu": nn.GELU(),
-        "tanh": nn.Tanh(),
-        "silu": nn.SiLU(),
-        "swish": nn.SiLU(),
+LOG_STD_MIN = 1e-9
+Z_STD_CLIP_DEFAULT = 50.0
+TEMP_INIT_DEFAULT = 1.0
+TEMP_MIN_DEFAULT = 0.1
+TEMP_MAX_DEFAULT = 10.0
+
+def get_activation(name_or_mod: Union[str, nn.Module]) -> nn.Module:
+    if isinstance(name_or_mod, nn.Module):
+        return name_or_mod
+    name = (name_or_mod or "silu").lower()
+    table = {
+        "relu": nn.ReLU,
+        "gelu": nn.GELU,
+        "tanh": nn.Tanh,
+        "silu": nn.SiLU,
+        "swish": nn.SiLU,
+        "elu": nn.ELU,
+        "leakyrelu": nn.LeakyReLU,
+        "leaky": nn.LeakyReLU,
+        "mish": nn.Mish,
+        "none": nn.Identity,
+        "identity": nn.Identity,
     }
-    if name not in activations:
-        raise ValueError(f"Unknown activation: {name}")
-    return activations[name]
+    if name not in table:
+        raise ValueError(f"Unknown activation '{name}'.")
+    return table[name]()
 
+def _act_factory(activation: Union[str, nn.Module, Callable[[], nn.Module]]) -> Callable[[], nn.Module]:
+    if isinstance(activation, nn.Module):
+        return lambda: activation
+    if isinstance(activation, str):
+        return lambda: get_activation(activation)
+    if callable(activation):
+        return activation
+    raise ValueError("activation must be str, nn.Module, or factory callable.")
 
 class MLP(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dims: Sequence[int],
-        output_dim: int,
-        activation: nn.Module,
-        dropout: float = 0.0,
-        zero_init_output: bool = False,
-    ):
+    def __init__(self, in_dim: int, hidden: Sequence[int], out_dim: int,
+                 activation: Union[str, nn.Module, Callable[[], nn.Module]],
+                 dropout: float = 0.0):
         super().__init__()
-        layers = []
-        prev = input_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(prev, h))
-            layers.append(activation.__class__())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            prev = h
+        layers: list[nn.Module] = []
+        dprev = int(in_dim)
+        make_act = _act_factory(activation)
+        for i, d in enumerate(list(hidden) + [int(out_dim)]):
+            layers.append(nn.Linear(dprev, d))
+            if i < len(hidden):
+                layers.append(make_act())
+                if dropout and dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+            dprev = d
+        self.net = nn.Sequential(*layers)
 
-        out = nn.Linear(prev, output_dim)
-        if zero_init_output:
-            nn.init.zeros_(out.weight)
-            nn.init.zeros_(out.bias)
-        layers.append(out)
-
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D401
-        return self.network(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Avoid saving NaNs/Infs inside Linear activations for autograd
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        for layer in self.net:
+            x = layer(x)
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        return x
 
 
-# ---------------------------- Encoder ----------------------------------------
+
+# ------------------------------- Encoder/Decoder ------------------------------
 
 class Encoder(nn.Module):
-    """Deterministic encoder: [y_i, g] -> z"""
-
     def __init__(
         self,
         state_dim: int,
         global_dim: int,
-        hidden_dims: Sequence[int],
+        hidden: Sequence[int],
         latent_dim: int,
-        activation: nn.Module,
+        activation: Union[str, nn.Module, Callable[[], nn.Module]],
         dropout: float = 0.0,
     ):
         super().__init__()
-        self.network = MLP(
-            state_dim + global_dim, hidden_dims, latent_dim, activation, dropout
-        )
+        self.state_dim = int(state_dim)
+        self.global_dim = int(global_dim)
+        self.z_dim = int(latent_dim)
+        self.net = MLP(self.state_dim + self.global_dim, hidden, self.z_dim, activation, dropout)
 
     def forward(self, y: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         x = torch.cat([y, g], dim=-1)
-        return self.network(x)
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        out = self.net(x)
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
-
-# ----------------------- Koopman Latent Dynamics -----------------------------
-
-class KoopmanDynamics(nn.Module):
-    """
-    Stable coupled latent dynamics with single-shot Δt.
-    Ensures f(y,0) = y through proper zero-step handling.
-    """
-
-    def __init__(
-        self,
-        latent_dim: int,
-        global_dim: int,
-        rank: int = 4,
-        bias_hidden: int = 128,
-        use_phi1_residual: bool = False,
-        dt_stats: Optional[Dict[str, float]] = None,
-        min_damping: float = 1e-4,
-    ):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.rank = min(rank, latent_dim)
-        self.use_phi1_residual = use_phi1_residual
-        self.min_damping = min_damping
-        self.logger = logging.getLogger(__name__)
-
-        # Networks for stable K(g) = S(g) - L(g)L(g)^T
-        self.skew_net = MLP(global_dim, [bias_hidden], latent_dim * latent_dim, nn.SiLU(), 0.0)
-        self.dissip_net = MLP(global_dim, [bias_hidden], latent_dim * self.rank, nn.SiLU(), 0.0)
-
-        # Learnable diagonal damping parameter (slightly smaller initial value)
-        self.gamma_param = nn.Parameter(torch.tensor(-6.0))  # ~0.0025 after softplus
-
-        # Bias network with log-dt features: [dt_norm, log10_dt, globals]
-        self.bias_net = MLP(
-            2 + global_dim,
-            [bias_hidden, bias_hidden],
-            latent_dim,
-            nn.SiLU(),
-            0.0,
-            zero_init_output=True,
-        )
-
-        # Optional residual network
-        if use_phi1_residual:
-            self.residual_net = MLP(
-                latent_dim + global_dim,
-                [bias_hidden],
-                latent_dim,
-                nn.SiLU(),
-                0.0,
-                zero_init_output=True,
-            )
-            # Apply spectral norm to first Linear only (guarded)
-            applied = False
-            for mod in self.residual_net.network.modules():
-                if (
-                    isinstance(mod, nn.Linear)
-                    and not applied
-                    and not hasattr(mod, "weight_orig")
-                ):
-                    nn.utils.spectral_norm(mod)
-                    applied = True
-                    break
-
-        # Conservative initialization
-        with torch.no_grad():
-            for net in [self.skew_net, self.dissip_net]:
-                for m in net.modules():
-                    if isinstance(m, nn.Linear):
-                        nn.init.normal_(m.weight, 0.0, 0.001)
-                        nn.init.zeros_(m.bias)
-
-        # Store dt normalization stats
-        if dt_stats is None:
-            raise ValueError("dt_stats required")
-
-        self.register_buffer("dt_log_min", torch.tensor(float(dt_stats["log_min"])) )
-        self.register_buffer("dt_log_max", torch.tensor(float(dt_stats["log_max"])) )
-
-        # Physical dt bounds for clamping
-        dt_min_phys = 10.0 ** float(dt_stats["log_min"])
-        dt_max_phys = 10.0 ** float(dt_stats["log_max"])
-        self.register_buffer("dt_min_phys", torch.tensor(dt_min_phys))
-        self.register_buffer("dt_max_phys", torch.tensor(dt_max_phys))
-
-        self._dt_clamp_warned = False
-
-    def _build_stable_K(self, g: torch.Tensor) -> torch.Tensor:
-        """Build stable generator K(g) = S(g) - L(g)L(g)^T - γI"""
-        B = g.shape[0]
-        d = self.latent_dim
-
-        # Skew-symmetric part
-        A_flat = self.skew_net(g)
-        A = A_flat.view(B, d, d)
-        S = 0.5 * (A - A.transpose(1, 2))
-
-        # Dissipative part
-        L = self.dissip_net(g).view(B, d, self.rank)
-        D = torch.bmm(L, L.transpose(1, 2))
-
-        # Diagonal damping
-        gamma = F.softplus(self.gamma_param) + self.min_damping
-        eye = torch.eye(d, device=g.device, dtype=g.dtype)
-
-        K = S - D - gamma * eye.unsqueeze(0)
-        return K
-
-    def _denorm_dt_to_phys(self, dt_norm: torch.Tensor) -> torch.Tensor:
-        """Convert normalized Δt to physical units with clamping"""
-        dt_norm = dt_norm.clamp(0, 1)
-        log_dt = self.dt_log_min + dt_norm * (self.dt_log_max - self.dt_log_min)
-        dt_phys = (10.0 ** log_dt).clamp_min(1e-30)
-
-        # Clamp and warn once
-        dt_unclamped = dt_phys.clone()
-        dt_phys = dt_phys.clamp(self.dt_min_phys, self.dt_max_phys)
-
-        if not self._dt_clamp_warned and torch.any(dt_phys != dt_unclamped):
-            self._dt_clamp_warned = True
-            if self.training:
-                self.logger.warning(
-                    f"dt clamped to training range [{self.dt_min_phys.item():.3e}, {self.dt_max_phys.item():.3e}]"
-                )
-
-        return dt_phys
-
-    def _compute_phi1(
-        self, K_scaled: torch.Tensor, eye: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Compute φ₁(K) = (exp(K) - I) / K via block-matrix trick."""
-        B, d, _ = K_scaled.shape
-        device = K_scaled.device
-
-        # Build augmented matrix [[K, I], [0, K]]
-        aug = torch.zeros(B, 2 * d, 2 * d, device=device, dtype=K_scaled.dtype)
-        aug[:, :d, :d] = K_scaled
-
-        if eye is None:
-            eye = torch.eye(d, device=device, dtype=K_scaled.dtype)
-        aug[:, :d, d:] = eye.unsqueeze(0) if eye.ndim == 2 else eye
-        aug[:, d:, d:] = K_scaled
-
-        exp_aug = torch.linalg.matrix_exp(aug)
-        phi1 = exp_aug[:, :d, d:]
-        return phi1
-
-    @torch.no_grad()
-    def step_with_K(
-        self,
-        z: torch.Tensor,         # [B, Z]
-        dt_norm: torch.Tensor,   # [B, 1] or [B]
-        g: torch.Tensor,         # [B, G]
-        K: torch.Tensor,         # [B, d, d] (precomputed)
-    ) -> torch.Tensor:
-        """Single-step evolution that reuses a precomputed K.
-        Matches the per-step body of `forward` but skips rebuilding K.
-        Returns z_next: [B, Z].
-        """
-        if dt_norm.ndim == 1:
-            dt_norm = dt_norm.unsqueeze(1)  # [B,1]
-
-        B = z.shape[0]
-        d = self.latent_dim
-        eye = torch.eye(d, device=K.device, dtype=K.dtype)
-
-        # Zero-step fast path
-        is_zero = dt_norm <= 0
-        if torch.all(is_zero):
-            return z
-
-        # Unique on normalized dt (exact duplicates), then map to physical once
-        vals_norm, inv = torch.unique(dt_norm, return_inverse=True, dim=0)  # [U,1], [B]
-        vals_phys = torch.where(
-            vals_norm <= 0,
-            torch.zeros_like(vals_norm),
-            self._denorm_dt_to_phys(vals_norm),
-        )  # [U,1]
-
-        # Heuristic fallback: if no dedup benefit, do full-batch once
-        U = vals_phys.shape[0]
-        exp_K = torch.empty(B, d, d, device=K.device, dtype=K.dtype)
-        phi1 = torch.empty_like(exp_K)
-
-        if U > 0.8 * B:
-            dt_phys_full = torch.where(
-                is_zero, torch.zeros_like(dt_norm), self._denorm_dt_to_phys(dt_norm)
-            )  # [B,1]
-            K_scaled = K * dt_phys_full.unsqueeze(-1)  # [B,d,d]
-            exp_K[:] = torch.linalg.matrix_exp(K_scaled)
-            phi1[:] = self._compute_phi1(K_scaled, eye)
-        else:
-            # Initialize to avoid stale values when filling by mask
-            exp_K.zero_()
-            phi1.zero_()
-            for u in range(U):
-                m = inv == u  # [B]
-                v = vals_phys[u]  # [1] or [1,1]
-                if torch.all(v == 0):
-                    exp_K[m] = eye
-                    phi1[m] = eye
-                else:
-                    v3 = v.view(1, 1, 1)
-                    K_scaled = K[m] * v3  # [Nu,d,d]
-                    exp_K[m] = torch.linalg.matrix_exp(K_scaled)
-                    phi1[m] = self._compute_phi1(K_scaled, eye)
-
-        # Linear evolution
-        z_linear = torch.bmm(exp_K, z.unsqueeze(-1)).squeeze(-1)
-
-        # Bias with log-dt features
-        dt_phys_full = torch.where(
-            is_zero, torch.zeros_like(dt_norm), self._denorm_dt_to_phys(dt_norm)
-        )
-        log_dt = torch.where(
-            is_zero, torch.zeros_like(dt_phys_full), torch.log10(dt_phys_full.clamp(min=1e-30))
-        )
-        bias_input = torch.cat([dt_norm, log_dt, g], dim=-1)  # [B, 2+G]
-        bias_vec = torch.tanh(self.bias_net(bias_input)) * dt_phys_full  # [B, Z]
-        bias = torch.bmm(phi1, bias_vec.unsqueeze(-1)).squeeze(-1)  # [B, Z]
-
-        # Optional residual
-        if self.use_phi1_residual and hasattr(self, "residual_net"):
-            r_raw = self.residual_net(torch.cat([z, g], dim=-1))  # [B, Z]
-            r = r_raw * dt_phys_full
-            r_integrated = torch.bmm(phi1, r.unsqueeze(-1)).squeeze(-1)
-            z_next = z_linear + bias + r_integrated
-        else:
-            z_next = z_linear + bias
-
-        return z_next
-
-    def forward(
-        self, z: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Forward dynamics with efficient bucketing for shared timesteps.
-
-        z: [B, Z] or [B, 1, Z] initial latent state
-        dt_norm: [B, K] or [B, K, 1] or [B] normalized time steps
-        g: [B, G] global features
-        Returns: [B, K, Z] evolved states
-        """
-        # Handle input shapes
-        if z.ndim == 2:
-            B, Z = z.shape
-            z = z.unsqueeze(1)
-        else:
-            B, _, Z = z.shape
-
-        assert z.shape[1] == 1, "Single initial state expected"
-        z_curr = z[:, 0]
-
-        # Normalize dt_norm to [B, K]
-        if dt_norm.ndim == 1:
-            dt_norm = dt_norm.unsqueeze(1)
-        if dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
-            dt_norm = dt_norm.squeeze(-1)
-        K_steps = dt_norm.shape[1]
-
-        # Build stable generator once
-        K = self._build_stable_K(g)
-        d = self.latent_dim
-
-        # Precompute identity and reusable buffers once
-        eye = torch.eye(d, device=K.device, dtype=K.dtype)
-        exp_K_buf = torch.empty(B, d, d, device=K.device, dtype=K.dtype)
-        phi1_buf = torch.empty_like(exp_K_buf)
-
-        if self.training:
-            assert (dt_norm >= 0).all() and (dt_norm <= 1).all(), "dt_norm out of bounds"
-
-        outputs = []
-
-        for k in range(K_steps):
-            dt_k = dt_norm[:, k : k + 1]  # [B,1]
-
-            # Fast path for all-zero step
-            is_zero = dt_k <= 0
-            if torch.all(is_zero):
-                outputs.append(z_curr)
-                continue
-
-            # Unique on dt_norm, map to physical once
-            vals_norm, inv = torch.unique(dt_k, return_inverse=True, dim=0)  # [U,1], [B]
-            vals_phys = torch.where(
-                vals_norm <= 0,
-                torch.zeros_like(vals_norm),
-                self._denorm_dt_to_phys(vals_norm),
-            )  # [U,1]
-
-            U = vals_phys.shape[0]
-            exp_K = exp_K_buf
-            phi1 = phi1_buf
-
-            if U > 0.8 * B:
-                # No real dedup benefit: do full-batch once
-                dt_phys_full = torch.where(
-                    is_zero, torch.zeros_like(dt_k), self._denorm_dt_to_phys(dt_k)
-                )  # [B,1]
-                K_scaled = K * dt_phys_full.unsqueeze(-1)  # [B,d,d]
-                exp_K[:] = torch.linalg.matrix_exp(K_scaled)
-                phi1[:] = self._compute_phi1(K_scaled, eye)
-            else:
-                # Fill by bucket
-                exp_K.zero_()
-                phi1.zero_()
-                for u in range(U):
-                    m = inv == u  # [B]
-                    v = vals_phys[u]  # [1] or [1,1]
-                    if torch.all(v == 0):
-                        exp_K[m] = eye
-                        phi1[m] = eye
-                    else:
-                        v3 = v.view(1, 1, 1)
-                        K_scaled = K[m] * v3  # [Nu,d,d]
-                        exp_K[m] = torch.linalg.matrix_exp(K_scaled)
-                        phi1[m] = self._compute_phi1(K_scaled, eye)
-
-            # Linear evolution
-            z_linear = torch.bmm(exp_K, z_curr.unsqueeze(-1)).squeeze(-1)
-
-            # Bias with log-dt features
-            dt_phys_full = torch.where(
-                is_zero, torch.zeros_like(dt_k), self._denorm_dt_to_phys(dt_k)
-            )
-            log_dt = torch.where(
-                is_zero, torch.zeros_like(dt_phys_full), torch.log10(dt_phys_full.clamp(min=1e-30))
-            )
-            bias_input = torch.cat([dt_k, log_dt, g], dim=-1)  # [B, 2+G]
-            bias_vec = torch.tanh(self.bias_net(bias_input)) * dt_phys_full  # [B, Z]
-            bias = torch.bmm(phi1, bias_vec.unsqueeze(-1)).squeeze(-1)
-
-            # Optional residual
-            if self.use_phi1_residual and hasattr(self, "residual_net"):
-                r_raw = self.residual_net(torch.cat([z_curr, g], dim=-1))  # [B, Z]
-                r = r_raw * dt_phys_full
-                r_integrated = torch.bmm(phi1, r.unsqueeze(-1)).squeeze(-1)
-                z_next = z_linear + bias + r_integrated
-            else:
-                z_next = z_linear + bias
-
-            outputs.append(z_next)
-            z_curr = z_next
-
-        return torch.stack(outputs, dim=1)
-
-
-# ----------------------------- Decoder ---------------------------------------
 
 class Decoder(nn.Module):
-    """Decoder with optional simplex constraint for mole fractions"""
+    """
+    Two modes:
+      1) softmax_head=True:
+         logits → softmax(p) → log10(p) → standardize((log10_p - mean)/std)
+         Return standardized predictions (same space as targets).
+      2) softmax_head=False:
+         raw linear head in target space; we still apply NaN-to-num and clamp as guardrails.
 
-    def __init__(
-        self,
-        latent_dim: int,
-        hidden_dims: Sequence[int],
-        state_dim: int,
-        activation: nn.Module,
-        dropout: float = 0.0,
-        softmax_head: bool = True,
-        log_stats: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ):
+    z_std_clip (float or None): clamps the output in either mode.
+    """
+    def __init__(self, latent_dim: int, hidden: Sequence[int], state_dim: int,
+                 activation: Union[str, nn.Module, Callable[[], nn.Module]], dropout: float = 0.0, *,
+                 softmax_head: bool = True,
+                 log_stats: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                 temp_init: float = TEMP_INIT_DEFAULT,
+                 temp_range: Tuple[float, float] = (TEMP_MIN_DEFAULT, TEMP_MAX_DEFAULT),
+                 learn_temp: bool = True,
+                 z_std_clip: Optional[float] = Z_STD_CLIP_DEFAULT):
         super().__init__()
-        self.network = MLP(latent_dim, hidden_dims, state_dim, activation, dropout)
-        self.softmax_head = softmax_head
-        self.state_dim = state_dim
-
-        if softmax_head:
-            if log_stats is None:
-                raise ValueError("softmax_head requires log_mean and log_std")
-
-            # Ensure correct device placement
-            device = next(self.network.parameters()).device
-            self.register_buffer("log_mean", log_stats[0].to(device))
-            self.register_buffer("log_std", log_stats[1].clamp(min=1e-10).to(device))
-
-            assert self.log_mean.shape[0] == state_dim
-            assert self.log_std.shape[0] == state_dim
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:  # noqa: D401
-        y_base = self.network(z)
-        assert y_base.shape[-1] == self.state_dim, "Output shape mismatch"
+        self.net = MLP(latent_dim, hidden, state_dim, activation, dropout)
+        self.softmax_head = bool(softmax_head)
+        self.state_dim = int(state_dim)
+        self.learn_temp = bool(learn_temp)
+        self.z_std_clip = float(z_std_clip) if z_std_clip is not None else None
 
         if self.softmax_head:
-            ln10 = math.log(10.0)
-            logits = y_base.clamp(-40, 40)
-            log_p = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-            log10_p = log_p / ln10
+            if log_stats is None:
+                raise ValueError("softmax_head=True requires (log_mean, log_std) per species.")
+            log_mean, log_std = log_stats
+            # sanitize stats aggressively
+            log_mean = torch.nan_to_num(log_mean.detach().clone(), nan=0.0, neginf=-60.0, posinf=60.0)
+            log_std  = torch.nan_to_num(log_std.detach().clone(),  nan=1.0, neginf=1.0,  posinf=1.0).clamp(min=LOG_STD_MIN)
+            self.register_buffer("log_mean", log_mean)
+            self.register_buffer("log_std", log_std)
+            if self.log_mean.shape[0] != self.state_dim or self.log_std.shape[0] != self.state_dim:
+                raise ValueError("Decoder stats shape mismatch.")
+            tmin, tmax = float(temp_range[0]), float(temp_range[1])
+            self.tmin, self.tmax = tmin, tmax
+            if self.learn_temp:
+                self.temp = nn.Parameter(torch.tensor(float(temp_init)))
+            else:
+                self.register_buffer("temp_fixed", torch.tensor(float(temp_init)))
 
-            mu = self.log_mean.view(1, 1, -1) if y_base.ndim == 3 else self.log_mean
-            sig = self.log_std.view(1, 1, -1) if y_base.ndim == 3 else self.log_std
-            return (log10_p - mu) / sig
+        # small-init the final linear to keep early logits near zero
+        head = None
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                head = m
+        if head is not None:
+            nn.init.normal_(head.weight, mean=0.0, std=1e-4)  # tighter for bf16 stability
+            nn.init.zeros_(head.bias)
 
-        return y_base
+    def _temperature(self) -> torch.Tensor:
+        if not self.softmax_head:
+            return torch.as_tensor(TEMP_INIT_DEFAULT, device=next(self.parameters()).device)
+        if self.learn_temp:
+            return self.temp.clamp(self.tmin, self.tmax)
+        return self.temp_fixed.clamp(self.tmin, self.tmax)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # Sanitize latent before first Linear to avoid Addmm NaN in backward
+        z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+        logits = self.net(z)
+
+        if not self.softmax_head:
+            out = torch.nan_to_num(logits, nan=0.0, neginf=-1e6, posinf=1e6)
+            if self.z_std_clip is not None:
+                out = out.clamp_(-self.z_std_clip, self.z_std_clip)
+            return out
+
+        # softmax path
+        t = torch.nan_to_num(self._temperature(), nan=float(TEMP_MIN_DEFAULT)).clamp(TEMP_MIN_DEFAULT, TEMP_MAX_DEFAULT)
+        x = torch.nan_to_num(logits / t)
+        log10e = 1.0 / math.log(10.0)
+        log10_p = F.log_softmax(x, dim=-1) * log10e
+        log10_p = torch.nan_to_num(log10_p, nan=-1e6, neginf=-1e6, posinf=1e6)
+        z_std = (log10_p - self.log_mean) / self.log_std
+        z_std = torch.nan_to_num(z_std, nan=0.0, neginf=-1e6, posinf=1e6)
+        if self.z_std_clip is not None:
+            z_std = z_std.clamp_(-self.z_std_clip, self.z_std_clip)
+        return z_std
 
 
-# --------------------------- Full Model --------------------------------------
+# -------------------------- LPV Stable Latent Dynamics ------------------------
 
-class FlowMapKoopman(nn.Module):
+class _NoOpTimeWarp(nn.Module):
+    def __init__(self, smax_init: float = 0.0):
+        super().__init__()
+        self.register_buffer("smax", torch.tensor(float(smax_init)))
+        self.last_s_mean = 0.0
+
+class LPVDynamics(nn.Module):
     """
-    Flow-map Koopman autoencoder optimized for stiff chemical kinetics.
-    Guarantees identity at zero timestep and efficient multi-scale dynamics.
+    A(P,T) = S - L L^T - γ I; z_next = exp(A Δt) z
+    - S is skew-symmetric (optional) scaled by tanh(scale_S)
+    - L is low-rank with positive singular values via softplus
     """
+    def __init__(self, latent_dim: int, global_dim: int,
+                 cond_hidden: Sequence[int], rank_l: int, use_S: bool, gamma: float,
+                 activation: Union[str, nn.Module, Callable[[], nn.Module]], dropout: float,
+                 dt_stats: Dict[str, float]):
+        super().__init__()
+        self.z = int(latent_dim)
+        self.g = int(global_dim)
+        self.r = int(rank_l)
+        self.use_S = bool(use_S)
+        self.gamma = float(gamma)
 
+        self.cond = MLP(self.g, cond_hidden, self.r + (self.z * self.z if self.use_S else 0),
+                        activation, dropout)
+
+        with torch.no_grad():
+            Q, _ = torch.linalg.qr(torch.randn(self.z, self.r))
+        self.register_buffer("base_U", Q)                 # [z,r]
+        self.register_buffer("I", torch.eye(self.z))      # [z,z]
+        self.timewarp = _NoOpTimeWarp(0.0)
+
+        # Δt log range buffers (log10 space)
+        if ("log_min" not in dt_stats) or ("log_max" not in dt_stats):
+            raise ValueError("dt_stats must include 'log_min' and 'log_max' (log10 space).")
+        log_min = float(dt_stats["log_min"])
+        log_max = float(dt_stats["log_max"])
+        if not math.isfinite(log_min) or not math.isfinite(log_max) or (log_max <= log_min):
+            raise ValueError(f"Bad dt_stats: log_min={log_min}, log_max={log_max}")
+        self.register_buffer("dt_log_min", torch.tensor(log_min, dtype=torch.float32))
+        self.register_buffer("dt_log_max", torch.tensor(log_max, dtype=torch.float32))
+
+        self.scale_S = nn.Parameter(torch.tensor(1.0))
+
+    def _build_A(self, pt: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        B = pt.shape[0]
+        pt = torch.nan_to_num(pt, nan=0.0, posinf=0.0, neginf=0.0)
+        h = self.cond(pt)
+        h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.use_S:
+            s, m_head = torch.split(h, [self.r, self.z * self.z], dim=-1)
+        else:
+            s, m_head = h, None
+
+        s = F.softplus(s)   # [B,r] positive
+        U = self.base_U     # [z,r]
+        L = U.unsqueeze(0) * s.unsqueeze(1)              # [B,z,r]
+        LLt = torch.matmul(L, L.transpose(1, 2))         # [B,z,z], PSD
+
+        if self.use_S:
+            M = m_head.reshape(B, self.z, self.z)
+            S = 0.5 * (M - M.transpose(1, 2))
+            S = torch.tanh(self.scale_S) * S
+        else:
+            S = torch.zeros(B, self.z, self.z, device=pt.device, dtype=pt.dtype)
+
+        A = S - LLt - self.gamma * self.I.to(device=pt.device, dtype=pt.dtype).expand(B, -1, -1)
+        A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+        aux = {"damp_mean": float(s.mean().detach().cpu()),
+               "gamma": self.gamma,
+               "smax": float(self.timewarp.smax.detach().cpu())}
+        return A, aux
+
+    @property
+    def _dt_range_scalar(self) -> torch.Tensor:
+        return (self.dt_log_max - self.dt_log_min).clamp_min(1e-12)
+
+    # In model.py, inside class LPVDynamics
+    def _denorm_dt(self, dt_norm: torch.Tensor) -> torch.Tensor:
+        """
+        Map normalized dt in [0,1] to physical seconds using stored log10 range.
+        Guard against NaN/Inf before clamping; cap log10(dt) to 38 (~1e38).
+        """
+        # sanitize first; clamp afterwards (clamp leaves NaNs unchanged)
+        dt_norm = torch.nan_to_num(dt_norm, nan=0.0, posinf=1.0, neginf=0.0)
+        dt_norm = dt_norm.clamp(0.0, 1.0)
+
+        log_dt = self.dt_log_min + dt_norm * self._dt_range_scalar
+        log_dt = torch.clamp(log_dt, max=38.0)
+
+        dt_phys = torch.exp(log_dt * math.log(10.0))
+        # ensure strictly positive and finite for matrix exp / eigen math
+        dt_phys = torch.nan_to_num(dt_phys, nan=1e-30, posinf=1e38, neginf=1e-30).clamp_min(1e-30)
+        return dt_phys
+
+    @staticmethod
+    def _to_3d(dt: torch.Tensor) -> torch.Tensor:
+        return dt.view(dt.shape[0], 1, 1)
+
+    # In model.py, inside class LPVDynamics
+    def step(self, z: torch.Tensor, dt_step_norm: torch.Tensor | float, g: torch.Tensor) -> torch.Tensor:
+        """
+        Single latent step z_{t+dt} = exp(A(g) * dt_phys) @ z_t
+        Uses fp32 matrix_exp for stable, differentiable propagation (no eigh).
+        Accepts scalar or [B]-shaped dt_step_norm. z: [B,Z], g: [B,G].
+        """
+        B, Z = z.shape
+
+        # Normalize dt shape & dtype robustly
+        if not torch.is_tensor(dt_step_norm):
+            dt_step_norm = torch.as_tensor(dt_step_norm, device=z.device, dtype=torch.float32)
+        dt_step_norm = dt_step_norm.to(dtype=torch.float32, device=z.device)
+        if dt_step_norm.ndim == 0:
+            dt_step_norm = dt_step_norm.expand(B)
+        elif dt_step_norm.ndim != 1 or dt_step_norm.shape[0] != B:
+            dt_step_norm = dt_step_norm.view(B)
+
+        # Build A(g) and propagate in fp32 with explicit autocast API
+        with torch.amp.autocast("cuda", enabled=False):
+            # A: [B,Z,Z] in fp32. Keep exactly symmetric when S-term is off.
+            A = self._build_A(g)[0].float()
+            if not self.use_S:
+                A = 0.5 * (A + A.transpose(-1, -2))
+
+            # Sanitize numerics
+            A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Physical dt in fp32; clamp to >=0
+            dt_phys32 = self._denorm_dt(dt_step_norm).to(torch.float32).clamp_min(0.0).view(B, 1, 1)
+
+            # Propagator and apply
+            Phi = torch.matrix_exp(A * dt_phys32)  # [B,Z,Z]
+            z_next32 = torch.bmm(Phi, z.float().unsqueeze(-1)).squeeze(-1)  # [B,Z]
+
+        return z_next32.to(z.dtype)
+
+
+# ------------------------------ Full Model -----------------------------------
+
+class StableLPVKoopmanAE(nn.Module):
+    """
+    Encoder → LPV Dynamics → Decoder.
+    Works entirely in normalized target space; only Δt is de/renormalized inside dynamics.
+
+    forward(y_i, dt_norm, g):
+      y_i: [B,S], dt_norm: [B] or [B,K], g: [B,G]  →  [B,K,S]
+    """
     def __init__(
         self,
         *,
@@ -516,159 +362,277 @@ class FlowMapKoopman(nn.Module):
         latent_dim: int,
         encoder_hidden: Sequence[int],
         decoder_hidden: Sequence[int],
-        koopman_rank: int = 4,
-        koopman_bias_hidden: int = 128,
-        use_phi1_residual: bool = False,
-        dt_stats: Optional[Dict[str, float]] = None,
-        activation: str = "silu",
+        activation: Union[str, nn.Module, Callable[[], nn.Module]] = "silu",
         dropout: float = 0.0,
         softmax_head: bool = True,
+        z_std_clip: Optional[float] = Z_STD_CLIP_DEFAULT,
+        predict_delta: bool = False,  # NEW: if True, return y_i + Δy
+        # decoder stats (only if softmax_head=True)
         target_log_mean: Optional[Sequence[float]] = None,
         target_log_std: Optional[Sequence[float]] = None,
-        min_damping: float = 1e-4,
+        # LPV dynamics
+        cond_hidden: Sequence[int] = (64, 64),
+        rank_l: int = 8,
+        use_S: bool = False,
+        gamma: float = 1e-2,
+        dt_stats: Dict[str, float] = None,
+        **kwargs,
     ):
         super().__init__()
+        if kwargs:
+            pass
 
-        self.S = state_dim
-        self.G = global_dim
-        self.Z = latent_dim
+        self.S_in = int(state_dim)
+        self.S_out = int(state_dim)
+        self.G_in = int(global_dim)
+        self.Z = int(latent_dim)
+        self.use_S = bool(use_S)
+        self.predict_delta = bool(predict_delta)
 
-        act = get_activation(activation)
+        act = get_activation(activation) if isinstance(activation, str) else activation
 
-        self.encoder = Encoder(state_dim, global_dim, encoder_hidden, latent_dim, act, dropout)
-        self.dynamics = KoopmanDynamics(
-            latent_dim=latent_dim,
-            global_dim=global_dim,
-            rank=koopman_rank,
-            bias_hidden=koopman_bias_hidden,
-            use_phi1_residual=use_phi1_residual,
+        self.encoder = Encoder(self.S_in, self.G_in, encoder_hidden, self.Z, act, dropout)
+        self.dynamics = LPVDynamics(
+            latent_dim=self.Z,
+            global_dim=self.G_in,
+            cond_hidden=cond_hidden,
+            rank_l=rank_l,
+            use_S=use_S,
+            gamma=gamma,
+            activation=act,
+            dropout=dropout,
             dt_stats=dt_stats,
-            min_damping=min_damping,
         )
 
         log_stats = None
         if softmax_head:
             if target_log_mean is None or target_log_std is None:
-                raise ValueError("softmax_head requires target_log_mean/std")
-            log_stats = (
-                torch.tensor(target_log_mean, dtype=torch.float32),
-                torch.tensor(target_log_std, dtype=torch.float32).clamp(min=1e-10),
-            )
+                raise ValueError("softmax_head=True requires target_log_mean/target_log_std arrays.")
+            log_mean = torch.tensor(list(target_log_mean), dtype=torch.float32)
+            log_std  = torch.tensor(list(target_log_std),  dtype=torch.float32)
+            log_stats = (log_mean, log_std)
 
-        self.decoder = Decoder(
-            latent_dim, decoder_hidden, state_dim, act, dropout, softmax_head, log_stats
-        )
+        self.decoder = Decoder(self.Z, decoder_hidden, self.S_out, act, dropout,
+                               softmax_head=softmax_head, log_stats=log_stats,
+                               z_std_clip=z_std_clip)
 
-        self.softmax_head = softmax_head
-
+    # ---- Trainer API: multi-time forward ----
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        """Single-shot multi-timestep prediction"""
-        z_i = self.encoder(y_i, g)
-        z_j = self.dynamics(z_i, dt_norm, g)
-        y_j = self.decoder(z_j)
-        return y_j
+        """
+        Predict K future states from an anchor.
+          y_i: [B,S], dt_norm: [B] or [B,K], g: [B,G]  →  y_pred: [B,K,S]
+        """
+        B, S = y_i.shape
+        if dt_norm.ndim == 1:
+            if dt_norm.shape[0] != B:
+                raise ValueError(f"dt_norm shape mismatch: got {tuple(dt_norm.shape)}, expected [{B}] or [{B},K]")
+            dt_norm = dt_norm.reshape(B, 1)
+        elif dt_norm.ndim == 2:
+            if dt_norm.shape[0] != B:
+                raise ValueError(f"dt_norm batch mismatch: got {tuple(dt_norm.shape)}, expected [{B},K]")
+        else:
+            raise ValueError(f"dt_norm must be [B] or [B,K], got {tuple(dt_norm.shape)}")
+        K = dt_norm.shape[1]
+
+        if self.predict_delta:
+            # Sequential path for Δy training consistency with step()/rollout
+            y_t = y_i
+            preds = []
+            for k in range(K):
+                y_t = self.step(y_t, dt_norm[:, k], g)
+                preds.append(y_t)
+            return torch.stack(preds, dim=1)
+
+        # Parallel vectorized path (standard Koopman propagation on z0)
+        z0 = self.encoder(y_i, g)          # [B,Z]
+        A, _ = self.dynamics._build_A(g)   # [B,Z,Z]
+        if not self.use_S:
+            eigvals32, eigvecs32 = torch.linalg.eigh(A.float())                                      # [B,Z],[B,Z,Z]
+            z0_eig32 = torch.bmm(eigvecs32.transpose(-2, -1), z0.float().unsqueeze(-1)).squeeze(-1)  # [B,Z]
+            dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()                                    # [B,K]
+            exp_lambda_dt32 = torch.exp(eigvals32.unsqueeze(1) * dt_phys32.unsqueeze(-1))            # [B,K,Z]
+            z_eig_next32 = z0_eig32.unsqueeze(1) * exp_lambda_dt32                                   # [B,K,Z]
+            z_next32 = torch.einsum('bij,bkj->bki', eigvecs32, z_eig_next32)                         # [B,K,Z]
+            z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
+            z_next = z_next32.to(z0.dtype)
+        else:
+            dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()                            # [B,K]
+            A32 = A.float().unsqueeze(1)                                                     # [B,1,Z,Z]
+            Phi32 = torch.matrix_exp(A32 * dt_phys32.reshape(B, K, 1, 1))                    # [B,K,Z,Z]
+            z0_32 = z0.float().reshape(B, 1, self.Z, 1)                                      # [B,1,Z,1]
+            z_next32 = torch.matmul(Phi32, z0_32).squeeze(-1)                                 # [B,K,Z]
+            z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
+            z_next = z_next32.to(z0.dtype)
+
+        # Decode with sanitization/clamp guard
+        z_next = torch.nan_to_num(z_next, nan=0.0, posinf=0.0, neginf=0.0)
+        z_next = z_next.clamp_(-100.0, 100.0)
+        y_pred = self.decoder(z_next.reshape(B * K, self.Z)).reshape(B, K, S)  # [B,K,S]
+        return y_pred
+
+
+    # ---- Convenience single-step (kept for callers that need it) ----
+    def step(self, y: torch.Tensor, dt_step_norm: torch.Tensor | float, g: torch.Tensor) -> torch.Tensor:
+        z = self.encoder(y, g)
+        z_next = self.dynamics.step(z, dt_step_norm, g)
+        y_next = self.decoder(z_next)
+        if self.predict_delta:
+            y_next = y + y_next
+        return y_next
 
     @torch.no_grad()
-    def rollout(
-        self,
-        y_0: torch.Tensor,
-        g: torch.Tensor,
-        dt_step: torch.Tensor,  # normalized Δt per step; scalar or [B]
-        max_steps: int = 100,
-    ) -> torch.Tensor:
+    def rollout(self, y0: torch.Tensor, g: torch.Tensor, dt_step_norm: torch.Tensor | float, steps: int) -> torch.Tensor:
         """
-        Efficient autoregressive rollout with cached K computation and step reuse.
-        Returns: [B, T, S]
+        Returns [B, steps, S] (does NOT include y0).
         """
-        B = y_0.shape[0]
-
-        dt_step = dt_step.reshape(-1)
-        if dt_step.numel() == 1:
-            dt_step = dt_step.expand(B)
-        elif dt_step.numel() != B:
-            raise ValueError("dt_step shape mismatch")
-
-        # Precompute K once for entire rollout
-        K = self.dynamics._build_stable_K(g)
-
-        trajectory = []
-        z_curr = self.encoder(y_0, g)  # [B,Z]
-
-        for _ in range(max_steps):
-            z_next = self.dynamics.step_with_K(z_curr, dt_step, g, K)  # [B,Z]
-            y_next = self.decoder(z_next)  # [B,S]
-            trajectory.append(y_next)
-            z_curr = z_next
-
-        return torch.stack(trajectory, dim=1)
+        B, _ = y0.shape
+        y_t = y0
+        out = []
+        for _ in range(int(steps)):
+            y_t = self.step(y_t, dt_step_norm, g)
+            out.append(y_t)
+        return torch.stack(out, dim=1)  # [B,steps,S]
 
 
-# ------------------------------ Factory --------------------------------------
+# --------------------- Manifest helpers + model factory -----------------------
 
-def create_model(config: dict) -> FlowMapKoopman:
-    """Build model from configuration"""
-    data_cfg = config.get("data", {})
-    species_vars = list(data_cfg.get("species_variables", []))
+def _load_manifest(config: dict) -> dict:
+    # Try config path first, then local fallback
+    cand: list[Path] = []
+    if "paths" in config and "processed_data_dir" in config["paths"]:
+        cand.append(Path(config["paths"]["processed_data_dir"]) / "normalization.json")
+    cand.append(Path("data/processed/normalization.json"))
+    for p in cand:
+        if p.exists():
+            with open(p, "r") as f:
+                return json.load(f)
+    raise FileNotFoundError(f"Could not find normalization manifest at: {', '.join(map(str, cand))}")
+
+def _gather_species_stats(methods: dict, stats: dict, species_vars: Sequence[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+    log_means, log_stds = [], []
+    for k in species_vars:
+        m = methods.get(k, "log-standard")
+        if m != "log-standard":
+            raise ValueError(f"Decoder softmax_head expects 'log-standard' for '{k}', got '{m}'.")
+        st = stats.get(k, {})
+        if ("log_mean" not in st) or ("log_std" not in st):
+            raise KeyError(f"Missing log stats for species '{k}' in manifest.")
+        lm = float(st.get("log_mean"))
+        ls = max(float(st.get("log_std")), LOG_STD_MIN)
+        log_means.append(lm)
+        log_stds.append(ls)
+    return torch.tensor(log_means, dtype=torch.float32), torch.tensor(log_stds, dtype=torch.float32)
+
+def _get_dt_stats(manifest: dict, stats: dict) -> Dict[str, float]:
+    # standard location
+    if "dt" in manifest:
+        st = manifest["dt"]
+        if "log_min" in st and "log_max" in st:
+            return {"log_min": float(st["log_min"]), "log_max": float(st["log_max"])}
+    # stats fallback
+    if "dt" in stats:
+        st = stats["dt"]
+        if "log_min" in st and "log_max" in st:
+            return {"log_min": float(st["log_min"]), "log_max": float(st["log_max"])}
+    # common aliases
+    for k in ("Δt", "delta_t", "t_delta", "t_step", "dt_phys"):
+        if k in stats and "log_min" in stats[k] and "log_max" in stats[k]:
+            st = stats[k]
+            return {"log_min": float(st["log_min"]), "log_max": float(st["log_max"])}
+    raise KeyError("Could not find dt stats (expected dt.log_min/log_max) in manifest.")
+
+# sensible defaults
+LATENT_DIM_DEFAULT = 32
+ENCODER_HIDDEN_DEFAULT = (256, 256)
+DECODER_HIDDEN_DEFAULT = (256, 256)
+COND_HIDDEN_DEFAULT = (64, 64)
+RANK_L_DEFAULT = 8
+GAMMA_DEFAULT = 1e-2
+
+def create_model(config: dict) -> nn.Module:
+    """
+    Build model from config + normalization manifest.
+
+    Expected shape resolution:
+      - species_variables list comes from config["data"]["species_variables"]
+        or is inferred from manifest stats by excluding globals and dt-like keys.
+      - global_variables from config (recommended: ["P","T"]).
+    """
+    manifest = _load_manifest(config)
+    stats = manifest.get("stats", {})
+    methods = manifest.get("methods", {})
+    data_cfg = config.get("data", {}) or {}
+
+    species_vars = list(data_cfg.get("species_variables", []) or [])
+    global_vars = list(data_cfg.get("global_variables", []) or [])
+    if not global_vars:
+        # common default if present in stats
+        if "P" in stats and "T" in stats:
+            global_vars = ["P", "T"]
+        else:
+            raise ValueError("No global_variables provided and P/T not found in manifest stats.")
+
     if not species_vars:
-        raise KeyError("data.species_variables must be set")
+        time_var = data_cfg.get("time_variable", "t_time")  # Get from config
+        reserved = {"dt", "Δt", "delta_t", "t_delta", "t_step", "dt_phys", time_var} | set(global_vars)
+        species_vars = [k for k in stats.keys() if k not in reserved]
 
-    global_vars = list(data_cfg.get("global_variables", []))
-    S = len(species_vars)
-    G = len(global_vars)
+    if not species_vars:
+        raise ValueError("No species_variables resolved from config or manifest.")
 
-    mcfg = config.get("model", {})
-    latent_dim = int(mcfg.get("latent_dim", 12))
-    encoder_hidden = mcfg.get("encoder_hidden", [128, 128])
-    decoder_hidden = mcfg.get("decoder_hidden", [128, 128])
-
-    kcfg = mcfg.get("koopman", {})
-    koopman_rank = int(kcfg.get("rank", 4))
-    bias_hidden = int(kcfg.get("bias_hidden", 128))
-    use_phi1 = bool(kcfg.get("use_phi1_residual", False))
-    min_damping = float(kcfg.get("min_damping", 1e-4))
-
-    activation = str(mcfg.get("activation", "silu"))
-    dropout = float(mcfg.get("dropout", 0.0))
+    # If softmax head is used, gather per-species log stats
+    mcfg = config.get("model", {}) or {}
     softmax_head = bool(mcfg.get("softmax_head", True))
-
-    proc_dir = Path(config["paths"]["processed_data_dir"])
-    manifest_path = proc_dir / "normalization.json"
-    with open(manifest_path, "r") as f:
-        manifest = json.load(f)
-
-    if "dt" not in manifest:
-        raise ValueError("dt normalization spec missing")
-
-    dt_stats = {
-        "log_min": float(manifest["dt"]["log_min"]),
-        "log_max": float(manifest["dt"]["log_max"]),
-    }
-
-    target_log_mean = None
-    target_log_std = None
     if softmax_head:
-        stats = manifest["per_key_stats"]
-        target_log_mean = []
-        target_log_std = []
-        for name in species_vars:
-            s = stats.get(name, {})
-            target_log_mean.append(float(s.get("log_mean", 0.0)))
-            target_log_std.append(float(s.get("log_std", 1.0)))
+        log_mean, log_std = _gather_species_stats(methods, stats, species_vars)
+        target_log_mean = log_mean.tolist()
+        target_log_std = log_std.tolist()
+    else:
+        target_log_mean = target_log_std = None
 
-    return FlowMapKoopman(
-        state_dim=S,
-        global_dim=G,
+    # dynamics dt stats
+    dt_stats = _get_dt_stats(manifest, stats)
+
+    # model hyperparams
+    latent_dim = int(mcfg.get("latent_dim", LATENT_DIM_DEFAULT))
+    enc_h = tuple(mcfg.get("encoder_hidden", ENCODER_HIDDEN_DEFAULT))
+    dec_h = tuple(mcfg.get("decoder_hidden", DECODER_HIDDEN_DEFAULT))
+    activation = mcfg.get("activation", "silu")
+    dropout = float(mcfg.get("dropout", 0.0))
+    cond_h = tuple(mcfg.get("cond_hidden", COND_HIDDEN_DEFAULT))
+    rank_l = int(mcfg.get("rank_l", RANK_L_DEFAULT))
+    use_S  = bool(mcfg.get("use_S", False))
+    gamma  = float(mcfg.get("gamma", GAMMA_DEFAULT))
+    z_std_clip = float(mcfg.get("z_std_clip", Z_STD_CLIP_DEFAULT))
+    predict_delta = bool(mcfg.get("predict_delta", False))
+
+    model = StableLPVKoopmanAE(
+        state_dim=len(species_vars),
+        global_dim=len(global_vars),
         latent_dim=latent_dim,
-        encoder_hidden=encoder_hidden,
-        decoder_hidden=decoder_hidden,
-        koopman_rank=koopman_rank,
-        koopman_bias_hidden=bias_hidden,
-        use_phi1_residual=use_phi1,
-        dt_stats=dt_stats,
+        encoder_hidden=enc_h,
+        decoder_hidden=dec_h,
         activation=activation,
         dropout=dropout,
         softmax_head=softmax_head,
+        z_std_clip=z_std_clip,
+        predict_delta=predict_delta,
         target_log_mean=target_log_mean,
         target_log_std=target_log_std,
-        min_damping=min_damping,
+        cond_hidden=cond_h,
+        rank_l=rank_l,
+        use_S=use_S,
+        gamma=gamma,
+        dt_stats=dt_stats,
     )
+    return model
+
+
+# Back-compat alias
+FlowMapKoopman = StableLPVKoopmanAE
+
+__all__ = [
+    "MLP", "Encoder", "Decoder",
+    "LPVDynamics", "StableLPVKoopmanAE",
+    "create_model", "FlowMapKoopman",
+]

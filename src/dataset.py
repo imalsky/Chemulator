@@ -494,7 +494,9 @@ class FlowMapPairsDataset(Dataset):
 
     def _allocate_buffers(self):
         buf_dtype = self._runtime_dtype if self._stage_device.type == "cuda" else torch.float32
-        self.G = torch.empty((self.N, self.G_dim), device=self._stage_device, dtype=buf_dtype)
+        # Keep globals in float32 for stability of K(g) even on CUDA
+        self.G = torch.empty((self.N, self.G_dim), device=self._stage_device, dtype=torch.float32)
+        # States/targets can follow the runtime dtype
         self.Y = torch.empty((self.N, self.T, self.S), device=self._stage_device, dtype=buf_dtype)
 
     def _load_and_stage_data(self):
@@ -513,7 +515,8 @@ class FlowMapPairsDataset(Dataset):
             global_vars = self.cfg["data"].get("global_variables", [])
             if global_vars:
                 g = self.norm.normalize(g, global_vars)
-            self.G[sl] = g.to(dtype=self.G.dtype, non_blocking=True)
+            # Write G as float32 (stable for Koopman K(g))
+            self.G[sl] = g.to(self._stage_device, dtype=torch.float32, non_blocking=True)
 
             # Normalize species
             y = torch.from_numpy(y_np)
@@ -593,10 +596,19 @@ class FlowMapPairsDataset(Dataset):
         anchor_i = pair[:, 1]
         B = traj.shape[0]
 
-        if self.log_dt_sampling:
-            offsets = self._sample_log_dt_offsets(B, self.K, self._torch_gen)
+        if self.share_times_across_batch:
+            # Sample K offsets once and share them across the whole batch
+            if self.log_dt_sampling:
+                base_off = self._sample_log_dt_offsets(1, self.K, self._torch_gen)  # [1,K]
+            else:
+                base_off = self._sample_uniform_offsets(1, self.K, self._torch_gen)  # [1,K]
+            offsets = base_off.expand(B, self.K)  # [B,K], identical per row
         else:
-            offsets = self._sample_uniform_offsets(B, self.K, self._torch_gen)
+            # Per-row offsets (slower; many unique Δt)
+            if self.log_dt_sampling:
+                offsets = self._sample_log_dt_offsets(B, self.K, self._torch_gen)
+            else:
+                offsets = self._sample_uniform_offsets(B, self.K, self._torch_gen)
 
         target_j = anchor_i.unsqueeze(1) + offsets
         mask = target_j < self.T
@@ -609,12 +621,14 @@ class FlowMapPairsDataset(Dataset):
         y_j = self.Y[traj_exp, target_j]
 
         if self.dt_table is not None and self._has_shared_uniform_grid:
-            dt_norm = self.dt_table[anchor_i.unsqueeze(1), target_j].unsqueeze(-1)
+            # Use precomputed normalized dt table → already [B,K]
+            dt_norm = self.dt_table[anchor_i.unsqueeze(1), target_j]  # [B,K]
         else:
+            # Compute physical Δt then normalize → [B,K]
             anchor_i_exp = anchor_i.unsqueeze(1).expand_as(target_j)
             dt_phys = self.steps_to_dt_phys(anchor_i_exp, target_j, traj_exp)
             dt_phys = torch.clamp(dt_phys, min=self.epsilon)
-            dt_norm = self.norm.normalize_dt_from_phys(dt_phys).unsqueeze(-1)
+            dt_norm = self.norm.normalize_dt_from_phys(dt_phys)  # [B,K]
 
         aux = {"i": anchor_i, "j": target_j}
 

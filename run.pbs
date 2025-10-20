@@ -2,7 +2,6 @@
 # --- PBS ---
 #PBS -N gh200_train_job
 #PBS -q gpu_long
-####PBS -l select=1:ncpus=72:ngpus=1:model=gh200
 #PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
 #PBS -l walltime=120:00:00
 #PBS -W group_list=s2458
@@ -11,7 +10,36 @@
 
 set -euo pipefail
 
-# ===== Canonical repo root & logging (follow bind mounts/symlinks) =====
+# ===== Debug toggles =====
+DEBUG=${DEBUG:-0}        # 1 = heavy debug (sync kernels, short run, FP32)
+SAN=${SAN:-0}            # 1 = run under compute-sanitizer (very slow)
+set +u
+if [ "$DEBUG" -eq 1 ]; then
+  export CUDA_LAUNCH_BLOCKING=1
+  export TORCH_SHOW_CPP_STACKTRACES=1
+  export PYTORCH_JIT=0
+  export PYTHONFAULTHANDLER=1
+  export CUDA_MODULE_LOADING=EAGER
+  export CUDA_CACHE_DISABLE=1
+  export CUBLAS_WORKSPACE_CONFIG=:4096:8
+  export NVIDIA_TF32_OVERRIDE=0             # TF32 off at env level
+  export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+  PRECISION_ARG="--precision 32-true"
+  LIMIT_ARGS="--max_steps 1 --limit_train_batches 1 --limit_val_batches 0 --num_sanity_val_steps 0"
+  set -x
+else
+  PRECISION_ARG=""
+  LIMIT_ARGS=""
+fi
+set -u
+
+# If requested, wrap python with compute-sanitizer (memcheck)
+RUNNER=()
+if [ "$SAN" -eq 1 ]; then
+  RUNNER=(compute-sanitizer --tool memcheck --leak-check full --report-api-errors yes --show-backtrace yes --error-exitcode=99)
+fi
+
+# ===== Canonical repo root & logging =====
 cd -P "${PBS_O_WORKDIR:?}"
 export ROOT="$(/bin/pwd -P)"
 mkdir -p "$ROOT/logs"
@@ -37,30 +65,26 @@ set +e
 conda activate pyt2_7_gh
 ACT_RC=$?
 set -e
-# quiet env-log if unavailable
 conda env-log log -n pyt2_7_gh >/dev/null 2>&1 || true
-
 if [ $ACT_RC -ne 0 ] || [ -z "${CONDA_PREFIX:-}" ] || [[ "${CONDA_PREFIX##*/}" != "pyt2_7_gh" ]]; then
   echo "ERROR: failed to activate conda env 'pyt2_7_gh'"; exit 2
 fi
 echo "Conda env: $CONDA_PREFIX"
-
 PY="$(command -v python)"
 echo "Python: $PY"
 
 # ===== Stability & FS toggles =====
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONNOUSERSITE=1
+ulimit -c unlimited || true
 
 # ===== Project paths =====
 SRC="$ROOT/src"
 VENDOR="$ROOT/.deps"
 mkdir -p "$VENDOR"
-
-# Ensure project + vendored wheels on PYTHONPATH
 export PYTHONPATH="$VENDOR:$ROOT:$SRC:${PYTHONPATH:-}"
 
-# ===== Vendor numpy/h5py (to avoid re-pulling numpy deps) =====
+# ===== Vendor numpy/h5py (to avoid user-site conflicts) =====
 echo "Cleaning any stale NumPy in $VENDOR ..."
 rm -rf "$VENDOR/numpy" "$VENDOR"/numpy-*.dist-info "$VENDOR"/numpy.libs || true
 
@@ -80,12 +104,11 @@ except Exception as e:
 import sys; sys.exit(0 if ok else 1)
 PY
 then
-  echo "Installing numpy==1.26.4 into $VENDOR ..."
+  echo "Installing numpy==1.26.4 into .deps ..."
   "$PY" -m pip install --no-cache-dir --only-binary=:all: \
     --target "$VENDOR" --no-deps --upgrade --force-reinstall "numpy==1.26.4"
 fi
 
-# Verify C-extension actually loads
 "$PY" - <<'PY'
 import importlib, numpy as np
 m = importlib.import_module('numpy.core._multiarray_umath')
@@ -116,26 +139,20 @@ print("h5py (vendored):", h5py.__version__, "from", h5py.__file__)
 PY
 fi
 
-# Quick sanity printout
+# ===== Print Torch/CUDA build info =====
 "$PY" - <<'PY'
-import os, sys, numpy, h5py
-print("os.getcwd():", os.getcwd())
-print("ROOT env:   ", os.environ.get("ROOT"))
-print("src on sys.path:", any(p.endswith('/src') for p in sys.path))
-print("utils exists at ROOT/src:", os.path.exists(os.path.join(os.environ["ROOT"], "src", "utils.py")))
-print("numpy:", numpy.__version__, "from", numpy.__file__)
-print("h5py :", h5py.__version__,  "from", h5py.__file__)
+import torch, os
+print("Torch:", torch.__version__, "CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("Device count:", torch.cuda.device_count())
+    print("Device name:", torch.cuda.get_device_name(0))
+print("TF32 (matmul, cudnn):", torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+try:
+    import torch.backends.cuda
+    torch.__config__.show()
+except Exception as e:
+    print("torch.__config__.show() failed:", e)
 PY
-
-echo "---------------------------------"
-echo "GPU check:"
-"$PY" - <<'PY'
-import torch
-print("CUDA available:", torch.cuda.is_available())
-print("Device count:", torch.cuda.device_count())
-print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A")
-PY
-echo "---------------------------------"
 nvidia-smi || true
 
 # ===== Phase A: decide preprocess vs hydrate =====
@@ -167,6 +184,10 @@ PY
 echo "$DECISION_OUT"
 eval "$(echo "$DECISION_OUT" | egrep '^(SKIP|PROC_DIR)=' )"
 
+# FIX: Export the variables so they're available to subprocesses
+export SKIP
+export PROC_DIR
+
 # Optional: force skip preprocessing regardless of manifest
 if [ "${FORCE_SKIP_PREPROCESS:-0}" -eq 1 ]; then
   echo "FORCE_SKIP_PREPROCESS=1 — skipping preprocessing."
@@ -189,8 +210,6 @@ fi
 # ===== Phase A: PREPROCESS (MPI) — only if SKIP==0 =====
 if [ "${SKIP:-0}" -eq 0 ]; then
   echo "Phase A: Preprocessing with MPI (32 ranks)…"
-
-  # small driver script for the preprocessor
   cat > .preprocess.py <<'PY'
 from pathlib import Path
 from utils import load_json_config, setup_logging
@@ -200,20 +219,44 @@ setup_logging()
 DataPreprocessor(cfg).run()
 PY
 
-  # 32 ranks * 2 threads = 64 (under 72 cores)
   export OMP_NUM_THREADS=2
   export MKL_NUM_THREADS=2
   export OPENBLAS_NUM_THREADS=2
   export NUMEXPR_NUM_THREADS=2
-
-  # HYDRA/OpenMPI: propagate env
   mpiexec -np 32 -genvall "$PY" ./.preprocess.py || { echo "Preprocess failed"; exit 3; }
-
-  # unset threads for GPU phase
   unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS
 else
   echo "Phase A: Skipped (hydrating from processed artifacts)."
 fi
+
+# ===== Minimal *model-only* probe (isolates model.py linalg path) =====
+echo "Running model-only probe…"
+"$PY" - <<'PY' || { echo "Model probe failed (forward/backward)"; exit 4; }
+import os, torch
+from model import FlowMapKoopman
+torch.manual_seed(0)
+torch.set_grad_enabled(True)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+S, G, Z = 12, 2, 12
+dt_stats = {'log_min': -8.0, 'log_max': -2.0}
+m = FlowMapKoopman(
+    state_dim=S, global_dim=G, latent_dim=Z,
+    encoder_hidden=[64], decoder_hidden=[64],
+    koopman_rank=4, koopman_bias_hidden=64,
+    use_phi1_residual=False, dt_stats=dt_stats,
+    activation='silu', dropout=0.0, softmax_head=False, min_damping=1e-4
+).to(device)
+B, K = 8, 6
+y = torch.randn(B, S, device=device, dtype=torch.float32, requires_grad=True)
+g = torch.randn(B, G, device=device, dtype=torch.float32)
+dt = torch.rand(B, K, device=device, dtype=torch.float32)
+out = m(y, dt, g)   # [B,K,S]
+loss = out.square().mean()
+loss.backward()
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+print("Model-only probe OK. out:", tuple(out.shape))
+PY
 
 # ===== Phase B: TRAIN single-process on the GPU =====
 echo "---------------------------------"
@@ -227,9 +270,25 @@ PY
 echo "---------------------------------"
 
 echo "Phase B: Training single-process…"
-"$PY" -u src/main.py
+set +e
+/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/main.py $PRECISION_ARG $LIMIT_ARGS
+RC=$?
+set -e
+
+if [ $RC -ne 0 ]; then
+  echo "Training returned non-zero RC=$RC — running quick post-mortem."
+  # Print last 200 lines of log (already tee'd), and a tiny CUDA memory summary
+  "$PY" - <<'PY' || true
+import torch, sys
+if torch.cuda.is_available():
+    try:
+        print(torch.cuda.memory_summary(device=None, abbreviated=True))
+    except Exception as e:
+        print("memory_summary failed:", e, file=sys.stderr)
+PY
+  exit $RC
+fi
 
 echo "#####################################################"
 echo "Job finished at $(date)"
 echo "#####################################################"
-
