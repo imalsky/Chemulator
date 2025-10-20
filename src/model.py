@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Stable LPV Koopman Autoencoder (numerically safe, train-stable)
-===============================================================
+Stable LPV Koopman Autoencoder (numerically safe, train-stable, g-conditioned decoder)
+======================================================================================
 
 Design goals
 ------------
-- **Training uses matrix_exp** (no eigen backprop at step 0).
-- **Eval can use eigh** when `use_S=False` for speed.
-- **Exponent safety**: Δt is capped *from γ* ⇒ |λ·Δt| ≤ LAMDT_MAX_ABS (default 50).
-- **Bounded low‑rank damping**: s = s_bound * sigmoid(raw) ∈ [0, s_bound].
-- **Optional Frobenius cap** on L to limit ||L Lᵀ|| relative to γ.
-- **Predict‑delta is anchor‑relative** (no cumsum): ŷ = y_i + Δy.
-- **No spectral_norm by default** to avoid step‑0 NaNs; can be enabled later.
+- Training uses matrix_exp (no eigen backprop at step 0).
+- Eval can use eigh when `use_S=False` for speed.
+- Exponent safety: Δt is capped to avoid exp overflow (see global DT cap below).
+- Bounded low-rank damping: s = s_bound * sigmoid(raw) ∈ [0, s_bound].
+- Optional Frobenius cap on L to limit ||L Lᵀ|| relative to γ.
+- Predict-delta is anchor-relative (no cumsum): ŷ = y_i + Δy.
+- Decoder is **conditioned on global inputs g** → correct long-time behavior (z→0 still yields g-dependent outputs).
 """
 
 from __future__ import annotations
@@ -24,6 +24,18 @@ from typing import Callable, Dict, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# =============================================================================
+# 🔒 Global Δt clamp
+# -----------------------------------------------------------------------------
+# If not None, this caps the physical time step Δt (in seconds) *globally*,
+# regardless of manifest or gamma-based capping.
+# Set to None to disable this global cap.
+# Examples:
+#   DT_PHYS_MAX_GLOBAL = None          # no global cap (recommended)
+#   DT_PHYS_MAX_GLOBAL = 1e6           # cap at 1,000,000 seconds
+# =============================================================================
+DT_PHYS_MAX_GLOBAL: Optional[float] = None
 
 # ---------------------------- Constants / Utils -------------------------------
 
@@ -77,7 +89,7 @@ def _act_factory(activation: Union[str, nn.Module, Callable[[], nn.Module]]) -> 
 # ----------------------------- Orthonormal basis ------------------------------
 
 def _orthonormal_dct2(n: int) -> torch.Tensor:
-    """Return n×n orthonormal DCT‑II matrix (float32)."""
+    """Return n×n orthonormal DCT-II matrix (float32)."""
     C = torch.empty(n, n, dtype=torch.float32)
     scale0 = math.sqrt(1.0 / n)
     scale = math.sqrt(2.0 / n)
@@ -100,7 +112,6 @@ class MLP(nn.Module):
         make_act = _act_factory(activation)
         for i, d in enumerate(list(hidden) + [int(out_dim)]):
             lin = nn.Linear(dprev, d)
-            # Disabled by default; can be enabled from config later
             if spectral_norm:
                 lin = nn.utils.spectral_norm(lin)
             layers.append(lin)
@@ -141,7 +152,14 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim: int, hidden: Sequence[int], state_dim: int,
+    """
+    Two modes:
+      1) softmax_head=True: logits → softmax → log10 → standardize
+      2) softmax_head=False: raw linear head (normalized target space)
+
+    NOTE: This decoder is **g-conditioned** when constructed with in_dim = latent_dim + global_dim.
+    """
+    def __init__(self, in_dim: int, hidden: Sequence[int], state_dim: int,
                  activation: Union[str, nn.Module, Callable[[], nn.Module]], dropout: float = 0.0, *,
                  softmax_head: bool = True,
                  log_stats: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -150,7 +168,7 @@ class Decoder(nn.Module):
                  learn_temp: bool = True,
                  z_std_clip: Optional[float] = Z_STD_CLIP_DEFAULT):
         super().__init__()
-        self.net = MLP(latent_dim, hidden, state_dim, activation, dropout)
+        self.net = MLP(in_dim, hidden, state_dim, activation, dropout)  # in_dim can be Z or Z+G
         self.softmax_head = bool(softmax_head)
         self.state_dim = int(state_dim)
         self.learn_temp = bool(learn_temp)
@@ -187,9 +205,10 @@ class Decoder(nn.Module):
             return self.temp.clamp(self.tmin, self.tmax)
         return self.temp_fixed.clamp(self.tmin, self.tmax)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-Z_CLAMP, Z_CLAMP)
-        logits = self.net(z)
+    def forward(self, dec_in: torch.Tensor) -> torch.Tensor:
+        # dec_in is either z or [z, g] depending on construction
+        dec_in = torch.nan_to_num(dec_in, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-Z_CLAMP, Z_CLAMP)
+        logits = self.net(dec_in)
 
         if not self.softmax_head:
             out = torch.nan_to_num(logits, nan=0.0, neginf=-1e6, posinf=1e6)
@@ -232,7 +251,8 @@ class LPVDynamics(nn.Module):
                  L_fro_factor: float = 0.5,
                  spectral_norm_cond: bool = False,
                  basis: str = "dct",
-                 stability_projection_eps: Optional[float] = None):
+                 stability_projection_eps: Optional[float] = None,
+                 cap_via_gamma: bool = True):
         super().__init__()
         self.z = int(latent_dim)
         self.g = int(global_dim)
@@ -242,6 +262,7 @@ class LPVDynamics(nn.Module):
         self.s_bound = float(s_bound)
         self.L_fro_factor = float(L_fro_factor)
         self.stability_projection_eps = stability_projection_eps
+        self.cap_via_gamma = bool(cap_via_gamma)
 
         self.cond = MLP(self.g, cond_hidden, self.r + (self.z * self.z if self.use_S else 0),
                         activation, dropout, spectral_norm=spectral_norm_cond)
@@ -337,13 +358,23 @@ class LPVDynamics(nn.Module):
         return A, {}
 
     def _denorm_dt(self, dt_norm: torch.Tensor) -> torch.Tensor:
-        """[B] or [B,K] normalized → physical seconds, capped by γ to keep |λ·Δt| ≤ LAMDT_MAX_ABS."""
+        """[B] or [B,K] normalized → physical seconds, with layered caps."""
         dt_norm = torch.nan_to_num(dt_norm, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         log_dt = self.dt_log_min + dt_norm.to(torch.float64) * self._dt_range_scalar.to(torch.float64)
-        dt_cap = LAMDT_MAX_ABS / max(self.gamma, 1e-12)  # seconds
-        log_cap_gamma = math.log10(dt_cap)
-        log_cap_manifest = float(self.dt_log_max.item())
-        log_dt = log_dt.clamp(max=min(log_cap_gamma, log_cap_manifest))
+
+        # Compose the maximum allowed log10(dt) from three sources:
+        max_cap = float(self.dt_log_max.item())  # 1) dataset manifest (always enforced)
+
+        if self.cap_via_gamma:
+            # 2) gamma-based cap (keeps |λ·Δt| ≤ LAMDT_MAX_ABS)
+            dt_cap = LAMDT_MAX_ABS / max(self.gamma, 1e-12)
+            max_cap = min(max_cap, math.log10(dt_cap))
+
+        if DT_PHYS_MAX_GLOBAL is not None:
+            # 3) global hard cap (overrides both if smaller)
+            max_cap = min(max_cap, math.log10(float(DT_PHYS_MAX_GLOBAL)))
+
+        log_dt = log_dt.clamp(max=max_cap)
         dt_phys = torch.exp(log_dt * LN10).clamp_(min=1e-30)
         return dt_phys.to(torch.float32)
 
@@ -412,6 +443,9 @@ class StableLPVKoopmanAE(nn.Module):
         spectral_norm_cond: bool = False,
         basis: str = "dct",
         stability_projection_eps: Optional[float] = None,
+        cap_via_gamma: bool = True,
+        # NEW: condition decoder on g
+        decoder_condition_on_g: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -424,6 +458,7 @@ class StableLPVKoopmanAE(nn.Module):
         self.Z = int(latent_dim)
         self.use_S = bool(use_S)
         self.predict_delta = bool(predict_delta)
+        self.decoder_condition_on_g = bool(decoder_condition_on_g)
 
         act = get_activation(activation) if isinstance(activation, str) else activation
 
@@ -443,6 +478,7 @@ class StableLPVKoopmanAE(nn.Module):
             spectral_norm_cond=spectral_norm_cond,
             basis=basis,
             stability_projection_eps=stability_projection_eps,
+            cap_via_gamma=cap_via_gamma,
         )
 
         log_stats = None
@@ -453,9 +489,22 @@ class StableLPVKoopmanAE(nn.Module):
             log_std = torch.tensor(list(target_log_std), dtype=torch.float32)
             log_stats = (log_mean, log_std)
 
-        self.decoder = Decoder(self.Z, decoder_hidden, self.S_out, act, dropout,
+        dec_in_dim = self.Z + (self.G_in if self.decoder_condition_on_g else 0)
+        self.decoder = Decoder(dec_in_dim, decoder_hidden, self.S_out, act, dropout,
                                softmax_head=softmax_head, log_stats=log_stats,
                                z_std_clip=z_std_clip)
+
+    def _make_decoder_input(self, z: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        if self.decoder_condition_on_g:
+            if z.dim() != g.dim():
+                # Broadcast g to match z's leading dims
+                # z: [..., Z], g: [B,G] or [...,G]
+                repeat_shape = [1] * z.dim()
+                for i in range(z.dim() - 2):
+                    g = g.unsqueeze(1)
+                g = g.expand_as(z[..., :g.shape[-1]])
+            return torch.cat([z, g], dim=-1)
+        return z
 
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         B, S = y_i.shape
@@ -501,9 +550,16 @@ class StableLPVKoopmanAE(nn.Module):
                 z_next32 = torch.matmul(Phi32, z0_32).squeeze(-1)
 
         z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
-        z_next = z_next32.to(z0.dtype).clamp_(-Z_CLAMP, Z_CLAMP)
+        z_next = z_next32.to(z0.dtype).clamp_(-Z_CLAMP, Z_CLAMP)      # [B,K,Z]
 
-        y_out = self.decoder(z_next.reshape(B * K, self.Z)).reshape(B, K, S)
+        # ---- g-conditioned decode over all K ----
+        if self.decoder_condition_on_g:
+            g_rep = g.unsqueeze(1).expand(B, K, self.G_in)            # [B,K,G]
+            dec_in = torch.cat([z_next, g_rep], dim=-1)               # [B,K,Z+G]
+        else:
+            dec_in = z_next                                           # [B,K,Z]
+
+        y_out = self.decoder(dec_in.reshape(B * K, -1)).reshape(B, K, S)
         if self.predict_delta:
             y_out = y_i.unsqueeze(1) + y_out
         return y_out
@@ -511,7 +567,9 @@ class StableLPVKoopmanAE(nn.Module):
     def step(self, y: torch.Tensor, dt_step_norm: torch.Tensor | float, g: torch.Tensor) -> torch.Tensor:
         z = self.encoder(y, g)
         z_next = self.dynamics.step(z, dt_step_norm, g)
-        y_next = self.decoder(z_next)
+        # g-conditioned decode
+        dec_in = torch.cat([z_next, g], dim=-1) if self.decoder_condition_on_g else z_next
+        y_next = self.decoder(dec_in)
         if self.predict_delta:
             y_next = y + y_next
         return y_next
@@ -640,6 +698,8 @@ def create_model(config: dict) -> nn.Module:
     stability_projection_eps = mcfg.get("stability_projection_eps", None)
     if stability_projection_eps is not None:
         stability_projection_eps = float(stability_projection_eps)
+    cap_via_gamma = bool(mcfg.get("cap_via_gamma", True))
+    decoder_condition_on_g = bool(mcfg.get("decoder_condition_on_g", True))
 
     model = StableLPVKoopmanAE(
         state_dim=len(species_vars),
@@ -664,6 +724,8 @@ def create_model(config: dict) -> nn.Module:
         spectral_norm_cond=spectral_norm_cond,
         basis=basis,
         stability_projection_eps=stability_projection_eps,
+        cap_via_gamma=cap_via_gamma,
+        decoder_condition_on_g=decoder_condition_on_g,
     )
     return model
 
