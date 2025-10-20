@@ -25,10 +25,15 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
+torch.backends.cudnn.benchmark = True
+
+
 import pytorch_lightning as pl
 from pytorch_lightning import LightningModule, Trainer as LightningTrainer
-from pytorch_lightning.callbacks import Callback, ModelCheckpoint, LearningRateMonitor
-from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.callbacks import (
+    Callback, ModelCheckpoint, LearningRateMonitor,
+    EarlyStopping, StochasticWeightAveraging, RichProgressBar)
+from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
 from normalizer import NormalizationHelper  # for fractional loss denorm
 
@@ -94,18 +99,20 @@ class CombinedLoss(nn.Module):
                   + frac_weight * FractionalLoss_phys                      (optional)
         Accepts mask with shapes [B], [B,K], [B,K,1], or [B,K,S].
         """
-        # Sanitize inputs
+        # --- Sanitize inputs ---
         pred_norm = torch.nan_to_num(pred_norm, nan=0.0, posinf=0.0, neginf=0.0)
         target_norm = torch.nan_to_num(target_norm, nan=0.0, posinf=0.0, neginf=0.0)
 
         if pred_norm.ndim != 3 or target_norm.ndim != 3:
-            raise RuntimeError(f"Expected pred/target to be 3D [B,K,S]; "
-                               f"got pred={list(pred_norm.shape)}, target={list(target_norm.shape)}")
+            raise RuntimeError(
+                f"Expected pred/target to be 3D [B,K,S]; got pred={list(pred_norm.shape)}, "
+                f"target={list(target_norm.shape)}"
+            )
 
         B, K, S = pred_norm.shape
         finite = torch.isfinite(pred_norm) & torch.isfinite(target_norm)
 
-        # Coerce mask to be broadcastable to [B,K,S]
+        # --- Coerce mask to be broadcastable to [B,K,S] ---
         if mask is not None:
             m = mask
             if not torch.is_tensor(m):
@@ -137,14 +144,14 @@ class CombinedLoss(nn.Module):
 
         out: Dict[str, torch.Tensor] = {}
 
-        # Core MSE (normalized)
+        # --- Core MSE (normalized) ---
         r = pred_norm - target_norm
         mse = r.pow(2)
         mse_reduced = self._apply_mask_and_reduce(mse, mask)
         total = mse_reduced
         out["mse"] = mse_reduced
 
-        # Optional Tail-Huber (normalized space, focused on tail region)
+        # --- Optional Tail-Huber (normalized space, focused on tail region) ---
         if self.tail_weight > 0.0:
             z = target_norm
             tail_mask = (z <= self.tail_z_threshold)
@@ -158,21 +165,50 @@ class CombinedLoss(nn.Module):
             out["tail_huber"] = tail_huber
             total = total + self.tail_weight * tail_huber
 
-        # Optional fractional loss (denormalized physical space)
+        # --- Optional fractional loss (denormalized physical space) — numerically safe ---
         if (self.frac_weight > 0.0) and (self.denorm_fn is not None):
             try:
-                pred_phys = self.denorm_fn(pred_norm)
-                targ_phys = self.denorm_fn(target_norm)
-                # robust sanitize
-                pred_phys = torch.nan_to_num(pred_phys, nan=0.0, posinf=0.0, neginf=0.0)
-                targ_phys = torch.nan_to_num(targ_phys, nan=0.0, posinf=0.0, neginf=0.0)
-                rel = (pred_phys - targ_phys) / (targ_phys.abs() + self.frac_eps)
-                frac = rel.pow(2)
+                # Always compute denorm + fractional in full precision to avoid bf16 under/overflow
+                if pred_norm.is_cuda:
+                    ctx = torch.amp.autocast(device_type="cuda", enabled=False)
+                else:
+                    # No-op context on CPU
+                    class _NoAutocast:
+                        def __enter__(self): return None
+
+                        def __exit__(self, exc_type, exc, tb): return False
+
+                    ctx = _NoAutocast()
+
+                with ctx:
+                    pred_phys = self.denorm_fn(pred_norm.float())
+                    targ_phys = self.denorm_fn(target_norm.float())
+
+                    pred_phys = torch.nan_to_num(pred_phys, nan=0.0, posinf=0.0, neginf=0.0)
+                    targ_phys = torch.nan_to_num(targ_phys, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    # Ignore tiny targets to avoid division by ~0 (trace species)
+                    # tune these two thresholds as needed:
+                    frac_ignore_below = 1e-12  # in physical units
+                    frac_rel_cap = 1e3  # cap relative error magnitude
+
+                    denom = targ_phys.abs()
+                    small = denom < frac_ignore_below
+                    safe_denom = torch.where(small, torch.full_like(denom, frac_ignore_below), denom)
+
+                    rel = (pred_phys - targ_phys) / (safe_denom + self.frac_eps)
+                    # cap extreme relative errors
+                    rel = rel.clamp(min=-frac_rel_cap, max=frac_rel_cap)
+                    # zero-out contribution where target is extremely small
+                    rel = torch.where(small, torch.zeros_like(rel), rel)
+
+                    frac = rel.pow(2)
+
                 frac_reduced = self._apply_mask_and_reduce(frac, mask)
                 out["fractional"] = frac_reduced
                 total = total + self.frac_weight * frac_reduced
             except Exception:
-                # If denorm fails for any reason, don't kill training; just skip this term.
+                # If denorm or fractional fails for any reason, don't kill training; just skip this term.
                 pass
 
         out["total"] = total
@@ -240,19 +276,14 @@ class NonFiniteGuard(Callback):
             pass
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if self._param_tripped:
-            return
         try:
-            with torch.no_grad():
-                for name, p in pl_module.model.named_parameters():
-                    if p is not None and not torch.isfinite(p).all():
-                        self._param_tripped = True
-                        self.py_logger.error(
-                            f"[GUARD] Epoch {trainer.current_epoch}, Batch {batch_idx}: "
-                            f"Non-finite parameter in '{name}'"
-                        )
-                        pl_module.log("param_nonfinite", 1.0, on_step=True, on_epoch=True, prog_bar=True)
-                        break
+            # batch = (y_i, dt, y_j, g, [aux], [mask])
+            if isinstance(batch, (list, tuple)) and len(batch) > 1:
+                dt = batch[1]
+                if isinstance(dt, torch.Tensor):
+                    b = int(dt.shape[0])
+                    k = int(dt.shape[1]) if dt.ndim >= 2 else 1
+                    self._n_samples += b * k  # count anchors * times
         except Exception:
             pass
 
@@ -580,11 +611,13 @@ class AutoEncoderModule(LightningModule):
     ) -> Optional[torch.Tensor]:
         """
         Rollout loss computed autoregressively with teacher forcing.
-        FIXED: Properly handles predict_delta with cumulative semantics.
+        Uses model.step() which handles encoding, dynamics, g-conditioned decoding, and predict_delta.
+        Correctly handles masks with shapes: [B], [B,K], [B,K,1], or [B,K,S].
         """
         if horizon <= 0:
             return None
 
+        # Normalize dt_norm to [B,K]
         if dt_norm.ndim == 1:
             dt_norm = dt_norm.unsqueeze(1)
         elif dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
@@ -593,48 +626,60 @@ class AutoEncoderModule(LightningModule):
             raise ValueError(f"dt_norm must be [B,K]; got {tuple(dt_norm.shape)}")
 
         B, K = dt_norm.shape
+        S = y_i.shape[-1]
         H = min(K, max(1, horizon))
 
         y_curr = y_i
         losses = []
-        predict_delta = getattr(self.model, "predict_delta", False)
 
         for t in range(H):
-            # Encode current state
-            z_curr = self.model.encoder(y_curr, g)
+            # One-step prediction through the model (includes predict_delta & g-conditioning)
+            y_pred = self.model.step(y_curr, dt_norm[:, t], g)
 
-            # Propagate in latent
-            dt_step = dt_norm[:, t]
-            z_next = self.model.dynamics.step(z_curr, dt_step, g)
-
-            # Decode
-            y_decoded = self.model.decoder(z_next)
-
-            # Apply predict_delta semantics
-            if predict_delta:
-                y_pred = y_curr + y_decoded
-            else:
-                y_pred = y_decoded
-
-            # Ground truth
+            # Ground truth at this offset (fallback to last if K mismatch)
             y_true = y_j[:, t] if (t < y_j.shape[1]) else y_j[:, -1]
 
-            # Optional mask
-            step_mask = None
+            # ----- Build per-step masks -----
+            step_mask: Optional[torch.Tensor] = None  # [B,S] or [B] accepted by _safe_mse_with_mask
+            tf_mask: Optional[torch.Tensor] = None  # [B] for teacher-forcing gate
+
             if mask is not None:
-                step_mask = (mask[:, t] if mask.ndim == 2 else mask[:, t, 0])
+                if mask.ndim == 1 and mask.shape[0] == B:
+                    # [B] => loss mask broadcast to [B,S]; TF gate is same [B]
+                    tf_mask = mask
+                    step_mask = mask.view(B, 1).expand(B, S)
+                elif mask.ndim == 2 and mask.shape == (B, K):
+                    # [B,K] => pick time slice -> [B]; expand for loss
+                    tf_mask = mask[:, t]
+                    step_mask = tf_mask.view(B, 1).expand(B, S)
+                elif mask.ndim == 3:
+                    if mask.shape[0] != B:
+                        raise ValueError(f"Mask batch mismatch: {tuple(mask.shape)} vs B={B}")
+                    if mask.shape[1] not in (1, K):
+                        raise ValueError(f"3D mask second dim must be 1 or K; got {tuple(mask.shape)} with K={K}")
+                    # Select time slice (use t or 0 if singleton)
+                    time_idx = t if mask.shape[1] == K else 0
+                    ms = mask[:, time_idx, ...]  # [B,S] or [B,1]
+                    if ms.ndim == 2 and ms.shape[1] == S:
+                        step_mask = ms
+                        tf_mask = ms.all(dim=-1)  # [B]
+                    elif ms.ndim == 2 and ms.shape[1] == 1:
+                        # [B,1] -> broadcast for loss; TF gate is [B]
+                        step_mask = ms.expand(B, S)
+                        tf_mask = ms.squeeze(-1)
+                    else:
+                        raise ValueError(f"Unsupported 3D mask slice shape: {tuple(ms.shape)}; expected [B,S] or [B,1]")
 
             # Loss for this step
             l = self._safe_mse_with_mask(y_pred, y_true, step_mask)
             losses.append(l)
 
-            # Teacher forcing: choose next starting point
+            # Teacher forcing: mix next y_curr
             if t < H - 1:
-                use_tf = (torch.rand(B, device=self.device) < tf_prob).float()
-                if step_mask is not None:
-                    use_tf = use_tf * step_mask.float()
-                use_tf = use_tf.unsqueeze(-1)
-
+                use_tf = (torch.rand(B, device=self.device) < tf_prob).float()  # [B]
+                if tf_mask is not None:
+                    use_tf = use_tf * tf_mask.float()
+                use_tf = use_tf.unsqueeze(-1)  # [B,1]
                 y_curr = use_tf * y_true.detach() + (1.0 - use_tf) * y_pred.detach()
 
         return torch.stack(losses).mean() if losses else None
@@ -650,12 +695,14 @@ class AutoEncoderModule(LightningModule):
             tf_prob: float
     ) -> Optional[torch.Tensor]:
         """
-        Rollout loss with CACHED encoding (faster, for parallel training mode).
-        FIXED: Properly handles predict_delta with cumulative semantics.
+        Rollout loss with cached encoding and A(g). Operates in latent space, then decodes.
+        Correctly handles g-conditioned decoder and predict_delta.
+        Correctly handles masks with shapes: [B], [B,K], [B,K,1], or [B,K,S].
         """
         if horizon <= 0:
             return None
 
+        # Normalize dt_norm to [B,K]
         if dt_norm.ndim == 1:
             dt_norm = dt_norm.unsqueeze(1)
         elif dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
@@ -664,62 +711,88 @@ class AutoEncoderModule(LightningModule):
             raise ValueError(f"dt_norm must be [B,K]; got {tuple(dt_norm.shape)}")
 
         B, K = dt_norm.shape
+        S = y_i.shape[-1]
         H = min(K, max(1, horizon))
         predict_delta = getattr(self.model, "predict_delta", False)
+        decoder_condition_on_g = getattr(self.model, "decoder_condition_on_g", False)
 
-        # Cache: encode once, build A once
-        z_curr = self.model.encoder(y_i, g)
+        # Cache encode and A(g)
+        z_curr = self.model.encoder(y_i, g)  # [B,Z]
         A, _ = self.model.dynamics._build_A(g)
 
         y_curr = y_i
         losses = []
 
         for t in range(H):
-            # Propagate using cached A
+            # Propagate latent with cached A
             dt_step = dt_norm[:, t]
             dt_phys = self.model.dynamics._denorm_dt(dt_step)
 
             with torch.amp.autocast("cuda", enabled=False):
-                A_float = A.float()
-                dt_float = dt_phys.float().view(B, 1, 1)
-                Phi = torch.matrix_exp(A_float * dt_float)
+                A_float = A.float()  # [B,Z,Z]
+                dt_float = dt_phys.float().view(B, 1, 1)  # [B,1,1]
+                Phi = torch.matrix_exp(A_float * dt_float)  # [B,Z,Z]
                 z_next = torch.bmm(Phi, z_curr.float().unsqueeze(-1)).squeeze(-1)
-                z_next = z_next.to(z_curr.dtype)
+                z_next = z_next.to(z_curr.dtype)  # [B,Z]
 
-            # Decode
-            y_decoded = self.model.decoder(z_next)
-
-            # Apply predict_delta
-            if predict_delta:
-                y_pred = y_curr + y_decoded
+            # Decode (respect g-conditioning)
+            if decoder_condition_on_g:
+                dec_in = torch.cat([z_next, g], dim=-1)  # [B,Z+G]
             else:
-                y_pred = y_decoded
+                dec_in = z_next  # [B,Z]
+            y_decoded = self.model.decoder(dec_in)  # [B,S]
 
-            # Ground truth
+            # Apply predict-delta if enabled
+            y_pred = y_curr + y_decoded if predict_delta else y_decoded
+
+            # Ground truth at this offset
             y_true = y_j[:, t] if (t < y_j.shape[1]) else y_j[:, -1]
 
-            # Optional mask
-            step_mask = None
-            if mask is not None:
-                step_mask = (mask[:, t] if mask.ndim == 2 else mask[:, t, 0])
+            # ----- Build per-step masks -----
+            step_mask: Optional[torch.Tensor] = None  # [B,S] or [B]
+            tf_mask: Optional[torch.Tensor] = None  # [B]
 
-            # Loss
+            if mask is not None:
+                if mask.ndim == 1 and mask.shape[0] == B:
+                    tf_mask = mask
+                    step_mask = mask.view(B, 1).expand(B, S)
+                elif mask.ndim == 2 and mask.shape == (B, K):
+                    tf_mask = mask[:, t]
+                    step_mask = tf_mask.view(B, 1).expand(B, S)
+                elif mask.ndim == 3:
+                    if mask.shape[0] != B:
+                        raise ValueError(f"Mask batch mismatch: {tuple(mask.shape)} vs B={B}")
+                    if mask.shape[1] not in (1, K):
+                        raise ValueError(f"3D mask second dim must be 1 or K; got {tuple(mask.shape)} with K={K}")
+                    time_idx = t if mask.shape[1] == K else 0
+                    ms = mask[:, time_idx, ...]  # [B,S] or [B,1]
+                    if ms.ndim == 2 and ms.shape[1] == S:
+                        step_mask = ms
+                        tf_mask = ms.all(dim=-1)  # [B]
+                    elif ms.ndim == 2 and ms.shape[1] == 1:
+                        step_mask = ms.expand(B, S)
+                        tf_mask = ms.squeeze(-1)
+                    else:
+                        raise ValueError(f"Unsupported 3D mask slice shape: {tuple(ms.shape)}; expected [B,S] or [B,1]")
+
+            # Loss for this step
             l = self._safe_mse_with_mask(y_pred, y_true, step_mask)
             losses.append(l)
 
-            # Teacher forcing in latent space
+            # Teacher forcing in latent (and y_curr if predict_delta)
             if t < H - 1:
-                use_tf = (torch.rand(B, device=self.device) < tf_prob).float()
-                if step_mask is not None:
-                    use_tf = use_tf * step_mask.float()
-                use_tf = use_tf.unsqueeze(-1)
+                use_tf = (torch.rand(B, device=self.device) < tf_prob).float()  # [B]
+                if tf_mask is not None:
+                    use_tf = use_tf * tf_mask.float()
+                use_tf = use_tf.unsqueeze(-1)  # [B,1]
 
+                # Next latent: either encode ground truth or keep z_next
                 z_gt = self.model.encoder(y_true.detach(), g)
                 z_curr = use_tf * z_gt.detach() + (1.0 - use_tf) * z_next.detach()
 
+                # If predict_delta=True, y_curr participates in forming y_pred; keep it consistent
                 if predict_delta:
-                    y_curr = use_tf.squeeze(-1).unsqueeze(-1) * y_true.detach() + \
-                             (1.0 - use_tf.squeeze(-1).unsqueeze(-1)) * y_pred.detach()
+                    y_curr = use_tf * y_true.detach() + (1.0 - use_tf) * y_pred.detach()
 
         return torch.stack(losses).mean() if losses else None
 
@@ -844,16 +917,20 @@ class Trainer:
         lcfg = self.cfg.get("lightning", {}) or {}
         tcfg = self.cfg.get("training", {}) or {}
 
+        # ----------------------------
+        # Runtime / hyperparameters
+        # ----------------------------
         batch_size = int(tcfg.get("batch_size", self.train_loader.batch_size or 512))
         val_batch_size = int(tcfg.get("val_batch_size", batch_size * 2))
 
-        precision = lcfg.get("precision", "bf16-mixed")
+        precision = str(lcfg.get("precision", "bf16-mixed"))
         devices = lcfg.get("devices", 1)
         accelerator = lcfg.get("accelerator", "auto")
         accumulate = int(lcfg.get("accumulate_grad_batches", 1))
-        max_epochs = int(tcfg.get("epochs", 100))
         strategy = lcfg.get("strategy", "auto")
+        num_sanity_val_steps = int(lcfg.get("num_sanity_val_steps", 0))
 
+        max_epochs = int(tcfg.get("epochs", 100))
         fast_dev = bool(tcfg.get("fast_dev_run", False))
         if fast_dev:
             max_epochs = 1
@@ -864,63 +941,144 @@ class Trainer:
             limit_train = 1.0
             limit_val = 1.0
 
+        self.logger.info(f"[batch] accumulate_grad_batches = {accumulate}")
+
+        # ----------------------------
+        # Fresh DataLoaders (reuse dataset & settings from originals)
+        # ----------------------------
         from torch.utils.data import DataLoader as TorchDataLoader
         train_loader = TorchDataLoader(
             self.train_loader.dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=self.train_loader.num_workers,
+            num_workers=getattr(self.train_loader, "num_workers", 0),
             pin_memory=getattr(self.train_loader, "pin_memory", False),
             collate_fn=getattr(self.train_loader, "collate_fn", None),
             persistent_workers=getattr(self.train_loader, "persistent_workers", False),
+            prefetch_factor=getattr(self.train_loader, "prefetch_factor", None),
         )
         val_loader = TorchDataLoader(
             self.val_loader.dataset,
             batch_size=val_batch_size,
             shuffle=False,
-            num_workers=self.val_loader.num_workers,
+            num_workers=getattr(self.val_loader, "num_workers", 0),
             pin_memory=getattr(self.val_loader, "pin_memory", False),
             collate_fn=getattr(self.val_loader, "collate_fn", None),
             persistent_workers=getattr(self.val_loader, "persistent_workers", False),
+            prefetch_factor=getattr(self.val_loader, "prefetch_factor", None),
         )
 
+        # ----------------------------
+        # Checkpointing / logging
+        # ----------------------------
+        ckpt_dir = self.work_dir / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
         ckpt_cb = ModelCheckpoint(
-            dirpath=str(self.work_dir),
-            filename="model-{epoch:03d}-{val_loss:.6f}",
-            save_top_k=1,
+            dirpath=str(ckpt_dir),
+            filename="best-{epoch:03d}-{val_loss:.6f}",
             monitor="val_loss",
             mode="min",
+            save_top_k=3,
             save_last=True,
             every_n_epochs=1,
         )
+
+        # Early stopping (sensible defaults; disable by setting patience<=0 in cfg if desired)
+        es_patience = int(tcfg.get("early_stop_patience", 15))
+        early_stop = EarlyStopping(
+            monitor="val_loss",
+            patience=max(0, es_patience),
+            mode="min",
+            min_delta=float(tcfg.get("early_stop_min_delta", 1e-5)),
+            verbose=True,
+        ) if es_patience > 0 else None
+
+        # SWA (start late in training to stabilize)
+        swa = StochasticWeightAveraging(
+            swa_lrs=float(tcfg.get("swa_lrs", 1e-5)),
+            swa_epoch_start=max(1, int(0.75 * max_epochs)),
+        )
+
         lrmon = LearningRateMonitor(logging_interval="epoch")
-        csvlog = CSVLogger(save_dir=str(self.work_dir), name="logs")
+        csvlog = CSVLogger(save_dir=str(self.work_dir), name="csv_logs")
+        tblog = TensorBoardLogger(save_dir=str(self.work_dir), name="tb_logs")
+
+        # Our custom callbacks (epoch stats go to your python logger/file)
         epoch_setter = EpochSetterCallback()
         stats_cb = SimpleStatsCallback(py_logger=self.logger)
         grad_cb = GradNormLogger()
         finite_guard = NonFiniteGuard(py_logger=self.logger)
 
+        callbacks = [ckpt_cb, swa, lrmon, epoch_setter, stats_cb, grad_cb, finite_guard]
+        if early_stop is not None:
+            callbacks.insert(1, early_stop)
+
+        # ----------------------------
+        # Resume behavior (NO auto-resume unless asked)
+        #   - If training.resume is a non-empty path and exists -> resume from it
+        #   - elif training.auto_resume == True and last.ckpt exists -> resume
+        #   - else -> start fresh
+        # ----------------------------
+        resume_ckpt: Optional[str] = None
+        resume_cfg = tcfg.get("resume", None)
+        auto_resume = bool(tcfg.get("auto_resume", False))
+
+        if isinstance(resume_cfg, str) and len(resume_cfg.strip()) > 0:
+            candidate = Path(resume_cfg.strip())
+            if candidate.exists():
+                resume_ckpt = str(candidate)
+                self.logger.info(f"Resuming from checkpoint (training.resume): {resume_ckpt}")
+            else:
+                self.logger.warning(f"Requested resume path not found: {candidate}")
+        elif auto_resume:
+            last_ckpt = ckpt_dir / "last.ckpt"
+            if last_ckpt.exists():
+                resume_ckpt = str(last_ckpt)
+                self.logger.info(f"Auto-resuming from checkpoint: {resume_ckpt}")
+
+        # ----------------------------
+        # Lightning Trainer
+        # ----------------------------
         trainer = LightningTrainer(
             accelerator=accelerator,
             devices=devices,
             precision=precision,
+            strategy=strategy,
             max_epochs=max_epochs,
+            min_epochs=int(tcfg.get("min_epochs", 1)),
             limit_train_batches=limit_train,
             limit_val_batches=limit_val,
             accumulate_grad_batches=accumulate,
-            strategy=strategy,
-            logger=csvlog,
-            callbacks=[ckpt_cb, lrmon, epoch_setter, stats_cb, grad_cb, finite_guard],
-            log_every_n_steps=100,
-            enable_progress_bar=True,
+            num_sanity_val_steps=num_sanity_val_steps,
+
+            logger=[csvlog, tblog],
+            callbacks=callbacks,
+
+            # Keep CLI quiet; our SimpleStatsCallback writes per-epoch to python logging
+            log_every_n_steps=int(tcfg.get("log_every_n_steps", 50)),
+            enable_progress_bar=bool(tcfg.get("enable_progress_bar", False)),
+            enable_model_summary=True,
+
             gradient_clip_val=float(tcfg.get("gradient_clip", 0.0)),
             gradient_clip_algorithm="norm",
-            num_sanity_val_steps=0,
+            benchmark=bool(self.cfg.get("system", {}).get("cudnn_benchmark", True)),
         )
 
-        trainer.fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        # ----------------------------
+        # Fit
+        # ----------------------------
+        trainer.fit(
+            module,
+            train_dataloaders=train_loader,
+            val_dataloaders=val_loader,
+            ckpt_path=resume_ckpt,  # None => start fresh
+        )
 
-        best_val = None
+        # ----------------------------
+        # Best val & export a slim .pt
+        # ----------------------------
+        best_val: Optional[float] = None
         if ckpt_cb.best_model_score is not None:
             best_val = float(ckpt_cb.best_model_score.cpu().item())
         else:

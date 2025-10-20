@@ -23,7 +23,7 @@
   "dataset": {
     // Multi-time sampling per anchor
     "multi_time_per_anchor": true,
-    "times_per_anchor": 4,
+    "times_per_anchor": 8,
     "share_times_across_batch": true,
 
     // Log-uniform dt sampling
@@ -42,7 +42,7 @@
     "require_dt_stats": false,
 
     // Storage dtype for staged tensors
-    "storage_dtype": "32",
+    "storage_dtype": "bf16",
 
     // DataLoader settings
     "preload_train_to_gpu": false,
@@ -64,9 +64,9 @@
   // ===============================
   "model": {
     // === Core architecture ===
-    "latent_dim": 16,                 // reduced from 64
-    "encoder_hidden": [128, 128],     // reduced from [256,256,256]
-    "decoder_hidden": [128, 128],     // reduced from [256,256,256]
+    "latent_dim": 64,                 // reduced from 64
+    "encoder_hidden": [256, 256],     // reduced from [256,256,256]
+    "decoder_hidden": [256],     // reduced from [256,256,256]
     "activation": "silu",
     "dropout": 0.0,
 
@@ -77,10 +77,10 @@
     "decoder_condition_on_g": true,   // NEW: decoder takes [z, g]
 
     // === LPV dynamics conditioning ===
-    "cond_hidden": [32, 32],
-    "rank_l": 8,                      // reduced from 32
+    "cond_hidden": [64, 64],
+    "rank_l": 16,                      // reduced from 32
     "use_S": false,                   // keep symmetric, faster & safer
-    "gamma": 0.50,                    // increased from 0.10 (more damping)
+    "gamma": 0.25,                    // increased from 0.10 (more damping)
 
     // === Stability / safety knobs ===
     "s_bound": 2.0,                   // max singular value scale for L (s ∈ [0, s_bound])
@@ -98,11 +98,11 @@
   // ===============================
   "training": {
     // Batch sizes
-    "batch_size": 512,        // reduced from 2048
-    "val_batch_size": 1024,   // reduced from 2048
+    "batch_size": 2048,        // reduced from 2048
+    "val_batch_size": 2048,   // reduced from 2048
 
     // Trajectory pair sampling
-    "pairs_per_traj": 4,
+    "pairs_per_traj": 8,
     "pairs_per_traj_val": 1,
 
     // Time span in pairs (keep high to allow large dt coverage)
@@ -116,7 +116,7 @@
 
     // LR / regularization
     "lr": 5.0e-5,             // reduced from 1e-4
-    "min_lr": 1.0e-7,         // reduced from 1e-6
+    "min_lr": 1.0e-8,         // reduced from 1e-6
     "weight_decay": 1.0e-4,   // reduced from 1e-3
     "warmup_epochs": 20,      // increased from 10
     "epochs": 100,
@@ -132,15 +132,15 @@
       },
       "fractional": {
         "weight": 0.0,        // disabled initially
-        "eps": 1e-8
+        "eps": 0.1
       }
     },
 
     // Auxiliary losses - disabled initially for stability
     "auxiliary_losses": {
       "rollout_enabled": false,
-      "rollout_weight": 0.5,
-      "rollout_horizon": 4,
+      "rollout_weight": 0.25,
+      "rollout_horizon": 2,
       "rollout_warmup_epochs": 10,
       "rollout_use_cached_encoding": true,
 
@@ -156,7 +156,7 @@
       "semigroup_warmup_epochs": 10
     },
 
-    "resume": null,
+    "resume": false,
     "auto_resume": false,
     "fast_dev_run": false
   },
@@ -168,8 +168,8 @@
     "accelerator": "auto",
     "devices": 1,
     // Start with FP32 for stability
-    "precision": "32",
-    "accumulate_grad_batches": 1,
+    "precision": "bf16-mixed",
+    "accumulate_grad_batches": 4,
     "strategy": "auto",
     "num_sanity_val_steps": 0
   },
