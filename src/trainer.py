@@ -681,66 +681,80 @@ class AutoEncoderModule(LightningModule):
 
         return {"loss": total}
 
-    # IMPORTANT: rollout loss — gradients enabled (no @torch.no_grad here)
     def _compute_rollout_loss(
             self,
             y_i: torch.Tensor, g: torch.Tensor,
             y_j: torch.Tensor, dt_norm: torch.Tensor, mask: Optional[torch.Tensor],
             horizon: int, tf_prob: float
     ) -> Optional[torch.Tensor]:
+        """
+        Rollout loss computed in latent space:
+          - Encode once (z_curr = enc(y_i, g))
+          - Propagate one step in latent (dynamics.step on z)
+          - Decode once per step for loss (needed to compare to y_true)
+          - Teacher forcing (if used) only re-encodes ground truth for those samples.
+        """
         if horizon <= 0:
             return None
 
         if dt_norm.ndim == 1:
             dt_norm = dt_norm.unsqueeze(1)  # [B] -> [B,1]
         elif dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
-            dt_norm = dt_norm.squeeze(-1)   # [B,K,1] -> [B,K]
+            dt_norm = dt_norm.squeeze(-1)  # [B,K,1] -> [B,K]
         if dt_norm.ndim != 2:
             raise ValueError(f"dt_norm must be [B,K]; got {tuple(dt_norm.shape)}")
         B, K = dt_norm.shape
-
         H = min(K, max(1, horizon))
 
-        # Early-epoch stability: run rollout in fp32 even under AMP
+        # Early-epoch stability: force fp32 rollout if configured
         force_fp32 = (self.current_epoch < int(self.rollout_fp32_epochs))
         amp_ctx = (
             torch.autocast(device_type="cuda", enabled=not force_fp32)
             if torch.cuda.is_available() else contextlib.nullcontext()
         )
-
-        # make sure we start from fp32 state inside no-AMP region if needed
-        y_curr = y_i.float() if force_fp32 else y_i
         g_cast = g.float() if force_fp32 else g
+        y_anchor = y_i.float() if force_fp32 else y_i  # used if predict_delta=True
 
         losses: list[torch.Tensor] = []
 
         with amp_ctx:
+            # Encode once at start
+            z_curr = self.model.encoder(y_anchor, g_cast)
+
             for t in range(H):
                 dt_step = dt_norm[:, t]
                 dt_step = dt_step.float() if force_fp32 else dt_step
 
-                y_pred = self.model.step(y_curr, dt_step, g_cast)
+                # Latent step (no re-encode)
+                z_next = self.model.dynamics.step(z_curr, dt_step, g_cast)
 
+                # Decode once for loss at this step
+                y_pred = self.model.decoder(z_next)
+                if getattr(self.model, "predict_delta", False):
+                    # Anchor-relative Δy semantics for rollout as well
+                    y_pred = y_anchor + y_pred
+
+                # Supervision target
                 y_true = y_j[:, t] if (t < y_j.shape[1]) else y_j[:, -1]
                 y_true = y_true.float() if force_fp32 else y_true
 
-                # mask handling for this step
+                # Optional step mask
                 step_mask = None
                 if mask is not None:
                     step_mask = (mask[:, t] if mask.ndim == 2 else mask[:, t, 0])
 
-                # numerically safe MSE (prevents NaN/Inf propagation)
+                # Numerically safe MSE
                 l = self._safe_mse_with_mask(y_pred, y_true, step_mask)
-
                 losses.append(l)
 
+                # Teacher forcing: only re-encode ground truth for selected samples
                 if t < H - 1:
                     use_tf = (torch.rand(B, device=self.device) < tf_prob).float().unsqueeze(-1)
                     if step_mask is not None:
-                        m = step_mask.unsqueeze(-1)
-                        use_tf = use_tf * m.float()
-                    # stop gradient through the curriculum path to avoid exploding BPTT
-                    y_curr = use_tf * y_true.detach() + (1.0 - use_tf) * y_pred.detach()
+                        use_tf = use_tf * step_mask.unsqueeze(-1).float()
+
+                    z_tf = self.model.encoder(y_true.detach(), g_cast)  # encode GT only when used
+                    z_curr = use_tf * z_tf.detach() + (1.0 - use_tf) * z_next.detach()
 
         return torch.stack(losses).mean() if losses else None
 

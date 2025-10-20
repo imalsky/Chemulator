@@ -5,18 +5,17 @@ Stable LPV Koopman Autoencoder (trainer-compatible, hardened)
 
 Key points:
 - forward(y_i, dt_norm, g) returns [B, K, S] for multi-time prediction (K can be 1).
+- Encoder/Decoder do a single sanitize at their boundaries (avoid repeated nan_to_num in hot loops).
 - Decoder is numerically hardened:
   * Stats sanitized
+  * Optional temperature with bounds
+  * Logits clamped pre-softmax for bf16 stability
   * Output clamp applied both for softmax_head=True (standardized log space) and False (raw head)
   * Small-init on final decoder linear to keep early logits tame
 - Stable LPV dynamics A(P,T) = S - L L^T - γ I, optional skew S
 - Δt is denormalized from [0,1] using manifest log-space stats, with overflow guards
-- Optional predict_delta: if True, model predicts Δy in normalized space and returns y_i + Δy
-
-Config knobs (under "model"):
-  - latent_dim, encoder_hidden, decoder_hidden, activation, dropout
-  - softmax_head (bool), z_std_clip (float), predict_delta (bool)
-  - cond_hidden, rank_l, use_S, gamma
+- predict_delta: if True, model predicts Δy in normalized space and returns y_i + Δy
+- Latent propagation clamps λ·Δt to prevent exp overflow/underflow
 """
 
 from __future__ import annotations
@@ -39,6 +38,16 @@ TEMP_INIT_DEFAULT = 1.0
 TEMP_MIN_DEFAULT = 0.1
 TEMP_MAX_DEFAULT = 10.0
 
+# Clamp for eigen-exponent products to avoid overflow/underflow in exp
+LAMDT_MAX_ABS = 50.0  # exp(±50) ~ [2e-22, 3e21]
+
+# Clamp for logits before softmax to avoid bf16 overflow in extreme cases
+LOGIT_CLAMP = 80.0
+
+# Clamp for latent magnitude before decoding (protect Linear matmul)
+Z_CLAMP = 100.0
+
+
 def get_activation(name_or_mod: Union[str, nn.Module]) -> nn.Module:
     if isinstance(name_or_mod, nn.Module):
         return name_or_mod
@@ -60,6 +69,7 @@ def get_activation(name_or_mod: Union[str, nn.Module]) -> nn.Module:
         raise ValueError(f"Unknown activation '{name}'.")
     return table[name]()
 
+
 def _act_factory(activation: Union[str, nn.Module, Callable[[], nn.Module]]) -> Callable[[], nn.Module]:
     if isinstance(activation, nn.Module):
         return lambda: activation
@@ -68,6 +78,7 @@ def _act_factory(activation: Union[str, nn.Module, Callable[[], nn.Module]]) -> 
     if callable(activation):
         return activation
     raise ValueError("activation must be str, nn.Module, or factory callable.")
+
 
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden: Sequence[int], out_dim: int,
@@ -87,13 +98,9 @@ class MLP(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Avoid saving NaNs/Infs inside Linear activations for autograd
+        # Single sanitize at boundary; avoid per-layer nan_to_num
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        for layer in self.net:
-            x = layer(x)
-            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        return x
-
+        return self.net(x)
 
 
 # ------------------------------- Encoder/Decoder ------------------------------
@@ -117,8 +124,7 @@ class Encoder(nn.Module):
     def forward(self, y: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         x = torch.cat([y, g], dim=-1)
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        out = self.net(x)
-        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+        return self.net(x)
 
 
 class Decoder(nn.Module):
@@ -128,7 +134,7 @@ class Decoder(nn.Module):
          logits → softmax(p) → log10(p) → standardize((log10_p - mean)/std)
          Return standardized predictions (same space as targets).
       2) softmax_head=False:
-         raw linear head in target space; we still apply NaN-to-num and clamp as guardrails.
+         raw linear head in target space; NaN-to-num + clamp guardrails.
 
     z_std_clip (float or None): clamps the output in either mode.
     """
@@ -153,7 +159,7 @@ class Decoder(nn.Module):
             log_mean, log_std = log_stats
             # sanitize stats aggressively
             log_mean = torch.nan_to_num(log_mean.detach().clone(), nan=0.0, neginf=-60.0, posinf=60.0)
-            log_std  = torch.nan_to_num(log_std.detach().clone(),  nan=1.0, neginf=1.0,  posinf=1.0).clamp(min=LOG_STD_MIN)
+            log_std = torch.nan_to_num(log_std.detach().clone(), nan=1.0, neginf=1.0, posinf=1.0).clamp(min=LOG_STD_MIN)
             self.register_buffer("log_mean", log_mean)
             self.register_buffer("log_std", log_std)
             if self.log_mean.shape[0] != self.state_dim or self.log_std.shape[0] != self.state_dim:
@@ -183,7 +189,7 @@ class Decoder(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         # Sanitize latent before first Linear to avoid Addmm NaN in backward
-        z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+        z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-Z_CLAMP, Z_CLAMP)
         logits = self.net(z)
 
         if not self.softmax_head:
@@ -194,7 +200,7 @@ class Decoder(nn.Module):
 
         # softmax path
         t = torch.nan_to_num(self._temperature(), nan=float(TEMP_MIN_DEFAULT)).clamp(TEMP_MIN_DEFAULT, TEMP_MAX_DEFAULT)
-        x = torch.nan_to_num(logits / t)
+        x = torch.nan_to_num(logits / t).clamp_(-LOGIT_CLAMP, LOGIT_CLAMP)  # clamp for stability
         log10e = 1.0 / math.log(10.0)
         log10_p = F.log_softmax(x, dim=-1) * log10e
         log10_p = torch.nan_to_num(log10_p, nan=-1e6, neginf=-1e6, posinf=1e6)
@@ -212,6 +218,7 @@ class _NoOpTimeWarp(nn.Module):
         super().__init__()
         self.register_buffer("smax", torch.tensor(float(smax_init)))
         self.last_s_mean = 0.0
+
 
 class LPVDynamics(nn.Module):
     """
@@ -251,96 +258,90 @@ class LPVDynamics(nn.Module):
 
         self.scale_S = nn.Parameter(torch.tensor(1.0))
 
-    def _build_A(self, pt: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def _build_A(self, pt: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        """
+        Build A(g): S - L L^T - γ I
+        Single sanitize at input; one construction pass; no repeated to()/nan_to_num() churn.
+        """
         B = pt.shape[0]
         pt = torch.nan_to_num(pt, nan=0.0, posinf=0.0, neginf=0.0)
-        h = self.cond(pt)
-        h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
+
+        h = self.cond(pt)  # [B, r + (z*z if use_S)]
         if self.use_S:
             s, m_head = torch.split(h, [self.r, self.z * self.z], dim=-1)
         else:
             s, m_head = h, None
 
-        s = F.softplus(s)   # [B,r] positive
-        U = self.base_U     # [z,r]
-        L = U.unsqueeze(0) * s.unsqueeze(1)              # [B,z,r]
-        LLt = torch.matmul(L, L.transpose(1, 2))         # [B,z,z], PSD
+        s = F.softplus(s)  # [B,r]  (positive)
+        U = self.base_U    # [z,r]
+        L = U.unsqueeze(0) * s.unsqueeze(1)  # [B,z,r]
+        LLt = torch.matmul(L, L.transpose(1, 2))  # [B,z,z], PSD
 
         if self.use_S:
             M = m_head.reshape(B, self.z, self.z)
-            S = 0.5 * (M - M.transpose(1, 2))
+            S = 0.5 * (M - M.transpose(1, 2))  # skew
             S = torch.tanh(self.scale_S) * S
         else:
             S = torch.zeros(B, self.z, self.z, device=pt.device, dtype=pt.dtype)
 
         A = S - LLt - self.gamma * self.I.to(device=pt.device, dtype=pt.dtype).expand(B, -1, -1)
-        A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
-        aux = {"damp_mean": float(s.mean().detach().cpu()),
-               "gamma": self.gamma,
-               "smax": float(self.timewarp.smax.detach().cpu())}
+        A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)  # final guard
+        aux = {
+            "damp_mean": float(s.mean().detach().cpu()),
+            "gamma": self.gamma,
+            "smax": float(self.timewarp.smax.detach().cpu()),
+        }
         return A, aux
 
     @property
     def _dt_range_scalar(self) -> torch.Tensor:
         return (self.dt_log_max - self.dt_log_min).clamp_min(1e-12)
 
-    # In model.py, inside class LPVDynamics
     def _denorm_dt(self, dt_norm: torch.Tensor) -> torch.Tensor:
         """
         Map normalized dt in [0,1] to physical seconds using stored log10 range.
         Guard against NaN/Inf before clamping; cap log10(dt) to 38 (~1e38).
         """
-        # sanitize first; clamp afterwards (clamp leaves NaNs unchanged)
-        dt_norm = torch.nan_to_num(dt_norm, nan=0.0, posinf=1.0, neginf=0.0)
-        dt_norm = dt_norm.clamp(0.0, 1.0)
-
+        dt_norm = torch.nan_to_num(dt_norm, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         log_dt = self.dt_log_min + dt_norm * self._dt_range_scalar
-        log_dt = torch.clamp(log_dt, max=38.0)
-
+        log_dt = torch.clamp(log_dt, max=38.0)  # ~1e38 cap
         dt_phys = torch.exp(log_dt * math.log(10.0))
-        # ensure strictly positive and finite for matrix exp / eigen math
         dt_phys = torch.nan_to_num(dt_phys, nan=1e-30, posinf=1e38, neginf=1e-30).clamp_min(1e-30)
         return dt_phys
 
-    @staticmethod
-    def _to_3d(dt: torch.Tensor) -> torch.Tensor:
-        return dt.view(dt.shape[0], 1, 1)
-
-    # In model.py, inside class LPVDynamics
-    def step(self, z: torch.Tensor, dt_step_norm: torch.Tensor | float, g: torch.Tensor) -> torch.Tensor:
+    def step(self, z: torch.Tensor, dt_step_norm: torch.Tensor | float, pt: torch.Tensor) -> torch.Tensor:
         """
-        Single latent step z_{t+dt} = exp(A(g) * dt_phys) @ z_t
-        Uses fp32 matrix_exp for stable, differentiable propagation (no eigh).
-        Accepts scalar or [B]-shaped dt_step_norm. z: [B,Z], g: [B,G].
+        Backward-compatible latent step with normalized Δt.
+        Converts to physical seconds and calls step_phys (no eigh here).
         """
-        B, Z = z.shape
-
-        # Normalize dt shape & dtype robustly
         if not torch.is_tensor(dt_step_norm):
             dt_step_norm = torch.as_tensor(dt_step_norm, device=z.device, dtype=torch.float32)
         dt_step_norm = dt_step_norm.to(dtype=torch.float32, device=z.device)
         if dt_step_norm.ndim == 0:
-            dt_step_norm = dt_step_norm.expand(B)
-        elif dt_step_norm.ndim != 1 or dt_step_norm.shape[0] != B:
-            dt_step_norm = dt_step_norm.view(B)
+            dt_step_norm = dt_step_norm.expand(z.shape[0])
+        elif dt_step_norm.ndim != 1 or dt_step_norm.shape[0] != z.shape[0]:
+            dt_step_norm = dt_step_norm.view(z.shape[0])
+        dt_phys = self._denorm_dt(dt_step_norm)
+        return self.step_phys(z, dt_phys, pt)
 
-        # Build A(g) and propagate in fp32 with explicit autocast API
+    def step_phys(self, z: torch.Tensor, dt_phys: torch.Tensor, pt: torch.Tensor) -> torch.Tensor:
+        """
+        Latent step with physical Δt provided (skips per-step denorm).
+          z: [B,Z], dt_phys: [B], pt: [B,G]
+        Uses fp32 matrix_exp for stable, differentiable propagation.
+        """
+        B, Z = z.shape
+        if dt_phys.ndim != 1 or dt_phys.shape[0] != B:
+            raise ValueError(f"dt_phys must be [B]; got {tuple(dt_phys.shape)} vs B={B}")
+
         with torch.amp.autocast("cuda", enabled=False):
-            # A: [B,Z,Z] in fp32. Keep exactly symmetric when S-term is off.
-            A = self._build_A(g)[0].float()
-            if not self.use_S:
-                A = 0.5 * (A + A.transpose(-1, -2))
+            A, _ = self._build_A(pt)
+            A32 = A.float()  # [B,Z,Z]
+            dt32 = torch.nan_to_num(dt_phys.float(), nan=1e-30, posinf=1e38, neginf=1e-30).clamp_min(0.0).view(B, 1, 1)
+            Phi = torch.matrix_exp(A32 * dt32)  # [B,Z,Z]
+            z_next32 = torch.bmm(Phi, z.float().unsqueeze(-1)).squeeze(-1)
 
-            # Sanitize numerics
-            A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
-
-            # Physical dt in fp32; clamp to >=0
-            dt_phys32 = self._denorm_dt(dt_step_norm).to(torch.float32).clamp_min(0.0).view(B, 1, 1)
-
-            # Propagator and apply
-            Phi = torch.matrix_exp(A * dt_phys32)  # [B,Z,Z]
-            z_next32 = torch.bmm(Phi, z.float().unsqueeze(-1)).squeeze(-1)  # [B,Z]
-
+        z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
         return z_next32.to(z.dtype)
 
 
@@ -366,7 +367,7 @@ class StableLPVKoopmanAE(nn.Module):
         dropout: float = 0.0,
         softmax_head: bool = True,
         z_std_clip: Optional[float] = Z_STD_CLIP_DEFAULT,
-        predict_delta: bool = False,  # NEW: if True, return y_i + Δy
+        predict_delta: bool = False,
         # decoder stats (only if softmax_head=True)
         target_log_mean: Optional[Sequence[float]] = None,
         target_log_std: Optional[Sequence[float]] = None,
@@ -380,6 +381,7 @@ class StableLPVKoopmanAE(nn.Module):
     ):
         super().__init__()
         if kwargs:
+            # ignore unrecognized kwargs for forward-compat
             pass
 
         self.S_in = int(state_dim)
@@ -409,7 +411,7 @@ class StableLPVKoopmanAE(nn.Module):
             if target_log_mean is None or target_log_std is None:
                 raise ValueError("softmax_head=True requires target_log_mean/target_log_std arrays.")
             log_mean = torch.tensor(list(target_log_mean), dtype=torch.float32)
-            log_std  = torch.tensor(list(target_log_std),  dtype=torch.float32)
+            log_std = torch.tensor(list(target_log_std), dtype=torch.float32)
             log_stats = (log_mean, log_std)
 
         self.decoder = Decoder(self.Z, decoder_hidden, self.S_out, act, dropout,
@@ -419,8 +421,10 @@ class StableLPVKoopmanAE(nn.Module):
     # ---- Trainer API: multi-time forward ----
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
-        Predict K future states from an anchor.
-          y_i: [B,S], dt_norm: [B] or [B,K], g: [B,G]  →  y_pred: [B,K,S]
+        Efficient multi-time prediction.
+          y_i: [B,S], dt_norm: [B] or [B,K], g: [B,G]  →  [B,K,S]
+        Encodes once, propagates all K steps in latent space, decodes once (batched).
+        For predict_delta=True, returns y_i + Δy_k for each k (anchor-relative).
         """
         B, S = y_i.shape
         if dt_norm.ndim == 1:
@@ -434,42 +438,56 @@ class StableLPVKoopmanAE(nn.Module):
             raise ValueError(f"dt_norm must be [B] or [B,K], got {tuple(dt_norm.shape)}")
         K = dt_norm.shape[1]
 
+        # Single sanitize at the boundary
+        y_i = torch.nan_to_num(y_i, nan=0.0, posinf=0.0, neginf=0.0)
+        g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Encode once
+        z0 = self.encoder(y_i, g)  # [B,Z]
+
+        # Build A(g) once
+        A, _ = self.dynamics._build_A(g)  # [B,Z,Z]
+
+        # Vectorized propagation for all K steps
+        try:
+            if not self.use_S:
+                # Eigh path for symmetric A (fast). Operate in fp32.
+                eigvals32, eigvecs32 = torch.linalg.eigh(A.float())  # [B,Z], [B,Z,Z]
+                z0_eig32 = torch.bmm(eigvecs32.transpose(-2, -1), z0.float().unsqueeze(-1)).squeeze(-1)  # [B,Z]
+                dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()  # [B,K]
+                lam_dt = eigvals32.unsqueeze(1) * dt_phys32.unsqueeze(-1)  # [B,K,Z]
+                lam_dt = lam_dt.clamp_(-LAMDT_MAX_ABS, LAMDT_MAX_ABS)
+                exp_lam_dt = torch.exp(lam_dt)  # [B,K,Z]
+                z_eig_next = z0_eig32.unsqueeze(1) * exp_lam_dt  # [B,K,Z]
+                z_next32 = torch.einsum('bij,bkj->bki', eigvecs32, z_eig_next)  # [B,K,Z]
+                z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
+                z_next = z_next32.to(z0.dtype)
+            else:
+                # Generic matrix_exp path in fp32
+                dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()  # [B,K]
+                A32 = A.float().unsqueeze(1)  # [B,1,Z,Z]
+                Phi32 = torch.matrix_exp(A32 * dt_phys32.reshape(B, K, 1, 1))  # [B,K,Z,Z]
+                z0_32 = z0.float().reshape(B, 1, self.Z, 1)  # [B,1,Z,1]
+                z_next32 = torch.matmul(Phi32, z0_32).squeeze(-1)  # [B,K,Z]
+                z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
+                z_next = z_next32.to(z0.dtype)
+        except RuntimeError:
+            # Fallback to matrix_exp if eigh path fails numerically
+            dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()  # [B,K]
+            A32 = A.float().unsqueeze(1)  # [B,1,Z,Z]
+            Phi32 = torch.matrix_exp(A32 * dt_phys32.reshape(B, K, 1, 1))  # [B,K,Z,Z]
+            z0_32 = z0.float().reshape(B, 1, self.Z, 1)  # [B,1,Z,1]
+            z_next32 = torch.matmul(Phi32, z0_32).squeeze(-1)  # [B,K,Z]
+            z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
+            z_next = z_next32.to(z0.dtype)
+
+        # Single batched decode for all K latents
+        z_next = z_next.clamp_(-Z_CLAMP, Z_CLAMP)
+        y_out = self.decoder(z_next.reshape(B * K, self.Z)).reshape(B, K, S)  # [B,K,S]
+
         if self.predict_delta:
-            # Sequential path for Δy training consistency with step()/rollout
-            y_t = y_i
-            preds = []
-            for k in range(K):
-                y_t = self.step(y_t, dt_norm[:, k], g)
-                preds.append(y_t)
-            return torch.stack(preds, dim=1)
-
-        # Parallel vectorized path (standard Koopman propagation on z0)
-        z0 = self.encoder(y_i, g)          # [B,Z]
-        A, _ = self.dynamics._build_A(g)   # [B,Z,Z]
-        if not self.use_S:
-            eigvals32, eigvecs32 = torch.linalg.eigh(A.float())                                      # [B,Z],[B,Z,Z]
-            z0_eig32 = torch.bmm(eigvecs32.transpose(-2, -1), z0.float().unsqueeze(-1)).squeeze(-1)  # [B,Z]
-            dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()                                    # [B,K]
-            exp_lambda_dt32 = torch.exp(eigvals32.unsqueeze(1) * dt_phys32.unsqueeze(-1))            # [B,K,Z]
-            z_eig_next32 = z0_eig32.unsqueeze(1) * exp_lambda_dt32                                   # [B,K,Z]
-            z_next32 = torch.einsum('bij,bkj->bki', eigvecs32, z_eig_next32)                         # [B,K,Z]
-            z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
-            z_next = z_next32.to(z0.dtype)
-        else:
-            dt_phys32 = self.dynamics._denorm_dt(dt_norm).float()                            # [B,K]
-            A32 = A.float().unsqueeze(1)                                                     # [B,1,Z,Z]
-            Phi32 = torch.matrix_exp(A32 * dt_phys32.reshape(B, K, 1, 1))                    # [B,K,Z,Z]
-            z0_32 = z0.float().reshape(B, 1, self.Z, 1)                                      # [B,1,Z,1]
-            z_next32 = torch.matmul(Phi32, z0_32).squeeze(-1)                                 # [B,K,Z]
-            z_next32 = torch.nan_to_num(z_next32, nan=0.0, posinf=0.0, neginf=0.0)
-            z_next = z_next32.to(z0.dtype)
-
-        # Decode with sanitization/clamp guard
-        z_next = torch.nan_to_num(z_next, nan=0.0, posinf=0.0, neginf=0.0)
-        z_next = z_next.clamp_(-100.0, 100.0)
-        y_pred = self.decoder(z_next.reshape(B * K, self.Z)).reshape(B, K, S)  # [B,K,S]
-        return y_pred
-
+            y_out = y_i.unsqueeze(1) + y_out
+        return y_out
 
     # ---- Convenience single-step (kept for callers that need it) ----
     def step(self, y: torch.Tensor, dt_step_norm: torch.Tensor | float, g: torch.Tensor) -> torch.Tensor:
@@ -508,6 +526,7 @@ def _load_manifest(config: dict) -> dict:
                 return json.load(f)
     raise FileNotFoundError(f"Could not find normalization manifest at: {', '.join(map(str, cand))}")
 
+
 def _gather_species_stats(methods: dict, stats: dict, species_vars: Sequence[str]) -> Tuple[torch.Tensor, torch.Tensor]:
     log_means, log_stds = [], []
     for k in species_vars:
@@ -522,6 +541,7 @@ def _gather_species_stats(methods: dict, stats: dict, species_vars: Sequence[str
         log_means.append(lm)
         log_stds.append(ls)
     return torch.tensor(log_means, dtype=torch.float32), torch.tensor(log_stds, dtype=torch.float32)
+
 
 def _get_dt_stats(manifest: dict, stats: dict) -> Dict[str, float]:
     # standard location
@@ -541,6 +561,7 @@ def _get_dt_stats(manifest: dict, stats: dict) -> Dict[str, float]:
             return {"log_min": float(st["log_min"]), "log_max": float(st["log_max"])}
     raise KeyError("Could not find dt stats (expected dt.log_min/log_max) in manifest.")
 
+
 # sensible defaults
 LATENT_DIM_DEFAULT = 32
 ENCODER_HIDDEN_DEFAULT = (256, 256)
@@ -548,6 +569,7 @@ DECODER_HIDDEN_DEFAULT = (256, 256)
 COND_HIDDEN_DEFAULT = (64, 64)
 RANK_L_DEFAULT = 8
 GAMMA_DEFAULT = 1e-2
+
 
 def create_model(config: dict) -> nn.Module:
     """
@@ -566,14 +588,13 @@ def create_model(config: dict) -> nn.Module:
     species_vars = list(data_cfg.get("species_variables", []) or [])
     global_vars = list(data_cfg.get("global_variables", []) or [])
     if not global_vars:
-        # common default if present in stats
         if "P" in stats and "T" in stats:
             global_vars = ["P", "T"]
         else:
             raise ValueError("No global_variables provided and P/T not found in manifest stats.")
 
     if not species_vars:
-        time_var = data_cfg.get("time_variable", "t_time")  # Get from config
+        time_var = data_cfg.get("time_variable", "t_time")
         reserved = {"dt", "Δt", "delta_t", "t_delta", "t_step", "dt_phys", time_var} | set(global_vars)
         species_vars = [k for k in stats.keys() if k not in reserved]
 
@@ -601,8 +622,8 @@ def create_model(config: dict) -> nn.Module:
     dropout = float(mcfg.get("dropout", 0.0))
     cond_h = tuple(mcfg.get("cond_hidden", COND_HIDDEN_DEFAULT))
     rank_l = int(mcfg.get("rank_l", RANK_L_DEFAULT))
-    use_S  = bool(mcfg.get("use_S", False))
-    gamma  = float(mcfg.get("gamma", GAMMA_DEFAULT))
+    use_S = bool(mcfg.get("use_S", False))
+    gamma = float(mcfg.get("gamma", GAMMA_DEFAULT))
     z_std_clip = float(mcfg.get("z_std_clip", Z_STD_CLIP_DEFAULT))
     predict_delta = bool(mcfg.get("predict_delta", False))
 
