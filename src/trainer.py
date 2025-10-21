@@ -257,6 +257,7 @@ class NonFiniteGuard(Callback):
         self._grad_tripped = False
         self._param_tripped = False
         self.py_logger = py_logger or logging.getLogger("trainer")
+        self._n_samples = 0
 
     def on_after_backward(self, trainer, pl_module):
         if self._grad_tripped:
@@ -695,14 +696,14 @@ class AutoEncoderModule(LightningModule):
             tf_prob: float
     ) -> Optional[torch.Tensor]:
         """
-        Rollout loss with cached encoding and A(g). Operates in latent space, then decodes.
-        Correctly handles g-conditioned decoder and predict_delta.
-        Correctly handles masks with shapes: [B], [B,K], [B,K,1], or [B,K,S].
+        Cached rollout aux loss. Uses closed-form (U,s) when use_S=False; skew path uses
+        step_phys_with_A (eig fast-path in eval) instead of raw matrix_exp.
+        Supports masks shaped [B], [B,K], [B,K,1], or [B,K,S].
         """
         if horizon <= 0:
             return None
 
-        # Normalize dt_norm to [B,K]
+        # --- normalize dt to [B,K] ---
         if dt_norm.ndim == 1:
             dt_norm = dt_norm.unsqueeze(1)
         elif dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
@@ -716,48 +717,53 @@ class AutoEncoderModule(LightningModule):
         predict_delta = getattr(self.model, "predict_delta", False)
         decoder_condition_on_g = getattr(self.model, "decoder_condition_on_g", False)
 
-        # Cache encode and A(g)
+        # --- encode once ---
         z_curr = self.model.encoder(y_i, g)  # [B,Z]
-        A, _ = self.model.dynamics._build_A(g)
+
+        # --- build dynamics once (avoid A if not needed) ---
+        if not self.model.dynamics.use_S:
+            info = self.model.dynamics._build_info(g)  # {'U','s'}
+            A = None
+            use_lowrank = True
+        else:
+            A, _ = self.model.dynamics._build_A(g)
+            info = {}
+            use_lowrank = False
+
+        # --- denorm all Δt once ---
+        dt_phys_all = self.model.dynamics._denorm_dt(dt_norm)  # [B,K]
 
         y_curr = y_i
-        losses = []
+        losses: list[torch.Tensor] = []
 
         for t in range(H):
-            # Propagate latent with cached A
-            dt_step = dt_norm[:, t]
-            dt_phys = self.model.dynamics._denorm_dt(dt_step)
+            dt_phys = dt_phys_all[:, t]  # [B]
 
-            with torch.amp.autocast("cuda", enabled=False):
-                A_float = A.float()  # [B,Z,Z]
-                dt_float = dt_phys.float().view(B, 1, 1)  # [B,1,1]
-                Phi = torch.matrix_exp(A_float * dt_float)  # [B,Z,Z]
-                z_next = torch.bmm(Phi, z_curr.float().unsqueeze(-1)).squeeze(-1)
-                z_next = z_next.to(z_curr.dtype)  # [B,Z]
-
-            # Decode (respect g-conditioning)
-            if decoder_condition_on_g:
-                dec_in = torch.cat([z_next, g], dim=-1)  # [B,Z+G]
+            # ---- latent step ----
+            if use_lowrank:
+                z_next = self.model.dynamics.propagate_with_info(z_curr, dt_phys, info, A=None)  # closed form
             else:
-                dec_in = z_next  # [B,Z]
+                z_next = self.model.dynamics.step_phys_with_A(z_curr, dt_phys, A)  # skew-safe (eig in eval)
+
+            # ---- decode (respect g-conditioning) ----
+            dec_in = torch.cat([z_next, g], dim=-1) if decoder_condition_on_g else z_next
             y_decoded = self.model.decoder(dec_in)  # [B,S]
 
-            # Apply predict-delta if enabled
+            # ---- delta semantics ----
             y_pred = y_curr + y_decoded if predict_delta else y_decoded
 
-            # Ground truth at this offset
+            # ---- ground truth at this offset ----
             y_true = y_j[:, t] if (t < y_j.shape[1]) else y_j[:, -1]
 
-            # ----- Build per-step masks -----
+            # ---- masks ----
             step_mask: Optional[torch.Tensor] = None  # [B,S] or [B]
             tf_mask: Optional[torch.Tensor] = None  # [B]
-
             if mask is not None:
                 if mask.ndim == 1 and mask.shape[0] == B:
-                    tf_mask = mask
-                    step_mask = mask.view(B, 1).expand(B, S)
+                    tf_mask = (mask > 0.5) if mask.dtype != torch.bool else mask
+                    step_mask = tf_mask.view(B, 1).expand(B, S)
                 elif mask.ndim == 2 and mask.shape == (B, K):
-                    tf_mask = mask[:, t]
+                    tf_mask = (mask[:, t] > 0.5) if mask.dtype != torch.bool else mask[:, t]
                     step_mask = tf_mask.view(B, 1).expand(B, S)
                 elif mask.ndim == 3:
                     if mask.shape[0] != B:
@@ -768,31 +774,29 @@ class AutoEncoderModule(LightningModule):
                     ms = mask[:, time_idx, ...]  # [B,S] or [B,1]
                     if ms.ndim == 2 and ms.shape[1] == S:
                         step_mask = ms
-                        tf_mask = ms.all(dim=-1)  # [B]
+                        tf_mask = (ms > 0.5).all(dim=-1) if ms.dtype != torch.bool else ms.all(dim=-1)
                     elif ms.ndim == 2 and ms.shape[1] == 1:
                         step_mask = ms.expand(B, S)
-                        tf_mask = ms.squeeze(-1)
+                        tf_mask = (ms > 0.5).squeeze(-1) if ms.dtype != torch.bool else ms.squeeze(-1)
                     else:
                         raise ValueError(f"Unsupported 3D mask slice shape: {tuple(ms.shape)}; expected [B,S] or [B,1]")
 
-            # Loss for this step
+            # ---- step loss ----
             l = self._safe_mse_with_mask(y_pred, y_true, step_mask)
             losses.append(l)
 
-            # Teacher forcing in latent (and y_curr if predict_delta)
+            # ---- per-sample teacher forcing ----
             if t < H - 1:
-                use_tf = (torch.rand(B, device=self.device) < tf_prob).float()  # [B]
+                use_tf = (torch.rand(B, device=y_i.device) < tf_prob).float().unsqueeze(-1)  # [B,1]
                 if tf_mask is not None:
-                    use_tf = use_tf * tf_mask.float()
-                use_tf = use_tf.unsqueeze(-1)  # [B,1]
+                    use_tf = use_tf * tf_mask.float().unsqueeze(-1)
 
-                # Next latent: either encode ground truth or keep z_next
-                z_gt = self.model.encoder(y_true.detach(), g)
-                z_curr = use_tf * z_gt.detach() + (1.0 - use_tf) * z_next.detach()
+                with torch.no_grad():
+                    z_gt = self.model.encoder(y_true, g)
+                z_curr = use_tf * z_gt + (1.0 - use_tf) * z_next.detach()
 
-                # If predict_delta=True, y_curr participates in forming y_pred; keep it consistent
                 if predict_delta:
-                    y_curr = use_tf * y_true.detach() + (1.0 - use_tf) * y_pred.detach()
+                    y_curr = use_tf * y_true + (1.0 - use_tf) * y_pred.detach()
 
         return torch.stack(losses).mean() if losses else None
 
@@ -990,7 +994,7 @@ class Trainer:
             monitor="val_loss",
             patience=max(0, es_patience),
             mode="min",
-            min_delta=float(tcfg.get("early_stop_min_delta", 1e-5)),
+            min_delta=float(tcfg.get("early_stop_min_delta", 1e-6)),
             verbose=True,
         ) if es_patience > 0 else None
 

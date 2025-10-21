@@ -628,7 +628,7 @@ class FlowMapPairsDataset(Dataset):
             anchor_i_exp = anchor_i.unsqueeze(1).expand_as(target_j)
             dt_phys = self.steps_to_dt_phys(anchor_i_exp, target_j, traj_exp)
             dt_phys = torch.clamp(dt_phys, min=self.epsilon)
-            dt_norm = self.norm.normalize_dt_from_phys(dt_phys)  # [B,K]
+            dt_norm = self.norm.normalize_dt_from_phys(dt_phys).to(torch.float32)  # [B,K]
 
         aux = {"i": anchor_i, "j": target_j}
 
