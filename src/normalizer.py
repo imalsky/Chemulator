@@ -164,8 +164,6 @@ class NormalizationHelper:
             raise ValueError(f"Shape mismatch: {x.shape[-1]} cols vs {num_keys} keys")
 
         result = x.clone()
-        device = x.device or self.device
-        dtype = x.dtype
 
         for col_idx, key in enumerate(keys):
             method = str(self.methods.get(key, "log-standard"))

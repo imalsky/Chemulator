@@ -1,39 +1,6 @@
 #!/usr/bin/env python3
 """
 Flow-map DeepONet Training Pipeline - Main Entry Point
-======================================================
-
-OVERVIEW
---------
-Orchestrates the complete training workflow from configuration to model deployment:
-  1. Load and validate configuration (config.jsonc)
-  2. Initialize hardware (GPU, TF32, cuDNN, threading)
-  3. Ensure preprocessed data exists (run preprocessor if needed)
-  4. Hydrate config from processed artifacts (species, dt stats, etc.)
-  5. Build datasets and dataloaders (GPU-resident for throughput)
-  6. Construct model (with normalization stats from manifest)
-  7. Train via Lightning-backed Trainer wrapper
-  8. Export best checkpoint
-
-Objective
----------
-Train a *simple, numerically stable autoencoder* that can make **autoregressive**
-predictions for a **stiff chemical system**.
-
-Design principles:
-- Work entirely in **normalized standardized log10 space**; targets are standardized,
-  predictions are compared in that same space.
-- Normalize Δt using **log-min–max**; the model denormalizes internally only to
-  construct dynamics features. Keep Δt_norm ∈ [0,1].
-- Favor **stability first** (no NaNs, bounded updates, gradient clipping) and **accuracy**
-  second. Start near-identity; expand capacity only if needed.
-- Use a **short→long rollout** curriculum with **teacher forcing**; optionally add a
-  light **semigroup consistency** loss.
-- A lightweight **time-warp** scales effective step size for stiffness; **smax** is
-  annealed during training.
-
-Inputs: hydrated config + normalization manifest (species stats, dt log_min/log_max).
-Outputs: best Lightning checkpoint and a legacy `best_model.pt` (state_dict + metadata).
 """
 
 from __future__ import annotations
@@ -57,19 +24,12 @@ from dataset import FlowMapPairsDataset, create_dataloader
 from model import create_model
 from trainer import Trainer  # Lightning-backed wrapper
 
-# --------------------------------------------------------------------------------------
-# Configuration constants
-# --------------------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config.jsonc"
 GLOBAL_SEED = 42
 GLOBAL_WORK_DIR = REPO_ROOT / "models" / "autoencoder-flowmap"
 
-
-# --------------------------------------------------------------------------------------
-# Small helpers
-# --------------------------------------------------------------------------------------
 
 def _parse_int_or_auto(val: Any, default_if_auto: int) -> int:
     """
@@ -84,7 +44,6 @@ def _parse_int_or_auto(val: Any, default_if_auto: int) -> int:
         return int(default_if_auto)
     return int(s)
 
-
 def _auto_num_workers(default_if_auto: int = 0) -> int:
     """
     Reasonable default for DataLoader workers. If you are preloading to GPU, keep low.
@@ -96,10 +55,6 @@ def _auto_num_workers(default_if_auto: int = 0) -> int:
     # Favor low workers when tensors are GPU-resident already
     return max(0, min(8, cpu // 8))
 
-
-# --------------------------------------------------------------------------------------
-# Helper: re-hydrate cfg.data.* from an existing processed data directory
-# --------------------------------------------------------------------------------------
 
 def hydrate_config_from_processed(
         cfg: Dict[str, Any],
@@ -166,10 +121,7 @@ def hydrate_config_from_processed(
 
     # Must have species variables
     if not species_from_processed:
-        raise RuntimeError(
-            "[hydrate] Unable to determine species_variables from processed artifacts. "
-            "Expected normalization.json.meta.species_variables or preprocessing_summary.json.species_variables."
-        )
+        raise RuntimeError("[hydrate] Unable to determine species_variables")
 
     # Optional context logging from summary/index if present
     if norm_path.exists():
@@ -190,35 +142,23 @@ def hydrate_config_from_processed(
 
     prev_species = list(data_cfg.get("species_variables", []))
     if prev_species and prev_species != species_from_processed:
-        logger.warning(
-            "[hydrate] Overriding config.data.species_variables with values from processed data.\n"
-            f"          Previous: {prev_species}\n"
-            f"          New     : {species_from_processed}"
-        )
+        logger.warning("[hydrate] Overriding config.data.species_variables with values from processed data.")
     else:
-        logger.info(f"[hydrate] Setting config.data.species_variables = {species_from_processed}")
+        logger.info(f"[hydrate] Setting config.data.species_variables. e.g {species_from_processed[0]}")
     data_cfg["species_variables"] = list(species_from_processed)
 
     if globals_from_processed:
         prev_globals = list(data_cfg.get("global_variables", []))
         if prev_globals and prev_globals != globals_from_processed:
-            logger.warning(
-                "[hydrate] Overriding config.data.global_variables with values from processed data.\n"
-                f"          Previous: {prev_globals}\n"
-                f"          New     : {globals_from_processed}"
-            )
+            logger.warning("[hydrate] Overriding config.data.global_variables with values from processed data.")
         else:
-            logger.info(f"[hydrate] Setting config.data.global_variables = {globals_from_processed}")
+            logger.info(f"[hydrate] Setting config.data.global_variables {globals_from_processed}")
         data_cfg["global_variables"] = list(globals_from_processed)
 
     if time_from_processed:
         prev_time = data_cfg.get("time_variable")
         if prev_time and prev_time != time_from_processed:
-            logger.warning(
-                "[hydrate] Overriding config.data.time_variable with value from processed data.\n"
-                f"          Previous: {prev_time}\n"
-                f"          New     : {time_from_processed}"
-            )
+            logger.warning("[hydrate] Overriding config.data.time_variable with value from processed data.")
         else:
             logger.info(f"[hydrate] Setting config.data.time_variable = {time_from_processed}")
         data_cfg["time_variable"] = str(time_from_processed)
@@ -348,10 +288,7 @@ def ensure_preprocessed_data(
         return processed_dir
 
     # No manifest -> run preprocessing now
-    logger.info(
-        f"[ensure_preprocessed] Normalization manifest not found at {normalization_path}\n"
-        f"[ensure_preprocessed] Running preprocessing to generate shards and stats…"
-    )
+    logger.info(f"[ensure_preprocessed] Normalization manifest not found at {normalization_path}")
     pre_logger = logger.getChild("preprocessor")
     dp = DataPreprocessor(cfg, logger=pre_logger)
     dp.run()
@@ -401,7 +338,8 @@ torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     pairs_per_traj = int(training_cfg.get("pairs_per_traj", 64))
     pairs_per_traj_val = int(training_cfg.get("pairs_per_traj_val", pairs_per_traj))
     min_steps = int(training_cfg.get("min_steps", 1))
-    max_steps_val = int(training_cfg.get("max_steps", 0)) or None
+    max_steps_raw = training_cfg.get("max_steps")
+    max_steps_val = int(max_steps_raw) if max_steps_raw else None
     base_seed = int(cfg.get("system", {}).get("seed", 42))
 
     # Train dataset (optionally GPU-resident)
@@ -545,10 +483,13 @@ def build_model(
     model.to(device)
 
     # --- I/O dimension diagnostics ---
-    S_in = getattr(model, "S_in", getattr(model, "S", None))
     S_out = getattr(model, "S_out", getattr(model, "S", None))
-    G = getattr(model, "G", "?")
-    p = getattr(model, "p", "?")
+    S_in = getattr(model, "S_in", S_out)  # assume symmetric I/O if not exposed
+    G = getattr(model, "G", getattr(model, "G_in",
+                                    len(cfg.get("data", {}).get("global_variables", [])) or "?"))
+    p = getattr(model, "p",
+                getattr(getattr(model, "dynamics", None), "r",
+                        getattr(model, "rank_l", "?")))
     logger.info(f"Model dims: S_in={S_in}, S_out={S_out}, G={G}, p={p}")
 
     ti = getattr(model, "target_idx", None)

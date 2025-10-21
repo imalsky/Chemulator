@@ -23,7 +23,7 @@ from utils import load_json, seed_everything
 
 # ------------------------------ Settings -------------------------------------
 
-SAMPLE_IDX = 0
+SAMPLE_IDX = 4
 Q_COUNT = 100
 XMIN, XMAX = 1e-3, 1e8
 
@@ -193,7 +193,7 @@ def main():
               fontsize=10, title_fontsize=11)
 
     fig.tight_layout()
-    out_path = MODEL_DIR / "plots" / f"predictions_K{K}_sample_{SAMPLE_IDX}.png"
+    out_path = MODEL_DIR / "plots" / f"something_wrong_{SAMPLE_IDX}.png"
     out_path.parent.mkdir(exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)

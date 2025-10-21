@@ -1,9 +1,32 @@
 #!/usr/bin/env python3
 """
-Flow-map DeepONet Dataset with Log-Δt Sampling (FAST VERSION)
-==============================================================
-Optimized to skip expensive scanning when dataset structure is known.
-FIXED: Corrected initialization order and added safe defaults for all attributes.
+Flow-Map Koopman Dataset (Optimized)
+=====================================
+PyTorch Dataset for loading preprocessed trajectory data with variable time steps.
+Supports efficient batch generation with log-uniform or uniform time sampling.
+
+Key Features:
+- Fast loading: optional scanning skip when structure is known
+- Flexible time sampling: log-uniform (preferred) or uniform distributions
+- GPU preloading: optional staging of entire dataset to GPU memory
+- Shared or per-trajectory time grids with automatic detection
+- Precomputed dt lookup tables for uniform grids (significant speedup)
+- Deterministic epoch-based sampling with set_epoch()
+- Picklable collate function for multiprocess data loading (macOS/spawn compatible)
+
+Performance Modes:
+- skip_scan: Skip file scanning (requires valid metadata)
+- preload_to_gpu: Stage entire dataset to GPU (for datasets < GPU memory)
+- precompute_dt_table: Build dt lookup table (uniform grids only)
+- share_times_across_batch: Use identical time steps across batch (faster)
+
+Batch Format: (y_i, dt_norm, y_j, g, aux, mask)
+- y_i: [B, S] - Initial states
+- dt_norm: [B, K] - Normalized time steps ∈ [0,1]
+- y_j: [B, K, S] - Target states
+- g: [B, G] - Global parameters
+- aux: dict with 'i', 'j' indices
+- mask: [B, K] - Valid step mask
 """
 
 from __future__ import annotations
@@ -22,9 +45,33 @@ from torch.utils.data import Dataset
 
 from normalizer import NormalizationHelper
 from utils import load_json
+from functools import partial
 
 
 # --------------------------------- Utilities ---------------------------------
+
+
+def collate_flowmap(batch_indices, *, dataset):
+    """
+    Picklable, top-level collate function for FlowMapPairsDataset.
+    Converts the incoming list/tensor of indices to a LongTensor on the
+    dataset's target device, then delegates to dataset._gather_batch(...).
+
+    This MUST be top-level (not nested) so it can be pickled by DataLoader
+    worker processes under 'spawn' (macOS/Python 3.12).
+    """
+    # DataLoader may give list[int], tuple[int], or a 1D tensor of indices
+    if isinstance(batch_indices, (list, tuple)):
+        idxs = torch.tensor(batch_indices, dtype=torch.long, device=dataset.device)
+    elif isinstance(batch_indices, torch.Tensor):
+        if batch_indices.dtype != torch.long:
+            batch_indices = batch_indices.to(dtype=torch.long)
+        idxs = batch_indices.to(dataset.device, non_blocking=True)
+    else:
+        # Single index fallback
+        idxs = torch.tensor([int(batch_indices)], dtype=torch.long, device=dataset.device)
+
+    return dataset._gather_batch(idxs)
 
 def format_bytes(n: int | float) -> str:
     n = float(n)
@@ -110,7 +157,6 @@ class FlowMapPairsDataset(Dataset):
         if not self.species_vars:
             raise KeyError("config.data.species_variables must be set")
 
-        # FIXED: Initialize safe defaults for attributes checked later
         self.dt_table = None
         self._has_shared_uniform_grid = False
         self.shared_time_grid = None
@@ -132,6 +178,9 @@ class FlowMapPairsDataset(Dataset):
         self.T = int(scan["time_length"])
         self.S = int(scan["state_dim"])
         self.G_dim = int(scan["global_dim"])
+        gv = self.cfg.get("data", {}).get("global_variables", [])
+        if gv and len(gv) != self.G_dim:
+            raise RuntimeError(f"Global count mismatch: shards have {self.G_dim}, config lists {len(gv)}")
 
         # Validate species dimensions
         if len(self.species_vars) != self.S:
@@ -143,7 +192,7 @@ class FlowMapPairsDataset(Dataset):
 
         # Step bounds
         self.min_steps = int(min_steps)
-        self.max_steps = int(max_steps) if max_steps else self.K
+        self.max_steps = int(max_steps) if max_steps else (self.T - 1)
         self._validate_step_bounds()
 
         # Length
@@ -500,45 +549,47 @@ class FlowMapPairsDataset(Dataset):
         self.Y = torch.empty((self.N, self.T, self.S), device=self._stage_device, dtype=buf_dtype)
 
     def _load_and_stage_data(self):
-        """Load and normalize data to device."""
+        """Load raw shards, normalize tensors using normalization.json, and stage to device."""
         write_ptr = 0
         start = time.perf_counter()
 
-        for idx, f in enumerate(self.files, 1):
-            path = Path(f)
-            _, g_np, t_np, y_np = load_shard_arrays(path)
-            n = y_np.shape[0]
-            sl = slice(write_ptr, write_ptr + n)
+        with torch.no_grad():
+            for idx, f in enumerate(self.files, 1):
+                path = Path(f)
+                _x0_np, g_np, t_np, y_np = load_shard_arrays(path)
+                n = y_np.shape[0]
+                sl = slice(write_ptr, write_ptr + n)
 
-            # Normalize globals
-            g = torch.from_numpy(g_np.astype(np.float32, copy=False)).to(self._stage_device)
-            global_vars = self.cfg["data"].get("global_variables", [])
-            if global_vars:
-                g = self.norm.normalize(g, global_vars)
-            # Write G as float32 (stable for Koopman K(g))
-            self.G[sl] = g.to(self._stage_device, dtype=torch.float32, non_blocking=True)
+                # ------------------ Globals ------------------
+                g = torch.from_numpy(g_np.astype(np.float32, copy=False)).to(self._stage_device)
+                global_vars = self.cfg["data"].get("global_variables", [])
+                if global_vars:
+                    g = self.norm.normalize(g, global_vars)  # device-aware
+                # Keep globals as float32 for K(g) stability
+                self.G[sl].copy_(g.to(dtype=torch.float32, non_blocking=True))
 
-            # Normalize species
-            y = torch.from_numpy(y_np)
-            y_norm = self.norm.normalize(y, self.species_vars).reshape(n, self.T, self.S)
-            self.Y[sl] = y_norm.to(self._stage_device, dtype=self.Y.dtype, non_blocking=True)
+                # ------------------ Species ------------------
+                # y_np: [n, T, S] (raw). Normalize along the last dim using manifest stats.
+                y = torch.from_numpy(y_np).to(self._stage_device)
+                y_norm = self.norm.normalize(y, self.species_vars)  # preserves [n, T, S]
+                self.Y[sl].copy_(y_norm.to(dtype=self.Y.dtype, non_blocking=True))
 
-            # Store time grids if not shared
-            if not self.has_shared_grid:
-                if t_np.ndim == 1:
-                    t = torch.from_numpy(t_np.astype(np.float64, copy=False)).to(self._stage_device)
-                    self.time_grid_per_row[sl] = t.view(1, self.T).expand(n, self.T)
-                else:
-                    self.time_grid_per_row[sl] = torch.from_numpy(
-                        t_np.astype(np.float64, copy=False)
-                    ).to(self._stage_device)
+                # ------------------ Time grids ------------------
+                if not self.has_shared_grid:
+                    if t_np.ndim == 1:
+                        # single grid reused across rows
+                        t = torch.from_numpy(t_np.astype(np.float64, copy=False)).to(self._stage_device)
+                        self.time_grid_per_row[sl].copy_(t.view(1, self.T).expand(n, self.T))
+                    else:
+                        t = torch.from_numpy(t_np.astype(np.float64, copy=False)).to(self._stage_device)
+                        self.time_grid_per_row[sl].copy_(t)
 
-            write_ptr += n
+                write_ptr += n
 
-            if idx % self.log_every_files == 0 or idx == len(self.files):
-                elapsed = time.perf_counter() - start
-                dev = "GPU" if self._stage_device.type == "cuda" else "CPU"
-                print(f"[{self.split}] Loaded {idx}/{len(self.files)} shards to {dev} in {elapsed:.1f}s")
+                if idx % self.log_every_files == 0 or idx == len(self.files):
+                    elapsed = time.perf_counter() - start
+                    dev = "GPU" if self._stage_device.type == "cuda" else "CPU"
+                    print(f"[{self.split}] Loaded {idx}/{len(self.files)} shards to {dev} in {elapsed:.1f}s")
 
     def _report_memory_usage(self):
         if self._stage_device.type == "cuda" and torch.cuda.is_available():
@@ -632,10 +683,7 @@ class FlowMapPairsDataset(Dataset):
 
         aux = {"i": anchor_i, "j": target_j}
 
-        if self.share_times_across_batch:
-            return y_i, dt_norm, y_j, g, aux, mask
-        else:
-            return y_i, dt_norm, y_j, g, aux
+        return y_i, dt_norm, y_j, g, aux, mask
 
     def __len__(self) -> int:
         return self._length
@@ -654,32 +702,47 @@ def create_dataloader(
         prefetch_factor: int = 2,
         persistent_workers: bool = False
 ) -> torch.utils.data.DataLoader:
-    """Create DataLoader for FlowMapPairsDataset."""
+    """
+    Create a DataLoader for FlowMapPairsDataset that:
+      - Uses a picklable, top-level collate_fn (so workers can spawn on macOS).
+      - Disables pin_memory on MPS (not supported) and when staging is non-CPU.
+      - Disables workers automatically if the dataset is preloaded to an accelerator.
 
-    on_cuda = dataset._stage_device.type == "cuda"
-    if on_cuda:
+    Notes:
+      * If the dataset is staged to a non-CPU device (CUDA/MPS), workers are forced to 0.
+      * pin_memory is only meaningful when moving CPU tensors → CUDA; on MPS it is unsupported.
+      * prefetch_factor/persistent_workers are only set when num_workers > 0.
+    """
+    dev = dataset._stage_device  # where the dataset is staged
+    dev_type = getattr(dev, "type", "cpu")
+
+    # If data is already on an accelerator (CUDA/MPS), workers cannot safely copy it between processes.
+    if dev_type != "cpu":
         num_workers = 0
+        persistent_workers = False
+        # Pinning makes no sense if tensors are already on device; also silences MPS warning.
         pin_memory = False
-        shuffle = False
 
-    def _collate(idxs):
-        if isinstance(idxs, (list, tuple)):
-            idxs = torch.tensor(idxs, dtype=torch.long, device=dataset.device)
-        elif isinstance(idxs, torch.Tensor):
-            if idxs.device != dataset.device:
-                idxs = idxs.to(dataset.device, dtype=torch.long, non_blocking=True)
-        return dataset._gather_batch(idxs)
+    # If runtime is using MPS, pin_memory is not supported (warning otherwise)
+    try:
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            pin_memory = False
+    except Exception:
+        # If detection fails, do nothing; conservative settings above still protect MPS users.
+        pass
 
+    # Build kwargs, attaching a picklable collate (partial binds the dataset reference)
     kwargs = {
         "dataset": dataset,
         "batch_size": int(batch_size),
         "shuffle": bool(shuffle),
+        "drop_last": False,
+        "collate_fn": partial(collate_flowmap, dataset=dataset),
         "num_workers": int(num_workers),
         "pin_memory": bool(pin_memory),
-        "drop_last": False,
-        "collate_fn": _collate
     }
 
+    # Only set worker-related extras when we truly have workers
     if num_workers > 0:
         kwargs["prefetch_factor"] = int(prefetch_factor)
         kwargs["persistent_workers"] = bool(persistent_workers)
