@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""
-Plot raw (denormalized) test profiles exactly as stored in the processed dataset.
+"""Minimal Flow-map AE (exported .pt2) prediction + plotting (handles [K,1,S] outputs).
 
-- Loads processed data + normalization.json from the model's config.json path.
-- Denormalizes species trajectories and plots EVERY recorded point (no interpolation or resampling).
-- Does not use or load any model artifacts.
+- Expects an exported torch.export program whose forward signature is:
+    forward(y: [B,S], dt: [B,1], g: [B,G]) -> [B,1,S]
+- This script batches K queries by repeating the anchor across batch (B=K).
 """
 
 import os
@@ -16,190 +15,202 @@ import torch
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-# =========================== Globals / Settings ===============================
+# --------------------------- Paths & Imports ---------------------------------
 
-# Repo + model layout
 REPO = Path(__file__).parent.parent
-MODEL_NAME = "stable-lpv-koopman"                   # <- your model folder name
-MODEL_DIR = REPO / "models" / MODEL_NAME            # contains config.json
+MODEL_DIR = REPO / "models/v1"          # <- change if needed
+EP_FILENAME = "export_k1_cpu.pt2"       # choose your artifact ("export_k1_gpu.pt2" is fine too)
 
-# What to plot
-SAMPLE_IDX = 14                                      # which test sample to show
-XMIN, XMAX = None, None                             # set to floats (seconds) or leave None
-PLOT_LOGLOG = True                                  # True => log-log axes; zeros/negatives hidden
-SCATTER_MARKER = 'o'                                # marker only (no lines => no interpolation)
-SCATTER_SIZE = 2
-SCATTER_ALPHA = 0.9
+# Add src to path
+sys.path.insert(0, str(REPO / "src"))
+from normalizer import NormalizationHelper
+from utils import load_json, seed_everything
 
-# Output
-OUT_DIR = MODEL_DIR / "plots"
-OUT_NAME = f"test_profile_sample_{SAMPLE_IDX}.png"
+# ------------------------------ Settings -------------------------------------
 
-# Optional MPL style (ignored if missing)
+SAMPLE_IDX = 1
+Q_COUNT = 100
+XMIN, XMAX = 1e-3, 1e8
+
 try:
     plt.style.use("science.mplstyle")
 except Exception:
     pass
 
-# Make src importable
-sys.path.insert(0, str(REPO / "src"))
-from normalizer import NormalizationHelper  # uses only normalization.json
-from utils import load_json                 # small helper
+# -----------------------------------------------------------------------------
 
+def _load_meta_json(pt2_path: Path) -> dict:
+    meta_path = pt2_path.with_suffix(pt2_path.suffix + ".meta.json")
+    if meta_path.exists():
+        with meta_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
-# ================================ Helpers =====================================
+def main():
+    os.chdir(REPO)
+    seed_everything(42)
 
-def _load_meta_json_from_norm(norm_data: dict) -> dict:
-    meta = norm_data.get("meta", {})
-    if not meta:
-        raise KeyError("normalization.json missing 'meta' section.")
-    return meta
-
-
-def _load_processed_paths() -> tuple[Path, dict]:
+    # ---------- Load config & normalization ----------
     cfg = load_json(MODEL_DIR / "config.json")
     data_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
     if not data_dir.exists():
         raise FileNotFoundError(f"Processed data dir not found: {data_dir}")
-    norm_path = data_dir / "normalization.json"
-    if not norm_path.exists():
-        raise FileNotFoundError(f"normalization.json not found: {norm_path}")
-    norm_data = load_json(norm_path)
-    return data_dir, norm_data
 
+    norm_data = load_json(data_dir / "normalization.json")
+    meta = norm_data["meta"]
+    species = list(meta["species_variables"])
+    globals_v = list(meta.get("global_variables", []))
+    target_species_cfg = list(cfg.get("data", {}).get("target_species", species))
 
-# ================================ Main ========================================
+    # ---------- Load exported program ----------
+    from torch.export import load as load_exported
+    ep_path = MODEL_DIR / EP_FILENAME
+    if not ep_path.exists():
+        raise FileNotFoundError(f"Exported program not found: {ep_path}")
+    ep = load_exported(ep_path)
+    gm = ep.module()    # GraphModule; do NOT call .eval()
 
-def main():
-    os.chdir(REPO)
+    # Optional meta info
+    meta_json = _load_meta_json(ep_path)
+    s_out_meta = int(meta_json["S_out"]) if "S_out" in meta_json else None
 
-    # ---------- Locate processed data + normalization ----------
-    data_dir, norm_data = _load_processed_paths()
-    meta = _load_meta_json_from_norm(norm_data)
-    species = list(meta["species_variables"])               # order used in y_mat columns
-
-    # ---------- Build normalizer (JSON-only) ----------
+    # ---------- Normalizer ----------
     norm = NormalizationHelper(norm_data)
 
-    # ---------- Load ONE test shard (raw points; no resampling) ----------
+    # ---------- Load one test shard ----------
     shards = sorted((data_dir / "test").glob("shard_*.npz"))
     if not shards:
-        raise FileNotFoundError(f"No test shards found under {data_dir / 'test'}")
-    shard_path = shards[0]
+        raise FileNotFoundError(f"No test shards found in {data_dir / 'test'}")
+    with np.load(shards[0]) as d:
+        y_all = d["y_mat"].astype(np.float32)   # [N, M, S]
+        g_all = d["globals"].astype(np.float32) # [N, G]
+        t_phys_all = d["t_vec"]                 # [M] or [N, M]
 
-    with np.load(shard_path) as d:
-        y_all = d["y_mat"].astype(np.float32)              # [N, M, S]
-        t_all = d["t_vec"]                                 # [M] or [N, M]
+    print(f"Using shard: {shards[0].name}  |  total samples: {len(y_all)}")
+    y = y_all[SAMPLE_IDX]                              # [M, S]
+    g = g_all[SAMPLE_IDX]                              # [G]
+    t_phys = t_phys_all if t_phys_all.ndim == 1 else t_phys_all[SAMPLE_IDX]  # [M]
+    M = len(t_phys)
 
-    print(f"Using shard: {shard_path.name} | total samples: {len(y_all)}")
+    # ---------- Prepare anchor (t0), globals, and queries ----------
+    y0 = torch.from_numpy(y[0:1])                      # [1, S]
+    g_tensor = torch.from_numpy(g[None, :])            # [1, G]
+    y0_norm = norm.normalize(y0, species).to(torch.float32)
+    g_norm  = norm.normalize(g_tensor, globals_v).to(torch.float32)
 
-    if SAMPLE_IDX < 0 or SAMPLE_IDX >= len(y_all):
-        raise IndexError(f"SAMPLE_IDX={SAMPLE_IDX} out of range [0, {len(y_all)-1}]")
+    qn = max(1, min(Q_COUNT, M - 1))
+    q_idx = np.linspace(1, M - 1, qn).round().astype(int)
+    t_sel = t_phys[q_idx].astype(np.float32)
+    dt_phys = np.maximum(t_sel - t_phys[0], 0.0).astype(np.float32)
 
-    # Slice one sample's trajectory (raw underlying points)
-    y_norm = y_all[SAMPLE_IDX]                             # [M, S] (normalized)
-    if t_all.ndim == 1:
-        t_phys = t_all.astype(np.float64)                  # [M]
+    dt_norm = norm.normalize_dt_from_phys(torch.from_numpy(dt_phys)).to(torch.float32)  # [K]
+
+    # *** IMPORTANT: exported program expects dt shape [B, 1], NOT [B, 1, 1]
+    dt_norm_b1 = dt_norm.view(-1, 1)                                                      # [K,1]
+
+    K = dt_norm_b1.shape[0]
+    y_batch = y0_norm.repeat(K, 1)                                                        # [K, S]
+    g_batch = g_norm.repeat(K, 1)                                                         # [K, G]
+
+    # ---------- Inference ----------
+    with torch.inference_mode():
+        out = gm(y_batch, dt_norm_b1, g_batch)  # typically [K,1,S]
+
+    # Squeeze singleton step dim if present
+    if out.dim() == 3:
+        if out.size(1) == 1:
+            y_pred_z = out[:, 0, :]      # [K, S_out]
+        elif out.size(0) == 1:
+            y_pred_z = out[0, :, :]      # [K, S_out]
+        else:
+            # Unexpected extra step dimension; flatten it
+            y_pred_z = out.reshape(out.size(0) * out.size(1), out.size(2))
+            # Align K-dependent arrays to match the new K
+            K = y_pred_z.shape[0]
+            if len(q_idx) != K:
+                q_idx = np.linspace(1, M - 1, K).round().astype(int)
+                t_sel = t_phys[q_idx].astype(np.float32)
+                dt_phys = np.maximum(t_sel - t_phys[0], 0.0).astype(np.float32)
     else:
-        t_phys = t_all[SAMPLE_IDX].astype(np.float64)      # [M]
+        y_pred_z = out  # [K, S_out]
 
-    # ---------- Denormalize species to physical space ----------
-    # Keep every point; do NOT filter, smooth, or interpolate.
-    y_norm_t = torch.from_numpy(y_norm)                    # [M, S] torch
-    y_phys_t = norm.denormalize(y_norm_t, species)         # [M, S] torch
-    y_phys = y_phys_t.cpu().numpy()                        # numpy
+    S_out_pred = y_pred_z.shape[1]
+    if s_out_meta is not None and s_out_meta != S_out_pred:
+        print(f"[warn] meta S_out={s_out_meta} but export returned S_out={S_out_pred}; using {S_out_pred}.")
 
-    # Optional time range mask (still "exactly the stored points" within range)
-    if XMIN is not None or XMAX is not None:
-        xmin = -np.inf if XMIN is None else float(XMIN)
-        xmax = +np.inf if XMAX is None else float(XMAX)
-        m = (t_phys >= xmin) & (t_phys <= xmax)
-        t_plot = t_phys[m]
-        y_plot = y_phys[m]
-    else:
-        t_plot = t_phys
-        y_plot = y_phys
+    # Align target species to predicted columns
+    if S_out_pred != len(target_species_cfg):
+        print(f"[info] Model predicts {S_out_pred} species; truncating/aligning target list (was {len(target_species_cfg)}).")
+    target_species_used = target_species_cfg[:S_out_pred]
 
-    # If using log axes, drop non-positive points (cannot display on log scale).
-    # We DO NOT modify values (no clipping); we simply omit invalid points per species.
-    if PLOT_LOGLOG:
-        valid_mask = t_plot > 0
-        t_plot = t_plot[valid_mask]
-        y_plot = y_plot[valid_mask, :]
+    # Ground truth slice in the same order
+    try:
+        target_idx = [species.index(s) for s in target_species_used]
+    except ValueError as e:
+        missing = str(e).split("'")[1]
+        raise KeyError(f"Target species '{missing}' not found in species_variables.") from None
 
-    if t_plot.size == 0:
-        raise RuntimeError("No points remain to plot after applying axis/mask constraints.")
+    y_true = y[:, target_idx]                        # [M, S_out_pred]
 
-    # ---------- Plot (scatter ONLY; no lines => no interpolation) ----------
+    # ---------- Denormalize predictions to physical space ----------
+    y_pred = norm.denormalize(y_pred_z, target_species_used).cpu().numpy()  # [K, S_out_pred]
+
+    # ------------------------------- Plot -------------------------------------
     fig, ax = plt.subplots(figsize=(10, 5))
-    colors = plt.cm.tab20(np.linspace(0, 0.95, y_plot.shape[1]))
+    colors = plt.cm.tab20(np.linspace(0, 0.95, len(target_species_used)))
 
-    # For each species, scatter ALL points exactly once
-    for i, name in enumerate(species[:y_plot.shape[1]]):
-        if PLOT_LOGLOG:
-            # Drop non-positive y values on log scale (can't display)
-            mask_y = y_plot[:, i] > 0
-            tp = t_plot[mask_y]
-            yp = y_plot[mask_y, i]
-        else:
-            tp = t_plot
-            yp = y_plot[:, i]
+    # Filter by x-limits
+    m_gt = (t_phys >= XMIN) & (t_phys <= XMAX)
+    m_pred = (t_sel >= XMIN) & (t_sel <= XMAX)
+    t_gt_plot = t_phys[m_gt]
+    y_gt_plot = np.clip(y_true[m_gt], 1e-30, None)
+    t_pred_plot = t_sel[m_pred]
+    y_pred_plot = np.clip(y_pred[m_pred], 1e-30, None)
 
-        if tp.size == 0:
-            continue
+    n_cols = min(y_gt_plot.shape[1], y_pred_plot.shape[1], len(target_species_used))
+    for i in range(n_cols):
+        name = target_species_used[i]
+        c = colors[i]
+        ax.loglog(t_gt_plot, y_gt_plot[:, i], '-', lw=1.8, alpha=0.9, color=c)
+        if t_gt_plot.size:
+            ax.loglog([t_gt_plot[0]], [y_gt_plot[0, i]], 'o', mfc='none', color=c, ms=5)
+        if t_pred_plot.size > 0:
+            ax.loglog(t_pred_plot, y_pred_plot[:, i], '--', lw=1.4, alpha=0.85, color=c)
 
-        if PLOT_LOGLOG:
-            ax.loglog(tp, yp, linestyle='none',
-                      marker=SCATTER_MARKER, ms=SCATTER_SIZE,
-                      alpha=SCATTER_ALPHA, color=colors[i],
-                      label=name if i == 0 else None)
-        else:
-            ax.plot(tp, yp, linestyle='none',
-                    marker=SCATTER_MARKER, ms=SCATTER_SIZE,
-                    alpha=SCATTER_ALPHA, color=colors[i],
-                    label=name if i == 0 else None)
-
-    # Axis labels/grid
+    ax.set_xlim(XMIN, XMAX)
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Relative Abundance (phys)")
+    ax.set_ylabel("Relative Abundance")
     ax.grid(False)
 
-    # Legend by GT max (same ordering trick as before)
-    # Compute per-species max on the actually-plotted points to avoid bias.
-    col_max = []
-    for i in range(y_plot.shape[1]):
-        if PLOT_LOGLOG:
-            vals = y_plot[:, i]
-            vals = vals[vals > 0]
-        else:
-            vals = y_plot[:, i]
-        col_max.append(vals.max() if vals.size else -np.inf)
-
-    order = np.argsort(np.array(col_max))[::-1]
-    legend_handles = [Line2D([0], [0], color=colors[idx], marker=SCATTER_MARKER,
-                             linestyle='none', markersize=SCATTER_SIZE, alpha=SCATTER_ALPHA)
-                      for idx in order[:min(len(order), y_plot.shape[1])]]
-    legend_labels = [species[idx] for idx in order[:min(len(order), y_plot.shape[1])]]
+    # Legend: order by GT max
+    order = np.argsort(np.max(y_gt_plot, axis=0))[::-1][:n_cols]
+    legend_handles = [Line2D([0], [0], color=colors[idx], lw=2.0, alpha=0.9) for idx in order]
+    legend_labels = [target_species_used[idx] for idx in order]
     leg1 = ax.legend(handles=legend_handles, labels=legend_labels,
                      loc='center left', bbox_to_anchor=(1.01, 0.6),
                      title='Species', fontsize=10, title_fontsize=11, ncol=1)
     ax.add_artist(leg1)
 
-    # Style key for clarity (still no lines drawn)
     style_handles = [
-        Line2D([0], [0], color='black', marker=SCATTER_MARKER, linestyle='none',
-               markersize=SCATTER_SIZE, alpha=1.0, label='Raw Points'),
+        Line2D([0], [0], color='black', lw=2.0, ls='-', label='Ground Truth'),
+        Line2D([0], [0], color='black', lw=1.6, ls='--', label='Model Prediction'),
     ]
     ax.legend(handles=style_handles, loc='center left', bbox_to_anchor=(1.01, 0.2),
               fontsize=10, title_fontsize=11)
 
     fig.tight_layout()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUT_DIR / OUT_NAME
+    out_path = MODEL_DIR / "plots" / f"something_wrong_{SAMPLE_IDX}.png"
+    out_path.parent.mkdir(exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[OK] Plot saved -> {out_path}")
+    print(f"Plot saved: {out_path}")
 
+    # -------------------------- Simple error metrics --------------------------
+    y_true_at_sel = y_true[q_idx]
+    y_true_at_sel = y_true_at_sel[:, :n_cols]
+    y_pred_eval = y_pred[:, :n_cols]
+    rel_err = np.abs(y_pred_eval - y_true_at_sel) / (np.abs(y_true_at_sel) + 1e-10)
+    print(f"Relative error: mean={rel_err.mean():.3e}, max={rel_err.max():.3e}")
 
 if __name__ == "__main__":
     main()
