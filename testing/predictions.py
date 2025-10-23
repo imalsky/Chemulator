@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal Flow-map AE (exported .pt2) prediction + plotting (handles [K,1,S] outputs).
-
-- Expects an exported torch.export program whose forward signature is:
-    forward(y: [B,S], dt: [B,1], g: [B,G]) -> [B,1,S]
-- This script batches K queries by repeating the anchor across batch (B=K).
-"""
+"""Minimal Flow-map AE (exported .pt2) prediction + plotting (handles [K,1,S] outputs)."""
 
 import os
 import sys
@@ -18,8 +13,8 @@ from matplotlib.lines import Line2D
 # --------------------------- Paths & Imports ---------------------------------
 
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models/v1"          # <- change if needed
-EP_FILENAME = "export_k1_cpu.pt2"       # choose your artifact ("export_k1_gpu.pt2" is fine too)
+MODEL_DIR = REPO / "models/autoencoder"  # <- change if needed
+EP_FILENAME = "export_k1_cpu.pt2"        # choose your artifact
 
 # Add src to path
 sys.path.insert(0, str(REPO / "src"))
@@ -28,7 +23,7 @@ from utils import load_json, seed_everything
 
 # ------------------------------ Settings -------------------------------------
 
-SAMPLE_IDX = 1
+SAMPLE_IDX = 10
 Q_COUNT = 100
 XMIN, XMAX = 1e-3, 1e8
 
@@ -46,6 +41,46 @@ def _load_meta_json(pt2_path: Path) -> dict:
             return json.load(f)
     return {}
 
+def _pick_target_species(meta_json, cfg, species_from_norm, s_out_pred) -> list:
+    """Choose target species robustly and make sure length matches s_out_pred."""
+    cfg_target = (cfg.get("data", {}) or {}).get("target_species", None)
+    if cfg_target is not None and len(cfg_target) == 0:
+        # Explicit empty list in config should NOT win
+        cfg_target = None
+
+    meta_target = meta_json.get("target_species") or None
+
+    # Preference order: meta_target > cfg_target > species_from_norm
+    for cand_name, cand in (("meta.target_species", meta_target),
+                            ("config.data.target_species", cfg_target),
+                            ("normalization species", species_from_norm)):
+        if cand and len(cand) > 0:
+            chosen = list(cand)
+            print(f"[debug] target_species source = {cand_name} (len={len(chosen)})")
+            break
+    else:
+        # Last-ditch: fake names to match cols (shouldn’t happen if normalization is sane)
+        chosen = [f"col{i}" for i in range(max(1, s_out_pred))]
+        print("[warn] No valid target species found; using placeholder names.")
+
+    # If too many, truncate; if too few, try to pad from normalization species (best guess)
+    if len(chosen) > s_out_pred:
+        print(f"[info] Truncating target list from {len(chosen)} → {s_out_pred} to match model outputs.")
+        chosen = chosen[:s_out_pred]
+    elif len(chosen) < s_out_pred:
+        # try to pad with remaining normalization species (preserving order)
+        pad_pool = [s for s in species_from_norm if s not in chosen]
+        need = s_out_pred - len(chosen)
+        take = pad_pool[:need]
+        if take:
+            print(f"[info] Padding target list by {len(take)} using normalization species.")
+            chosen = chosen + take
+        if len(chosen) < s_out_pred:
+            # still short — we will trim y_pred_z later to the keys we *do* have
+            print(f"[warn] Still short after padding: have {len(chosen)} keys for {s_out_pred} columns.")
+
+    return chosen
+
 def main():
     os.chdir(REPO)
     seed_everything(42)
@@ -60,7 +95,6 @@ def main():
     meta = norm_data["meta"]
     species = list(meta["species_variables"])
     globals_v = list(meta.get("global_variables", []))
-    target_species_cfg = list(cfg.get("data", {}).get("target_species", species))
 
     # ---------- Load exported program ----------
     from torch.export import load as load_exported
@@ -68,7 +102,7 @@ def main():
     if not ep_path.exists():
         raise FileNotFoundError(f"Exported program not found: {ep_path}")
     ep = load_exported(ep_path)
-    gm = ep.module()    # GraphModule; do NOT call .eval()
+    gm = ep.module()    # GraphModule; don't need .eval()
 
     # Optional meta info
     meta_json = _load_meta_json(ep_path)
@@ -104,17 +138,14 @@ def main():
     dt_phys = np.maximum(t_sel - t_phys[0], 0.0).astype(np.float32)
 
     dt_norm = norm.normalize_dt_from_phys(torch.from_numpy(dt_phys)).to(torch.float32)  # [K]
-
-    # *** IMPORTANT: exported program expects dt shape [B, 1], NOT [B, 1, 1]
-    dt_norm_b1 = dt_norm.view(-1, 1)                                                      # [K,1]
-
-    K = dt_norm_b1.shape[0]
-    y_batch = y0_norm.repeat(K, 1)                                                        # [K, S]
-    g_batch = g_norm.repeat(K, 1)                                                         # [K, G]
+    dt_norm_b11 = dt_norm.view(-1, 1, 1)                                                # [K,1,1]
+    K = dt_norm_b11.shape[0]
+    y_batch = y0_norm.repeat(K, 1)                                                      # [K, S]
+    g_batch = g_norm.repeat(K, 1)                                                       # [K, G]
 
     # ---------- Inference ----------
     with torch.inference_mode():
-        out = gm(y_batch, dt_norm_b1, g_batch)  # typically [K,1,S]
+        out = gm(y_batch, dt_norm_b11, g_batch)  # typically [K,1,S_out]
 
     # Squeeze singleton step dim if present
     if out.dim() == 3:
@@ -123,9 +154,7 @@ def main():
         elif out.size(0) == 1:
             y_pred_z = out[0, :, :]      # [K, S_out]
         else:
-            # Unexpected extra step dimension; flatten it
             y_pred_z = out.reshape(out.size(0) * out.size(1), out.size(2))
-            # Align K-dependent arrays to match the new K
             K = y_pred_z.shape[0]
             if len(q_idx) != K:
                 q_idx = np.linspace(1, M - 1, K).round().astype(int)
@@ -138,26 +167,40 @@ def main():
     if s_out_meta is not None and s_out_meta != S_out_pred:
         print(f"[warn] meta S_out={s_out_meta} but export returned S_out={S_out_pred}; using {S_out_pred}.")
 
-    # Align target species to predicted columns
-    if S_out_pred != len(target_species_cfg):
-        print(f"[info] Model predicts {S_out_pred} species; truncating/aligning target list (was {len(target_species_cfg)}).")
-    target_species_used = target_species_cfg[:S_out_pred]
+    # ---------- Choose target species robustly ----------
+    target_species_used = _pick_target_species(meta_json, cfg, species, S_out_pred)
+
+    # Ensure all chosen targets exist in normalization; drop unknowns and trim columns to match.
+    keep_idx = []
+    keep_names = []
+    for i, name in enumerate(target_species_used):
+        if name in species:
+            keep_idx.append(i)
+            keep_names.append(name)
+        else:
+            print(f"[warn] dropping unknown target '{name}' (not in normalization).")
+
+    if not keep_idx:
+        raise ValueError("No valid target species remain after filtering against normalization.json.")
+
+    # Align prediction columns to kept keys
+    if len(keep_idx) != S_out_pred:
+        # If we had to drop some keys, trim y_pred_z to the new size
+        old = S_out_pred
+        S_out_pred = len(keep_idx)
+        y_pred_z = y_pred_z[:, :S_out_pred]
+        print(f"[info] trimmed prediction columns from {old} → {S_out_pred} to match available keys.")
 
     # Ground truth slice in the same order
-    try:
-        target_idx = [species.index(s) for s in target_species_used]
-    except ValueError as e:
-        missing = str(e).split("'")[1]
-        raise KeyError(f"Target species '{missing}' not found in species_variables.") from None
-
+    target_idx = [species.index(s) for s in keep_names]
     y_true = y[:, target_idx]                        # [M, S_out_pred]
 
     # ---------- Denormalize predictions to physical space ----------
-    y_pred = norm.denormalize(y_pred_z, target_species_used).cpu().numpy()  # [K, S_out_pred]
+    y_pred = norm.denormalize(y_pred_z, keep_names).cpu().numpy()  # [K, S_out_pred]
 
     # ------------------------------- Plot -------------------------------------
     fig, ax = plt.subplots(figsize=(10, 5))
-    colors = plt.cm.tab20(np.linspace(0, 0.95, len(target_species_used)))
+    colors = plt.cm.tab20(np.linspace(0, 0.95, len(keep_names)))
 
     # Filter by x-limits
     m_gt = (t_phys >= XMIN) & (t_phys <= XMAX)
@@ -167,9 +210,9 @@ def main():
     t_pred_plot = t_sel[m_pred]
     y_pred_plot = np.clip(y_pred[m_pred], 1e-30, None)
 
-    n_cols = min(y_gt_plot.shape[1], y_pred_plot.shape[1], len(target_species_used))
+    n_cols = min(y_gt_plot.shape[1], y_pred_plot.shape[1], len(keep_names))
     for i in range(n_cols):
-        name = target_species_used[i]
+        name = keep_names[i]
         c = colors[i]
         ax.loglog(t_gt_plot, y_gt_plot[:, i], '-', lw=1.8, alpha=0.9, color=c)
         if t_gt_plot.size:
@@ -185,7 +228,7 @@ def main():
     # Legend: order by GT max
     order = np.argsort(np.max(y_gt_plot, axis=0))[::-1][:n_cols]
     legend_handles = [Line2D([0], [0], color=colors[idx], lw=2.0, alpha=0.9) for idx in order]
-    legend_labels = [target_species_used[idx] for idx in order]
+    legend_labels = [keep_names[idx] for idx in order]
     leg1 = ax.legend(handles=legend_handles, labels=legend_labels,
                      loc='center left', bbox_to_anchor=(1.01, 0.6),
                      title='Species', fontsize=10, title_fontsize=11, ncol=1)
@@ -206,8 +249,7 @@ def main():
     print(f"Plot saved: {out_path}")
 
     # -------------------------- Simple error metrics --------------------------
-    y_true_at_sel = y_true[q_idx]
-    y_true_at_sel = y_true_at_sel[:, :n_cols]
+    y_true_at_sel = y_true[q_idx][:, :n_cols]
     y_pred_eval = y_pred[:, :n_cols]
     rel_err = np.abs(y_pred_eval - y_true_at_sel) / (np.abs(y_true_at_sel) + 1e-10)
     print(f"Relative error: mean={rel_err.mean():.3e}, max={rel_err.max():.3e}")
