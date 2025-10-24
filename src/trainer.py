@@ -320,7 +320,8 @@ class EpochSummaryLineCallback(Callback):
         if math.isnan(train_v):
             train_v = float(getattr(pl_module, "_last_train_metric", float("nan")))
 
-        val_v   = _getf("val_mse")
+        val_v = _getf("val")  # total validation loss you log
+
         tf_prob = pl_module._get_teacher_forcing_prob(epoch)
         H       = pl_module._get_rollout_horizon(epoch)
 
@@ -933,8 +934,8 @@ class Trainer:
 
         ckpt_cb = ModelCheckpoint(
             dirpath=str(self.work_dir / "checkpoints"),
-            filename="epoch{epoch:04d}-val{val_mse:.6e}",
-            monitor="val_mse",
+            filename="epoch{epoch:04d}-val{val:.6e}",
+            monitor="val",  # <- you log this in validation_step
             mode="min",
             save_top_k=save_top_k,
             save_last=True,
@@ -942,7 +943,7 @@ class Trainer:
         )
         lr_cb = LearningRateMonitor(logging_interval="epoch")
         es_patience = int(lcfg.get("early_stop_patience", 0))
-        es_cb = EarlyStopping(monitor="val_mse", mode="min", patience=es_patience) if es_patience > 0 else None
+        es_cb = EarlyStopping(monitor="val", mode="min", patience=es_patience) if es_patience > 0 else None
         epoch_cb = EpochSetterCallback()
         summary_cb = EpochSummaryLineCallback()
 
@@ -989,7 +990,7 @@ class Trainer:
             gradient_clip_algorithm="norm",
             benchmark=benchmark,
             enable_progress_bar=False,
-            log_every_n_steps=9999999999999,
+            log_every_n_steps=max(1, len(self.train_loader)),
         )
 
         trainer.fit(

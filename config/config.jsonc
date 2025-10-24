@@ -72,7 +72,7 @@
   // ===============================
   "model": {
     // Architecture
-    "latent_dim": 256,
+    "latent_dim": 128,
     "encoder_hidden": [512, 512, 512, 512],
     "dynamics_hidden": [512, 512, 512, 512],
     "decoder_hidden": [512, 512, 512, 512],
@@ -95,8 +95,8 @@
   // ===============================
   "training": {
     // Batching / sampling (used by main.build_datasets_and_loaders and preprocessor)
-    "batch_size": 32768,
-    "val_batch_size": 32768,
+    "batch_size": 65536,
+    "val_batch_size": 65536,
     "pairs_per_traj": 12,
     "pairs_per_traj_val": 12,
 
@@ -129,7 +129,7 @@
     },
     "loss_epsilon": 1e-30,
 
-    "ema": { "enable": false, "decay": 0.999 },            // EMA callback (minimal)
+    "ema": { "enable": false, "decay": 0.9995 },            // EMA callback (minimal)
     "swa": { "enable": false, "epoch_start": 0.8 },       // SWA callback (optional)
     "model_soup": { "enable": false, "top_k": 3 },         // Average best-k ckpts post-fit
 
