@@ -7,7 +7,7 @@ import json
 import logging
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Tuple, Optional, Union
+from typing import Any, Dict, Tuple, Optional, Union, Sequence
 
 # Resolve duplicate library issue on macOS (harmless elsewhere)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"

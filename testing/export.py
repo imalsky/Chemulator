@@ -1,155 +1,202 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-import os, json, re, sys, pathlib
-from pathlib import Path
-import torch, torch.nn.functional as F
+"""
+Export Flow-map AE to torch.export format with K=1 baked in.
+Patches model forward to remove control flow for tracing compatibility.
+"""
 
-# --------------------------- Paths & Imports ---------------------------------
+from __future__ import annotations
+
+import json
+import pathlib
+import re
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+
+# Paths
 ROOT = Path(__file__).resolve().parents[1]
-SRC  = ROOT / "src"
+SRC = ROOT / "src"
 MODEL_DIR = ROOT / "models" / "autoencoder"
 CONFIG = MODEL_DIR / "config.json"
 OUT = MODEL_DIR / "export_k1_cpu.pt2"
 
-# Ensure relative paths in config (e.g., data/processed_*) resolve correctly
-os.chdir(ROOT)
-
 sys.path.insert(0, str(SRC))
-from model import create_model, FlowMapAutoencoder  # type: ignore
+from model import create_model, FlowMapAutoencoder
 
-# PyTorch 2.6 safe unpickler for Lightning checkpoints
+# Safe unpickler for Lightning checkpoints
 try:
     torch.serialization.add_safe_globals([pathlib.PosixPath, pathlib.WindowsPath])
 except Exception:
     pass
 
-# ------------------------------ Utils ----------------------------------------
-def _jload(p: Path): return json.loads(p.read_text())
 
-def _pick_ckpt(d: Path) -> Path:
-    best = d / "best_model.pt"
-    if best.exists(): return best
-    ckdir = d / "checkpoints"
-    if ckdir.exists():
-        bests = []
-        for p in ckdir.glob("epoch*.ckpt"):
-            m = re.match(r"epoch(\d+)-val([0-9eE+\-\.]+)\.ckpt$", p.name)
-            if m:
-                epoch = int(m.group(1))
-                try:
-                    val = float(m.group(2))
-                except Exception:
-                    val = float("inf")
-                bests.append((val, -epoch, p))
-        if bests:
-            bests.sort(key=lambda t: (t[0], t[1]))
-            return bests[0][2]
-        last = ckdir / "last.ckpt"
-        if last.exists(): return last
-    pts = sorted(d.glob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if pts: return pts[0]
-    raise FileNotFoundError(f"No checkpoint found in {d}")
+def load_config(path: Path) -> dict:
+    """Load JSON config file."""
+    return json.loads(path.read_text())
 
-def _safe_load(path: Path):
+
+def find_checkpoint(model_dir: Path) -> Path:
+    """Find best available checkpoint in priority order."""
+    # Priority 1: best_model.pt
+    best = model_dir / "best_model.pt"
+    if best.exists():
+        return best
+
+    # Priority 2: best validation checkpoint
+    ckpt_dir = model_dir / "checkpoints"
+    if ckpt_dir.exists():
+        candidates = []
+        for ckpt_path in ckpt_dir.glob("epoch*.ckpt"):
+            match = re.match(r"epoch(\d+)-val([0-9eE+\-\.]+)\.ckpt$", ckpt_path.name)
+            if match:
+                epoch = int(match.group(1))
+                val_loss = float(match.group(2)) if match.group(2) else float("inf")
+                candidates.append((val_loss, -epoch, ckpt_path))
+
+        if candidates:
+            candidates.sort()
+            return candidates[0][2]
+
+        # Fallback: last.ckpt
+        last = ckpt_dir / "last.ckpt"
+        if last.exists():
+            return last
+
+    # Priority 3: most recent .pt file
+    pt_files = sorted(model_dir.glob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if pt_files:
+        return pt_files[0]
+
+    raise FileNotFoundError(f"No checkpoint found in {model_dir}")
+
+
+def load_checkpoint(path: Path) -> dict:
+    """Load checkpoint with fallback for weights_only compatibility."""
     try:
-        return torch.load(path, map_location="cpu")  # weights_only=True also OK for many ckpts
+        return torch.load(path, map_location="cpu")
     except Exception:
         return torch.load(path, map_location="cpu", weights_only=False)
 
-def _strip_prefix(k: str) -> str:
-    for pref in ("model.", "module.", "_orig_mod."):
-        if k.startswith(pref): return k[len(pref):]
-    return k
 
-def _load_state_dict(path: Path, model: torch.nn.Module) -> dict:
-    payload = _safe_load(path)
+def extract_state_dict(ckpt_path: Path, model: torch.nn.Module) -> dict:
+    """Extract and filter state dict from checkpoint."""
+    payload = load_checkpoint(ckpt_path)
+
     if not isinstance(payload, dict):
-        raise RuntimeError(f"Bad checkpoint payload type: {type(payload)}")
-    raw = None
-    for k in ("state_dict", "model", "model_state_dict", "ema_model"):
-        if isinstance(payload.get(k), dict):
-            raw = payload[k]
+        raise RuntimeError(f"Invalid checkpoint format: {type(payload)}")
+
+    # Find state dict in checkpoint
+    raw_state = None
+    for key in ("state_dict", "model", "model_state_dict", "ema_model"):
+        if isinstance(payload.get(key), dict):
+            raw_state = payload[key]
             break
-    if raw is None:
-        raw = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor)}
-    raw = {_strip_prefix(k): v for k, v in raw.items()}
 
-    want = set(model.state_dict().keys())
-    filt = {k: v for k, v in raw.items() if k in want}
-    missing = [k for k in model.state_dict().keys() if k not in filt]
+    # Fallback: treat payload as state dict
+    if raw_state is None:
+        raw_state = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor)}
+
+    # Strip common prefixes
+    def strip_prefix(key: str) -> str:
+        for prefix in ("model.", "module.", "_orig_mod."):
+            if key.startswith(prefix):
+                return key[len(prefix):]
+        return key
+
+    raw_state = {strip_prefix(k): v for k, v in raw_state.items()}
+
+    # Filter to model keys
+    model_keys = set(model.state_dict().keys())
+    filtered = {k: v for k, v in raw_state.items() if k in model_keys}
+
+    missing = [k for k in model_keys if k not in filtered]
     if missing:
-        raise RuntimeError(f"Missing {len(missing)} keys; e.g. {missing[0]}")
-    return filt
+        raise RuntimeError(f"Missing {len(missing)} keys in checkpoint, e.g. {missing[0]}")
 
-# --------- Branch-free heads and forward (remove data-dependent guards) -------
-def _softmax_head_no_guard(self, logits: torch.Tensor) -> torch.Tensor:
-    # Softmax (ln), convert to log10, normalize with stored stats. Do all in tensor ops.
-    log_p = F.log_softmax(logits, dim=-1)               # natural log
-    z_f = (log_p.float() * self.ln10_inv - self.log_mean) / self.log_std
-    return z_f.to(dtype=logits.dtype)
+    return filtered
 
-def _head_from_logprobs_no_guard(self, log_p: torch.Tensor) -> torch.Tensor:
-    z_f = (log_p.float() * self.ln10_inv - self.log_mean) / self.log_std
-    return z_f.to(dtype=log_p.dtype)
 
-def _forward_no_guard(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-    """
-    Same math as your FlowMapAutoencoder.forward, but without any
-    `if torch.isfinite(...).all()` Python branches that break torch.export.
-    Shapes:
-      y_i:    [B, S_in]   (normalized)
-      dt_norm:[B, K]
-      g:      [B, G]
-    Returns:
-      [B, K, S_out] (normalized)
-    """
-    z_i = self.encoder(y_i, g)                      # [B,Z]
-    z_k = self.dynamics(z_i, dt_norm, g)            # [B,K,Z]
-    if self.decoder_condition_on_g:
-        z_k = self.film(z_k, g)                     # [B,K,Z]
-    logits = self.decoder(z_k)                      # [B,K,S_out]
+def patch_model_for_export(model_class):
+    """Patch model methods to remove control flow for torch.export compatibility."""
 
-    if not self.predict_logit_delta:
-        return self._softmax_head_from_logits(logits)
+    def softmax_head_no_guard(self, logits: torch.Tensor) -> torch.Tensor:
+        """Softmax head without data-dependent guards."""
+        log_p = F.log_softmax(logits, dim=-1)
+        z_f = (log_p.float() * self.ln10_inv - self.log_mean) / self.log_std
+        return z_f.to(dtype=logits.dtype)
 
-    # logit-delta path
-    base = y_i if self.S_out == self.S_in else y_i.index_select(1, self.target_idx)
-    base_logp = self._denorm_to_logp(base)          # [B,S_out]
-    log_q = F.log_softmax(logits, dim=-1).float()   # [B,K,S_out]
-    log_p = base_logp.unsqueeze(1) + log_q          # [B,K,S_out]
-    log_p = log_p - torch.logsumexp(log_p, dim=-1, keepdim=True)
-    return self._head_from_logprobs(log_p)
+    def head_from_logprobs_no_guard(self, log_p: torch.Tensor) -> torch.Tensor:
+        """Log probability head without data-dependent guards."""
+        z_f = (log_p.float() * self.ln10_inv - self.log_mean) / self.log_std
+        return z_f.to(dtype=log_p.dtype)
 
-# Apply patches for tracing
-FlowMapAutoencoder._softmax_head_from_logits = _softmax_head_no_guard
-FlowMapAutoencoder._head_from_logprobs      = _head_from_logprobs_no_guard
-FlowMapAutoencoder.forward                  = _forward_no_guard
+    def forward_no_guard(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """Forward pass without control flow branches."""
+        z_i = self.encoder(y_i, g)
+        z_k = self.dynamics(z_i, dt_norm, g)
 
-# ---------------------------------- Main -------------------------------------
+        if self.decoder_condition_on_g:
+            z_k = self.film(z_k, g)
+
+        logits = self.decoder(z_k)
+
+        if not self.predict_logit_delta:
+            return self._softmax_head_from_logits(logits)
+
+        # Logit-delta path
+        base = y_i if self.S_out == self.S_in else y_i.index_select(1, self.target_idx)
+        base_logp = self._denorm_to_logp(base)
+        log_q = F.log_softmax(logits, dim=-1).float()
+        log_p = base_logp.unsqueeze(1) + log_q
+        log_p = log_p - torch.logsumexp(log_p, dim=-1, keepdim=True)
+        return self._head_from_logprobs(log_p)
+
+    model_class._softmax_head_from_logits = softmax_head_no_guard
+    model_class._head_from_logprobs = head_from_logprobs_no_guard
+    model_class.forward = forward_no_guard
+
+
 def main():
-    cfg = _jload(CONFIG)                 # no rehydration; use config.json as-is
-    model = create_model(cfg).eval().cpu()
+    # Setup
+    import os
+    os.chdir(ROOT)
 
-    sd = _load_state_dict(_pick_ckpt(MODEL_DIR), model)
-    model.load_state_dict(sd, strict=True)
+    # Load config and create model
+    config = load_config(CONFIG)
+    model = create_model(config).eval().cpu()
 
-    # Dynamic batch; fix K=1 for this artifact
+    # Load weights
+    ckpt_path = find_checkpoint(MODEL_DIR)
+    state_dict = extract_state_dict(ckpt_path, model)
+    model.load_state_dict(state_dict, strict=True)
+    print(f"Loaded checkpoint: {ckpt_path.name}")
+
+    # Patch for export
+    patch_model_for_export(FlowMapAutoencoder)
+
+    # Create example inputs (K=1)
     B = torch.export.Dim("batch")
     S_in = model.S_in
     G = getattr(model, "global_dim", getattr(model, "G", 0))
 
-    y  = torch.zeros(2, S_in, dtype=torch.float32)      # [B,S]
-    dt = torch.zeros(2, 1,    dtype=torch.float32)      # [B,1]  (K=1)
-    g  = torch.zeros(2, G,    dtype=torch.float32)      # [B,G]
+    y_example = torch.zeros(2, S_in, dtype=torch.float32)
+    dt_example = torch.zeros(2, 1, dtype=torch.float32)
+    g_example = torch.zeros(2, G, dtype=torch.float32)
 
-    ep = torch.export.export(
-        model, (y, dt, g),
-        dynamic_shapes=({0: B}, {0: B}, {0: B})         # only batch is dynamic
+    # Export
+    exported_program = torch.export.export(
+        model,
+        (y_example, dt_example, g_example),
+        dynamic_shapes=({0: B}, {0: B}, {0: B})
     )
 
+    # Save
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    torch.export.save(ep, OUT)
+    torch.export.save(exported_program, OUT)
     print(f"Exported → {OUT}")
+
 
 if __name__ == "__main__":
     main()

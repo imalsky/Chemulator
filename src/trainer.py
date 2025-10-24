@@ -31,16 +31,12 @@ from typing import Any, Dict, Optional, Tuple, Union, Sequence
 
 import json
 import logging
-import math
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import time
 import math
 import torch
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback
 
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -520,12 +516,41 @@ class AutoEncoderModule(LightningModule):
 
     # ------------------ Optimizer & Schedulers ------------------
 
+    # ------------------ Optimizer & Schedulers ------------------
+
     def configure_optimizers(self):
-        opt = AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-        warm = LinearLR(opt, start_factor=1e-4, end_factor=1.0, total_iters=max(1, self.warmup_epochs))
-        cos = CosineAnnealingLR(opt, T_max=max(1, self.epochs - self.warmup_epochs), eta_min=self.min_lr)
+        # Try CUDA fused AdamW (Hopper: typically +5–15% step-time). Fallback to standard AdamW if unsupported.
+        try:
+            opt = AdamW(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+                fused=True,  # will raise TypeError on older/cu-less builds
+            )
+        except TypeError:
+            opt = AdamW(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+            )
+
+        warm = LinearLR(
+            opt,
+            start_factor=1e-4,
+            end_factor=1.0,
+            total_iters=max(1, self.warmup_epochs),
+        )
+        cos = CosineAnnealingLR(
+            opt,
+            T_max=max(1, self.epochs - self.warmup_epochs),
+            eta_min=self.min_lr,
+        )
         sch = SequentialLR(opt, schedulers=[warm, cos], milestones=[self.warmup_epochs])
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "epoch"}}
+
+        return {
+            "optimizer": opt,
+            "lr_scheduler": {"scheduler": sch, "interval": "epoch"},
+        }
 
     # ------------------ Schedules ------------------
 
@@ -569,8 +594,6 @@ class AutoEncoderModule(LightningModule):
         steps_norm = (torch.log10(steps_phys.clamp_min(tiny)) - log_min) / rng
         return steps_norm.clamp(0.0, 1.0)
 
-    # ---------- ROLLOUT LOSS (UNIFIED) ----------
-
     def _compute_rollout_loss_unified(
             self,
             y_i: torch.Tensor,
@@ -583,7 +606,7 @@ class AutoEncoderModule(LightningModule):
     ) -> Optional[torch.Tensor]:
         """
         Unified rollout loss:
-          - TF == 0: use model.rollout_vectorized (preserves head semantics).
+          - TF == 0: use model.rollout_vectorized (pure latent rollout; gradients ON).
           - TF >  0: teacher forcing loop with FiLM(g) cached once per batch, and
                      correct delta-logit composition in log-probability space.
         Returns a scalar loss or None when horizon < 2.
@@ -596,6 +619,7 @@ class AutoEncoderModule(LightningModule):
         dt_steps_norm = self._offsets_to_steps_norm(dt_offsets[:, :H])
 
         if tf_prob < 1e-8:
+            # NOTE: rollout_vectorized must NOT be under @torch.no_grad() so this stays trainable.
             y_pred = self.model.rollout_vectorized(y_i, g, dt_steps_norm)  # [B,H,S]
             y_tgt = y_j[:, :H, :]
             rmask = mask[:, :H] if mask is not None else None
@@ -604,7 +628,7 @@ class AutoEncoderModule(LightningModule):
             return _masked_mse(y_pred, y_tgt, rmask)
 
         use_film = bool(getattr(self.model, "decoder_condition_on_g", False)) and hasattr(self.model, "film") and (
-                    self.model.film is not None)
+                self.model.film is not None)
         if use_film:
             gb = self.model.film.proj(g)  # [B, 2Z]
             gamma, beta = gb.chunk(2, dim=-1)  # [B,Z], [B,Z]
@@ -628,23 +652,26 @@ class AutoEncoderModule(LightningModule):
 
         for k in range(H):
             if hasattr(self.model, "encode") and hasattr(self.model, "decode"):
-                z = self.model.encode(y_curr, g)                         # [B,Z]
-                z = apply_film(z)                                        # [B,Z]
-                logits = self.model.decode(z, g, return_logits=True)     # [B,S]
-            else:
-                if hasattr(self.model, "encoder") and hasattr(self.model, "dynamics") and hasattr(self.model, "decoder"):
-                    z = self.model.encoder(y_curr, g)
-                    z = self.model.dynamics.step(z, dt_steps_norm[:, k], g)
+                # Preferred path: use wrappers if present
+                z = self.model.encode(y_curr, g)  # [B,Z]
+                z = self.model.dynamics.step(z, dt_steps_norm[:, k], g)  # [B,Z]
+                if use_film:
                     z = apply_film(z)
-                    logits = self.model.decoder(z)
-                else:
-                    logits = self.model.step(y_curr, dt_steps_norm[:, k], g, return_logits=True)
+                logits = self.model.decoder(z)  # [B,S]
+            else:
+                # Raw modules; be tuple-safe with VAE encoders
+                enc_out = self.model.encoder(y_curr, g)
+                z = enc_out[0] if isinstance(enc_out, (tuple, list)) else enc_out  # [B,Z]
+                z = self.model.dynamics.step(z, dt_steps_norm[:, k], g)  # [B,Z]
+                if use_film:
+                    z = apply_film(z)
+                logits = self.model.decoder(z)  # [B,S]
 
             if use_delta:
                 log_q = F.log_softmax(logits, dim=-1).float()
                 combined = cur_logp + log_q
                 log_p = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
-                y_next = self.model._head_from_logprobs(log_p)           # normalized output
+                y_next = self.model._head_from_logprobs(log_p)  # normalized
             else:
                 y_next = self.model._softmax_head_from_logits(logits)
 
@@ -660,7 +687,8 @@ class AutoEncoderModule(LightningModule):
                     y_curr = y_next
 
             if use_delta:
-                base = y_curr if (self.model.S_out == self.model.S_in) else y_curr.index_select(1, self.model.target_idx)
+                base = y_curr if (self.model.S_out == self.model.S_in) else y_curr.index_select(1,
+                                                                                                self.model.target_idx)
                 cur_logp = self.model._denorm_to_logp(base)
 
         y_pred = torch.stack(preds, dim=1)  # [B,H,S]
@@ -704,7 +732,15 @@ class AutoEncoderModule(LightningModule):
     # ------------------ Hooks for gradient diagnostics ------------------
 
     def on_before_optimizer_step(self, optimizer) -> None:
-        """Compute and cache L2 grad norm before the optimizer step."""
+        """Compute & cache L2 grad norm; optionally clip grads manually (works with fused AdamW)."""
+        # ---- manual clipping (safe with fused and non-fused) ----
+        if self.grad_clip is not None and float(self.grad_clip) > 0.0:
+            try:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.grad_clip))
+            except Exception as e:
+                print(f"[WARN] manual grad clip failed: {e}")
+
+        # ---- grad-norm diagnostics ----
         g2 = 0.0
         for p in self.model.parameters():
             if p is not None and p.grad is not None:
@@ -745,12 +781,26 @@ class AutoEncoderModule(LightningModule):
             forward_loss = comp["total"].float()
             self.log("train_mse_norm", comp["mse"].detach(), on_step=False, on_epoch=True, logger=True)
             self.log("train_frac_phys", comp["frac"].detach(), on_step=False, on_epoch=True, logger=True)
-            self.log("train_mse", forward_loss.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log("train", forward_loss.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
         else:
             forward_loss = _masked_mse(pred, y_j, mask).float()
-            self.log("train_mse", forward_loss.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log("train", forward_loss.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
-        total = forward_loss
+        beta_kl = float(self.cfg.get("training", {}).get("beta_kl", 0.0))
+        kl = getattr(self.model, "kl_loss", None)
+        if beta_kl != 0.0 and kl is not None:
+            # Ensure tensor, finite, device/dtype compatible
+            if not torch.is_tensor(kl):
+                kl = torch.as_tensor(kl, device=pred.device, dtype=pred.dtype)
+            if not torch.isfinite(kl):
+                kl = torch.zeros((), device=pred.device, dtype=pred.dtype)
+            self.log("train_kl", kl.detach(), on_step=False, on_epoch=True, logger=True)
+            kl_term = beta_kl * kl
+        else:
+            kl_term = pred.new_zeros(())
+
+        total = forward_loss + kl_term
+        # ----------------------------------------------
 
         if self.rollout_enabled and self.rollout_weight > 0:
             H = self._get_rollout_horizon(self.current_epoch)
@@ -804,7 +854,7 @@ class AutoEncoderModule(LightningModule):
         elif float(loss) > 1e6:
             print(f"[WARN] validation_step: very large MSE={float(loss):.3e} at batch {batch_idx}.")
 
-        self.log("val_mse", loss.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val", loss.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     # --------------------------- External Trainer Wrapper ---------------------------
@@ -831,10 +881,39 @@ class Trainer:
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
     def train(self) -> float:
+        compile_cfg = (self.cfg.get("torch_compile") or {})
+        if bool(compile_cfg.get("enable", False)):
+            backend   = compile_cfg.get("backend", "inductor")
+            mode      = compile_cfg.get("mode", "reduce-overhead")
+            dynamic   = bool(compile_cfg.get("dynamic", False))
+            fullgraph = bool(compile_cfg.get("fullgraph", False))
+            try:
+                self.model = torch.compile(
+                    self.model,
+                    backend=backend,
+                    mode=mode,
+                    dynamic=dynamic,
+                    fullgraph=fullgraph,
+                )
+                try:
+                    self.logger.info(
+                        f"torch.compile enabled: backend={backend}, mode={mode}, "
+                        f"dynamic={dynamic}, fullgraph={fullgraph}"
+                    )
+                except Exception:
+                    print(f"[INFO] torch.compile enabled: backend={backend}, mode={mode}, "
+                          f"dynamic={dynamic}, fullgraph={fullgraph}")
+            except Exception as e:
+                try:
+                    self.logger.warning(f"torch.compile failed; continuing uncompiled: {e}")
+                except Exception:
+                    print(f"[WARN] torch.compile failed; continuing uncompiled: {e}")
+
         module = AutoEncoderModule(self.model, self.cfg, self.work_dir)
 
         lcfg = self.cfg.get("lightning", {})
         tcfg = self.cfg.get("training", {})
+        benchmark = bool(lcfg.get("benchmark", True))
 
         precision = str(lcfg.get("precision", "bf16-mixed"))
         devices = lcfg.get("devices", 1)
@@ -877,7 +956,10 @@ class Trainer:
                 try:
                     callbacks.append(_EMA_CB(decay=decay))  # portable signature
                 except TypeError:
-                    callbacks.append(_EMA_CB(decay=decay))
+                    try:
+                        callbacks.append(_EMA_CB(decay=decay, every_n_steps=1))
+                    except Exception:
+                        print("[WARN] EMA: could not construct callback; skipping.")
             else:
                 print("[WARN] EMA callback not available in this Lightning version; skipping.")
 
@@ -903,10 +985,10 @@ class Trainer:
             num_sanity_val_steps=num_sanity,
             logger=[csv_logger, tb_logger],
             callbacks=callbacks,
-            gradient_clip_val=float(tcfg.get("gradient_clip", 1.0)),
+            gradient_clip_val=0.0,
             gradient_clip_algorithm="norm",
-            benchmark=False,
-            enable_progress_bar=False,  # keep stdout clean; we print our own line
+            benchmark=benchmark,
+            enable_progress_bar=True,
             log_every_n_steps=50,
         )
 

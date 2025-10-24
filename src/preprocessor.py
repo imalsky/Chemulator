@@ -17,6 +17,7 @@ Key Features:
 
 Quality Control:
 - Minimum value thresholds: Drops profiles with any species below min_value
+- This dropping of profiles with small values is intentional to sanitize thdata
 - Time grid validation: Ensures monotonic, consistent time grids per file
 - NaN filtering: Removes trajectories with missing or invalid data
 - Dimension consistency: Validates all species variables are present
@@ -342,7 +343,6 @@ class DataPreprocessor:
         self.methods = dict(load_config_value(norm_cfg, ["methods"], required=True))
         self.epsilon = float(load_config_value(norm_cfg, ["epsilon"], required=True))
         self.min_std = float(load_config_value(norm_cfg, ["min_std"], required=True))
-        self.clamp_value = float(load_config_value(norm_cfg, ["clamp_value"], required=True))
 
         # Preprocessing - with better defaults for fewer shards
         preproc_cfg = self.cfg.get("preprocessing", {})
@@ -1313,7 +1313,6 @@ class DataPreprocessor:
             "normalization_methods": methods,
             "epsilon": self.epsilon,
             "min_std": self.min_std,
-            "clamp_value": self.clamp_value,
             "dt": dt_spec,
             "meta": {
                 "species_variables": list(self.species_vars),
