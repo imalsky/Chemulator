@@ -106,7 +106,7 @@ class Encoder(nn.Module):
         eps = torch.randn_like(std)
         z = mu + eps * std
         # Per-batch KL
-        kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        kl = (-0.5 * (1 + logvar - mu.square() - logvar.exp()).sum(dim=-1)).mean()
         return z, kl
 
 

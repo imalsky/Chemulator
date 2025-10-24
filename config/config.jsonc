@@ -4,7 +4,7 @@
   // ===============================
   "paths": {
     "processed_data_dir": "data/processed",
-    "work_dir": "models/autoencoder_big",
+    "work_dir": "models/autoencoder-v2",
     "raw_data_files": []
   },
   // ===============================
@@ -120,7 +120,7 @@
     "gradient_clip": 0,
 
     // Loss
-    "loss_mode": "mse", //"adaptive_stiff"
+    "loss_mode": "adaptive_stiff", //"adaptive_stiff"
     "loss_rel_cap": 10.0,
     "adaptive_stiff_loss": {
       "lambda_phys": 1.0,

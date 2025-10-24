@@ -116,7 +116,7 @@ class AdaptiveStiffLoss(nn.Module):
         tz = true_norm.float()
 
         # 1) MSE in normalized space (mean over species)
-        mse_bk = (pz - tz).pow(2).mean(dim=-1)  # [... without S]
+        mse_bk = (pz - tz).square().mean(dim=-1)
 
         # 2) Fractional L1 in physical space (sanitized, optionally capped)
         pred_phys = self._norm_helper.denormalize(pz, self.species_keys)  # [..., S]
@@ -205,7 +205,7 @@ def _masked_mse(
     if clip is not None and clip > 0:
         resid = resid.clamp(-clip, clip)
 
-    per_bk = resid.pow(2).mean(dim=-1)  # [B,K]
+    per_bk = resid.square().mean(dim=-1)
 
     if mask is not None:
         m = mask.to(dtype=per_bk.dtype, device=per_bk.device)
@@ -988,8 +988,8 @@ class Trainer:
             gradient_clip_val=0.0,
             gradient_clip_algorithm="norm",
             benchmark=benchmark,
-            enable_progress_bar=True,
-            log_every_n_steps=50,
+            enable_progress_bar=False,
+            log_every_n_steps=9999999999999,
         )
 
         trainer.fit(
