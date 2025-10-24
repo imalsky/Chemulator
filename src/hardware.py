@@ -69,10 +69,6 @@ def optimize_hardware(
     # Configure CPU threading
     _configure_cpu_threading(config, logger)
 
-    # Configure deterministic mode if requested
-    if bool(config.get("deterministic", False)):
-        _enable_deterministic_mode(logger)
-
 def _configure_linalg_backend(config: dict, logger: logging.Logger) -> None:
     """
     Optionally select CUDA linalg backend ('cusolver' or 'magma') to avoid driver/library issues.

@@ -1,524 +1,825 @@
 #!/usr/bin/env python3
 """
-PyTorch Lightning Trainer for Koopman Autoencoder
-==================================================
-Simplified training loop with MSE loss, gradient clipping, and learning rate scheduling.
-Designed for flow-map prediction with optional auxiliary losses.
+Trainer for Stable LPV Koopman Autoencoder
+==========================================
 
-Key Features:
-- MSE loss with optional masking for invalid time steps
-- Teacher forcing with configurable decay schedule
-- Rollout loss for multi-step prediction stability
-- Cosine annealing LR with linear warmup
-- Gradient clipping for training stability
-- PyTorch Lightning integration (checkpointing, logging, early stopping)
-- Batch shape validation with clear error messages
+- Forward loss trains on all Δt offsets each step (covers full Δt support).
+- Unified rollout loss: vectorized when TF=0; cached loop when TF>0.
+- Teacher-forcing schedule (none | linear).
+- Rollout horizon warmup.
+- Cosine LR with linear warmup; AdamW; Lightning gradient clipping.
+- Lightning checkpointing + best model export.
+- Adaptive stiff loss (fractional physical + MSE normalized), device-safe.
+- End-of-epoch one-line summary: epoch, train/val, ||g||, ||p||, lr, TF, H.
 
-Loss Components:
-1. One-step prediction: MSE between predicted and target states
-2. Rollout (optional): Multi-step forward prediction with error accumulation
-3. Teacher forcing: Gradual transition from ground truth to autoregressive
+Config toggles:
+  training.ema         → {"enable": bool, "decay": float}
+  training.swa         → {"enable": bool, "epoch_start": float, "swa_lrs": float|null}
+  training.model_soup  → {"enable": bool, "top_k": int}
 
-Training Schedule:
-- Warmup: Linear LR increase over first N epochs
-- Main: Cosine annealing to min_lr
-- Optional: Early stopping on validation loss
-
-Note: Assumes K > 1 (multiple time predictions per batch).
+Batch format: (y_i, dt_norm_offsets, y_j, g, [aux], [mask])
+    y_i:    [B, S]
+    dt:     [B, K]  (OFFSETS from anchor, normalized)
+    y_j:    [B, K, S]
+    g:      [B, G]
+    mask:   [B, K] or None
 """
-from __future__ import annotations
 
-import logging
-import time
-import math
+from __future__ import annotations
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
-import os
+from typing import Any, Dict, Optional, Tuple, Union, Sequence
+
+import json
+import logging
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import time
+import math
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
+
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
+
+import pytorch_lightning as pl
 from pytorch_lightning import LightningModule, Trainer as LightningTrainer
-from pytorch_lightning.callbacks import (
-    Callback, ModelCheckpoint, LearningRateMonitor, EarlyStopping)
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
+# Try both modern and legacy Lightning callback import paths for EMA/SWA
+try:
+    from lightning.pytorch.callbacks import EMA as _EMA_CB, StochasticWeightAveraging as _SWA_CB  # type: ignore
+except Exception:
+    try:
+        from pytorch_lightning.callbacks import EMA as _EMA_CB, StochasticWeightAveraging as _SWA_CB  # type: ignore
+    except Exception:
+        _EMA_CB = None
+        _SWA_CB = None
 
-# Maximum residual magnitude before clipping (prevents gradient explosion)
+# Cap residuals to prevent exploding gradients on rare bad batches
 MAX_RESIDUAL = 1e4
 
-# --------------------------------------------------------------------------------------
-# Batch Shape Validator
-# --------------------------------------------------------------------------------------
 
-def validate_batch_shape(batch, expected_K: int, expected_S: int, batch_idx: int = 0):
-    """
-    Validate batch has the expected shape. Fail fast with clear error.
+# ------------------------------ Adaptive Stiff Loss -------------------------------
 
-    Expected batch: (y_i, dt_norm, y_j, g, aux, mask)
-    - y_i: [B, S]
-    - dt_norm: [B, K]
-    - y_j: [B, K, S]
-    - g: [B, G]
-    - mask: [B, K] (optional)
+class AdaptiveStiffLoss(nn.Module):
     """
+    total = λ_mse * MSE(z-space) + λ_phys * mean(|Δ| / (|true| + eps_phys))
+
+    - Computes normalized MSE and a fractional L1 in physical space.
+    - Reductions in float32 (bf16/half safe).
+    - Sanitizes NaN/Inf; optional relative cap.
+    - Mask may be [B,K] and is normalized by sum(mask).
+    """
+    def __init__(
+        self,
+        manifest: dict,
+        species_keys: Sequence[str],
+        lambda_phys: float = 1.0,
+        lambda_mse: float = 0.1,
+        epsilon_phys: float = 1e-20,
+        rel_cap: Optional[float] = None,
+        device=None,
+    ):
+        super().__init__()
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        self.species_keys = list(species_keys)
+        self.lambda_phys = float(lambda_phys)
+        self.lambda_mse = float(lambda_mse)
+        self.eps_phys = float(epsilon_phys)
+        self.rel_cap = float(rel_cap) if (rel_cap is not None and rel_cap > 0) else None
+        self.manifest = manifest
+
+        # Construct helper now on current device; enforce device-match in forward()
+        from normalizer import NormalizationHelper
+        self._norm_helper = NormalizationHelper(self.manifest, device=self.device)
+
+    def forward(
+        self,
+        pred_norm: torch.Tensor,               # [..., S]
+        true_norm: torch.Tensor,               # [..., S]
+        mask: Optional[torch.Tensor] = None,   # [B,K] or None
+        return_components: bool = False,
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        dev = pred_norm.device
+        # Ensure helper resides on the current compute device
+        if getattr(self._norm_helper, "device", None) != dev:
+            try:
+                self._norm_helper = self._norm_helper.to(dev)  # if helper supports .to()
+            except Exception:
+                from normalizer import NormalizationHelper
+                self._norm_helper = NormalizationHelper(self.manifest, device=dev)
+
+        # bf16/half-safe reductions
+        pz = pred_norm.float()
+        tz = true_norm.float()
+
+        # 1) MSE in normalized space (mean over species)
+        mse_bk = (pz - tz).pow(2).mean(dim=-1)  # [... without S]
+
+        # 2) Fractional L1 in physical space (sanitized, optionally capped)
+        pred_phys = self._norm_helper.denormalize(pz, self.species_keys)  # [..., S]
+        true_phys = self._norm_helper.denormalize(tz, self.species_keys)  # [..., S]
+        frac = (pred_phys - true_phys).abs() / (true_phys.abs() + self.eps_phys)
+        frac = torch.nan_to_num(frac, nan=0.0, posinf=1e6, neginf=0.0)
+        if self.rel_cap is not None:
+            frac = frac.clamp_max(self.rel_cap)
+        frac_bk = frac.mean(dim=-1)  # [... without S]
+
+        # Masking & reduction
+        if mask is not None and mask.ndim == mse_bk.ndim:
+            m = mask.to(dtype=mse_bk.dtype, device=mse_bk.device)
+            denom = m.sum().clamp_min(1.0)
+            mse_scalar = (mse_bk * m).sum() / denom
+            frac_scalar = (frac_bk * m).sum() / denom
+        else:
+            mse_scalar = mse_bk.mean()
+            frac_scalar = frac_bk.mean()
+
+        mse_component = self.lambda_mse * mse_scalar
+        frac_component = self.lambda_phys * frac_scalar
+        total = mse_component + frac_component
+
+        if return_components:
+            return {"total": total, "mse": mse_scalar.detach(), "frac": frac_scalar.detach()}
+        return total
+
+
+# --------------------------- Utilities ---------------------------
+
+def _validate_batch(batch, batch_idx: int = 0) -> Tuple[int, int, int]:
     if len(batch) < 4:
-        raise RuntimeError(f"Batch has {len(batch)} items, expected at least 4")
+        raise RuntimeError(f"Batch has {len(batch)} items, expected at least 4 (y_i, dt, y_j, g, [aux], [mask])")
+    y_i, dt, y_j, g = batch[:4]
+    if not (isinstance(y_i, torch.Tensor) and isinstance(dt, torch.Tensor)
+            and isinstance(y_j, torch.Tensor) and isinstance(g, torch.Tensor)):
+        raise RuntimeError("Batch must contain tensors for y_i, dt, y_j, g")
 
-    y_i, dt_norm, y_j, g = batch[:4]
-
-    # Check y_i shape [B, S]
     if y_i.ndim != 2:
-        raise RuntimeError(f"y_i must be [B, S], got shape {tuple(y_i.shape)}")
-    B, S = y_i.shape
-    if S != expected_S:
-        raise RuntimeError(f"y_i has S={S}, expected S={expected_S}")
-
-    # Check dt_norm shape [B, K]
-    if dt_norm.ndim != 2:
-        raise RuntimeError(f"dt_norm must be [B, K], got shape {tuple(dt_norm.shape)}")
-    if dt_norm.shape[0] != B:
-        raise RuntimeError(f"dt_norm batch mismatch: {dt_norm.shape[0]} vs {B}")
-    K = dt_norm.shape[1]
-    if K != expected_K:
-        raise RuntimeError(f"dt_norm has K={K}, expected K={expected_K}")
-
-    # Check y_j shape [B, K, S]
+        raise RuntimeError(f"y_i must be [B,S], got {tuple(y_i.shape)}")
+    if dt.ndim != 2:
+        raise RuntimeError(f"dt_norm must be [B,K], got {tuple(dt.shape)}")
     if y_j.ndim != 3:
-        raise RuntimeError(f"y_j must be [B, K, S], got shape {tuple(y_j.shape)}")
-    if y_j.shape != (B, K, S):
-        raise RuntimeError(f"y_j shape {tuple(y_j.shape)} doesn't match [B={B}, K={K}, S={S}]")
-
-    # Check g shape [B, G]
+        raise RuntimeError(f"y_j must be [B,K,S], got {tuple(y_j.shape)}")
     if g.ndim != 2:
-        raise RuntimeError(f"g must be [B, G], got shape {tuple(g.shape)}")
-    if g.shape[0] != B:
-        raise RuntimeError(f"g batch mismatch: {g.shape[0]} vs {B}")
+        raise RuntimeError(f"g must be [B,G], got {tuple(g.shape)}")
 
-    # Check mask if present (should be [B, K])
+    B, S = y_i.shape
+    Bdt, K = dt.shape
+    By, Ky, Sy = y_j.shape
+    Bg, _ = g.shape
+
+    if not (B == Bdt == By == Bg):
+        raise RuntimeError(f"Batch size mismatch in batch {batch_idx}: y_i={B}, dt={Bdt}, y_j={By}, g={Bg}")
+    if not (K == Ky):
+        raise RuntimeError(f"K mismatch in batch {batch_idx}: dt={K}, y_j={Ky}")
+    if not (S == Sy):
+        raise RuntimeError(f"S mismatch in batch {batch_idx}: y_i={S}, y_j={Sy}")
+
     if len(batch) >= 6:
         mask = batch[5]
         if mask is not None:
-            if not isinstance(mask, torch.Tensor):
-                raise RuntimeError(f"mask must be a tensor, got {type(mask)}")
-            if mask.shape != (B, K):
-                raise RuntimeError(f"mask shape {tuple(mask.shape)} doesn't match [B={B}, K={K}]")
+            if not isinstance(mask, torch.Tensor) or mask.shape != (B, K):
+                raise RuntimeError(f"mask must be [B,K]; got {None if mask is None else tuple(mask.shape)}")
+
+    return B, K, S
 
 
-# --------------------------------------------------------------------------------------
-# Simple MSE Loss with Mask
-# --------------------------------------------------------------------------------------
+def _masked_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    clip: float = MAX_RESIDUAL,
+    warn_threshold: float = 1e6,
+) -> torch.Tensor:
+    """Robust MSE in normalized space; float32 reductions; supports [B,K] mask."""
+    pred32 = pred.float()
+    target32 = target.float()
 
-def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-    """
-    Robust L2 via Huber (SmoothL1) with optional [B,K] mask.
-    pred, target: [B, K, S]
-    mask: [B, K] or None
-    """
-    # Per-(B,K) mean over species
-    per_bk = F.smooth_l1_loss(pred, target, beta=1.0, reduction="none").mean(dim=-1)  # [B, K]
+    resid = pred32 - target32
+    if not torch.isfinite(resid).all():
+        print("[WARN] _masked_mse: non-finite residuals detected; replacing with zeros.")
+        resid = torch.nan_to_num(resid, nan=0.0, posinf=clip, neginf=-clip)
+
+    if clip is not None and clip > 0:
+        resid = resid.clamp(-clip, clip)
+
+    per_bk = resid.pow(2).mean(dim=-1)  # [B,K]
+
     if mask is not None:
-        m = mask.float()
-        return (per_bk * m).sum() / m.sum().clamp_min(1.0)
-    return per_bk.mean()
+        m = mask.to(dtype=per_bk.dtype, device=per_bk.device)
+        denom = m.sum().clamp_min(1.0)
+        loss = (per_bk * m).sum() / denom
+    else:
+        loss = per_bk.mean()
+
+    if torch.isfinite(loss) and float(loss) > warn_threshold:
+        print(f"[WARN] _masked_mse: unusually large MSE={float(loss):.3e}.")
+    return loss
 
 
-# --------------------------------------------------------------------------------------
-# Callbacks
-# --------------------------------------------------------------------------------------
+# --------------------------- Callbacks ---------------------------
 
 class EpochSetterCallback(Callback):
-    """Log TF/horizon and reseed datasets each epoch."""
-
-    def on_train_epoch_start(self, trainer, pl_module):
+    """Log TF prob and rollout horizon at start of each epoch."""
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: "AutoEncoderModule") -> None:
         epoch = trainer.current_epoch
-
-        # Existing logging
         tf_p = pl_module._get_teacher_forcing_prob(epoch)
         H = pl_module._get_rollout_horizon(epoch)
-        pl_module.log("tf_prob", tf_p, on_epoch=True, prog_bar=False)
+        pl_module.log("tf_prob", float(tf_p), on_epoch=True, prog_bar=False)
         pl_module.log("rollout_horizon", float(H), on_epoch=True, prog_bar=False)
 
-        maybe_loaders = []
-        if getattr(trainer, "train_dataloader", None) is not None:
-            maybe_loaders.append(trainer.train_dataloader)
-        if getattr(trainer, "val_dataloaders", None) is not None:
-            maybe_loaders.append(trainer.val_dataloaders)
 
-        for dl in maybe_loaders:
-            if dl is None:
-                continue
-            dls = dl if isinstance(dl, (list, tuple)) else [dl]
-            for _dl in dls:
-                ds = getattr(_dl, "dataset", None)
-                if hasattr(ds, "set_epoch"):
-                    ds.set_epoch(epoch)
+class EpochSummaryLineCallback(Callback):
+    """
+    One-line, aligned epoch summary with timer.
 
-class SimpleStatsCallback(Callback):
-    """Log basic epoch stats."""
-
-    def __init__(self, py_logger: Optional[logging.Logger] = None):
+    Columns:
+      EPOCH | train | val | ||g|| | ||p|| | lr | tf | H | time
+    - Prints once per epoch (after val if present, else after train).
+    - Uses scientific notation and fixed widths for stable alignment.
+    - Shows elapsed epoch time as mm:ss or h:mm:ss.
+    """
+    def __init__(self):
         super().__init__()
-        self.py_logger = py_logger or logging.getLogger("trainer")
-        self._epoch_start_time = None
+        self._header_printed = False
+        self._printed_epoch = -1
+        self._t0 = None  # epoch start time
 
-    def on_train_epoch_start(self, trainer, pl_module):
-        self._epoch_start_time = time.time()
+        # Fixed column widths for aligned output
+        self._w_num  = 10  # train/val/||g||/||p||/lr widths
+        self._w_tf   = 5
+        self._w_H    = 3
+        self._w_time = 8   # supports h:mm:ss
 
-    def on_train_epoch_end(self, trainer, pl_module):
-        elapsed = time.time() - (self._epoch_start_time or time.time())
+    # ---------------- internal helpers ----------------
 
-        cm = trainer.callback_metrics
-        train_loss = float(cm.get("train_loss", float("nan")))
-        val_loss = float(cm.get("val_loss", float("nan")))
+    def _fmt_secs(self, seconds: float) -> str:
+        if seconds is None or seconds < 0:
+            return "--:--"
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        return f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
 
+    def _maybe_print_header(self):
+        if self._header_printed:
+            return
+        # Header line (short but informative)
+        # train/val are total losses; ||g||, ||p|| are L2 norms; lr is group 0 LR
+        hdr = (
+            "EPOCH | "
+            f"{'train':>{self._w_num}} | "
+            f"{'val':>{self._w_num}} | "
+            f"{'||g||':>{self._w_num}} | "
+            f"{'||p||':>{self._w_num}} | "
+            f"{'lr':>{self._w_num}} | "
+            f"{'tf':>{self._w_tf}} | "
+            f"{'H':>{self._w_H}} | "
+            f"{'time':>{self._w_time}}"
+        )
+        sep = (
+            "----- | "
+            + " | ".join([
+                "-" * self._w_num,  # train
+                "-" * self._w_num,  # val
+                "-" * self._w_num,  # ||g||
+                "-" * self._w_num,  # ||p||
+                "-" * self._w_num,  # lr
+                "-" * self._w_tf,   # tf
+                "-" * self._w_H,    # H
+                "-" * self._w_time  # time
+            ])
+        )
+        print(hdr, flush=True)
+        print(sep, flush=True)
+        self._header_printed = True
+
+    def _emit(self, trainer: pl.Trainer, pl_module: "AutoEncoderModule", elapsed_s: float) -> None:
+        if trainer.sanity_checking:
+            return
+
+        self._maybe_print_header()
+
+        epoch = trainer.current_epoch
+        m = trainer.callback_metrics
+
+        def _getf(key: str) -> float:
+            if key not in m:
+                return float("nan")
+            v = m[key]
+            if torch.is_tensor(v):
+                v = v.detach().float().cpu().item()
+            return float(v)
+
+        # Prefer train_total; fall back to train_mse; then module cache
+        train_v = _getf("train_total")
+        if math.isnan(train_v):
+            train_v = _getf("train_mse")
+        if math.isnan(train_v):
+            train_v = float(getattr(pl_module, "_last_train_metric", float("nan")))
+
+        val_v   = _getf("val_mse")
+        tf_prob = pl_module._get_teacher_forcing_prob(epoch)
+        H       = pl_module._get_rollout_horizon(epoch)
+
+        # LR (group 0)
         try:
             lr = float(trainer.optimizers[0].param_groups[0]["lr"])
-        except:
+        except Exception:
             lr = float("nan")
 
-        self.py_logger.info(
-            f"Epoch {trainer.current_epoch:3d} | "
-            f"train={train_loss:.3e} val={val_loss:.3e} | "
-            f"lr={lr:.2e} | "
-            f"time={elapsed:.1f}s"
+        # Norms
+        with torch.no_grad():
+            p2 = 0.0
+            for p in pl_module.model.parameters():
+                if p is None:
+                    continue
+                ps = p.detach().float().pow(2).sum()
+                if torch.isfinite(ps):
+                    p2 += float(ps.item())
+            param_norm = math.sqrt(p2)
+
+        grad_norm = float(getattr(pl_module, "_last_grad_norm", float("nan")))
+        tstr = self._fmt_secs(elapsed_s)
+
+        line = (
+            f"E{epoch:04d} | "
+            f"{train_v:>{self._w_num}.3e} | "
+            f"{val_v:>{self._w_num}.3e} | "
+            f"{grad_norm:>{self._w_num}.3e} | "
+            f"{param_norm:>{self._w_num}.3e} | "
+            f"{lr:>{self._w_num}.3e} | "
+            f"{tf_prob:>{self._w_tf}.3f} | "
+            f"{H:>{self._w_H}d} | "
+            f"{tstr:>{self._w_time}}"
         )
+        print(line, flush=True)
+
+    # ---------------- Lightning hooks ----------------
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: "AutoEncoderModule") -> None:
+        # Start timer for this epoch
+        self._t0 = time.perf_counter()
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: "AutoEncoderModule") -> None:
+        # If there's NO validation, emit here; else let validation hook print
+        nval = 0
+        try:
+            nval = int(trainer.num_val_batches)
+        except Exception:
+            try:
+                nval = sum(int(x) for x in trainer.num_val_batches)
+            except Exception:
+                nval = 0
+        if nval == 0:
+            elapsed = (time.perf_counter() - self._t0) if self._t0 is not None else float("nan")
+            self._emit(trainer, pl_module, elapsed)
+            self._printed_epoch = trainer.current_epoch
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: "AutoEncoderModule") -> None:
+        # Print after validation (train metrics exist by now). Avoid double print.
+        if self._printed_epoch == trainer.current_epoch:
+            return
+        elapsed = (time.perf_counter() - self._t0) if self._t0 is not None else float("nan")
+        self._emit(trainer, pl_module, elapsed)
+        self._printed_epoch = trainer.current_epoch
 
 
-# --------------------------------------------------------------------------------------
-# Lightning Module
-# --------------------------------------------------------------------------------------
+# --------------------------- Lightning Module ---------------------------
 
 class AutoEncoderModule(LightningModule):
-    """Simplified Lightning wrapper - MSE only, simple shape validation."""
-
     def __init__(self, model: nn.Module, cfg: Dict[str, Any], work_dir: Union[str, Path]):
         super().__init__()
-        self.save_hyperparameters(ignore=['model'])
+        self.save_hyperparameters(ignore=["model"])
         self.model = model
         self.cfg = cfg
         self.work_dir = Path(work_dir)
-        self.py_logger = logging.getLogger(__name__)
 
-        # Get values directly from config
-        tcfg = cfg["training"]
-        self.learning_rate = float(tcfg["lr"])
-        self.min_lr = float(tcfg["min_lr"])
-        self.weight_decay = float(tcfg["weight_decay"])
-        self.grad_clip = float(tcfg["gradient_clip"])
-        self.epochs = int(tcfg["epochs"])
-        self.warmup_epochs = int(tcfg["warmup_epochs"])
+        # Training config
+        tcfg = cfg.get("training", {})
+        aux = tcfg.get("auxiliary_losses", {})
 
-        # Expected shapes from config
-        dcfg = cfg["dataset"]
-        self.expected_K = int(dcfg["times_per_anchor"])
-        self.expected_S = len(cfg["data"]["species_variables"])
+        self.learning_rate = float(tcfg.get("lr", 1e-3))
+        self.min_lr = float(tcfg.get("min_lr", 1e-6))
+        self.weight_decay = float(tcfg.get("weight_decay", 0.0))
+        self.grad_clip = float(tcfg.get("gradient_clip", 1.0))
+        self.epochs = int(tcfg.get("epochs", 100))
+        self.warmup_epochs = int(tcfg.get("warmup_epochs", 10))
 
-        if self.expected_K <= 1:
-            raise ValueError("This trainer assumes K > 1 (times_per_anchor > 1)")
-        if self.expected_S <= 1:
-            raise ValueError("This trainer assumes S > 1 (multiple species)")
+        # Rollout controls
+        self.rollout_enabled = bool(aux.get("rollout_enabled", False))
+        # NOTE: rollout_weight acts as a multiplier applied progressively with warmup
+        self.rollout_weight = float(aux.get("rollout_weight", 0.0))
+        self.max_rollout_horizon = int(aux.get("rollout_horizon", 4))
+        self.rollout_warmup_epochs = int(aux.get("rollout_warmup_epochs", 30))
 
-        # Auxiliary losses
-        aux = tcfg["auxiliary_losses"]
-        self.rollout_enabled = bool(aux["rollout_enabled"])
-        self.rollout_weight = float(aux["rollout_weight"])
-        self.max_rollout_horizon = int(aux["rollout_horizon"])
-        self.rollout_use_cached = bool(aux["rollout_use_cached_encoding"])
-        self.rollout_warmup_epochs = int(aux["rollout_warmup_epochs"])
+        # Teacher forcing schedule
+        tf_cfg = aux.get("rollout_teacher_forcing", {})
+        self.tf_mode = str(tf_cfg.get("mode", "none")).lower()  # "none" | "linear"
+        self.tf_start_p = float(tf_cfg.get("start_p", 0.0))
+        self.tf_end_p = float(tf_cfg.get("end_p", 0.0))
+        self.tf_end_epoch = int(tf_cfg.get("end_epoch", 0))
 
-        self.semigroup_enabled = bool(aux["semigroup_enabled"])
-        self.semigroup_weight = float(aux["semigroup_weight"])
-        self.semigroup_warmup_epochs = int(aux["semigroup_warmup_epochs"])
+        # Optional semigroup (off by default)
+        sg = aux.get("semigroup", {})
+        self.semigroup_enabled = bool(sg.get("enabled", False))
+        self.semigroup_weight = float(sg.get("weight", 0.0))
+        self.semigroup_warmup_epochs = int(sg.get("warmup_epochs", 0))
 
-        # Teacher forcing
-        tf_cfg = aux["rollout_teacher_forcing"]
-        self.tf_mode = str(tf_cfg["mode"])
-        self.tf_start = float(tf_cfg["start_p"])
-        self.tf_end = float(tf_cfg["end_p"])
-        self.tf_end_epoch = int(tf_cfg["end_epoch"])
+        # Loss (reverted to file-based manifest)
+        self._setup_adaptive_stiff_loss()
+
+        # Grad-norm cache for summary
+        self._last_grad_norm: float = float("nan")
+        self._last_train_metric: float = float("nan")
+
+    # ---------- manifest + loss setup (file-based) ----------
+
+    def _setup_adaptive_stiff_loss(self) -> None:
+        """Load manifest from processed folder; build AdaptiveStiffLoss."""
+        tcfg = self.cfg.get("training", {})
+        loss_mode = tcfg.get("loss_mode", "adaptive_stiff")
+        if loss_mode != "adaptive_stiff":
+            self.criterion = None
+            self.use_adaptive_stiff = False
+            return
+
+        paths = self.cfg.get("paths", {})
+        try:
+            processed_dir = Path(paths["processed_data_dir"]).expanduser().resolve()
+        except Exception as e:
+            raise RuntimeError("cfg['paths']['processed_data_dir'] is missing or invalid") from e
+
+        norm_path = processed_dir / "normalization.json"
+        if not norm_path.exists():
+            raise FileNotFoundError(
+                f"normalization.json not found at: {norm_path}. "
+                "Run preprocessing or point cfg.paths.processed_data_dir at a valid folder."
+            )
+        with open(norm_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        need_dt = bool(self.cfg.get("dataset", {}).get("require_dt_stats", False))
+        dt = manifest.get("dt", None)
+        has_dt = (isinstance(dt, dict) and ("log_min" in dt) and ("log_max" in dt))
+        if not has_dt:
+            msg = ("normalization.json is missing a valid 'dt' block "
+                   "(expects keys: log_min, log_max).")
+            if need_dt:
+                raise ValueError(msg)
+            else:
+                print(f"[WARN] {msg} Proceeding without dt because require_dt_stats=False.")
+
+        data_cfg = self.cfg.get("data", {})
+        species_keys = (data_cfg.get("target_species")
+                        or manifest.get("meta", {}).get("target_species")
+                        or manifest.get("meta", {}).get("species_variables"))
+        if not species_keys:
+            raise ValueError(
+                "Could not determine species_keys. "
+                "Set cfg.data.target_species or ensure manifest.meta.species_variables exists."
+            )
+        species_keys = list(species_keys)
+
+        pks = set((manifest.get("per_key_stats") or {}).keys())
+        missing = [k for k in species_keys if k not in pks]
+        if missing:
+            raise RuntimeError(
+                "Some species in target list are missing from manifest.per_key_stats: "
+                + ", ".join(missing)
+            )
+
+        loss_cfg = tcfg.get("adaptive_stiff_loss", {})
+        rel_cap = loss_cfg.get("rel_cap", tcfg.get("loss_rel_cap", None))
+
+        self.criterion = AdaptiveStiffLoss(
+            manifest=manifest,
+            species_keys=species_keys,
+            lambda_phys=float(loss_cfg.get("lambda_phys", 1.0)),
+            lambda_mse=float(loss_cfg.get("lambda_mse", 0.1)),
+            epsilon_phys=float(loss_cfg.get("epsilon_phys", 1e-20)),
+            rel_cap=(float(rel_cap) if rel_cap is not None else None),
+            device=self.device,
+        )
+        self.use_adaptive_stiff = True
+
+        print(
+            "Using AdaptiveStiffLoss (from file): "
+            f"lambda_phys={loss_cfg.get('lambda_phys', 1.0)}, "
+            f"lambda_mse={loss_cfg.get('lambda_mse', 0.1)}, "
+            f"epsilon_phys={loss_cfg.get('epsilon_phys', 1e-20)}, "
+            f"rel_cap={rel_cap}, "
+            f"dt_present={has_dt}"
+        )
+
+    # ------------------ Optimizer & Schedulers ------------------
 
     def configure_optimizers(self):
         opt = AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        warm = LinearLR(opt, start_factor=1e-4, end_factor=1.0, total_iters=max(1, self.warmup_epochs))
+        cos = CosineAnnealingLR(opt, T_max=max(1, self.epochs - self.warmup_epochs), eta_min=self.min_lr)
+        sch = SequentialLR(opt, schedulers=[warm, cos], milestones=[self.warmup_epochs])
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "epoch"}}
 
-        if self.warmup_epochs > 0:
-            warm = LinearLR(opt, start_factor=0.01, total_iters=self.warmup_epochs)
-            cos = CosineAnnealingLR(opt, T_max=max(self.epochs - self.warmup_epochs, 1), eta_min=self.min_lr)
-            sched = SequentialLR(opt, schedulers=[warm, cos], milestones=[self.warmup_epochs])
-        else:
-            sched = CosineAnnealingLR(opt, T_max=self.epochs, eta_min=self.min_lr)
-
-        return {
-            "optimizer": opt,
-            "lr_scheduler": {
-                "scheduler": sched,
-                "interval": "epoch",
-                "frequency": 1,
-                "name": "learning_rate"
-            }
-        }
+    # ------------------ Schedules ------------------
 
     def _get_teacher_forcing_prob(self, epoch: int) -> float:
         if self.tf_mode == "none":
             return 0.0
-        if self.tf_mode == "constant":
-            return self.tf_start
-        if epoch >= self.tf_end_epoch:
-            return self.tf_end
-        t = epoch / max(1, self.tf_end_epoch)
         if self.tf_mode == "linear":
-            return self.tf_start + (self.tf_end - self.tf_start) * t
-        else:  # cosine_ramp
-            return self.tf_end + 0.5 * (self.tf_start - self.tf_end) * (1 + math.cos(math.pi * t))
+            if epoch >= self.tf_end_epoch:
+                return self.tf_end_p
+            t = max(0.0, min(1.0, epoch / max(1, self.tf_end_epoch)))
+            return float((1 - t) * self.tf_start_p + t * self.tf_end_p)
+        return 0.0
 
     def _get_rollout_horizon(self, epoch: int) -> int:
         if self.max_rollout_horizon <= 1:
             return 1
-        t = min(max(epoch, 0), self.tf_end_epoch) / max(1, self.tf_end_epoch)
-        H = 1 + int(round((self.max_rollout_horizon - 1) * t))
-        return max(1, min(self.max_rollout_horizon, H))
+        ramp = max(1, self.rollout_warmup_epochs)
+        frac = max(0.0, min(1.0, epoch / ramp))
+        return int(max(1, round(frac * self.max_rollout_horizon)))
 
-    def training_step(self, batch, batch_idx):
-        # Validate batch shape on first batch of each epoch
-        if batch_idx == 0:
-            validate_batch_shape(batch, self.expected_K, self.expected_S, batch_idx)
+    # ---------- OFFSETS->STEP SIZES (normalized, via physical space) ----------
 
-        # Unpack batch (validated shape)
-        y_i, dt, y_j, g = batch[:4]
-        mask = batch[5] if len(batch) >= 6 else None
+    def _offsets_to_steps_norm(self, dt_norm_offsets: torch.Tensor) -> torch.Tensor:
+        """
+        Convert normalized offsets (from anchor) → normalized per-step increments.
+        Converts in physical space; then re-normalizes increments.
+        """
+        d = getattr(self.model, "dynamics", None)
+        if d is None or not hasattr(d, "dt_log_min") or not hasattr(d, "dt_log_max"):
+            x = dt_norm_offsets
+            return torch.diff(torch.cat([torch.zeros_like(x[:, :1]), x], dim=1), dim=1).clamp(0.0, 1.0)
 
-        # Forward
-        pred = self.model(y_i, dt, g)
+        log_min = float(getattr(d, "dt_log_min").item() if torch.is_tensor(d.dt_log_min) else d.dt_log_min)
+        log_max = float(getattr(d, "dt_log_max").item() if torch.is_tensor(d.dt_log_max) else d.dt_log_max)
+        rng = max(1e-12, (log_max - log_min))
+        ln10 = math.log(10.0)
 
-        # MSE loss
-        mse = masked_mse_loss(pred, y_j, mask)
-        total = mse
-        self.log("train_mse", mse, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        dt_offs_phys = torch.exp((log_min + dt_norm_offsets.clamp(0.0, 1.0) * rng) * ln10)  # [B,K]
+        steps_phys = torch.cat([dt_offs_phys[:, :1], dt_offs_phys[:, 1:] - dt_offs_phys[:, :-1]], dim=1)
+        tiny = torch.finfo(steps_phys.dtype).tiny
+        steps_norm = (torch.log10(steps_phys.clamp_min(tiny)) - log_min) / rng
+        return steps_norm.clamp(0.0, 1.0)
 
-        # Rollout loss
-        if self.rollout_enabled and self.rollout_weight > 0:
-            H = self._get_rollout_horizon(self.current_epoch)
-            tf_p = self._get_teacher_forcing_prob(self.current_epoch)
-            rollout_warm = min(1.0, self.current_epoch / max(1, self.rollout_warmup_epochs))
-            effective_rollout_w = self.rollout_weight * rollout_warm
+    # ---------- ROLLOUT LOSS (UNIFIED) ----------
 
-            if effective_rollout_w > 1e-8:
-                if self.rollout_use_cached:
-                    rollout_loss = self._compute_rollout_loss_cached(y_i, g, y_j, dt, mask, H, tf_p)
+    def _compute_rollout_loss_unified(
+            self,
+            y_i: torch.Tensor,
+            g: torch.Tensor,
+            y_j: torch.Tensor,
+            dt_offsets: torch.Tensor,
+            mask: Optional[torch.Tensor],
+            H: int,
+            tf_prob: float,
+    ) -> Optional[torch.Tensor]:
+        """
+        Unified rollout loss:
+          - TF == 0: use model.rollout_vectorized (preserves head semantics).
+          - TF >  0: teacher forcing loop with FiLM(g) cached once per batch, and
+                     correct delta-logit composition in log-probability space.
+        Returns a scalar loss or None when horizon < 2.
+        """
+        B, K_avail, _ = y_j.shape
+        H = min(H, K_avail)
+        if H < 2:
+            return None
+
+        dt_steps_norm = self._offsets_to_steps_norm(dt_offsets[:, :H])
+
+        if tf_prob < 1e-8:
+            y_pred = self.model.rollout_vectorized(y_i, g, dt_steps_norm)  # [B,H,S]
+            y_tgt = y_j[:, :H, :]
+            rmask = mask[:, :H] if mask is not None else None
+            if self.use_adaptive_stiff and self.criterion is not None:
+                return self.criterion(y_pred, y_tgt, rmask, return_components=False)
+            return _masked_mse(y_pred, y_tgt, rmask)
+
+        use_film = bool(getattr(self.model, "decoder_condition_on_g", False)) and hasattr(self.model, "film") and (
+                    self.model.film is not None)
+        if use_film:
+            gb = self.model.film.proj(g)  # [B, 2Z]
+            gamma, beta = gb.chunk(2, dim=-1)  # [B,Z], [B,Z]
+            alpha = float(self.model.film.alpha)
+
+            def apply_film(z_lat: torch.Tensor) -> torch.Tensor:
+                return (1.0 + alpha * torch.tanh(gamma)) * z_lat + beta
+        else:
+            def apply_film(z_lat: torch.Tensor) -> torch.Tensor:
+                return z_lat
+
+        preds = []
+        y_curr = y_i
+
+        use_delta = bool(getattr(self.model, "predict_logit_delta", False))
+        if use_delta:
+            base = y_curr if (self.model.S_out == self.model.S_in) else y_curr.index_select(1, self.model.target_idx)
+            cur_logp = self.model._denorm_to_logp(base)  # [B,S_out]
+        else:
+            cur_logp = None
+
+        for k in range(H):
+            if hasattr(self.model, "encode") and hasattr(self.model, "decode"):
+                z = self.model.encode(y_curr, g)                         # [B,Z]
+                z = apply_film(z)                                        # [B,Z]
+                logits = self.model.decode(z, g, return_logits=True)     # [B,S]
+            else:
+                if hasattr(self.model, "encoder") and hasattr(self.model, "dynamics") and hasattr(self.model, "decoder"):
+                    z = self.model.encoder(y_curr, g)
+                    z = self.model.dynamics.step(z, dt_steps_norm[:, k], g)
+                    z = apply_film(z)
+                    logits = self.model.decoder(z)
                 else:
-                    rollout_loss = self._compute_rollout_loss(y_i, g, y_j, dt, mask, H, tf_p)
+                    logits = self.model.step(y_curr, dt_steps_norm[:, k], g, return_logits=True)
 
-                if rollout_loss is not None and torch.isfinite(rollout_loss):
-                    total = total + effective_rollout_w * rollout_loss
-                    self.log("rollout_loss", rollout_loss, on_step=False, on_epoch=True, logger=True)
-
-        # Semigroup loss
-        if self.semigroup_enabled and self.semigroup_weight > 0:
-            sg_warm = min(1.0, self.current_epoch / max(1, self.semigroup_warmup_epochs))
-            effective_sg_w = self.semigroup_weight * sg_warm
-            if effective_sg_w > 1e-8:
-                sgl = self._compute_semigroup_loss(y_i, g)
-                if sgl is not None and torch.isfinite(sgl):
-                    total = total + effective_sg_w * sgl
-                    self.log("semigroup_loss", sgl, on_step=False, on_epoch=True, logger=True)
-
-        if not torch.isfinite(total):
-            raise RuntimeError(f"Non-finite loss at epoch {self.current_epoch}, batch {batch_idx}")
-
-        self.log("train_loss", total, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        return total
-
-    def _compute_rollout_loss(
-            self,
-            y_i: torch.Tensor,
-            g: torch.Tensor,
-            y_j: torch.Tensor,
-            dt_norm: torch.Tensor,
-            mask: Optional[torch.Tensor],
-            horizon: int,
-            tf_prob: float
-    ) -> Optional[torch.Tensor]:
-        """Autoregressive rollout loss with teacher forcing."""
-        if horizon <= 0:
-            return None
-
-        B, K = dt_norm.shape
-        S = y_i.shape[-1]
-        H = min(K, max(1, horizon))
-
-        y_curr = y_i
-        losses = []
-
-        for t in range(H):
-            # One-step prediction
-            y_pred = self.model.step(y_curr, dt_norm[:, t], g)
-            y_true = y_j[:, t]
-
-            # Mask for this timestep
-            step_mask = mask[:, t] if mask is not None else None
-
-            # Loss
-            residual = y_pred - y_true
-            residual = residual.clamp(-MAX_RESIDUAL, MAX_RESIDUAL)
-            loss = residual.pow(2).mean(dim=-1)  # [B]
-
-            if step_mask is not None:
-                loss = (loss * step_mask.float()).sum() / step_mask.float().sum().clamp_min(1.0)
+            if use_delta:
+                log_q = F.log_softmax(logits, dim=-1).float()
+                combined = cur_logp + log_q
+                log_p = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
+                y_next = self.model._head_from_logprobs(log_p)           # normalized output
             else:
-                loss = loss.mean()
+                y_next = self.model._softmax_head_from_logits(logits)
 
-            losses.append(loss)
+            preds.append(y_next)
 
-            # Teacher forcing
-            if t < H - 1:
-                use_tf = (torch.rand(B, device=self.device) < tf_prob).float().unsqueeze(-1)
-                if step_mask is not None:
-                    use_tf = use_tf * step_mask.float().unsqueeze(-1)
-                y_curr = use_tf * y_true.detach() + (1.0 - use_tf) * y_pred.detach()
-
-        return torch.stack(losses).mean() if losses else None
-
-    def _compute_rollout_loss_cached(
-            self,
-            y_i: torch.Tensor,
-            g: torch.Tensor,
-            y_j: torch.Tensor,
-            dt_norm: torch.Tensor,
-            mask: Optional[torch.Tensor],
-            horizon: int,
-            tf_prob: float
-    ) -> Optional[torch.Tensor]:
-        """Cached encoding rollout loss."""
-        if horizon <= 0:
-            return None
-
-        B, K = dt_norm.shape
-        S = y_i.shape[-1]
-        H = min(K, max(1, horizon))
-        predict_delta = getattr(self.model, "predict_delta", False)
-        decoder_condition_on_g = getattr(self.model, "decoder_condition_on_g", False)
-
-        z_curr = self.model.encoder(y_i, g)
-        use_lowrank = not self.model.dynamics.use_S
-
-        y_curr = y_i
-        losses = []
-
-        for t in range(H):
-            dtk_norm = dt_norm[:, t]
-
-            # Latent step
-            if use_lowrank:
-                z_next = self.model.dynamics.propagate_K_lowrank(z_curr, g, dtk_norm.view(-1, 1))[:, 0]
+            if tf_prob >= 1.0:
+                y_curr = y_j[:, k, :]
             else:
-                z_next = self.model.dynamics.step(z_curr, dtk_norm, g)
+                if self.training:
+                    coin = (torch.rand(B, device=y_i.device) < tf_prob).unsqueeze(-1)  # [B,1]
+                    y_curr = torch.where(coin, y_j[:, k, :], y_next.detach())
+                else:
+                    y_curr = y_next
 
-            # Decode
-            dec_in = torch.cat([z_next, g], dim=-1) if decoder_condition_on_g else z_next
-            y_decoded = self.model.decoder(dec_in)
-            y_pred = y_curr + y_decoded if predict_delta else y_decoded
+            if use_delta:
+                base = y_curr if (self.model.S_out == self.model.S_in) else y_curr.index_select(1, self.model.target_idx)
+                cur_logp = self.model._denorm_to_logp(base)
 
-            y_true = y_j[:, t]
+        y_pred = torch.stack(preds, dim=1)  # [B,H,S]
+        y_tgt = y_j[:, :H, :]
+        rmask = mask[:, :H] if mask is not None else None
 
-            # Mask for this timestep
-            step_mask = mask[:, t] if mask is not None else None
-
-            # Loss
-            residual = y_pred - y_true
-            residual = residual.clamp(-MAX_RESIDUAL, MAX_RESIDUAL)
-            loss = residual.pow(2).mean(dim=-1)  # [B]
-
-            if step_mask is not None:
-                loss = (loss * step_mask.float()).sum() / step_mask.float().sum().clamp_min(1.0)
-            else:
-                loss = loss.mean()
-
-            losses.append(loss)
-
-            # Teacher forcing
-            if t < H - 1:
-                use_tf = (torch.rand(B, device=y_i.device) < tf_prob).float().unsqueeze(-1)
-                if step_mask is not None:
-                    use_tf = use_tf * step_mask.float().unsqueeze(-1)
-
-                with torch.no_grad():
-                    z_gt = self.model.encoder(y_true, g)
-                z_curr = use_tf * z_gt + (1.0 - use_tf) * z_next.detach()
-
-                if predict_delta:
-                    y_curr = use_tf * y_true + (1.0 - use_tf) * y_pred.detach()
-
-        return torch.stack(losses).mean() if losses else None
+        if self.use_adaptive_stiff and self.criterion is not None:
+            return self.criterion(y_pred, y_tgt, rmask, return_components=False)
+        return _masked_mse(y_pred, y_tgt, rmask)
 
     def _compute_semigroup_loss(self, y_i: torch.Tensor, g: torch.Tensor) -> Optional[torch.Tensor]:
-        """Semigroup consistency: f(dt_a + dt_b, y) ≈ f(dt_b, f(dt_a, y))"""
+        """Optional semigroup consistency; returns loss or None."""
+        try:
+            d = self.model.dynamics
+            log_min = float(d.dt_log_min.item())
+            log_max = float(d.dt_log_max.item())
+            rng = max(1e-9, (log_max - log_min))
+        except Exception:
+            return None
+
         B = y_i.shape[0]
-        device = y_i.device
+        ln10 = math.log(10.0)
 
-        dt_a = torch.rand(B, device=device)
-        dt_b = torch.rand(B, device=device)
+        dt_tot_norm = torch.rand(B, device=y_i.device, dtype=torch.float32)  # [B]
+        dt_tot_phys = torch.exp((log_min + dt_tot_norm * rng) * ln10)        # [B]
+        u = torch.rand(B, device=y_i.device, dtype=torch.float32)            # [B]
+        dt_a_phys = u * dt_tot_phys
+        dt_b_phys = dt_tot_phys - dt_a_phys
 
-        dyn = getattr(self.model, "dynamics", None)
-        if dyn is not None and hasattr(dyn, "dt_log_min") and hasattr(dyn, "dt_log_max"):
-            log_min = float(dyn.dt_log_min)
-            log_max = float(dyn.dt_log_max)
-            rng = max(log_max - log_min, 1e-12)
+        tiny = torch.finfo(dt_tot_phys.dtype).tiny
+        dt_a_norm = (torch.log(dt_a_phys.clamp_min(tiny)) / ln10 - log_min) / rng
+        dt_b_norm = (torch.log(dt_b_phys.clamp_min(tiny)) / ln10 - log_min) / rng
 
-            dt_phys_a = (10.0 ** (log_min + dt_a * rng)).clamp_min(1e-30)
-            dt_phys_b = (10.0 ** (log_min + dt_b * rng)).clamp_min(1e-30)
-            dt_phys_ab = dt_phys_a + dt_phys_b
+        y_a = self.model.step(y_i, dt_a_norm, g)
+        y_ab = self.model.step(y_a, dt_b_norm, g)
+        y_total = self.model.step(y_i, dt_tot_norm, g)
 
-            dt_ab = (torch.log10(dt_phys_ab) - log_min) / rng
-            dt_ab = dt_ab.clamp(0.0, 1.0)
-        else:
-            dt_ab = (dt_a + dt_b).clamp(0.0, 1.0)
+        res = (y_ab - y_total).clamp(-MAX_RESIDUAL, MAX_RESIDUAL)
+        return res.pow(2).mean()
 
-        # Two sequential steps
-        y_a = self.model(y_i, dt_a.unsqueeze(1), g)[:, 0]
-        y_ab_seq = self.model(y_a, dt_b.unsqueeze(1), g)[:, 0]
+    # ------------------ Hooks for gradient diagnostics ------------------
 
-        # Single combined step
-        y_ab_combined = self.model(y_i, dt_ab.unsqueeze(1), g)[:, 0]
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """Compute and cache L2 grad norm before the optimizer step."""
+        g2 = 0.0
+        for p in self.model.parameters():
+            if p is not None and p.grad is not None:
+                ps = p.grad.detach().float().pow(2).sum()
+                if torch.isfinite(ps):
+                    g2 += float(ps.item())
+        self._last_grad_norm = math.sqrt(g2) if g2 > 0.0 else 0.0
 
-        return F.mse_loss(y_ab_seq, y_ab_combined)
+    def on_train_epoch_end(self):
+        """Cache a stable training metric so epoch summary has a value even on epoch 0."""
+        try:
+            m = self.trainer.callback_metrics if hasattr(self, "trainer") and self.trainer is not None else {}
+            v = None
+            for k in ("train_total", "train_mse"):
+                if k in m:
+                    v = m[k]
+                    break
+            if v is not None:
+                if torch.is_tensor(v):
+                    v = v.detach().float().cpu().item()
+                self._last_train_metric = float(v)
+        except Exception:
+            pass
 
-    def validation_step(self, batch, batch_idx):
-        # Validate shape on first val batch
-        if batch_idx == 0:
-            validate_batch_shape(batch, self.expected_K, self.expected_S, batch_idx)
+    # ------------------ Training / Validation ------------------
 
-        y_i, dt, y_j, g = batch[:4]
+    def training_step(self, batch, batch_idx: int):
+        _validate_batch(batch, batch_idx)
+        y_i, dt_offsets, y_j, g = batch[:4]  # [B,S], [B,K], [B,K,S], [B,G]
         mask = batch[5] if len(batch) >= 6 else None
 
-        pred = self.model(y_i, dt, g)
+        pred = self.model(y_i, dt_offsets, g)  # [B,K,S] normalized
+        if not torch.isfinite(pred).all():
+            raise RuntimeError(f"Non-finite predictions in training batch {batch_idx}")
 
+        if self.use_adaptive_stiff and self.criterion is not None:
+            comp = self.criterion(pred, y_j, mask, return_components=True)
+            forward_loss = comp["total"].float()
+            self.log("train_mse_norm", comp["mse"].detach(), on_step=False, on_epoch=True, logger=True)
+            self.log("train_frac_phys", comp["frac"].detach(), on_step=False, on_epoch=True, logger=True)
+            self.log("train_mse", forward_loss.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        else:
+            forward_loss = _masked_mse(pred, y_j, mask).float()
+            self.log("train_mse", forward_loss.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+        total = forward_loss
+
+        if self.rollout_enabled and self.rollout_weight > 0:
+            H = self._get_rollout_horizon(self.current_epoch)
+            tfp = self._get_teacher_forcing_prob(self.current_epoch)
+            warm = min(1.0, self.current_epoch / max(1, self.rollout_warmup_epochs))
+            eff_w = self.rollout_weight * warm
+            if eff_w > 1e-8 and H > 0:
+                rloss = self._compute_rollout_loss_unified(y_i, g, y_j, dt_offsets, mask, H, tfp)
+                if rloss is not None and torch.isfinite(rloss):
+                    total = total + eff_w * rloss
+                    self.log("rollout_loss", rloss.detach(), on_step=False, on_epoch=True, logger=True)
+                    self.log("rollout_warm_weight", eff_w, on_step=False, on_epoch=True, logger=True)
+
+        if self.semigroup_enabled and self.semigroup_weight > 0:
+            sg_warm = min(1.0, self.current_epoch / max(1, self.semigroup_warmup_epochs))
+            eff_sg = self.semigroup_weight * sg_warm
+            if eff_sg > 1e-8:
+                sgl = self._compute_semigroup_loss(y_i, g)
+                if sgl is not None and torch.isfinite(sgl):
+                    total = total + eff_sg * sgl
+                    self.log("semigroup_loss", sgl.detach(), on_step=False, on_epoch=True, logger=True)
+                    self.log("semigroup_warm_weight", eff_sg, on_step=False, on_epoch=True, logger=True)
+
+        if not torch.isfinite(total):
+            print(f"[WARN] training_step: non-finite total loss at batch {batch_idx}.")
+        elif float(total) > 1e6:
+            print(f"[WARN] training_step: very large TOTAL={float(total):.3e} at batch {batch_idx}.")
+
+        self.log("train_total", total.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return total
+
+    def validation_step(self, batch, batch_idx: int):
+        _validate_batch(batch, batch_idx)
+        y_i, dt_offsets, y_j, g = batch[:4]
+        mask = batch[5] if len(batch) >= 6 else None
+
+        pred = self.model(y_i, dt_offsets, g)
         if not torch.isfinite(pred).all():
             raise RuntimeError(f"Non-finite predictions in validation batch {batch_idx}")
 
-        loss = masked_mse_loss(pred, y_j, mask)
+        if self.use_adaptive_stiff and self.criterion is not None:
+            comp = self.criterion(pred, y_j, mask, return_components=True)
+            loss = comp["total"].float()
+            self.log("val_mse_norm", comp["mse"].detach(), on_step=False, on_epoch=True, logger=True)
+            self.log("val_frac_phys", comp["frac"].detach(), on_step=False, on_epoch=True, logger=True)
+        else:
+            loss = _masked_mse(pred, y_j, mask).float()
 
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=False, logger=True)
+        if not torch.isfinite(loss):
+            print(f"[WARN] validation_step: non-finite loss at batch {batch_idx}.")
+        elif float(loss) > 1e6:
+            print(f"[WARN] validation_step: very large MSE={float(loss):.3e} at batch {batch_idx}.")
+
+        self.log("val_mse", loss.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
-
-# --------------------------------------------------------------------------------------
-# Public wrapper
-# --------------------------------------------------------------------------------------
+    # --------------------------- External Trainer Wrapper ---------------------------
 
 class Trainer:
-    """Simple wrapper around Lightning trainer."""
-
+    """Thin wrapper to construct Lightning objects and run training."""
     def __init__(
-            self,
-            model: nn.Module,
-            train_loader: DataLoader,
-            val_loader: DataLoader,
-            cfg: Dict[str, Any],
-            work_dir: Union[str, Path],
-            device: torch.device,
-            logger: logging.Logger,
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        cfg: Dict[str, Any],
+        work_dir: Union[str, Path],
+        device: torch.device,
+        logger: logging.Logger,
     ):
         self.model = model
         self.train_loader = train_loader
@@ -527,107 +828,88 @@ class Trainer:
         self.work_dir = Path(work_dir)
         self.device = device
         self.logger = logger
-
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
     def train(self) -> float:
-        """Execute training loop."""
         module = AutoEncoderModule(self.model, self.cfg, self.work_dir)
 
-        lcfg = self.cfg["lightning"]
-        tcfg = self.cfg["training"]
+        lcfg = self.cfg.get("lightning", {})
+        tcfg = self.cfg.get("training", {})
 
-        # Use config values directly
-        precision = str(lcfg["precision"])
-        devices = lcfg["devices"]
-        accelerator = lcfg["accelerator"]
-        accumulate = int(lcfg["accumulate_grad_batches"])
-        strategy = lcfg["strategy"]
-        num_sanity_val_steps = int(lcfg["num_sanity_val_steps"])
-        max_epochs = int(tcfg["epochs"])
+        precision = str(lcfg.get("precision", "bf16-mixed"))
+        devices = lcfg.get("devices", 1)
+        accum = int(lcfg.get("accumulate_grad_batches", 1))
+        strategy = lcfg.get("strategy", "auto")
+        num_sanity = int(lcfg.get("num_sanity_val_steps", 0))
+        max_epochs = int(tcfg.get("epochs", 100))
+        resume_ckpt = lcfg.get("resume_from", None)
 
-        # --- SMALL OVERRIDE: force CPU if MPS is available and force_cpu_on_mps is True ---
-        import os
-        force_cpu_on_mps = bool(lcfg.get("force_cpu_on_mps", True))
-        try:
-            has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-        except Exception:
-            has_mps = False
-        if force_cpu_on_mps and has_mps:
-            self.logger.warning("MPS detected, forcing CPU to avoid missing ops (e.g., torch.linalg.qr).")
-            accelerator = "cpu"
-            devices = 1
-            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-        # -------------------------------------------------------------------------------
+        # Loggers
+        csv_logger = CSVLogger(save_dir=str(self.work_dir), name="logs", version="csv")
+        tb_logger = TensorBoardLogger(save_dir=str(self.work_dir), name="tb")
 
-        # Checkpointing
-        ckpt_dir = self.work_dir / "checkpoints"
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        # Checkpointing (top-k if model soup is enabled)
+        ms_cfg = tcfg.get("model_soup", {})
+        save_top_k = int(ms_cfg.get("top_k", 1)) if bool(ms_cfg.get("enable", False)) else 1
 
         ckpt_cb = ModelCheckpoint(
-            dirpath=str(ckpt_dir),
-            filename="best-{epoch:03d}-{val_loss:.6f}",
-            monitor="val_loss",
+            dirpath=str(self.work_dir / "checkpoints"),
+            filename="epoch{epoch:04d}-val{val_mse:.6e}",
+            monitor="val_mse",
             mode="min",
-            save_top_k=3,
+            save_top_k=save_top_k,
             save_last=True,
-            every_n_epochs=1,
+            auto_insert_metric_name=False,
         )
+        lr_cb = LearningRateMonitor(logging_interval="epoch")
+        es_patience = int(lcfg.get("early_stop_patience", 0))
+        es_cb = EarlyStopping(monitor="val_mse", mode="min", patience=es_patience) if es_patience > 0 else None
+        epoch_cb = EpochSetterCallback()
+        summary_cb = EpochSummaryLineCallback()
 
-        # Early stopping
-        es_patience = int(tcfg.get("early_stop_patience", 30))
-        early_stop = None
-        if es_patience > 0:
-            early_stop = EarlyStopping(
-                monitor="val_loss",
-                patience=es_patience,
-                mode="min",
-                min_delta=1e-6,
-                verbose=False,
-            )
+        callbacks = [ckpt_cb, lr_cb, epoch_cb, summary_cb]
 
-        # Callbacks
-        lrmon = LearningRateMonitor(logging_interval="epoch")
-        csvlog = CSVLogger(save_dir=str(self.work_dir), name="csv_logs")
-        tblog = TensorBoardLogger(save_dir=str(self.work_dir), name="tb_logs")
-
-        epoch_setter = EpochSetterCallback()
-        stats_cb = SimpleStatsCallback(py_logger=self.logger)
-
-        callbacks = [ckpt_cb, lrmon, epoch_setter, stats_cb]
-        if early_stop is not None:
-            callbacks.append(early_stop)
-
-        # Simple resume logic: if training.resume is a valid path, resume from it
-        resume_ckpt = None
-        resume_cfg = tcfg.get("resume")
-        if resume_cfg and isinstance(resume_cfg, (str, Path)):
-            candidate = Path(resume_cfg)
-            if candidate.exists():
-                resume_ckpt = str(candidate)
-                self.logger.info(f"Resuming from: {resume_ckpt}")
+        # Optional EMA
+        ema_cfg = tcfg.get("ema", {})
+        if bool(ema_cfg.get("enable", False)):
+            if _EMA_CB is not None:
+                decay = float(ema_cfg.get("decay", 0.999))
+                try:
+                    callbacks.append(_EMA_CB(decay=decay))  # portable signature
+                except TypeError:
+                    callbacks.append(_EMA_CB(decay=decay))
             else:
-                self.logger.warning(f"Resume path not found: {candidate}")
+                print("[WARN] EMA callback not available in this Lightning version; skipping.")
 
-        # Lightning Trainer
+        # Optional SWA
+        swa_cfg = tcfg.get("swa", {})
+        if bool(swa_cfg.get("enable", False)):
+            if _SWA_CB is not None:
+                swa_lrs = swa_cfg.get("swa_lrs", None)
+                epoch_start = float(swa_cfg.get("epoch_start", 0.8))
+                callbacks.append(_SWA_CB(swa_lrs=swa_lrs, swa_epoch_start=epoch_start))
+            else:
+                print("[WARN] SWA callback not available in this Lightning version; skipping.")
+
+        if es_cb is not None:
+            callbacks.append(es_cb)
+
         trainer = LightningTrainer(
-            accelerator=accelerator,
+            max_epochs=max_epochs,
             devices=devices,
             precision=precision,
             strategy=strategy,
-            max_epochs=max_epochs,
-            accumulate_grad_batches=accumulate,
-            num_sanity_val_steps=num_sanity_val_steps,
-            logger=[csvlog, tblog],
+            accumulate_grad_batches=accum,
+            num_sanity_val_steps=num_sanity,
+            logger=[csv_logger, tb_logger],
             callbacks=callbacks,
-            enable_progress_bar=False,
-            enable_model_summary=False,
-            gradient_clip_val=float(tcfg["gradient_clip"]),
+            gradient_clip_val=float(tcfg.get("gradient_clip", 1.0)),
             gradient_clip_algorithm="norm",
-            benchmark=True,
+            benchmark=False,
+            enable_progress_bar=False,  # keep stdout clean; we print our own line
+            log_every_n_steps=50,
         )
 
-        # Fit
         trainer.fit(
             module,
             train_dataloaders=self.train_loader,
@@ -635,20 +917,51 @@ class Trainer:
             ckpt_path=resume_ckpt,
         )
 
-        # Best val loss
+        # Export best model
         best_val = None
         if ckpt_cb.best_model_score is not None:
-            best_val = float(ckpt_cb.best_model_score.cpu().item())
-
-        # Save best model
+            best_val = float(ckpt_cb.best_model_score.detach().cpu().item())
         if ckpt_cb.best_model_path:
             state = torch.load(ckpt_cb.best_model_path, map_location="cpu", weights_only=False)
             sd = state.get("state_dict", {})
             model_state = {k.replace("model.", "", 1): v for k, v in sd.items() if k.startswith("model.")}
             torch.save(
                 {"model": model_state, "best_val_loss": best_val, "config": self.cfg},
-                self.work_dir / "best_model.pt"
+                self.work_dir / "best_model.pt",
             )
             self.logger.info(f"Saved best_model.pt (val_loss={best_val:.6e})")
+
+        # Optional: Model Soup (average best-k checkpoints)
+        if bool(ms_cfg.get("enable", False)) and save_top_k > 1:
+            try:
+                best_k = ckpt_cb.best_k_models  # dict: path -> score
+                ckpt_paths = list(best_k.keys())
+                if len(ckpt_paths) >= 2:
+                    avg_state: Dict[str, torch.Tensor] = {}
+                    n = 0
+                    for pth in ckpt_paths:
+                        st = torch.load(pth, map_location="cpu", weights_only=False)
+                        sd = st.get("state_dict", {})
+                        model_sd = {k.replace("model.", "", 1): v for k, v in sd.items() if k.startswith("model.")}
+                        if not avg_state:
+                            for k, v in model_sd.items():
+                                if torch.is_tensor(v):
+                                    avg_state[k] = v.detach().clone().float()
+                            n = 1
+                        else:
+                            for k, v in model_sd.items():
+                                if torch.is_tensor(v) and k in avg_state:
+                                    avg_state[k] += v.detach().clone().float()
+                            n += 1
+                    if n > 0:
+                        for k in list(avg_state.keys()):
+                            avg_state[k] /= float(n)
+                        torch.save(
+                            {"model": avg_state, "soup_members": ckpt_paths, "config": self.cfg},
+                            self.work_dir / "soup_model.pt",
+                        )
+                        print(f"[ModelSoup] Saved soup_model.pt averaged from {n} checkpoints.")
+            except Exception as e:
+                print(f"[ModelSoup] Skipped due to error: {e}")
 
         return best_val if best_val is not None else float("inf")

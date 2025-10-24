@@ -2,7 +2,7 @@
 """
 Normalization Module
 =====================
-Centralized normalization for flow-map Koopman autoencoder.
+Centralized normalization.
 Key focus: Consistent dt normalization to [0,1] using log-min-max.
 """
 

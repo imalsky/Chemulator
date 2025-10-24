@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-Flow-map DeepONet Training Pipeline - Main Entry Point
-"""
 
 from __future__ import annotations
 
@@ -64,18 +61,22 @@ def hydrate_config_from_processed(
     """
     Re-hydrate cfg.data.* from an existing processed data directory.
 
-    Source of truth priority (for metadata):
-      1) normalization.json -> meta.{species_variables, global_variables, time_variable}
-      2) preprocessing_summary.json -> {species_variables, global_variables, time_variable}
-      3) shard_index.json -> used for sanity checks (sequence_mode, dims, etc.)
+    Priority:
+      species/globals/time:
+        1) normalization.json -> meta.{species_variables, global_variables, time_variable}
+        2) preprocessing_summary.json -> {species_variables, global_variables, time_variable}
+      target_species:
+        1) normalization.json -> meta.target_species (or top-level target_species)
+        2) preprocessing_summary.json -> target_species
+        3) fall back to cfg.data.target_species if valid subset
+        4) else default to species_variables
 
-    Split statistics:
+    Split stats:
       - Prefer sample counts from preprocessing_summary.json (valid_trajectories).
-      - Else try shard_index.json (splits.*.n_trajectories).
-      - Else try several alternate keys in summary/report/meta.
-      - Else fall back to counting NPZ files per split (shard count).
+      - Else shard_index.json (splits.*.n_trajectories).
+      - Else hunt alternate keys; else shard counts.
     """
-    # Resolve processed_dir from cfg if not explicitly passed
+    # Resolve processed_dir
     if processed_dir is None:
         processed_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
     else:
@@ -91,7 +92,7 @@ def hydrate_config_from_processed(
 
     logger.info(f"[hydrate] Using processed data at: {processed_dir}")
 
-    # Load artifacts if they exist
+    # Load artifacts (tolerant)
     def _load_json(p: Path) -> Optional[Dict[str, Any]]:
         if p.exists():
             try:
@@ -106,7 +107,7 @@ def hydrate_config_from_processed(
     index = _load_json(index_path)
     report = _load_json(report_path)
 
-    # Extract metadata (species/globals/time) with clear priority
+    # Extract core metadata
     meta = (manifest or {}).get("meta", {}) if manifest else {}
     species_from_processed = meta.get("species_variables")
     globals_from_processed = meta.get("global_variables")
@@ -119,32 +120,34 @@ def hydrate_config_from_processed(
     if time_from_processed is None and summary is not None:
         time_from_processed = summary.get("time_variable")
 
-    # Must have species variables
     if not species_from_processed:
         raise RuntimeError("[hydrate] Unable to determine species_variables")
 
-    # Optional context logging from summary/index if present
-    if norm_path.exists():
-        logger.info(f"[hydrate] Found normalization manifest: {norm_path}")
-    if summary is not None and "time_grid_len" in summary:
-        logger.info(f"[hydrate] Time grid length reported: {summary['time_grid_len']}")
-    if index is not None:
-        seq_mode = index.get("sequence_mode")
-        var_len = index.get("variable_length")
-        m_per = index.get("M_per_sample")
-        logger.info(
-            f"[hydrate] Index summary: sequence_mode={seq_mode}, "
-            f"variable_length={var_len}, M_per_sample={m_per}"
-        )
+    # Try to discover target_species explicitly from artifacts
+    targets_from_processed = None
+    if manifest:
+        targets_from_processed = meta.get("target_species") or manifest.get("target_species")
+    if targets_from_processed is None and summary is not None:
+        targets_from_processed = summary.get("target_species")
 
-    # Overwrite cfg.data.* with authoritative values from processed artifacts
+    # Validate target list is subset of species
+    if targets_from_processed:
+        missing = set(targets_from_processed) - set(species_from_processed)
+        if missing:
+            logger.warning(
+                "[hydrate] target_species from artifacts not a subset of species_variables; "
+                f"ignoring artifact targets. Missing={sorted(missing)}"
+            )
+            targets_from_processed = None
+
+    # Inject into cfg.data with clear precedence
     data_cfg = cfg.setdefault("data", {})
 
     prev_species = list(data_cfg.get("species_variables", []))
     if prev_species and prev_species != species_from_processed:
         logger.warning("[hydrate] Overriding config.data.species_variables with values from processed data.")
     else:
-        logger.info(f"[hydrate] Setting config.data.species_variables. e.g {species_from_processed[0]}")
+        logger.info(f"[hydrate] Setting config.data.species_variables (example: {species_from_processed[0]})")
     data_cfg["species_variables"] = list(species_from_processed)
 
     if globals_from_processed:
@@ -163,9 +166,37 @@ def hydrate_config_from_processed(
             logger.info(f"[hydrate] Setting config.data.time_variable = {time_from_processed}")
         data_cfg["time_variable"] = str(time_from_processed)
 
-    # Validate species dimension against shard index if obvious field present
+    # Decide target_species to use (artifacts > valid config > fallback to all species)
+    prev_targets = list(data_cfg.get("target_species", []))
+    chosen_targets: Optional[Sequence[str]] = None
+
+    if targets_from_processed:
+        chosen_targets = list(targets_from_processed)
+        if prev_targets and prev_targets != chosen_targets:
+            logger.warning("[hydrate] Overriding config.data.target_species with values from processed data.")
+    else:
+        # If config already specifies target_species and it's valid, keep it
+        if prev_targets:
+            missing = set(prev_targets) - set(species_from_processed)
+            if missing:
+                logger.warning(
+                    "[hydrate] config.data.target_species contains names not present in processed species; "
+                    f"overriding with full species_variables. Missing={sorted(missing)}"
+                )
+                chosen_targets = list(species_from_processed)
+            else:
+                chosen_targets = prev_targets
+        else:
+            # Default to all species
+            chosen_targets = list(species_from_processed)
+
+    data_cfg["target_species"] = list(chosen_targets)
+    logger.info(f"[hydrate] target_species set (S_out={len(chosen_targets)}).")
+
+    # Validate species dimensions against shard index when available
     if index is not None:
-        for key in ("n_species", "num_species", "n_target_species", "n_input_species", "species_dim"):
+        # Input species dimension
+        for key in ("n_species", "num_species", "n_input_species", "species_dim"):
             val = index.get(key)
             if isinstance(val, int) and val > 0:
                 if val != len(data_cfg["species_variables"]):
@@ -175,10 +206,24 @@ def hydrate_config_from_processed(
                         f"len(config.data.species_variables): {len(data_cfg['species_variables'])}\n"
                         "          The processed folder was generated with a different species list."
                     )
-                logger.info(f"[hydrate] Species dimension check passed (S={val}).")
+                logger.info(f"[hydrate] Species dimension check passed (S_in={val}).")
                 break
 
-    # dt spec requirement
+        # Target species dimension (if index provides it)
+        for key in ("n_target_species", "target_species_dim", "species_dim_out"):
+            val = index.get(key)
+            if isinstance(val, int) and val > 0:
+                if val != len(data_cfg["target_species"]):
+                    raise RuntimeError(
+                        "[hydrate] Target species dimension mismatch:\n"
+                        f"          shard_index: {val}  vs  "
+                        f"len(config.data.target_species): {len(data_cfg['target_species'])}\n"
+                        "          The processed folder expects a different target subset."
+                    )
+                logger.info(f"[hydrate] Target species dimension check passed (S_out={val}).")
+                break
+
+    # dt spec presence (optional requirement)
     require_dt = bool(cfg.get("dataset", {}).get("require_dt_stats", False))
     dt_spec = (manifest or {}).get("dt") if manifest else None
     if require_dt and not dt_spec:
@@ -188,9 +233,8 @@ def hydrate_config_from_processed(
     if dt_spec:
         logger.info(f"[hydrate] dt-spec present in normalization.json (keys={list(dt_spec.keys())}).")
 
-    # ---- Robust split stats logging (samples if possible; else shard counts) ----
+    # Split stats logging (samples if possible; else shard counts)
     def _pick_split_counts() -> Optional[Dict[str, int]]:
-        # 1) Preferred: summary.valid_trajectories
         if summary:
             v = summary.get("valid_trajectories")
             if isinstance(v, dict) and v:
@@ -198,17 +242,12 @@ def hydrate_config_from_processed(
                     return {k: int(v[k]) for k in v}
                 except Exception:
                     pass
-        # 2) shard_index.json -> splits.*.n_trajectories
         if index and isinstance(index.get("splits"), dict):
             try:
-                return {
-                    k: int(index["splits"][k].get("n_trajectories", 0))
-                    for k in index["splits"].keys()
-                }
+                return {k: int(index["splits"][k].get("n_trajectories", 0)) for k in index["splits"].keys()}
             except Exception:
                 pass
 
-        # 3) Other common keys in summary/report/meta
         def _hunt(container: Optional[Dict[str, Any]]) -> Optional[Dict[str, int]]:
             if not container:
                 return None
@@ -224,24 +263,20 @@ def hydrate_config_from_processed(
         sc = _hunt(summary) or _hunt(report) or _hunt((manifest or {}).get("meta") if manifest else None)
         if sc:
             return sc
-        # 4) Give up on sample counts
         return None
 
     sample_counts = _pick_split_counts()
     if sample_counts:
-        # normalize common split names
         def _first(d: Dict[str, int], keys) -> Union[int, str]:
             for k in keys:
                 if k in d:
                     return int(d[k])
             return "?"
-
         tr = _first(sample_counts, ("train", "training"))
         va = _first(sample_counts, ("validation", "val"))
         te = _first(sample_counts, ("test",))
         logger.info(f"[hydrate] Split counts (samples): train={tr}, validation={va}, test={te}")
     else:
-        # Fallback: count shard files in split directories
         def _count_npz(split: str) -> int:
             p = processed_dir / split
             if not p.exists():
@@ -250,14 +285,18 @@ def hydrate_config_from_processed(
                 return sum(1 for x in p.iterdir() if x.is_file() and x.suffix.lower() == ".npz")
             except Exception:
                 return 0
-
         trf = _count_npz("train")
         vaf = _count_npz("validation")
         tef = _count_npz("test")
         logger.info(f"[hydrate] Split counts (shards): train={trf} files, validation={vaf} files, test={tef} files")
 
-    logger.info(f"[hydrate] Completed re-injection from {'normalization.json' if manifest else 'processed artifacts'}.")
+    logger.info(
+        f"[hydrate] Completed re-injection from "
+        f"{'normalization.json' if manifest else 'processed artifacts'} "
+        f"(S_in={len(data_cfg['species_variables'])}, S_out={len(data_cfg['target_species'])})."
+    )
     return processed_dir
+
 
 
 # --------------------------------------------------------------------------------------
@@ -585,8 +624,20 @@ def main() -> None:
     paths = cfg.setdefault("paths", {})
     work_dir = Path(paths.get("work_dir", GLOBAL_WORK_DIR)).expanduser().resolve()
     paths["work_dir"] = str(work_dir)
+
+    # Handle existing work directory based on config
+    overwrite = bool(cfg.get("system", {}).get("overwrite_work_dir", False))
+    if work_dir.exists() and overwrite:
+        logger.warning(f"Work directory exists and will be DELETED: {work_dir}")
+        import shutil
+        shutil.rmtree(work_dir)
+        logger.warning(f"Deleted existing work directory: {work_dir}")
+    elif work_dir.exists():
+        logger.info(f"Work directory exists and will be reused: {work_dir}")
+
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    # Initial dump (pre-hydration snapshot)
     config_save_path = work_dir / "config.json"
     dump_json(config_save_path, cfg)
     logger.info(f"Saved training configuration to {config_save_path}")
@@ -609,6 +660,10 @@ def main() -> None:
     # Ensure preprocessed data exist and re-hydrate cfg from that directory if present
     processed_dir = ensure_preprocessed_data(cfg, logger)
     assert processed_dir.exists(), "Processed data directory must exist after preprocessing or hydration"
+
+    # >>> ADDED: persist the hydrated config (now includes species/globals/time)
+    dump_json(config_save_path, cfg)
+    logger.info("Saved hydrated configuration (with species) to work_dir/config.json")
 
     # Build datasets and dataloaders
     train_dataset, val_dataset, train_loader, val_loader = build_datasets_and_loaders(
@@ -646,6 +701,7 @@ def main() -> None:
 
     best_val_loss = trainer.train()
     logger.info(f"Training complete. Best validation loss: {best_val_loss:.6e}")
+
 
 
 if __name__ == "__main__":

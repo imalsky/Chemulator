@@ -31,9 +31,6 @@ else
   PRECISION_ARG=""
   LIMIT_ARGS=""
 fi
-
-
-
 set -u
 
 # If requested, wrap python with compute-sanitizer (memcheck)
@@ -149,7 +146,7 @@ print("Torch:", torch.__version__, "CUDA available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("Device count:", torch.cuda.device_count())
     print("Device name:", torch.cuda.get_device_name(0))
-print("TF32 (matmul, cudnn):", torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+print("TF32 (matmul, cudnn):", torch.backends.cuda.matmul.allow_tf32, torch.backends.cnn.allow_tf32 if hasattr(torch.backends, "cnn") else torch.backends.cudnn.allow_tf32)
 try:
     import torch.backends.cuda
     torch.__config__.show()
@@ -232,36 +229,7 @@ else
   echo "Phase A: Skipped (hydrating from processed artifacts)."
 fi
 
-# ===== Minimal *model-only* probe (isolates model.py linalg path) =====
-echo "Running model-only probe…"
-"$PY" - <<'PY' || { echo "Model probe failed (forward/backward)"; exit 4; }
-import os, torch
-from model import FlowMapKoopman
-torch.manual_seed(0)
-torch.set_grad_enabled(True)
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-S, G, Z = 12, 2, 12
-dt_stats = {'log_min': -8.0, 'log_max': -2.0}
-m = FlowMapKoopman(
-    state_dim=S, global_dim=G, latent_dim=Z,
-    encoder_hidden=[64], decoder_hidden=[64],
-    koopman_rank=4, koopman_bias_hidden=64,
-    use_phi1_residual=False, dt_stats=dt_stats,
-    activation='silu', dropout=0.0, softmax_head=False, min_damping=1e-4
-).to(device)
-B, K = 8, 6
-y = torch.randn(B, S, device=device, dtype=torch.float32, requires_grad=True)
-g = torch.randn(B, G, device=device, dtype=torch.float32)
-dt = torch.rand(B, K, device=device, dtype=torch.float32)
-out = m(y, dt, g)   # [B,K,S]
-loss = out.square().mean()
-loss.backward()
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-print("Model-only probe OK. out:", tuple(out.shape))
-PY
-
-# ===== Phase B: TRAIN single-process on the GPU =====
+# ===== GPU check before training =====
 echo "---------------------------------"
 echo "GPU check before training:"
 "$PY" - <<'PY'
@@ -272,25 +240,9 @@ print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available()
 PY
 echo "---------------------------------"
 
+# ===== Phase B: TRAIN single-process on the GPU =====
 echo "Phase B: Training single-process…"
-set +e
 /usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/main.py $PRECISION_ARG $LIMIT_ARGS
-RC=$?
-set -e
-
-if [ $RC -ne 0 ]; then
-  echo "Training returned non-zero RC=$RC — running quick post-mortem."
-  # Print last 200 lines of log (already tee'd), and a tiny CUDA memory summary
-  "$PY" - <<'PY' || true
-import torch, sys
-if torch.cuda.is_available():
-    try:
-        print(torch.cuda.memory_summary(device=None, abbreviated=True))
-    except Exception as e:
-        print("memory_summary failed:", e, file=sys.stderr)
-PY
-  exit $RC
-fi
 
 echo "#####################################################"
 echo "Job finished at $(date)"

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-Flow-Map Koopman Dataset (Optimized)
 =====================================
 PyTorch Dataset for loading preprocessed trajectory data with variable time steps.
 Supports efficient batch generation with log-uniform or uniform time sampling.

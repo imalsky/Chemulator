@@ -3,134 +3,144 @@
   // PATHS
   // ===============================
   "paths": {
-    "processed_data_dir": "data/processed",
-    "work_dir": "models/stable-lpv-koopman",
+    "processed_data_dir": "data/processed_medium",
+    "work_dir": "models/autoencoder",
     "raw_data_files": []
   },
 
   // ===============================
   // DATA SCHEMA
+  // (auto-hydrated from processed dir if present)
   // ===============================
   "data": {
-    "species_variables": [],
+    "species_variables": [],          // leave [] to auto-resolve from normalization.json
     "global_variables": ["P", "T"],
-    "time_variable": "t_time"
+    "time_variable": "t_time",
+    "target_species": []              // [] => predict all species
   },
 
   // ===============================
   // DATASET / DATALOADER
   // ===============================
   "dataset": {
+    // Multi-Δt targets per anchor
     "multi_time_per_anchor": true,
-    "times_per_anchor": 8,
-    "share_times_across_batch": true,
+    "times_per_anchor": 16,
+    "share_times_across_batch": false,
 
-    // Log-uniform dt sampling
+    // Time sampling / grid fast-paths
     "log_dt_sampling": true,
     "precompute_dt_table": true,
-
     "uniform_grid_rtol": 1e-6,
     "uniform_grid_atol": 1e-12,
     "snap_shared_grid": true,
     "assume_shared_grid": true,
     "skip_scan": true,
     "skip_validate_grids": true,
-    "require_dt_stats": false,
-    "storage_dtype": "32",
+    "require_dt_stats": true,
 
-    // DataLoader settings
-    "preload_train_to_gpu": false,
-    "preload_val_to_gpu": false,
-    "num_workers": 8,
-    "num_workers_val": 8,
+    // Dataset storage/runtime dtype (controls on-GPU buffers)
+    "storage_dtype": "float32",
+
+    // DataLoader plumbing (supports "auto" in code)
+    "preload_train_to_gpu": true,
+    "preload_val_to_gpu": true,
+    "num_workers": "auto",
+    "num_workers_val": "auto",
     "pin_memory": true,
     "pin_memory_val": true,
     "prefetch_factor": 2,
     "prefetch_factor_val": 2,
-    "persistent_workers": true,
-    "persistent_workers_val": true,
+    "persistent_workers": false,
+    "persistent_workers_val": false,
 
     "log_every_files": 1000
   },
 
+  // ===============================
+  // MODEL
+  // ===============================
   "model": {
-    "latent_dim": 24,
-    "encoder_hidden": [256,256,256],
-    "decoder_hidden": [256,256,256],
-    "activation": "leakyrelu",
+    // Architecture
+    "latent_dim": 256,
+    "encoder_hidden": [512, 512, 512, 512],
+    "dynamics_hidden": [512, 512, 512, 512],
+    "decoder_hidden": [512, 512, 512, 512],
+
+    // Act/Dropout
+    "activation": "silu",
     "dropout": 0.0,
 
-    "predict_delta": true,
-    "decoder_condition_on_g": true,
-    "z_std_clip": 10.0,
-
-    "rank_l": 8,
-    "learn_U": true,
-    "cond_hidden": [64,64],
-    "basis": "dct",
-
-    // Pick ONE of these two strategies:
-
-    // (A) Stable (no blow-ups): strictly non-positive eigenvalues
-    "lambda_para_min": -1e4, "lambda_para_max": 0.0,
-    "lambda_perp_min": -1e4, "lambda_perp_max": 0.0,
-    "exp_clip": 60
-
-    // (B) Allow tiny growth but avoid overflow
-    // "lambda_para_min": -30.0, "lambda_para_max":  1e-8,
-    // "lambda_perp_min": -30.0, "lambda_perp_max":  1e-8,
-    // "exp_clip": 100
+    // Behavior (matches current model.py)
+    "dynamics_residual": true,
+    "decoder_condition_on_g": false,      // FiLM gating on P,T
+    "predict_logit_delta": false,        // residual in logit (nat-log prob) space before softmax
+    "allow_partial_simplex": false       // set true only if predicting a subset that must sum to 1
   },
 
   // ===============================
   // TRAINING
   // ===============================
   "training": {
-    "batch_size": 4096,
-    "val_batch_size": 4096,
+    // Batching / sampling (used by main.build_datasets_and_loaders and preprocessor)
+    "batch_size": 10000,
+    "val_batch_size": 10000,
     "pairs_per_traj": 16,
-    "pairs_per_traj_val": 1,
+    "pairs_per_traj_val": 16,
 
-    // Time span in pairs (keep high to allow large dt coverage)
-    "min_steps": 1,
-    "max_steps": null,
-
-    // Dataset splits
+    // Splits for preprocessing (required by preprocessor)
     "val_fraction": 0.1,
     "test_fraction": 0.1,
     "use_fraction": 1.0,
 
-    // LR / regularization
+    // Allowed step-span (required by preprocessor; default-safe if you don’t care)
+    "min_steps": 1,
+    "max_steps": null,            // optional; omit for full range
+
+    // Optimizer / schedule
     "lr": 1e-4,
-    "min_lr": 1e-6,
-    "weight_decay": 5e-4,
+    "min_lr": 1e-7,
+    "weight_decay": 5e-5,
     "warmup_epochs": 10,
     "epochs": 100,
+    "gradient_clip": 2.0,
 
-    // Gradient clipping
-    "gradient_clip": 1.0,
+    // Loss
+    "loss_mode": "adaptive_stiff",
+    "loss_rel_cap": 10.0,
+    "adaptive_stiff_loss": {
+      "lambda_phys": 1.0,
+      "lambda_mse": 0.5,
+      "epsilon_phys": 1e-35
+    },
+    "loss_epsilon": 1e-30,
 
-    // Auxiliary losses - disabled initially for stability
+    "ema": { "enable": false, "decay": 0.999 },            // EMA callback (minimal)
+    "swa": { "enable": false, "epoch_start": 0.8 },       // SWA callback (optional)
+    "model_soup": { "enable": false, "top_k": 3 },         // Average best-k ckpts post-fit
+
+    // Aux losses (names/structure that trainer reads)
     "auxiliary_losses": {
       "rollout_enabled": false,
       "rollout_weight": 0.2,
       "rollout_horizon": 4,
-      "rollout_warmup_epochs": 10,
+      "rollout_warmup_epochs": 30,
       "rollout_use_cached_encoding": true,
-
       "rollout_teacher_forcing": {
         "mode": "linear",
         "start_p": 1.0,
         "end_p": 0.2,
         "end_epoch": 60
       },
-
-      "semigroup_enabled": false,
-      "semigroup_weight": 0.005,
-      "semigroup_warmup_epochs": 10
+      "semigroup": {
+        "enabled": false,
+        "weight": 0.005,
+        "warmup_epochs": 10
+      }
     },
-    "early_stop_patience": 30,
-    "resume": false
+
+    // Lightning’s final value will be set automatically; keep a default here
+    "accumulate_grad_batches": 1
   },
 
   // ===============================
@@ -139,10 +149,11 @@
   "lightning": {
     "accelerator": "auto",
     "devices": 1,
-    "precision": "32",
-    "accumulate_grad_batches": 4,
+    "precision": "bf16-mixed",
     "strategy": "auto",
-    "num_sanity_val_steps": 0
+    "num_sanity_val_steps": 2,
+    "early_stop_patience": 30
+    // "resume_from": "path/to/last.ckpt"   // optional; used by Trainer wrapper
   },
 
   // ===============================
@@ -183,6 +194,7 @@
     "deterministic": false,
     "linalg_library": null,
     "omp_threads": null,
-    "io_dtype": "float32"
+    "io_dtype": "float32",
+    "overwrite_work_dir": true
   }
 }
