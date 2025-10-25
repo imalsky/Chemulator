@@ -15,7 +15,7 @@ from matplotlib.lines import Line2D
 
 # Paths
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models/autoencoder"
+MODEL_DIR = REPO / "models/v1"
 EP_FILENAME = "export_k1_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))
@@ -23,7 +23,7 @@ from utils import load_json, seed_everything
 from normalizer import NormalizationHelper
 
 # Settings
-SAMPLE_IDX = 2
+SAMPLE_IDX = 5
 Q_COUNT = 100
 XMIN, XMAX = 1e-3, 1e8
 

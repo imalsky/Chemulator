@@ -44,18 +44,46 @@ import torch.nn.functional as F
 # Small helpers
 # -------------------------
 def get_activation(name: Union[str, nn.Module]) -> nn.Module:
+    """
+    Returns a torch.nn activation module by name (case-insensitive).
+    Includes practical extras beyond ReLU/GELU/SiLU/Tanh.
+    """
     if isinstance(name, nn.Module):
         return name
-    name = str(name).lower()
-    if name in ("relu",):
+    key = str(name).strip().lower()
+
+    # Common
+    if key in ("relu",):
         return nn.ReLU(inplace=True)
-    if name in ("gelu",):
-        return nn.GELU()
-    if name in ("silu", "swish"):
+    if key in ("relu6",):
+        return nn.ReLU6(inplace=True)
+    if key in ("gelu",):
+        return nn.GELU()  # PyTorch's default approximate=True on CUDA
+    if key in ("silu", "swish"):
         return nn.SiLU(inplace=True)
-    if name in ("tanh",):
+    if key in ("tanh",):
         return nn.Tanh()
+    if key in ("elu",):
+        return nn.ELU(inplace=True)
+    if key in ("selu",):
+        return nn.SELU()
+    if key in ("mish",):
+        return nn.Mish()
+    if key in ("leaky_relu", "lrelu", "leaky-relu"):
+        return nn.LeakyReLU(negative_slope=0.01, inplace=True)
+    if key in ("prelu",):
+        return nn.PReLU(num_parameters=1, init=0.25)
+    if key in ("hardswish", "hard_swish"):
+        return nn.Hardswish()
+    if key in ("softplus",):
+        return nn.Softplus()
+    if key in ("softsign",):
+        return nn.Softsign()
+    if key in ("identity", "none", ""):
+        return nn.Identity()
+
     raise ValueError(f"Unknown activation: {name}")
+
 
 
 class MLP(nn.Module):
@@ -381,31 +409,65 @@ class FlowMapAutoencoder(nn.Module):
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
         Vectorized independent offsets:
-            y_i:    [B, S_in]   (normalized)
-            dt_norm:[B, K]      (offsets from anchor; normalized)
-            g:      [B, G]
-        Returns:    [B, K, S_out] (normalized)
+            y_i:     [B, S_in]   (normalized)
+            dt_norm: [B, K]      (offsets from anchor; normalized)
+            g:       [B, G]
+
+        Returns:
+            [B, K, S_out] (normalized)
+
+        Side effect:
+            - Caches encoder + FiLM affine on this module so rollout_vectorized() can
+              reuse them in the same training step without re-encoding y_i.
+              This removes the "double encode" in the rollout loss path.
         """
-        z_i, self.kl_loss = self.encoder(y_i, g)               # [B,Z], KL (or None)
-        z_k = self.dynamics(z_i, dt_norm, g)                   # [B,K,Z]
+
+        # Encode anchor once (handles VAE mode and updates self.kl_loss)
+        enc_out = self.encoder(y_i, g)  # tuple(z, kl) if VAE, else just z
+        if isinstance(enc_out, (tuple, list)):
+            z_i, self.kl_loss = enc_out
+        else:
+            z_i, self.kl_loss = enc_out, None
+
+        # Cache latent for rollout loss reuse
+        self._cached_rollout_z0 = z_i  # [B, Z], requires grad
+
+        # Propagate latent over all requested offsets in one batched call
+        z_k = self.dynamics(z_i, dt_norm, g)  # [B, K, Z]
+
+        # Decoder-side FiLM conditioning
         if self.decoder_condition_on_g:
-            z_k = self.film(z_k, g)                            # [B,K,Z]
-        logits = self.decoder(z_k)                             # [B,K,S_out]
+            # Compute FiLM affine once and cache it for rollout_vectorized
+            gamma_adj, beta = self.film.compute_affine(g)  # [B, Z], [B, Z]
+            self._cached_rollout_film = (gamma_adj, beta)
 
+            # Broadcast FiLM over time dimension [B,K,Z]
+            z_k = gamma_adj.unsqueeze(1) * z_k + beta.unsqueeze(1)
+        else:
+            self._cached_rollout_film = None
+
+        # Decode all K steps at once
+        logits = self.decoder(z_k)  # [B, K, S_out]
+
+        # Plain softmax head path
         if not self.predict_logit_delta:
-            return self._softmax_head_from_logits(logits)
+            return self._softmax_head_from_logits(logits)  # [B, K, S_out]
 
-        # Combine in log-probability space
+        # --- logit-delta head path ---
+        # Combine decoder logits with the base state's distribution in log-probability space.
         base = y_i if self.S_out == self.S_in else y_i.index_select(1, self.target_idx)
-        base_logp = self._denorm_to_logp(base)                 # [B,S_out]
-        log_q = F.log_softmax(logits, dim=-1).float()          # [B,K,S_out]  (decoder distribution)
-        combined = base_logp.unsqueeze(1) + log_q              # [B,K,S_out]
+        base_logp = self._denorm_to_logp(base)  # [B, S_out]
+        log_q = F.log_softmax(logits, dim=-1).float()  # [B, K, S_out] (decoder dist)
+        combined = base_logp.unsqueeze(1) + log_q  # [B, K, S_out]
         log_p = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
 
         if not torch.isfinite(log_p).all():
-            warnings.warn("[FlowMapAutoencoder] Non-finite combined log-probs in forward().", RuntimeWarning)
+            warnings.warn(
+                "[FlowMapAutoencoder] Non-finite combined log-probs in forward().",
+                RuntimeWarning,
+            )
 
-        return self._head_from_logprobs(log_p)                 # [B,K,S_out] (normalized)
+        return self._head_from_logprobs(log_p)  # [B, K, S_out] (normalized)
 
     def step(self, y: torch.Tensor, dt_step_norm: Union[torch.Tensor, float], g: torch.Tensor,
              film_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
@@ -442,56 +504,93 @@ class FlowMapAutoencoder(nn.Module):
 
         return self._head_from_logprobs(log_p)                 # [B,S_out] (normalized)
 
-    def rollout_vectorized(self, y0: torch.Tensor, g: torch.Tensor, dt_steps_norm: torch.Tensor) -> torch.Tensor:
+    def rollout_vectorized(
+            self,
+            y0: torch.Tensor,
+            g: torch.Tensor,
+            dt_steps_norm: torch.Tensor,
+            z0: Optional[torch.Tensor] = None,
+            film_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
         """
-        Sequential K-step rollout (encode once, then compose latent steps):
-            y0:            [B, S_in]   (normalized)
+        K-step sequential rollout in latent space with a single batched decode when possible.
+
+        Args:
+            y0:            [B, S_in]   (normalized anchor state)
             g:             [B, G]
-            dt_steps_norm: [B, K]      per-step increments (normalized)
-        Returns:          [B, K, S_out] (normalized)
+            dt_steps_norm: [B, K]      per-step normalized increments (monotonic, >=0)
+            z0:            Optional precomputed latent for y0 from the *same batch*
+                           (cached by forward()). If provided, we will NOT re-run
+                           the encoder or re-touch self.kl_loss here.
+            film_cache:    Optional tuple (gamma_adj, beta) from FiLM.compute_affine(g),
+                           cached by forward() to avoid re-projecting g.
+
+        Returns:
+            [B, K, S_out] (normalized)
         """
-        # Encode once; keep the most recent KL (None if deterministic)
-        enc_out = self.encoder(y0, g)
-        if isinstance(enc_out, (tuple, list)):
-            z, self.kl_loss = enc_out  # [B, Z]
+
+        # --- Initial latent z ---
+        if z0 is None:
+            # Fallback: encode now (keeps old behavior if called standalone)
+            enc_out = self.encoder(y0, g)
+            if isinstance(enc_out, (tuple, list)):
+                z, self.kl_loss = enc_out
+            else:
+                z, self.kl_loss = enc_out, None
         else:
-            z, self.kl_loss = enc_out, None
+            # Use cached latent from forward(); gradient still flows
+            z = z0  # [B, Z]
+            # DO NOT overwrite self.kl_loss here; forward() already set it.
 
-        # Optional: cache FiLM once
-        film_cache = None
-        if self.decoder_condition_on_g:
-            film_cache = self.film.compute_affine(g)  # (gamma_tilde, beta), each [B, Z]
-
-        outs = []
-        # For logit-delta, we maintain cur_logp in probability space
+        B, K = dt_steps_norm.shape
         use_delta = bool(self.predict_logit_delta)
-        if use_delta:
-            base = y0 if (self.S_out == self.S_in) else y0.index_select(1, self.target_idx)
-            cur_logp = self._denorm_to_logp(base)  # [B, S_out]
 
-        K = dt_steps_norm.shape[1]
-        for k in range(K):
-            # latent step
-            z = self.dynamics.step(z, dt_steps_norm[:, k], g)  # [B, Z]
-            # decode (optionally using cached FiLM)
+        # --- FiLM affine ---
+        gamma_adj = beta = None
+        if self.decoder_condition_on_g:
+            if film_cache is None:
+                gamma_adj, beta = self.film.compute_affine(g)  # [B, Z], [B, Z]
+            else:
+                gamma_adj, beta = film_cache  # [B, Z], [B, Z]
+
+        # -------- Fast path: no logit-delta head --------
+        if not use_delta:
+            # Step latent forward K times, collect all states, then decode in one batched matmul
+            z_steps = []
+            for k in range(K):
+                z = self.dynamics.step(z, dt_steps_norm[:, k], g)  # [B, Z]
+                z_steps.append(z)
+            Z_seq = torch.stack(z_steps, dim=1)  # [B, K, Z]
+
             if self.decoder_condition_on_g:
-                gamma_adj, beta = film_cache
+                # Broadcast cached FiLM params across time
+                Z_seq = gamma_adj.unsqueeze(1) * Z_seq + beta.unsqueeze(1)  # [B, K, Z]
+
+            logits = self.decoder(Z_seq)  # [B, K, S_out]
+            return self._softmax_head_from_logits(logits)  # [B, K, S_out]
+
+        # -------- logit-delta head path (autoregressive in prob space) --------
+        outs = []
+        base = y0 if (self.S_out == self.S_in) else y0.index_select(1, self.target_idx)
+        cur_logp = self._denorm_to_logp(base).float()  # [B, S_out]
+
+        for k in range(K):
+            z = self.dynamics.step(z, dt_steps_norm[:, k], g)  # [B, Z]
+
+            if self.decoder_condition_on_g:
                 z_dec = gamma_adj * z + beta  # [B, Z]
                 logits = self.decoder(z_dec)  # [B, S_out]
             else:
                 logits = self.decoder(z)  # [B, S_out]
 
-            if not use_delta:
-                yk = self._softmax_head_from_logits(logits)  # normalized
-            else:
-                log_q = F.log_softmax(logits, dim=-1).float()  # [B, S_out]
-                combined = cur_logp + log_q
-                cur_logp = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
-                yk = self._head_from_logprobs(cur_logp)  # normalized
+            log_q = F.log_softmax(logits, dim=-1).float()  # [B, S_out]
+            combined = cur_logp + log_q
+            cur_logp = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
 
-            outs.append(yk)
+            outs.append(self._head_from_logprobs(cur_logp))  # [B, S_out]
 
         return torch.stack(outs, dim=1)  # [B, K, S_out]
+
 
 # -------------------------
 # Decoder

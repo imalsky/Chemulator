@@ -635,53 +635,117 @@ class FlowMapPairsDataset(Dataset):
 
     @torch.no_grad()
     def _gather_batch(self, idx_list: torch.LongTensor):
-        """Assemble batch with proper dt computation for non-uniform grids."""
+        """
+        Assemble a batch of training pairs.
+
+        For each sampled (trajectory τ, anchor index i), we generate K future
+        targets at indices j = i + Δt, where Δt are integer step offsets.
+
+        Returns:
+            y_i:      [B, S]           state at anchor index i   (normalized)
+            dt_norm:  [B, K]           normalized Δt (model input)
+            y_j:      [B, K, S]        states at i+Δt_k          (normalized)
+            g:        [B, G_dim]       global conditioning vars  (normalized except kept float32)
+            aux:      dict with:
+                        "i": [B]       anchor indices
+                        "j": [B, K]    target absolute indices (clamped to T-1)
+            mask:     [B, K]           True where j < T (valid), False where clamped
+
+        IMPORTANT FIX:
+        Offsets are now sorted ascending per batch element (monotonic forward time).
+        This ensures:
+          - No negative "step" in rollout.
+          - Sequential rollout in the trainer matches temporal order.
+        """
+
+        # Ensure idx_list is a LongTensor on the dataset's device
         if not isinstance(idx_list, torch.Tensor):
             idx_list = torch.tensor(idx_list, dtype=torch.long, device=self.device)
         elif idx_list.device != self.device:
             idx_list = idx_list.to(self.device, dtype=torch.long, non_blocking=True)
 
-        pair = self.index_map[idx_list]
-        traj = pair[:, 0]
-        anchor_i = pair[:, 1]
+        # Map flat sample index -> (trajectory id, anchor index)
+        pair = self.index_map[idx_list]  # [B, 2]
+        traj = pair[:, 0]  # [B]
+        anchor_i = pair[:, 1]  # [B]
         B = traj.shape[0]
 
+        # -------------------------------------------------------------------------
+        # Sample K step offsets (Δt in "number of steps", NOT physical time yet)
+        # We support two modes:
+        #   (1) share_times_across_batch: one [1,K] set of offsets broadcast to all B
+        #   (2) per-row offsets: each row samples its own [K]
+        #
+        # Offsets can be drawn log-uniform or uniform in step-space.
+        # NEW: we sort the offsets so they are monotonic increasing in time.
+        # -------------------------------------------------------------------------
         if self.share_times_across_batch:
-            # Sample K offsets once and share them across the whole batch
+            # One set of K offsets, applied to all items in the batch
             if self.log_dt_sampling:
                 base_off = self._sample_log_dt_offsets(1, self.K, self._torch_gen)  # [1,K]
             else:
                 base_off = self._sample_uniform_offsets(1, self.K, self._torch_gen)  # [1,K]
-            offsets = base_off.expand(B, self.K)  # [B,K], identical per row
+
+            # Sort to ensure strictly non-decreasing time progression
+            base_off_sorted, _ = torch.sort(base_off, dim=1)  # [1,K]
+            offsets = base_off_sorted.expand(B, self.K)  # [B,K]
         else:
-            # Per-row offsets (slower; many unique Δt)
+            # Independent offsets per row
             if self.log_dt_sampling:
-                offsets = self._sample_log_dt_offsets(B, self.K, self._torch_gen)
+                offsets = self._sample_log_dt_offsets(B, self.K, self._torch_gen)  # [B,K]
             else:
-                offsets = self._sample_uniform_offsets(B, self.K, self._torch_gen)
+                offsets = self._sample_uniform_offsets(B, self.K, self._torch_gen)  # [B,K]
 
-        target_j = anchor_i.unsqueeze(1) + offsets
-        mask = target_j < self.T
-        target_j = torch.clamp(target_j, max=self.T - 1)
+            # Sort each row so Δt_0 <= Δt_1 <= ... => forward-only rollout
+            offsets, _ = torch.sort(offsets, dim=1)  # [B,K]
 
-        g = self.G[traj]
-        y_i = self.Y[traj, anchor_i]
+        # -------------------------------------------------------------------------
+        # Compute absolute target indices j = i + Δt.
+        # Anything that would run off the end of the trajectory is clamped to T-1,
+        # and mask marks which targets were truly valid (not clamped).
+        # -------------------------------------------------------------------------
+        target_j = anchor_i.unsqueeze(1) + offsets  # [B,K]
+        mask = target_j < self.T  # [B,K] boolean
+        target_j = torch.clamp(target_j, max=self.T - 1)  # [B,K]
 
-        traj_exp = traj.unsqueeze(1).expand(B, self.K)
-        y_j = self.Y[traj_exp, target_j]
+        # -------------------------------------------------------------------------
+        # Gather batch tensors
+        # -------------------------------------------------------------------------
+        # Globals g: keep in float32 for stability in downstream dynamics (K(g))
+        g = self.G[traj]  # [B,G_dim]
 
+        # Anchor states y_i
+        y_i = self.Y[traj, anchor_i]  # [B,S]
+
+        # Future states y_j at each target index
+        traj_exp = traj.unsqueeze(1).expand(B, self.K)  # [B,K]
+        y_j = self.Y[traj_exp, target_j]  # [B,K,S]
+
+        # -------------------------------------------------------------------------
+        # Δt normalization:
+        # If we have a precomputed dt_table for a shared, uniform grid, use it.
+        # Otherwise compute physical Δt via steps_to_dt_phys() and normalize.
+        # -------------------------------------------------------------------------
         if self.dt_table is not None and self._has_shared_uniform_grid:
-            # Use precomputed normalized dt table → already [B,K]
-            dt_norm = self.dt_table[anchor_i.unsqueeze(1), target_j]  # [B,K]
+            # dt_table[i, j] already stores normalized Δt from i→j
+            dt_norm = self.dt_table[
+                anchor_i.unsqueeze(1),  # [B,1]
+                target_j  # [B,K]
+            ]  # [B,K]
         else:
-            # Compute physical Δt then normalize → [B,K]
-            anchor_i_exp = anchor_i.unsqueeze(1).expand_as(target_j)
-            dt_phys = self.steps_to_dt_phys(anchor_i_exp, target_j, traj_exp)
-            dt_phys = torch.clamp(dt_phys, min=self.epsilon)
+            # Compute raw physical Δt for each (i→j) pair, then normalize
+            anchor_i_exp = anchor_i.unsqueeze(1).expand_as(target_j)  # [B,K]
+            dt_phys = self.steps_to_dt_phys(anchor_i_exp, target_j, traj_exp)  # [B,K] (seconds or whatever)
+            dt_phys = torch.clamp(dt_phys, min=self.epsilon)  # avoid log(0) / div0
             dt_norm = self.norm.normalize_dt_from_phys(dt_phys).to(torch.float32)  # [B,K]
 
-        aux = {"i": anchor_i, "j": target_j}
+        # Aux diagnostic indices
+        aux = {
+            "i": anchor_i,  # [B]
+            "j": target_j,  # [B,K]
+        }
 
+        # Final return signature matches Trainer expectation
         return y_i, dt_norm, y_j, g, aux, mask
 
     def __len__(self) -> int:

@@ -7,7 +7,7 @@ Trainer for Stable LPV Koopman Autoencoder
 - Unified rollout loss: vectorized when TF=0; cached loop when TF>0.
 - Teacher-forcing schedule (none | linear).
 - Rollout horizon warmup.
-- Cosine LR with linear warmup; AdamW; Lightning gradient clipping.
+- Cosine LR with linear warmup; AdamW; manual gradient clipping (fused-optimizer safe).
 - Lightning checkpointing + best model export.
 - Adaptive stiff loss (fractional physical + MSE normalized), device-safe.
 - End-of-epoch one-line summary: epoch, train/val, ||g||, ||p||, lr, TF, H.
@@ -34,6 +34,7 @@ import logging
 import torch.nn as nn
 import torch.nn.functional as F
 
+from optuna.integration import PyTorchLightningPruningCallback
 import time
 import math
 import torch
@@ -65,13 +66,31 @@ MAX_RESIDUAL = 1e4
 
 class AdaptiveStiffLoss(nn.Module):
     """
-    total = λ_mse * MSE(z-space) + λ_phys * mean(|Δ| / (|true| + eps_phys))
+    Adaptive loss for stiff chemical systems.
 
-    - Computes normalized MSE and a fractional L1 in physical space.
-    - Reductions in float32 (bf16/half safe).
-    - Sanitizes NaN/Inf; optional relative cap.
-    - Mask may be [B,K] and is normalized by sum(mask).
+    total = λ_mse * MSE(z-space) + λ_phys * mean_s( |pred_phys - true_phys| / (|true_phys| + eps_phys) )
+
+    Features restored from the old trainer:
+      • Species weights based on dynamic log-range (stabilizes influence across species)
+      • Time-dependent weights that emphasize trajectory edges (t≈0 and t≈1)
+
+    Fast path (no full denorm) supports per-species log normalizations:
+      - "log-standard":   z = (log10(x) - log_mean) / log_std
+      - "log-min-max":    z = (log10(x) - log_min) / (log_max - log_min)
+
+    Args:
+      manifest: normalization manifest with keys:
+          - "per_key_stats": {key: {...}}
+          - "normalization_methods": {key: "log-standard"|"log-min-max"|...}
+      species_keys: list of species names (order must match model outputs)
+      lambda_phys: weight for fractional physical error term
+      lambda_mse:  weight for normalized-space MSE stabilizer
+      epsilon_phys: small constant in denominator of fractional error
+      rel_cap: optional clamp for fractional error (cap extreme outliers)
+      time_edge_gain: gain ≥ 1.0; w(t)=1+(g-1)*(1-4t(1-t)) → g at t=0,1 and 1 at t=0.5
+      device: torch device for internal buffers
     """
+
     def __init__(
         self,
         manifest: dict,
@@ -80,71 +99,219 @@ class AdaptiveStiffLoss(nn.Module):
         lambda_mse: float = 0.1,
         epsilon_phys: float = 1e-20,
         rel_cap: Optional[float] = None,
+        time_edge_gain: float = 2.0,
         device=None,
     ):
         super().__init__()
-        self.device = torch.device(device) if device is not None else torch.device("cpu")
+
+        if not isinstance(manifest, dict):
+            raise TypeError("[AdaptiveStiffLoss] manifest must be a dict")
+        if "per_key_stats" not in manifest or "normalization_methods" not in manifest:
+            raise KeyError("[AdaptiveStiffLoss] manifest must contain 'per_key_stats' and 'normalization_methods'")
+
+        if not species_keys:
+            raise RuntimeError("[AdaptiveStiffLoss] species_keys is empty")
+
+        self.manifest = manifest
         self.species_keys = list(species_keys)
         self.lambda_phys = float(lambda_phys)
-        self.lambda_mse = float(lambda_mse)
-        self.eps_phys = float(epsilon_phys)
-        self.rel_cap = float(rel_cap) if (rel_cap is not None and rel_cap > 0) else None
-        self.manifest = manifest
+        self.lambda_mse  = float(lambda_mse)
+        self.eps_phys    = float(epsilon_phys)
+        self.rel_cap     = float(rel_cap) if rel_cap is not None else None
+        self.time_edge_gain = float(time_edge_gain)
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
 
-        # Construct helper now on current device; enforce device-match in forward()
+        per_key_stats = manifest["per_key_stats"]
+        norm_methods  = manifest["normalization_methods"]
+        if not isinstance(per_key_stats, dict) or not isinstance(norm_methods, dict):
+            raise TypeError("[AdaptiveStiffLoss] 'per_key_stats' and 'normalization_methods' must both be dicts.")
+
+        # Build fast-path parameters and species weights
+        log_scales: list[float] = []
+        log_biases: list[float] = []
+        log_mins: list[float] = []
+        log_maxs: list[float] = []
+
+        for key in self.species_keys:
+            if key not in per_key_stats:
+                raise KeyError(f"[AdaptiveStiffLoss] Stats for '{key}' not found in manifest['per_key_stats']")
+            if key not in norm_methods:
+                raise KeyError(f"[AdaptiveStiffLoss] Method for '{key}' not found in manifest['normalization_methods']")
+
+            stats  = per_key_stats[key]
+            method = str(norm_methods[key]).strip().lower()
+
+            if method == "log-standard":
+                if "log_mean" not in stats or "log_std" not in stats:
+                    raise KeyError(f"[AdaptiveStiffLoss] '{key}' missing log_mean/log_std for log-standard")
+                log_mean = float(stats["log_mean"])
+                log_std  = float(stats["log_std"])
+                if not (math.isfinite(log_mean) and math.isfinite(log_std) and log_std > 0):
+                    raise ValueError(f"[AdaptiveStiffLoss] invalid log_mean/log_std for '{key}'")
+
+                # For fast path:
+                #   log10(x) = log_mean + log_std * z
+                log_bias  = log_mean
+                log_scale = log_std
+                # For species weighting (log-range), prefer provided min/max if present:
+                lo = float(stats.get("log_min", log_mean - 3.0 * log_std))
+                hi = float(stats.get("log_max", log_mean + 3.0 * log_std))
+
+            elif method == "log-min-max":
+                if "log_min" not in stats or "log_max" not in stats:
+                    raise KeyError(f"[AdaptiveStiffLoss] '{key}' missing log_min/log_max for log-min-max")
+                lo = float(stats["log_min"])
+                hi = float(stats["log_max"])
+                if not (math.isfinite(lo) and math.isfinite(hi) and hi > lo):
+                    raise ValueError(f"[AdaptiveStiffLoss] invalid log_min/log_max for '{key}'")
+
+                # For fast path:
+                #   log10(x) = log_min + (log_max - log_min) * z
+                log_bias  = lo
+                log_scale = hi - lo
+
+            else:
+                raise RuntimeError(
+                    f"[AdaptiveStiffLoss] Species '{key}' uses unsupported method '{method}'. "
+                    f"Only 'log-standard' and 'log-min-max' are supported by the fast path."
+                )
+
+            if not (math.isfinite(log_bias) and math.isfinite(log_scale) and log_scale > 0.0):
+                raise ValueError(f"[AdaptiveStiffLoss] non-finite/invalid bias/scale for '{key}': "
+                                 f"bias={log_bias}, scale={log_scale}")
+
+            log_scales.append(log_scale)
+            log_biases.append(log_bias)
+            log_mins.append(lo)
+            log_maxs.append(hi)
+
+        # Register constant buffers for vectorized fast path
+        self.register_buffer("_ln10", torch.tensor(math.log(10.0), dtype=torch.float32))
+        self.register_buffer("_log_scale_vec", torch.tensor(log_scales, dtype=torch.float32))
+        self.register_buffer("_log_bias_vec",  torch.tensor(log_biases, dtype=torch.float32))
+
+        # Species weights based on dynamic range (in log-space)
+        log_min_t = torch.tensor(log_mins, dtype=torch.float32)
+        log_max_t = torch.tensor(log_maxs, dtype=torch.float32)
+        log_range = torch.clamp(log_max_t - log_min_t, min=1e-6)
+        w_species = torch.sqrt(log_range)
+        w_species = w_species / (w_species.mean() + 1e-12)
+        w_species = torch.clamp(w_species, 0.5, 2.0)
+        self.register_buffer("w_species", w_species)
+
+        # Fallback helper for full denormalization (only used if shapes mismatch)
         from normalizer import NormalizationHelper
         self._norm_helper = NormalizationHelper(self.manifest, device=self.device)
 
+        # Flag to allow fast path when last-dim matches #species
+        self._fast_ok = True
+
+        # Final validation
+        for name, buf in [("_log_scale_vec", self._log_scale_vec),
+                          ("_log_bias_vec",  self._log_bias_vec),
+                          ("w_species",       self.w_species)]:
+            if not torch.isfinite(buf).all():
+                raise RuntimeError(f"[AdaptiveStiffLoss] Non-finite values in buffer '{name}'")
+
+    # --------------------------- internals ---------------------------
+
+    def _time_weights(self, t01: torch.Tensor) -> torch.Tensor:
+        """U-shaped weights: returns `gain` at 0 and 1, and 1 at 0.5."""
+        if self.time_edge_gain <= 1.0:
+            return torch.ones_like(t01)
+        return 1.0 + (self.time_edge_gain - 1.0) * (1.0 - 4.0 * t01 * (1.0 - t01))
+
+    # --------------------------- forward ---------------------------
+
     def forward(
         self,
-        pred_norm: torch.Tensor,               # [..., S]
-        true_norm: torch.Tensor,               # [..., S]
-        mask: Optional[torch.Tensor] = None,   # [B,K] or None
+        pred_norm: torch.Tensor,
+        true_norm: torch.Tensor,
+        t_norm: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
         return_components: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
-        dev = pred_norm.device
-        # Ensure helper resides on the current compute device
-        if getattr(self._norm_helper, "device", None) != dev:
-            try:
-                self._norm_helper = self._norm_helper.to(dev)  # if helper supports .to()
-            except Exception:
-                from normalizer import NormalizationHelper
-                self._norm_helper = NormalizationHelper(self.manifest, device=dev)
 
-        # bf16/half-safe reductions
+        # Promote to float32 for stable reductions
         pz = pred_norm.float()
         tz = true_norm.float()
+        if pz.shape[-1] != tz.shape[-1]:
+            raise ValueError(f"[AdaptiveStiffLoss] pred/true last dim mismatch: {pz.shape[-1]} vs {tz.shape[-1]}")
 
-        # 1) MSE in normalized space (mean over species)
-        mse_bk = (pz - tz).square().mean(dim=-1)
+        # 1) MSE in normalized space (per-sample: average over species)
+        mse_per_sample = (pz - tz).square().mean(dim=-1)  # shape = pred_norm.shape[:-1]
 
-        # 2) Fractional L1 in physical space (sanitized, optionally capped)
-        pred_phys = self._norm_helper.denormalize(pz, self.species_keys)  # [..., S]
-        true_phys = self._norm_helper.denormalize(tz, self.species_keys)  # [..., S]
-        frac = (pred_phys - true_phys).abs() / (true_phys.abs() + self.eps_phys)
+        # 2) Fractional |Δ| / (|true| + eps) in physical space
+        if self._fast_ok and self._log_scale_vec.numel() == pz.shape[-1]:
+            # Compute log10(true) and Δlog10 = (pz - tz) * scale
+            lnt = tz * self._log_scale_vec + self._log_bias_vec         # [..., S]
+            dlt = (pz - tz) * self._log_scale_vec                        # [..., S]
+
+            # true_phys = 10^lnt ; pred_phys - true_phys = true_phys * (10^dlt - 1)
+            true_phys = torch.exp(lnt * self._ln10)
+            delta_factor = torch.exp(dlt * self._ln10) - 1.0
+
+            numer = (true_phys * delta_factor.abs())                     # [..., S]
+            denom = true_phys.abs() + self.eps_phys                      # [..., S]
+            frac  = numer / denom
+        else:
+            # Fallback: compute in physical units via helper
+            # Ensure helper is initialized on correct device for any internal tensors
+            from normalizer import NormalizationHelper
+            self._norm_helper = NormalizationHelper(self.manifest, device=pz.device)
+
+            pred_phys = self._norm_helper.denormalize(pz, self.species_keys)
+            true_phys = self._norm_helper.denormalize(tz, self.species_keys)
+            frac = (pred_phys - true_phys).abs() / (true_phys.abs() + self.eps_phys)
+
+        # Numerical safety + optional cap
         frac = torch.nan_to_num(frac, nan=0.0, posinf=1e6, neginf=0.0)
         if self.rel_cap is not None:
             frac = frac.clamp_max(self.rel_cap)
-        frac_bk = frac.mean(dim=-1)  # [... without S]
 
-        # Masking & reduction
-        if mask is not None and mask.ndim == mse_bk.ndim:
-            m = mask.to(dtype=mse_bk.dtype, device=mse_bk.device)
+        # Apply species weights before reducing across species
+        if self.w_species.numel() == frac.shape[-1]:
+            frac = frac * self.w_species
+
+        frac_per_sample = frac.mean(dim=-1)  # shape = pred_norm.shape[:-1]
+
+        # 3) Optional time weights (expect shape broadcastable to per-sample losses)
+        if t_norm is not None:
+            t = t_norm
+            if t.ndim == frac_per_sample.ndim + 1 and t.shape[-1] == 1:
+                t = t.squeeze(-1)
+            # Broadcast to per-sample shape if needed
+            while t.ndim < frac_per_sample.ndim:
+                t = t.unsqueeze(-1)
+            t01 = torch.clamp(t, 0.0, 1.0).to(dtype=frac_per_sample.dtype, device=frac_per_sample.device)
+            wt = self._time_weights(t01)
+            mse_per_sample  = mse_per_sample * wt
+            frac_per_sample = frac_per_sample * wt
+
+        # 4) Optional mask over per-sample elements (e.g., [B,K])
+        if mask is not None:
+            m = mask
+            if m.ndim == frac_per_sample.ndim + 1 and m.shape[-1] == 1:
+                m = m.squeeze(-1)
+            while m.ndim < frac_per_sample.ndim:
+                m = m.unsqueeze(-1)
+            m = m.to(dtype=frac_per_sample.dtype, device=frac_per_sample.device)
             denom = m.sum().clamp_min(1.0)
-            mse_scalar = (mse_bk * m).sum() / denom
-            frac_scalar = (frac_bk * m).sum() / denom
+            mse_scalar  = (mse_per_sample  * m).sum() / denom
+            frac_scalar = (frac_per_sample * m).sum() / denom
         else:
-            mse_scalar = mse_bk.mean()
-            frac_scalar = frac_bk.mean()
+            mse_scalar  = mse_per_sample.mean()
+            frac_scalar = frac_per_sample.mean()
 
-        mse_component = self.lambda_mse * mse_scalar
-        frac_component = self.lambda_phys * frac_scalar
-        total = mse_component + frac_component
+        total = self.lambda_mse * mse_scalar + self.lambda_phys * frac_scalar
 
         if return_components:
-            return {"total": total, "mse": mse_scalar.detach(), "frac": frac_scalar.detach()}
+            return {
+                "total": total,
+                "mse": mse_scalar.detach(),
+                "frac": frac_scalar.detach(),
+            }
         return total
-
 
 # --------------------------- Utilities ---------------------------
 
@@ -494,6 +661,7 @@ class AutoEncoderModule(LightningModule):
 
         loss_cfg = tcfg.get("adaptive_stiff_loss", {})
         rel_cap = loss_cfg.get("rel_cap", tcfg.get("loss_rel_cap", None))
+        time_edge_gain = float(loss_cfg.get("time_edge_gain", 2.0))
 
         self.criterion = AdaptiveStiffLoss(
             manifest=manifest,
@@ -502,6 +670,7 @@ class AutoEncoderModule(LightningModule):
             lambda_mse=float(loss_cfg.get("lambda_mse", 0.1)),
             epsilon_phys=float(loss_cfg.get("epsilon_phys", 1e-20)),
             rel_cap=(float(rel_cap) if rel_cap is not None else None),
+            time_edge_gain=time_edge_gain,
             device=self.device,
         )
         self.use_adaptive_stiff = True
@@ -512,6 +681,7 @@ class AutoEncoderModule(LightningModule):
             f"lambda_mse={loss_cfg.get('lambda_mse', 0.1)}, "
             f"epsilon_phys={loss_cfg.get('epsilon_phys', 1e-20)}, "
             f"rel_cap={rel_cap}, "
+            f"time_edge_gain={time_edge_gain}, "
             f"dt_present={has_dt}"
         )
 
@@ -537,7 +707,7 @@ class AutoEncoderModule(LightningModule):
 
         warm = LinearLR(
             opt,
-            start_factor=1e-4,
+            start_factor=0.1,
             end_factor=1.0,
             total_iters=max(1, self.warmup_epochs),
         )
@@ -607,29 +777,58 @@ class AutoEncoderModule(LightningModule):
     ) -> Optional[torch.Tensor]:
         """
         Unified rollout loss:
-          - TF == 0: use model.rollout_vectorized (pure latent rollout; gradients ON).
-          - TF >  0: teacher forcing loop with FiLM(g) cached once per batch, and
+          - TF == 0: latent rollout with no teacher forcing (gradients ON). Reuses the
+                     encoder output + FiLM affine cached in model.forward() so we do
+                     NOT re-encode y_i.
+          - TF >  0: teacher-forcing loop with FiLM(g) cached once per batch, with
                      correct delta-logit composition in log-probability space.
-        Returns a scalar loss or None when horizon < 2.
+
+        Returns:
+            scalar loss or None when horizon < 2.
         """
         B, K_avail, _ = y_j.shape
         H = min(H, K_avail)
         if H < 2:
             return None
 
+        # Convert absolute offsets [B,K_abs] -> per-step increments [B,H]
         dt_steps_norm = self._offsets_to_steps_norm(dt_offsets[:, :H])
 
+        # -------- Pure rollout branch (no teacher forcing) --------
         if tf_prob < 1e-8:
-            # NOTE: rollout_vectorized must NOT be under @torch.no_grad() so this stays trainable.
-            y_pred = self.model.rollout_vectorized(y_i, g, dt_steps_norm)  # [B,H,S]
+            # Grab cached encoder/FiLM results from the forward() we already did this batch.
+            cached_z0 = getattr(self.model, "_cached_rollout_z0", None)
+            cached_film = getattr(self.model, "_cached_rollout_film", None)
+
+            # rollout_vectorized now accepts these caches to avoid double encoding
+            y_pred = self.model.rollout_vectorized(
+                y0=y_i,
+                g=g,
+                dt_steps_norm=dt_steps_norm,
+                z0=cached_z0,
+                film_cache=cached_film,
+            )  # [B, H, S]
+
             y_tgt = y_j[:, :H, :]
             rmask = mask[:, :H] if mask is not None else None
+
             if self.use_adaptive_stiff and self.criterion is not None:
-                return self.criterion(y_pred, y_tgt, rmask, return_components=False)
+                return self.criterion(
+                    pred_norm=y_pred,
+                    true_norm=y_tgt,
+                    t_norm=dt_offsets[:, :H],  # absolute normalized offsets
+                    mask=rmask,
+                    return_components=False,
+                )
+
             return _masked_mse(y_pred, y_tgt, rmask)
 
-        use_film = bool(getattr(self.model, "decoder_condition_on_g", False)) and hasattr(self.model, "film") and (
-                self.model.film is not None)
+        # -------- Teacher forcing branch (unchanged logic) --------
+        use_film = (
+                bool(getattr(self.model, "decoder_condition_on_g", False))
+                and hasattr(self.model, "film")
+                and (self.model.film is not None)
+        )
         if use_film:
             gb = self.model.film.proj(g)  # [B, 2Z]
             gamma, beta = gb.chunk(2, dim=-1)  # [B,Z], [B,Z]
@@ -653,14 +852,14 @@ class AutoEncoderModule(LightningModule):
 
         for k in range(H):
             if hasattr(self.model, "encode") and hasattr(self.model, "decode"):
-                # Preferred path: use wrappers if present
+                # Preferred path using wrappers
                 z = self.model.encode(y_curr, g)  # [B,Z]
                 z = self.model.dynamics.step(z, dt_steps_norm[:, k], g)  # [B,Z]
                 if use_film:
                     z = apply_film(z)
                 logits = self.model.decoder(z)  # [B,S]
             else:
-                # Raw modules; be tuple-safe with VAE encoders
+                # Fallback path (tuple-safe with VAE encoders)
                 enc_out = self.model.encoder(y_curr, g)
                 z = enc_out[0] if isinstance(enc_out, (tuple, list)) else enc_out  # [B,Z]
                 z = self.model.dynamics.step(z, dt_steps_norm[:, k], g)  # [B,Z]
@@ -678,6 +877,7 @@ class AutoEncoderModule(LightningModule):
 
             preds.append(y_next)
 
+            # Teacher forcing mix for next step
             if tf_prob >= 1.0:
                 y_curr = y_j[:, k, :]
             else:
@@ -692,12 +892,18 @@ class AutoEncoderModule(LightningModule):
                                                                                                 self.model.target_idx)
                 cur_logp = self.model._denorm_to_logp(base)
 
-        y_pred = torch.stack(preds, dim=1)  # [B,H,S]
+        y_pred = torch.stack(preds, dim=1)  # [B, H, S]
         y_tgt = y_j[:, :H, :]
         rmask = mask[:, :H] if mask is not None else None
 
         if self.use_adaptive_stiff and self.criterion is not None:
-            return self.criterion(y_pred, y_tgt, rmask, return_components=False)
+            return self.criterion(
+                pred_norm=y_pred,
+                true_norm=y_tgt,
+                t_norm=dt_offsets[:, :H],
+                mask=rmask,
+                return_components=False,
+            )
         return _masked_mse(y_pred, y_tgt, rmask)
 
     def _compute_semigroup_loss(self, y_i: torch.Tensor, g: torch.Tensor) -> Optional[torch.Tensor]:
@@ -733,7 +939,15 @@ class AutoEncoderModule(LightningModule):
     # ------------------ Hooks for gradient diagnostics ------------------
 
     def on_before_optimizer_step(self, optimizer) -> None:
-        """Compute & cache L2 grad norm; optionally clip grads manually (works with fused AdamW)."""
+        """
+        Compute & cache L2 grad norm; optionally clip grads manually.
+
+        Note: Manual clipping is used instead of Lightning's gradient_clip_val because:
+          - Works reliably with fused optimizers (fused=True in AdamW)
+          - Compatible with torch.compile on the model
+          - Avoids hook interception issues in mixed precision training
+        Lightning's gradient_clip_val is set for monitoring/logging only.
+        """
         # ---- manual clipping (safe with fused and non-fused) ----
         if self.grad_clip is not None and float(self.grad_clip) > 0.0:
             try:
@@ -778,7 +992,13 @@ class AutoEncoderModule(LightningModule):
             raise RuntimeError(f"Non-finite predictions in training batch {batch_idx}")
 
         if self.use_adaptive_stiff and self.criterion is not None:
-            comp = self.criterion(pred, y_j, mask, return_components=True)
+            comp = self.criterion(
+                pred_norm=pred,
+                true_norm=y_j,
+                t_norm=dt_offsets,  # [B,K] absolute normalized offsets
+                mask=mask,  # [B,K] validity mask
+                return_components=True,
+            )
             forward_loss = comp["total"].float()
             self.log("train_mse_norm", comp["mse"].detach(), on_step=False, on_epoch=True, logger=True)
             self.log("train_frac_phys", comp["frac"].detach(), on_step=False, on_epoch=True, logger=True)
@@ -843,7 +1063,13 @@ class AutoEncoderModule(LightningModule):
             raise RuntimeError(f"Non-finite predictions in validation batch {batch_idx}")
 
         if self.use_adaptive_stiff and self.criterion is not None:
-            comp = self.criterion(pred, y_j, mask, return_components=True)
+            comp = self.criterion(
+                pred_norm=pred,
+                true_norm=y_j,
+                t_norm=dt_offsets,  # [B,K] absolute normalized offsets
+                mask=mask,
+                return_components=True,
+            )
             loss = comp["total"].float()
             self.log("val_mse_norm", comp["mse"].detach(), on_step=False, on_epoch=True, logger=True)
             self.log("val_frac_phys", comp["frac"].detach(), on_step=False, on_epoch=True, logger=True)
@@ -871,6 +1097,8 @@ class Trainer:
         work_dir: Union[str, Path],
         device: torch.device,
         logger: logging.Logger,
+        optuna_trial: Optional[Any] = None,
+        optuna_monitor: str = "val",
     ):
         self.model = model
         self.train_loader = train_loader
@@ -879,6 +1107,12 @@ class Trainer:
         self.work_dir = Path(work_dir)
         self.device = device
         self.logger = logger
+
+        # Optuna pruning context
+        self.optuna_trial = optuna_trial
+        self.optuna_monitor = optuna_monitor
+
+        # Ensure output directory exists
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
     def train(self) -> float:
@@ -902,8 +1136,10 @@ class Trainer:
                         f"dynamic={dynamic}, fullgraph={fullgraph}"
                     )
                 except Exception:
-                    print(f"[INFO] torch.compile enabled: backend={backend}, mode={mode}, "
-                          f"dynamic={dynamic}, fullgraph={fullgraph}")
+                    print(
+                        f"[INFO] torch.compile enabled: backend={backend}, mode={mode}, "
+                        f"dynamic={dynamic}, fullgraph={fullgraph}"
+                    )
             except Exception as e:
                 try:
                     self.logger.warning(f"torch.compile failed; continuing uncompiled: {e}")
@@ -935,15 +1171,17 @@ class Trainer:
         ckpt_cb = ModelCheckpoint(
             dirpath=str(self.work_dir / "checkpoints"),
             filename="epoch{epoch:04d}-val{val:.6e}",
-            monitor="val",  # <- you log this in validation_step
+            monitor="val",  # this is logged in validation_step
             mode="min",
             save_top_k=save_top_k,
             save_last=True,
             auto_insert_metric_name=False,
         )
         lr_cb = LearningRateMonitor(logging_interval="epoch")
+
         es_patience = int(lcfg.get("early_stop_patience", 0))
         es_cb = EarlyStopping(monitor="val", mode="min", patience=es_patience) if es_patience > 0 else None
+
         epoch_cb = EpochSetterCallback()
         summary_cb = EpochSummaryLineCallback()
 
@@ -955,8 +1193,9 @@ class Trainer:
             if _EMA_CB is not None:
                 decay = float(ema_cfg.get("decay", 0.999))
                 try:
-                    callbacks.append(_EMA_CB(decay=decay))  # portable signature
+                    callbacks.append(_EMA_CB(decay=decay))
                 except TypeError:
+                    # different lightning versions have slightly different EMA sigs
                     try:
                         callbacks.append(_EMA_CB(decay=decay, every_n_steps=1))
                     except Exception:
@@ -974,6 +1213,22 @@ class Trainer:
             else:
                 print("[WARN] SWA callback not available in this Lightning version; skipping.")
 
+        # Optional Optuna pruning
+        if self.optuna_trial is not None:
+            try:
+                callbacks.append(
+                    PyTorchLightningPruningCallback(
+                        self.optuna_trial,
+                        monitor=self.optuna_monitor,
+                    )
+                )
+            except Exception as e:
+                try:
+                    self.logger.warning(f"Optuna pruning callback not attached: {e}")
+                except Exception:
+                    print(f"[WARN] Optuna pruning callback not attached: {e}")
+
+        # Early stopping at the end so it's evaluated too
         if es_cb is not None:
             callbacks.append(es_cb)
 
@@ -990,7 +1245,7 @@ class Trainer:
             gradient_clip_algorithm="norm",
             benchmark=benchmark,
             enable_progress_bar=False,
-            log_every_n_steps=max(1, len(self.train_loader)),
+            log_every_n_steps=999999999,
         )
 
         trainer.fit(
@@ -1007,14 +1262,18 @@ class Trainer:
         if ckpt_cb.best_model_path:
             state = torch.load(ckpt_cb.best_model_path, map_location="cpu", weights_only=False)
             sd = state.get("state_dict", {})
-            model_state = {k.replace("model.", "", 1): v for k, v in sd.items() if k.startswith("model.")}
+            model_state = {
+                k.replace("model.", "", 1): v
+                for k, v in sd.items()
+                if k.startswith("model.")
+            }
             torch.save(
                 {"model": model_state, "best_val_loss": best_val, "config": self.cfg},
                 self.work_dir / "best_model.pt",
             )
             self.logger.info(f"Saved best_model.pt (val_loss={best_val:.6e})")
 
-        # Optional: Model Soup (average best-k checkpoints)
+        # Optional model soup across top-k checkpoints
         if bool(ms_cfg.get("enable", False)) and save_top_k > 1:
             try:
                 best_k = ckpt_cb.best_k_models  # dict: path -> score
@@ -1025,7 +1284,11 @@ class Trainer:
                     for pth in ckpt_paths:
                         st = torch.load(pth, map_location="cpu", weights_only=False)
                         sd = st.get("state_dict", {})
-                        model_sd = {k.replace("model.", "", 1): v for k, v in sd.items() if k.startswith("model.")}
+                        model_sd = {
+                            k.replace("model.", "", 1): v
+                            for k, v in sd.items()
+                            if k.startswith("model.")
+                        }
                         if not avg_state:
                             for k, v in model_sd.items():
                                 if torch.is_tensor(v):

@@ -3,8 +3,8 @@
   // PATHS
   // ===============================
   "paths": {
-    "processed_data_dir": "data/processed",
-    "work_dir": "models/autoencoder-v2",
+    "processed_data_dir": "data/processed_medium",
+    "work_dir": "models/v3",
     "raw_data_files": []
   },
   // ===============================
@@ -13,7 +13,7 @@
   "torch_compile": {
     "enable": true,
     "backend": "inductor",
-    "mode": "reduce-overhead",
+    "mode": "default",
     "dynamic": false,
     "fullgraph": false
   },
@@ -35,8 +35,8 @@
   "dataset": {
     // Multi-Δt targets per anchor
     "multi_time_per_anchor": true,
-    "times_per_anchor": 12,
-    "share_times_across_batch": false,
+    "times_per_anchor": 8,
+    "share_times_across_batch": true,
 
     // Time sampling / grid fast-paths
     "log_dt_sampling": true,
@@ -72,10 +72,10 @@
   // ===============================
   "model": {
     // Architecture
-    "latent_dim": 128,
-    "encoder_hidden": [512, 512, 512, 512],
-    "dynamics_hidden": [512, 512, 512, 512],
-    "decoder_hidden": [512, 512, 512, 512],
+    "latent_dim": 512,
+    "encoder_hidden": [1024, 1024, 1024, 1024],
+    "dynamics_hidden":[1024, 1024, 1024, 1024],
+    "decoder_hidden": [1024, 1024, 1024, 1024],
 
     "vae_mode": true,
 
@@ -95,12 +95,12 @@
   // ===============================
   "training": {
     // Batching / sampling (used by main.build_datasets_and_loaders and preprocessor)
-    "batch_size": 65536,
-    "val_batch_size": 65536,
-    "pairs_per_traj": 12,
-    "pairs_per_traj_val": 12,
+    "batch_size": 32768,
+    "val_batch_size": 32768,
+    "pairs_per_traj": 8,
+    "pairs_per_traj_val": 8,
 
-    "beta_kl": 0.0025,
+    "beta_kl": 0.002,
 
     // Splits for preprocessing (required by preprocessor)
     "val_fraction": 0.1,
@@ -112,12 +112,12 @@
     "max_steps": null,            // optional; omit for full range
 
     // Optimizer / schedule
-    "lr": 1e-4,
-    "min_lr": 1e-7,
+    "lr": 5e-4,
+    "min_lr": 1e-8,
     "weight_decay": 1e-5,
     "warmup_epochs": 10,
-    "epochs": 100,
-    "gradient_clip": 0,
+    "epochs": 200,
+    "gradient_clip": 5.0,
 
     // Loss
     "loss_mode": "adaptive_stiff", //"adaptive_stiff"
@@ -125,19 +125,19 @@
     "adaptive_stiff_loss": {
       "lambda_phys": 1.0,
       "lambda_mse": 0.5,
-      "epsilon_phys": 1e-35
+      "epsilon_phys": 1e-30
     },
     "loss_epsilon": 1e-30,
 
-    "ema": { "enable": false, "decay": 0.9995 },            // EMA callback (minimal)
+    "ema": { "enable": false, "decay": 0.9999},            // EMA callback (minimal)
     "swa": { "enable": false, "epoch_start": 0.8 },       // SWA callback (optional)
     "model_soup": { "enable": false, "top_k": 3 },         // Average best-k ckpts post-fit
 
     // Aux losses (names/structure that trainer reads)
     "auxiliary_losses": {
       "rollout_enabled": false,
-      "rollout_weight": 0.2,
-      "rollout_horizon": 4,
+      "rollout_weight": 0.25,
+      "rollout_horizon": 3,
       "rollout_warmup_epochs": 30,
       "rollout_use_cached_encoding": true,
       "rollout_teacher_forcing": {

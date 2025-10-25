@@ -603,8 +603,6 @@ def main() -> None:
                         help="Path to config file (JSON/JSONC)")
     parser.add_argument("--resume", type=str, default=None,
                         help='Resume from checkpoint ("auto" or path)')
-    parser.add_argument("--fast_dev_run", action="store_true",
-                        help="Enable very short dev run for wiring checks")
     args = parser.parse_args()
 
     # Initialize logging first so subsequent steps are visible
@@ -682,11 +680,6 @@ def main() -> None:
     tr_cfg["accumulate_grad_batches"] = accum_value
     cfg.setdefault("lightning", {})["accumulate_grad_batches"] = accum_value
     logger.info(f"[batch] accumulate_grad_batches = {accum_value}")
-
-    # Fast dev run toggle
-    if args.fast_dev_run:
-        tr_cfg["fast_dev_run"] = True
-        logger.info("Fast dev run enabled (trainer will limit steps/epochs).")
 
     # Initialize trainer (Lightning-backed) and train
     trainer = Trainer(

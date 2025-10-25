@@ -241,8 +241,12 @@ PY
 echo "---------------------------------"
 
 # ===== Phase B: TRAIN single-process on the GPU =====
-echo "Phase B: Training single-process…"
-/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/main.py $PRECISION_ARG $LIMIT_ARGS
+###echo "Phase B: Training single-process…"
+###/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/main.py $PRECISION_ARG $LIMIT_ARGS
+
+echo "Phase B: Hyperparameter tuning…"
+/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/tune.py
+
 
 echo "#####################################################"
 echo "Job finished at $(date)"
