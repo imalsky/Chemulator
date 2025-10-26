@@ -1,9 +1,34 @@
 #!/usr/bin/env python3
+"""
+tune.py
+
+This version enforces apples-to-apples across trials (same rollout/semigroup curriculum,
+same batch size/epochs, etc.) AND makes the validation metric flexible WITHOUT touching trainer.py.
+
+How it works:
+- Trainer already logs some metric called "val" and returns best_val from .train().
+- Trainer may also (now or in the future) log other metrics like "val_long_rollout".
+- Trainer accepts `optuna_monitor=...` so it knows which metric to treat as the key metric.
+
+We DO NOT edit trainer.py. Instead:
+- You can select which metric Trainer should treat as the key metric by either:
+    1. setting environment variable TUNE_VAL_METRIC="val" or "val_long_rollout" or whatever Trainer knows about
+    2. or adding "optuna_monitor": "<metric_name>" under config["training"] in the base config
+    3. fallback is "val" if nothing is provided
+- tune.py resolves that metric name once and passes it into Trainer, so Trainer can internally use that
+  for checkpointing / pruning / best_val, etc.
+
+We ALSO remove the per-trial curriculum branching. Every trial trains with the same rollout+semigroup
+settings from the base config. Optuna only explores architecture, optimizer scalars, and loss weights,
+not "is rollout loss even on". That keeps trials comparable.
+"""
+
 from __future__ import annotations
 
 import copy
 import logging
 import shutil
+import os
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -31,7 +56,6 @@ from trainer import Trainer
 CONFIG_PATH = DEFAULT_CONFIG_PATH
 STUDY_NAME = "default"
 N_TRIALS = 100
-MONITOR_KEY = "val"
 
 # Delete or comment any entry below to SKIP searching it.
 # Lists => categorical
@@ -43,7 +67,6 @@ SWEEP: Dict[str, Any] = {
     # -------------------------
     "model.latent_dim": [48, 64, 96, 128, 160, 192, 256],
 
-    # Depth/width menus – keep a few large options for GH200, plus lean options
     "model.encoder_hidden": [
         [256, 256],
         [384, 384, 384],
@@ -67,50 +90,38 @@ SWEEP: Dict[str, Any] = {
         [768, 768, 768],
     ],
 
-    # Safe, supported activations in your model.py
+    # Runtime nonlinearities / heads
     "model.activation": ["silu", "gelu", "mish", "tanh", "relu"],
+    "model.dropout": (0.0, 0.30),
 
-    # Regularization
-    "model.dropout": (0.0, 0.30),  # uniform float in [0, 0.30]
-
-    # Behavioral flags
+    # Model behavior flags that do NOT change the existence of loss terms
     "model.dynamics_residual": [True, False],
     "model.decoder_condition_on_g": [True, False],
     "model.predict_logit_delta": [True, False],
-    "model.vae_mode": [True, False],
-    "model.allow_partial_simplex": [False],  # keep strict simplex unless you truly want a subset
+    # NOTE:
+    #   model.vae_mode is FIXED in the base config (do not sweep AE vs VAE).
+    #   model.allow_partial_simplex is FIXED in the base config (don't sweep mass conservation policy).
 
     # -------------------------
-    # training.*  (BASICS ONLY)
+    # training.* (optimizer only)
     # -------------------------
     "training.lr": ("log", 3e-5, 3e-3),
     "training.weight_decay": ("log", 1e-7, 1e-3),
-    "training.batch_size": [512, 1024, 2048, 4096],
-
-    # Only used when VAE is on; _apply_sweep already gates this
-    "training.beta_kl": (0.0, 0.02),
+    # NOTE:
+    #   training.batch_size is FIXED in base config, not swept.
+    #   training.beta_kl is FIXED in base config because vae_mode is fixed.
 
     # -------------------------
-    # auxiliary_losses.*  (KEPT OFF)
+    # auxiliary_losses.* (strength only)
     # -------------------------
-    "training.auxiliary_losses.rollout_enabled": [False],
-    # rollout knobs intentionally commented out so they are NOT explored
-    # "training.auxiliary_losses.rollout_weight": ("log", 5e-2, 1.0),
-    # "training.auxiliary_losses.rollout_horizon": [1, 2, 4, 8],
-    # "training.auxiliary_losses.rollout_warmup_epochs": (5, 40),
-    # "training.auxiliary_losses.rollout_teacher_forcing.mode": ["none", "linear"],
-    # "training.auxiliary_losses.rollout_teacher_forcing.start_p": (0.0, 1.0),
-    # "training.auxiliary_losses.rollout_teacher_forcing.end_p": (0.0, 1.0),
-    # "training.auxiliary_losses.rollout_teacher_forcing.end_epoch": (5, 60),
+    # rollout_enabled / horizon / TF schedule / warmup_epochs are FIXED in base config
+    "training.auxiliary_losses.rollout_weight": ("log", 1e-4, 5e-2),
 
-    "training.auxiliary_losses.semigroup.enabled": [False],
-    "training.auxiliary_losses.semigroup.weight": ("log", 1e-4, 5e-2),
-    "training.auxiliary_losses.semigroup.warmup_epochs": (0, 30),
+    # semigroup.enabled / warmup_epochs are FIXED in base config
+    "training.auxiliary_losses.semigroup.weight": ("log", 1e-5, 1e-2),
 
-    # lightning.* remains out of sweep (commented -> not explored)
-    # "lightning.early_stop_patience": (3, 10),
+    # lightning.* stays out of sweep
 }
-
 
 
 # -------------------- UTILS --------------------
@@ -167,14 +178,21 @@ def _apply_sweep(trial: optuna.Trial, base_cfg: Dict[str, Any]) -> Dict[str, Any
     """
     Sample trial config from SWEEP, then apply sanity cleanup:
       - Gate beta_kl on vae_mode
-      - Disable rollout knobs if rollout_enabled=False
-      - Clamp teacher forcing schedule
+      - Clamp teacher forcing schedule using fixed curriculum
       - Clamp rollout warmup to <= total epochs
       - Force val_batch_size if missing
+
+    IMPORTANT:
+    We do NOT:
+      - zero out rollout_weight if rollout_enabled==False
+      - zero out semigroup.weight if semigroup.enabled==False
+      - overwrite rollout_horizon, warmup_epochs, TF mode, etc.
+    Because those are fixed in the base config specifically to keep trials
+    apples-to-apples. Every trial must train under the same curriculum.
     """
     cfg = copy.deepcopy(base_cfg)
 
-    # 1) Sample from SWEEP
+    # 1) Sample all sweep parameters for this trial
     for key, space in SWEEP.items():
         if space is None:
             continue
@@ -184,60 +202,41 @@ def _apply_sweep(trial: optuna.Trial, base_cfg: Dict[str, Any]) -> Dict[str, Any
         except Exception as e:
             raise RuntimeError(f"Sampling {key} failed: {e}")
 
-    # 2) Gate β search on VAE mode
+    # 2) beta_kl only matters if vae_mode is on
     vae_on = bool(_get(cfg, "model.vae_mode", False))
-    if not vae_on and "training.beta_kl" in SWEEP:
+    if (not vae_on) and ("training.beta_kl" in SWEEP):
         _set(cfg, "training.beta_kl", _get(base_cfg, "training.beta_kl", 0.0))
 
-    # 3) Rollout / teacher forcing cleanup
-    rollout_enabled = bool(_get(cfg, "training.auxiliary_losses.rollout_enabled", False))
+    # 3) Clamp teacher forcing schedule / rollout warmup using the fixed curriculum
     total_epochs = int(_get(cfg, "training.epochs", 50))
 
-    if not rollout_enabled:
-        # rollout is off -> zero out related knobs so noise doesn't leak into the run
-        _set(cfg, "training.auxiliary_losses.rollout_weight", 0.0)
-        _set(cfg, "training.auxiliary_losses.rollout_horizon", 1)
-        _set(cfg, "training.auxiliary_losses.rollout_warmup_epochs", 0)
+    start_p = float(_get(cfg, "training.auxiliary_losses.rollout_teacher_forcing.start_p", 1.0))
+    end_p = float(_get(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_p", 0.0))
 
-        _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.mode", "none")
-        _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.start_p", 0.0)
-        _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_p", 0.0)
-        _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_epoch", 0)
-    else:
-        # enforce sane TF schedule
-        start_p = float(_get(cfg, "training.auxiliary_losses.rollout_teacher_forcing.start_p", 1.0))
-        end_p = float(_get(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_p", 0.0))
+    # enforce monotone decay: start_p >= end_p
+    if start_p < end_p:
+        start_p, end_p = end_p, start_p
 
-        # enforce monotone decay: start_p >= end_p
-        if start_p < end_p:
-            start_p, end_p = end_p, start_p
+    # clamp probs into [0,1]
+    start_p = max(0.0, min(1.0, start_p))
+    end_p   = max(0.0, min(1.0, end_p))
 
-        # clamp probs into [0,1]
-        start_p = max(0.0, min(1.0, start_p))
-        end_p = max(0.0, min(1.0, end_p))
+    _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.start_p", start_p)
+    _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_p", end_p)
 
-        _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.start_p", start_p)
-        _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_p", end_p)
+    # end_epoch can't exceed total epochs
+    end_epoch = int(_get(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_epoch", total_epochs))
+    if end_epoch > total_epochs:
+        end_epoch = total_epochs
+    _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_epoch", end_epoch)
 
-        # end_epoch can't exceed total epochs
-        end_epoch = int(_get(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_epoch", total_epochs))
-        if end_epoch > total_epochs:
-            end_epoch = total_epochs
-        _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_epoch", end_epoch)
+    # rollout warmup shouldn't last longer than total training
+    warmup_epochs = int(_get(cfg, "training.auxiliary_losses.rollout_warmup_epochs", 0))
+    if warmup_epochs > total_epochs:
+        warmup_epochs = total_epochs
+    _set(cfg, "training.auxiliary_losses.rollout_warmup_epochs", warmup_epochs)
 
-        # rollout warmup shouldn't last longer than total training
-        warmup_epochs = int(_get(cfg, "training.auxiliary_losses.rollout_warmup_epochs", 0))
-        if warmup_epochs > total_epochs:
-            warmup_epochs = total_epochs
-        _set(cfg, "training.auxiliary_losses.rollout_warmup_epochs", warmup_epochs)
-
-    # 4) semigroup cleanup
-    semigroup_enabled = bool(_get(cfg, "training.auxiliary_losses.semigroup.enabled", False))
-    if not semigroup_enabled:
-        _set(cfg, "training.auxiliary_losses.semigroup.weight", 0.0)
-        _set(cfg, "training.auxiliary_losses.semigroup.warmup_epochs", 0)
-
-    # 5) Force val batch if missing
+    # 4) Force val batch size if missing
     bs = int(_get(cfg, "training.batch_size", 512))
     _set(cfg, "training.val_batch_size", int(_get(cfg, "training.val_batch_size", bs)))
 
@@ -252,6 +251,7 @@ def _make_loaders_for_trial(
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
     Wrap the (persistent) dataset objects in DataLoaders configured for this trial.
+    Deterministic order (shuffle=False) so each trial sees data in the same sequence.
     """
     dcfg = cfg_trial.get("dataset", {})
     tcfg = cfg_trial.get("training", {})
@@ -271,7 +271,7 @@ def _make_loaders_for_trial(
     train_loader = create_dataloader(
         dataset=train_ds,
         batch_size=bs_tr,
-        shuffle=False,
+        shuffle=False,  # keep deterministic for comparability
         num_workers=nw,
         pin_memory=bool(dcfg.get("pin_memory", False)),
         prefetch_factor=pf_tr,
@@ -304,10 +304,41 @@ def _make_loaders_for_trial(
     return train_loader, val_loader
 
 
+def _resolve_monitor_key(cfg: Dict[str, Any]) -> str:
+    """
+    Decide which metric Trainer should treat as the key Optuna metric,
+    WITHOUT editing trainer.py.
+
+    Priority:
+      1. env var TUNE_VAL_METRIC
+      2. cfg["training"]["optuna_monitor"]
+      3. fallback "val"
+
+    Whatever we return here is passed into Trainer(optuna_monitor=...).
+    Trainer is responsible for:
+      - logging that metric
+      - tracking best value
+      - returning that best value from .train()
+    """
+    env_choice = os.getenv("TUNE_VAL_METRIC", "").strip()
+    if env_choice:
+        return env_choice
+
+    cfg_choice = (
+        cfg.get("training", {})
+        .get("optuna_monitor", "")
+    )
+    if isinstance(cfg_choice, str) and cfg_choice.strip():
+        return cfg_choice.strip()
+
+    return "val"
+
+
 # -------------------- OBJECTIVE --------------------
 
 def _make_objective(
     base_cfg: Dict[str, Any],
+    monitor_key: str,
     study_root: Path,
     device: torch.device,
     train_ds,
@@ -319,12 +350,12 @@ def _make_objective(
 
     Each trial:
       1. Re-seeds deterministically (base_seed + trial.number).
-      2. Samples a cfg_trial via _apply_sweep.
+      2. Samples cfg_trial via _apply_sweep (architecture/optimizer/weights only).
       3. Resets dataset RNG/index maps so every trial sees the same sampling schedule.
-      4. Builds DataLoaders with that cfg_trial.
+      4. Builds loaders with that cfg_trial.
       5. Resolves accumulate_grad_batches for Lightning.
       6. Builds model + Trainer, runs training.
-      7. Returns the best validation loss.
+      7. Returns the best value of `monitor_key` as reported by Trainer.train().
     """
 
     def objective(trial: optuna.Trial) -> float:
@@ -337,14 +368,14 @@ def _make_objective(
             trial_dir = study_root / f"trial_{trial.number:03d}"
             trial_dir.mkdir(parents=True, exist_ok=True)
 
-            # sample HPs
+            # sample HPs for this trial
             cfg_trial = _apply_sweep(trial, base_cfg)
 
-            # set trial work_dir
+            # set per-trial work_dir in config
             paths_trial = cfg_trial.setdefault("paths", {})
             paths_trial["work_dir"] = str(trial_dir)
 
-            # reset dataset sampling so each trial trains on the same initial schedule
+            # reset dataset sampling so each trial starts identically
             if hasattr(train_ds, "set_epoch"):
                 try:
                     train_ds.set_epoch(0)
@@ -356,7 +387,7 @@ def _make_objective(
                 except Exception as e:
                     logger.warning(f"val_ds.set_epoch(0) failed: {e}")
 
-            # loaders with this trial's batch size / workers
+            # loaders for this trial
             data_logger = logger.getChild(f"trial{trial.number:03d}.data")
             train_loader, val_loader = _make_loaders_for_trial(
                 cfg_trial, train_ds, val_ds, data_logger
@@ -378,11 +409,11 @@ def _make_objective(
             tcfg["accumulate_grad_batches"] = accum
             cfg_trial.setdefault("lightning", {})["accumulate_grad_batches"] = accum
 
-            # model
+            # build model for this trial
             model_logger = logger.getChild(f"trial{trial.number:03d}.model")
             model = build_model(cfg_trial, device, model_logger)
 
-            # train
+            # Trainer run for this trial
             run = Trainer(
                 model=model,
                 train_loader=train_loader,
@@ -391,20 +422,19 @@ def _make_objective(
                 work_dir=trial_dir,
                 device=device,
                 logger=logger.getChild(f"trial{trial.number:03d}.trainer"),
-                optuna_trial=trial,        # enable pruning callback in Trainer
-                optuna_monitor=MONITOR_KEY,
+                optuna_trial=trial,            # pruning callback inside Trainer
+                optuna_monitor=monitor_key,    # <- chosen metric name
             )
 
             best_val = float(run.train())
 
-            # record + save cfg snapshot for this trial
+            # record + save cfg snapshot
             trial.set_user_attr("best_val_loss", best_val)
             dump_json(trial_dir / "trial_config.final.json", cfg_trial)
 
             return best_val
 
         except optuna.TrialPruned:
-            # Let Optuna handle the pruning.
             raise
         except Exception as e:
             logger.error(f"Trial {trial.number} failed: {e}", exc_info=True)
@@ -439,7 +469,7 @@ def main():
     optimize_hardware(cfg.get("system", {}), device)
     runtime_dtype = _runtime_dtype_from_cfg(cfg)
 
-    # make sure we have data + hydrated cfg from disk
+    # make sure data is prepared + cfg is hydrated
     processed_dir = ensure_preprocessed_data(cfg, logger.getChild("pre"))
     assert processed_dir.exists(), "Processed data directory must exist."
     dump_json(study_root / "config.hydrated.json", cfg)
@@ -448,6 +478,9 @@ def main():
     train_ds, val_ds, _, _ = build_datasets_and_loaders(
         cfg, device, runtime_dtype, logger.getChild("data.init")
     )
+
+    # resolve which metric to optimize (flexible, no trainer.py edit needed)
+    monitor_key = _resolve_monitor_key(cfg)
 
     # Optuna study (sqlite so it's inspectable and resumable)
     storage = f"sqlite:///{study_root / 'optuna_study.db'}"
@@ -463,7 +496,7 @@ def main():
         ),
     )
 
-    objective = _make_objective(cfg, study_root, device, train_ds, val_ds, logger)
+    objective = _make_objective(cfg, monitor_key, study_root, device, train_ds, val_ds, logger)
     study.optimize(objective, n_trials=N_TRIALS)
 
     # dump best config

@@ -417,22 +417,21 @@ class FlowMapAutoencoder(nn.Module):
             [B, K, S_out] (normalized)
 
         Side effect:
-            - Caches encoder + FiLM affine on this module so rollout_vectorized() can
-              reuse them in the same training step without re-encoding y_i.
-              This removes the "double encode" in the rollout loss path.
+            - Caches encoder latent z0 and FiLM affine so rollout_vectorized() can
+              reuse them in the same training_step without re-encoding y_i.
         """
 
         # Encode anchor once (handles VAE mode and updates self.kl_loss)
-        enc_out = self.encoder(y_i, g)  # tuple(z, kl) if VAE, else just z
+        enc_out = self.encoder(y_i, g)  # tuple(z, kl) in both deterministic & VAE modes
         if isinstance(enc_out, (tuple, list)):
             z_i, self.kl_loss = enc_out
         else:
             z_i, self.kl_loss = enc_out, None
 
-        # Cache latent for rollout loss reuse
-        self._cached_rollout_z0 = z_i  # [B, Z], requires grad
+        # Cache latent for rollout loss reuse (will be cleared in training_step)
+        self._cached_rollout_z0 = z_i  # [B, Z], still requires grad
 
-        # Propagate latent over all requested offsets in one batched call
+        # Propagate latent over all requested offsets at once
         z_k = self.dynamics(z_i, dt_norm, g)  # [B, K, Z]
 
         # Decoder-side FiLM conditioning
@@ -454,10 +453,10 @@ class FlowMapAutoencoder(nn.Module):
             return self._softmax_head_from_logits(logits)  # [B, K, S_out]
 
         # --- logit-delta head path ---
-        # Combine decoder logits with the base state's distribution in log-probability space.
+        # Compose decoder logits with base distribution in log-probability space.
         base = y_i if self.S_out == self.S_in else y_i.index_select(1, self.target_idx)
-        base_logp = self._denorm_to_logp(base)  # [B, S_out]
-        log_q = F.log_softmax(logits, dim=-1).float()  # [B, K, S_out] (decoder dist)
+        base_logp = self._denorm_to_logp(base)  # [B, S_out] (natural log p_base)
+        log_q = F.log_softmax(logits, dim=-1).float()  # [B, K, S_out]
         combined = base_logp.unsqueeze(1) + log_q  # [B, K, S_out]
         log_p = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
 
@@ -467,7 +466,7 @@ class FlowMapAutoencoder(nn.Module):
                 RuntimeWarning,
             )
 
-        return self._head_from_logprobs(log_p)  # [B, K, S_out] (normalized)
+        return self._head_from_logprobs(log_p)  # [B, K, S_out] normalized
 
     def step(self, y: torch.Tensor, dt_step_norm: Union[torch.Tensor, float], g: torch.Tensor,
              film_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
@@ -513,39 +512,37 @@ class FlowMapAutoencoder(nn.Module):
             film_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
-        K-step sequential rollout in latent space with a single batched decode when possible.
+        Sequential latent rollout over a horizon, with a single batched decode when possible.
 
         Args:
             y0:            [B, S_in]   (normalized anchor state)
             g:             [B, G]
-            dt_steps_norm: [B, K]      per-step normalized increments (monotonic, >=0)
-            z0:            Optional precomputed latent for y0 from the *same batch*
-                           (cached by forward()). If provided, we will NOT re-run
-                           the encoder or re-touch self.kl_loss here.
-            film_cache:    Optional tuple (gamma_adj, beta) from FiLM.compute_affine(g),
-                           cached by forward() to avoid re-projecting g.
+            dt_steps_norm: [B, K]      per-step normalized increments (>=0, strictly forward)
+            z0:            Optional precomputed latent for y0 from this same batch
+                           (cached in forward()). If provided, we DO NOT re-run
+                           the encoder or touch self.kl_loss here.
+            film_cache:    Optional (gamma_adj, beta) from FiLM.compute_affine(g),
+                           cached in forward() to avoid recomputing FiLM.
 
         Returns:
             [B, K, S_out] (normalized)
         """
 
-        # --- Initial latent z ---
+        # Initial latent state
         if z0 is None:
-            # Fallback: encode now (keeps old behavior if called standalone)
             enc_out = self.encoder(y0, g)
             if isinstance(enc_out, (tuple, list)):
                 z, self.kl_loss = enc_out
             else:
                 z, self.kl_loss = enc_out, None
         else:
-            # Use cached latent from forward(); gradient still flows
-            z = z0  # [B, Z]
-            # DO NOT overwrite self.kl_loss here; forward() already set it.
+            z = z0
+            # We intentionally do NOT overwrite self.kl_loss here.
 
         B, K = dt_steps_norm.shape
         use_delta = bool(self.predict_logit_delta)
 
-        # --- FiLM affine ---
+        # FiLM affine for decoder
         gamma_adj = beta = None
         if self.decoder_condition_on_g:
             if film_cache is None:
@@ -553,9 +550,8 @@ class FlowMapAutoencoder(nn.Module):
             else:
                 gamma_adj, beta = film_cache  # [B, Z], [B, Z]
 
-        # -------- Fast path: no logit-delta head --------
+        # -------- fast path: no logit-delta head --------
         if not use_delta:
-            # Step latent forward K times, collect all states, then decode in one batched matmul
             z_steps = []
             for k in range(K):
                 z = self.dynamics.step(z, dt_steps_norm[:, k], g)  # [B, Z]
@@ -563,13 +559,12 @@ class FlowMapAutoencoder(nn.Module):
             Z_seq = torch.stack(z_steps, dim=1)  # [B, K, Z]
 
             if self.decoder_condition_on_g:
-                # Broadcast cached FiLM params across time
                 Z_seq = gamma_adj.unsqueeze(1) * Z_seq + beta.unsqueeze(1)  # [B, K, Z]
 
             logits = self.decoder(Z_seq)  # [B, K, S_out]
             return self._softmax_head_from_logits(logits)  # [B, K, S_out]
 
-        # -------- logit-delta head path (autoregressive in prob space) --------
+        # -------- logit-delta path (autoregressive in prob space) --------
         outs = []
         base = y0 if (self.S_out == self.S_in) else y0.index_select(1, self.target_idx)
         cur_logp = self._denorm_to_logp(base).float()  # [B, S_out]

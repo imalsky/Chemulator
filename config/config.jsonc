@@ -116,18 +116,18 @@
     "min_lr": 1e-8,
     "weight_decay": 1e-5,
     "warmup_epochs": 10,
-    "epochs": 200,
+    "epochs": 50,
     "gradient_clip": 5.0,
 
     // Loss
     "loss_mode": "adaptive_stiff", //"adaptive_stiff"
-    "loss_rel_cap": 10.0,
     "adaptive_stiff_loss": {
       "lambda_phys": 1.0,
       "lambda_mse": 0.5,
-      "epsilon_phys": 1e-30
+      "epsilon_phys": 1e-30,
+      "time_edge_gain": 1.0,     // ← ADD THIS LINE
+      "rel_cap": 10.0             // ← Also move this here (cleanup)
     },
-    "loss_epsilon": 1e-30,
 
     "ema": { "enable": false, "decay": 0.9999},            // EMA callback (minimal)
     "swa": { "enable": false, "epoch_start": 0.8 },       // SWA callback (optional)
@@ -135,20 +135,19 @@
 
     // Aux losses (names/structure that trainer reads)
     "auxiliary_losses": {
-      "rollout_enabled": false,
-      "rollout_weight": 0.25,
-      "rollout_horizon": 3,
-      "rollout_warmup_epochs": 30,
-      "rollout_use_cached_encoding": true,
+      "rollout_enabled": true,
+      "rollout_weight": 0.1,
+      "rollout_horizon": 4,
+      "rollout_warmup_epochs": 10,
       "rollout_teacher_forcing": {
         "mode": "linear",
         "start_p": 1.0,
-        "end_p": 0.2,
-        "end_epoch": 60
+        "end_p": 0.0,
+        "end_epoch": 20
       },
       "semigroup": {
-        "enabled": false,
-        "weight": 0.005,
+        "enabled": true,
+        "weight": 0.001,
         "warmup_epochs": 10
       }
     },

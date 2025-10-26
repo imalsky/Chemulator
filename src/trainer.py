@@ -34,10 +34,10 @@ import logging
 import torch.nn as nn
 import torch.nn.functional as F
 
-from optuna.integration import PyTorchLightningPruningCallback
 import time
 import math
 import torch
+import optuna
 
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -47,6 +47,14 @@ import pytorch_lightning as pl
 from pytorch_lightning import LightningModule, Trainer as LightningTrainer
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
+
+import warnings
+
+# Suppress dataloader worker warnings
+warnings.filterwarnings( "ignore",message=".*does not have many workers.*")
+
+# Suppress logging interval warning
+warnings.filterwarnings( "ignore", message=".*is smaller than the logging interval.*")
 
 # Try both modern and legacy Lightning callback import paths for EMA/SWA
 try:
@@ -96,10 +104,10 @@ class AdaptiveStiffLoss(nn.Module):
         manifest: dict,
         species_keys: Sequence[str],
         lambda_phys: float = 1.0,
-        lambda_mse: float = 0.1,
-        epsilon_phys: float = 1e-20,
+        lambda_mse: float = 0.5,
+        epsilon_phys: float = 1e-25,
         rel_cap: Optional[float] = None,
-        time_edge_gain: float = 2.0,
+        time_edge_gain: float = 1.0,
         device=None,
     ):
         super().__init__()
@@ -685,10 +693,6 @@ class AutoEncoderModule(LightningModule):
             f"dt_present={has_dt}"
         )
 
-    # ------------------ Optimizer & Schedulers ------------------
-
-    # ------------------ Optimizer & Schedulers ------------------
-
     def configure_optimizers(self):
         # Try CUDA fused AdamW (Hopper: typically +5–15% step-time). Fallback to standard AdamW if unsupported.
         try:
@@ -777,30 +781,30 @@ class AutoEncoderModule(LightningModule):
     ) -> Optional[torch.Tensor]:
         """
         Unified rollout loss:
-          - TF == 0: latent rollout with no teacher forcing (gradients ON). Reuses the
-                     encoder output + FiLM affine cached in model.forward() so we do
-                     NOT re-encode y_i.
-          - TF >  0: teacher-forcing loop with FiLM(g) cached once per batch, with
-                     correct delta-logit composition in log-probability space.
+          - tf_prob == 0: no teacher forcing. We do a latent rollout using
+            model.rollout_vectorized(...) and we REUSE the cached latent state
+            and FiLM affine from model.forward() in this same batch, so we do NOT
+            re-encode y_i.
+          - tf_prob  > 0: teacher forcing. We run a per-step loop that can
+            mix ground truth vs model predictions. FiLM params are computed once.
 
         Returns:
-            scalar loss or None when horizon < 2.
+            scalar loss (Tensor) or None (if horizon < 2).
         """
         B, K_avail, _ = y_j.shape
         H = min(H, K_avail)
         if H < 2:
             return None
 
-        # Convert absolute offsets [B,K_abs] -> per-step increments [B,H]
-        dt_steps_norm = self._offsets_to_steps_norm(dt_offsets[:, :H])
+        # Convert absolute offsets [B,K_abs] -> incremental step sizes [B,H]
+        dt_steps_norm = self._offsets_to_steps_norm(dt_offsets[:, :H])  # [B,H]
 
-        # -------- Pure rollout branch (no teacher forcing) --------
+        # -------- branch: no teacher forcing --------
         if tf_prob < 1e-8:
-            # Grab cached encoder/FiLM results from the forward() we already did this batch.
             cached_z0 = getattr(self.model, "_cached_rollout_z0", None)
             cached_film = getattr(self.model, "_cached_rollout_film", None)
 
-            # rollout_vectorized now accepts these caches to avoid double encoding
+            # rollout_vectorized now takes caches to avoid double encoding
             y_pred = self.model.rollout_vectorized(
                 y0=y_i,
                 g=g,
@@ -809,8 +813,8 @@ class AutoEncoderModule(LightningModule):
                 film_cache=cached_film,
             )  # [B, H, S]
 
-            y_tgt = y_j[:, :H, :]
-            rmask = mask[:, :H] if mask is not None else None
+            y_tgt = y_j[:, :H, :]  # [B, H, S]
+            rmask = mask[:, :H] if mask is not None else None  # [B, H]
 
             if self.use_adaptive_stiff and self.criterion is not None:
                 return self.criterion(
@@ -823,12 +827,13 @@ class AutoEncoderModule(LightningModule):
 
             return _masked_mse(y_pred, y_tgt, rmask)
 
-        # -------- Teacher forcing branch (unchanged logic) --------
+        # -------- branch: teacher forcing (>0) --------
         use_film = (
                 bool(getattr(self.model, "decoder_condition_on_g", False))
                 and hasattr(self.model, "film")
                 and (self.model.film is not None)
         )
+
         if use_film:
             gb = self.model.film.proj(g)  # [B, 2Z]
             gamma, beta = gb.chunk(2, dim=-1)  # [B,Z], [B,Z]
@@ -851,18 +856,17 @@ class AutoEncoderModule(LightningModule):
             cur_logp = None
 
         for k in range(H):
+            # Encode current state, step latent one dt, decode logits
             if hasattr(self.model, "encode") and hasattr(self.model, "decode"):
-                # Preferred path using wrappers
                 z = self.model.encode(y_curr, g)  # [B,Z]
                 z = self.model.dynamics.step(z, dt_steps_norm[:, k], g)  # [B,Z]
                 if use_film:
                     z = apply_film(z)
                 logits = self.model.decoder(z)  # [B,S]
             else:
-                # Fallback path (tuple-safe with VAE encoders)
                 enc_out = self.model.encoder(y_curr, g)
-                z = enc_out[0] if isinstance(enc_out, (tuple, list)) else enc_out  # [B,Z]
-                z = self.model.dynamics.step(z, dt_steps_norm[:, k], g)  # [B,Z]
+                z = enc_out[0] if isinstance(enc_out, (tuple, list)) else enc_out
+                z = self.model.dynamics.step(z, dt_steps_norm[:, k], g)
                 if use_film:
                     z = apply_film(z)
                 logits = self.model.decoder(z)  # [B,S]
@@ -987,6 +991,7 @@ class AutoEncoderModule(LightningModule):
         y_i, dt_offsets, y_j, g = batch[:4]  # [B,S], [B,K], [B,K,S], [B,G]
         mask = batch[5] if len(batch) >= 6 else None
 
+        # Forward loss on all K offsets
         pred = self.model(y_i, dt_offsets, g)  # [B,K,S] normalized
         if not torch.isfinite(pred).all():
             raise RuntimeError(f"Non-finite predictions in training batch {batch_idx}")
@@ -1007,10 +1012,10 @@ class AutoEncoderModule(LightningModule):
             forward_loss = _masked_mse(pred, y_j, mask).float()
             self.log("train", forward_loss.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
+        # KL term (only meaningful in VAE mode)
         beta_kl = float(self.cfg.get("training", {}).get("beta_kl", 0.0))
         kl = getattr(self.model, "kl_loss", None)
         if beta_kl != 0.0 and kl is not None:
-            # Ensure tensor, finite, device/dtype compatible
             if not torch.is_tensor(kl):
                 kl = torch.as_tensor(kl, device=pred.device, dtype=pred.dtype)
             if not torch.isfinite(kl):
@@ -1021,8 +1026,8 @@ class AutoEncoderModule(LightningModule):
             kl_term = pred.new_zeros(())
 
         total = forward_loss + kl_term
-        # ----------------------------------------------
 
+        # Optional rollout loss (multi-step consistency)
         if self.rollout_enabled and self.rollout_weight > 0:
             H = self._get_rollout_horizon(self.current_epoch)
             tfp = self._get_teacher_forcing_prob(self.current_epoch)
@@ -1035,6 +1040,7 @@ class AutoEncoderModule(LightningModule):
                     self.log("rollout_loss", rloss.detach(), on_step=False, on_epoch=True, logger=True)
                     self.log("rollout_warm_weight", eff_w, on_step=False, on_epoch=True, logger=True)
 
+        # Optional semigroup loss
         if self.semigroup_enabled and self.semigroup_weight > 0:
             sg_warm = min(1.0, self.current_epoch / max(1, self.semigroup_warmup_epochs))
             eff_sg = self.semigroup_weight * sg_warm
@@ -1051,6 +1057,13 @@ class AutoEncoderModule(LightningModule):
             print(f"[WARN] training_step: very large TOTAL={float(total):.3e} at batch {batch_idx}.")
 
         self.log("train_total", total.detach(), on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+        # ---- critical: drop caches so previous graphs can be freed ----
+        if hasattr(self.model, "_cached_rollout_z0"):
+            self.model._cached_rollout_z0 = None
+        if hasattr(self.model, "_cached_rollout_film"):
+            self.model._cached_rollout_film = None
+
         return total
 
     def validation_step(self, batch, batch_idx: int):
@@ -1142,9 +1155,9 @@ class Trainer:
                     )
             except Exception as e:
                 try:
-                    self.logger.warning(f"torch.compile failed; continuing uncompiled: {e}")
+                    self.logger.warning(f"torch.compile failed ({e}); continuing uncompiled.")
                 except Exception:
-                    print(f"[WARN] torch.compile failed; continuing uncompiled: {e}")
+                    print(f"[WARN] torch.compile failed ({e}); continuing uncompiled.")
 
         module = AutoEncoderModule(self.model, self.cfg, self.work_dir)
 
@@ -1160,75 +1173,92 @@ class Trainer:
         max_epochs = int(tcfg.get("epochs", 100))
         resume_ckpt = lcfg.get("resume_from", None)
 
+        # Metric to optimize / checkpoint / early-stop on.
+        monitor_metric = self.optuna_monitor  # e.g. "val"
+
         # Loggers
         csv_logger = CSVLogger(save_dir=str(self.work_dir), name="logs", version="csv")
         tb_logger = TensorBoardLogger(save_dir=str(self.work_dir), name="tb")
 
-        # Checkpointing (top-k if model soup is enabled)
+        # Checkpointing (supports model soup top-k)
         ms_cfg = tcfg.get("model_soup", {})
         save_top_k = int(ms_cfg.get("top_k", 1)) if bool(ms_cfg.get("enable", False)) else 1
 
         ckpt_cb = ModelCheckpoint(
             dirpath=str(self.work_dir / "checkpoints"),
-            filename="epoch{epoch:04d}-val{val:.6e}",
-            monitor="val",  # this is logged in validation_step
+            filename=f"epoch{{epoch:04d}}-{monitor_metric}",
+            monitor=monitor_metric,
             mode="min",
             save_top_k=save_top_k,
             save_last=True,
             auto_insert_metric_name=False,
         )
+
         lr_cb = LearningRateMonitor(logging_interval="epoch")
 
         es_patience = int(lcfg.get("early_stop_patience", 0))
-        es_cb = EarlyStopping(monitor="val", mode="min", patience=es_patience) if es_patience > 0 else None
+        es_cb = (
+            EarlyStopping(monitor=monitor_metric, mode="min", patience=es_patience)
+            if es_patience > 0
+            else None
+        )
 
         epoch_cb = EpochSetterCallback()
         summary_cb = EpochSummaryLineCallback()
 
         callbacks = [ckpt_cb, lr_cb, epoch_cb, summary_cb]
 
-        # Optional EMA
+        # ---------- EMA (guarded) ----------
         ema_cfg = tcfg.get("ema", {})
         if bool(ema_cfg.get("enable", False)):
-            if _EMA_CB is not None:
+            if _EMA_CB is not None and isinstance(_EMA_CB, type) and issubclass(_EMA_CB, Callback):
                 decay = float(ema_cfg.get("decay", 0.999))
                 try:
                     callbacks.append(_EMA_CB(decay=decay))
                 except TypeError:
-                    # different lightning versions have slightly different EMA sigs
                     try:
                         callbacks.append(_EMA_CB(decay=decay, every_n_steps=1))
                     except Exception:
                         print("[WARN] EMA: could not construct callback; skipping.")
             else:
-                print("[WARN] EMA callback not available in this Lightning version; skipping.")
+                print("[WARN] EMA callback not compatible with this Lightning Trainer; skipping.")
 
-        # Optional SWA
+        # ---------- SWA (guarded) ----------
         swa_cfg = tcfg.get("swa", {})
         if bool(swa_cfg.get("enable", False)):
-            if _SWA_CB is not None:
+            if _SWA_CB is not None and isinstance(_SWA_CB, type) and issubclass(_SWA_CB, Callback):
                 swa_lrs = swa_cfg.get("swa_lrs", None)
                 epoch_start = float(swa_cfg.get("epoch_start", 0.8))
                 callbacks.append(_SWA_CB(swa_lrs=swa_lrs, swa_epoch_start=epoch_start))
             else:
-                print("[WARN] SWA callback not available in this Lightning version; skipping.")
+                print("[WARN] SWA callback not compatible with this Lightning Trainer; skipping.")
 
-        # Optional Optuna pruning
+        # ---------- Optuna pruning (guarded exactly the same way) ----------
         if self.optuna_trial is not None:
             try:
-                callbacks.append(
-                    PyTorchLightningPruningCallback(
-                        self.optuna_trial,
-                        monitor=self.optuna_monitor,
-                    )
-                )
+                from optuna.integration import PyTorchLightningPruningCallback as _PruneCB  # type: ignore
+                if isinstance(_PruneCB, type) and issubclass(_PruneCB, Callback):
+                    try:
+                        callbacks.append(
+                            _PruneCB(
+                                self.optuna_trial,
+                                monitor=monitor_metric,
+                            )
+                        )
+                    except Exception as e:
+                        try:
+                            self.logger.warning(f"Optuna pruning callback could not be constructed: {e}")
+                        except Exception:
+                            print(f"[WARN] Optuna pruning callback could not be constructed: {e}")
+                else:
+                    print("[WARN] Optuna pruning callback incompatible with this Lightning Trainer; skipping.")
             except Exception as e:
                 try:
                     self.logger.warning(f"Optuna pruning callback not attached: {e}")
                 except Exception:
                     print(f"[WARN] Optuna pruning callback not attached: {e}")
 
-        # Early stopping at the end so it's evaluated too
+        # Early stopping goes last
         if es_cb is not None:
             callbacks.append(es_cb)
 
@@ -1255,10 +1285,11 @@ class Trainer:
             ckpt_path=resume_ckpt,
         )
 
-        # Export best model
+        # Export best model checkpoint to a clean state dict
         best_val = None
         if ckpt_cb.best_model_score is not None:
             best_val = float(ckpt_cb.best_model_score.detach().cpu().item())
+
         if ckpt_cb.best_model_path:
             state = torch.load(ckpt_cb.best_model_path, map_location="cpu", weights_only=False)
             sd = state.get("state_dict", {})
@@ -1268,10 +1299,18 @@ class Trainer:
                 if k.startswith("model.")
             }
             torch.save(
-                {"model": model_state, "best_val_loss": best_val, "config": self.cfg},
+                {"model": model_state, "config": self.cfg},
                 self.work_dir / "best_model.pt",
             )
-            self.logger.info(f"Saved best_model.pt (val_loss={best_val:.6e})")
+            msg = (
+                f"Exported best_model.pt (metric {monitor_metric}={best_val:.4e})"
+                if best_val is not None
+                else "Saved best_model.pt (no best_val)"
+            )
+            try:
+                self.logger.info(msg)
+            except Exception:
+                print(f"[INFO] {msg}")
 
         # Optional model soup across top-k checkpoints
         if bool(ms_cfg.get("enable", False)) and save_top_k > 1:

@@ -82,7 +82,20 @@ ulimit -c unlimited || true
 SRC="$ROOT/src"
 VENDOR="$ROOT/.deps"
 mkdir -p "$VENDOR"
-export PYTHONPATH="$VENDOR:$ROOT:$SRC:${PYTHONPATH:-}"
+
+# Figure out the site-packages for this conda env (pyt2_7_gh)
+SITE_PKGS="$("$PY" - <<'PY'
+import site
+cands = [p for p in site.getsitepackages() if p.endswith("site-packages")]
+print(cands[0] if cands else site.getsitepackages()[0])
+PY
+)"
+
+# Order matters:
+#   1. site-packages from the pyt2_7_gh env  -> gives us the cluster's torch/torchvision/lightning
+#   2. .deps                                  -> fallback for vendored wheels like h5py, numpy, etc.
+#   3. repo root/src                          -> our code
+export PYTHONPATH="$SITE_PKGS:$VENDOR:$ROOT:$SRC:${PYTHONPATH:-}"
 
 # ===== Vendor numpy/h5py (to avoid user-site conflicts) =====
 echo "Cleaning any stale NumPy in $VENDOR ..."
@@ -241,12 +254,8 @@ PY
 echo "---------------------------------"
 
 # ===== Phase B: TRAIN single-process on the GPU =====
-###echo "Phase B: Training single-process…"
-###/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/main.py $PRECISION_ARG $LIMIT_ARGS
-
-echo "Phase B: Hyperparameter tuning…"
+echo "Phase B: Training single-process…"
 /usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/tune.py
-
 
 echo "#####################################################"
 echo "Job finished at $(date)"
