@@ -112,7 +112,7 @@
     "max_steps": null,            // optional; omit for full range
 
     // Optimizer / schedule
-    "lr": 5e-4,
+    "lr": 1e-4,
     "min_lr": 1e-8,
     "weight_decay": 1e-5,
     "warmup_epochs": 10,
@@ -123,7 +123,7 @@
     "loss_mode": "adaptive_stiff", //"adaptive_stiff"
     "adaptive_stiff_loss": {
       "lambda_phys": 1.0,
-      "lambda_mse": 0.5,
+      "lambda_mse": 1.0,
       "epsilon_phys": 1e-30,
       "time_edge_gain": 1.0,     // ← ADD THIS LINE
       "rel_cap": 10.0             // ← Also move this here (cleanup)
@@ -137,18 +137,18 @@
     "auxiliary_losses": {
       "rollout_enabled": true,
       "rollout_weight": 0.1,
-      "rollout_horizon": 4,
-      "rollout_warmup_epochs": 10,
+      "rollout_horizon": 3,
+      "rollout_warmup_epochs": 5,
       "rollout_teacher_forcing": {
         "mode": "linear",
         "start_p": 1.0,
         "end_p": 0.0,
-        "end_epoch": 20
+        "end_epoch": 5
       },
       "semigroup": {
         "enabled": true,
-        "weight": 0.001,
-        "warmup_epochs": 10
+        "weight": 0.1,
+        "warmup_epochs": 5
       }
     },
 

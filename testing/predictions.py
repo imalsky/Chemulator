@@ -15,7 +15,7 @@ from matplotlib.lines import Line2D
 
 # Paths
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models/v1"
+MODEL_DIR = REPO / "models/trial_015"
 EP_FILENAME = "export_k1_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))
@@ -133,7 +133,10 @@ def main():
     seed_everything(42)
 
     # Load configuration
-    cfg = load_json(MODEL_DIR / "config.json")
+    try:
+        cfg = load_json(MODEL_DIR / "config.json")
+    except FileNotFoundError:
+        cfg = load_json(MODEL_DIR / "trial_config.final.json")
     data_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
     manifest = load_json(data_dir / "normalization.json")
 

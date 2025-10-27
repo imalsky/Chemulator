@@ -2,25 +2,55 @@
 """
 tune.py
 
-This version enforces apples-to-apples across trials (same rollout/semigroup curriculum,
-same batch size/epochs, etc.) AND makes the validation metric flexible WITHOUT touching trainer.py.
+Aggressive 2-stage hyperparameter search with early culling,
+WITHOUT touching trainer.py.
 
-How it works:
-- Trainer already logs some metric called "val" and returns best_val from .train().
-- Trainer may also (now or in the future) log other metrics like "val_long_rollout".
-- Trainer accepts `optuna_monitor=...` so it knows which metric to treat as the key metric.
+High-level flow per Optuna trial:
+---------------------------------
+Stage A ("probe"):
+  - Train the model for PROBE_EPOCHS (e.g. 3 epochs max).
+  - Get best validation metric ("val" by default, or whatever monitor_key is).
+  - Save checkpoint + config in trial_dir.
 
-We DO NOT edit trainer.py. Instead:
-- You can select which metric Trainer should treat as the key metric by either:
-    1. setting environment variable TUNE_VAL_METRIC="val" or "val_long_rollout" or whatever Trainer knows about
-    2. or adding "optuna_monitor": "<metric_name>" under config["training"] in the base config
-    3. fallback is "val" if nothing is provided
-- tune.py resolves that metric name once and passes it into Trainer, so Trainer can internally use that
-  for checkpointing / pruning / best_val, etc.
+Decision:
+  - Compare this probe score to the current study's best score so far.
+  - If it's clearly bad (worse than best_so_far * PRUNE_FACTOR, or non-finite),
+    we prune this trial immediately (raise optuna.TrialPruned).
+    -> That trial ends after ~3 epochs.
 
-We ALSO remove the per-trial curriculum branching. Every trial trains with the same rollout+semigroup
-settings from the base config. Optuna only explores architecture, optimizer scalars, and loss weights,
-not "is rollout loss even on". That keeps trials comparable.
+Stage B ("full"):
+  - Reload from the Stage A checkpoint.
+  - Resume training to the full configured number of epochs (e.g. 50).
+  - Return final best metric to Optuna.
+
+Why this works with NO trainer.py changes:
+------------------------------------------
+- We do not rely on per-epoch callbacks or trial.report() inside Trainer.
+- We just call Trainer.train() twice ourselves with different cfgs:
+    1) short probe, 2) (if promising) full.
+- trainer.py already:
+    * respects cfg["training"]["epochs"]
+    * accepts cfg["lightning"]["resume_from"] as ckpt_path
+    * exports best_model.pt / checkpoints/last.ckpt
+    * returns best metric from .train()
+
+Fairness / apples-to-apples:
+----------------------------
+- Every trial uses the SAME rollout/semigroup curriculum, teacher forcing
+  schedule, batch size logic, etc. We do not toggle those features per trial.
+- The only trials that get to finish are the ones that look promising
+  by epoch 3, so we save GPU on obvious losers.
+
+You can tune:
+    PROBE_EPOCHS   (audition length)
+    PRUNE_FACTOR   (strictness: smaller = harsher cut)
+
+We also:
+- Widen SWEEP (latent_dim, widths, beta_kl, etc.).
+- Add an early exit if an optuna study already exists, so you don't
+  accidentally resume a mismatched sweep.
+
+NOTE: This file assumes Python 3.10+.
 """
 
 from __future__ import annotations
@@ -29,6 +59,7 @@ import copy
 import logging
 import shutil
 import os
+import math
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -51,29 +82,40 @@ from dataset import create_dataloader
 from trainer import Trainer
 
 
-# -------------------- GLOBALS --------------------
+# -------------------- GLOBALS / KNOBS --------------------
 
-CONFIG_PATH = DEFAULT_CONFIG_PATH
-STUDY_NAME = "default"
-N_TRIALS = 100
+CONFIG_PATH = DEFAULT_CONFIG_PATH           # base config path
+STUDY_NAME = "v1"                           # tunes live in {work_dir}/tuning/{STUDY_NAME}
+N_TRIALS = 100                              # target trials
+
+PROBE_EPOCHS = 10                            # epochs to "audition" a trial
+PRUNE_FACTOR = 1.5                          # prune if probe_loss > best_so_far * PRUNE_FACTOR
 
 # Delete or comment any entry below to SKIP searching it.
-# Lists => categorical
-# Tuples of len 2 => uniform (int if both ints, else float)
-# ("log", lo, hi) => log-uniform float
+# Interpretation rules:
+#   list                      => categorical
+#   (low, high)               => uniform (int if both ints, else float)
+#   ("log", low, high)        => log-uniform float
 SWEEP: Dict[str, Any] = {
-    # -------------------------
-    # model.*  (ARCHITECTURE ONLY)
-    # -------------------------
-    "model.latent_dim": [48, 64, 96, 128, 160, 192, 256],
+    # ---- model.* (ARCH SHAPE / WIDTHS) ----
+    "model.latent_dim": [16, 32, 64, 128, 256, 512],
 
+    # IMPORTANT:
+    # Use LISTS (not tuples). Optuna's TPE sampler serializes categorical
+    # choices to JSON and will coerce tuples into lists in completed trials.
+    # On later trials it then compares those stored lists against the current
+    # choices. If we keep tuples here, that comparison blows up with:
+    #   ValueError: '[384, 384, 384]' not in ((256, 256), (384, 384, 384), ...)
+    # which kills every new trial. Lists avoid that by keeping the type
+    # consistent between past trials and current choices.
     "model.encoder_hidden": [
         [256, 256],
-        [384, 384, 384],
         [512, 512, 512],
         [512, 512, 512, 512],
-        [768, 768, 768],
         [1024, 1024],
+        [1024, 512, 256],
+        [1536, 1024, 512],
+        [1024, 1024, 1024],
     ],
     "model.dynamics_hidden": [
         [256, 256],
@@ -81,58 +123,57 @@ SWEEP: Dict[str, Any] = {
         [512, 256],
         [512, 512],
         [512, 512, 512],
+        [768, 768],
+        [1024, 512],
+        [1024, 1024],
     ],
     "model.decoder_hidden": [
         [256, 256],
-        [384, 384, 384],
         [512, 512, 512],
         [512, 512, 512, 512],
-        [768, 768, 768],
+        [256, 512, 1024],
+        [512, 1024, 1536],
+        [1024, 1024, 1024],
     ],
 
-    # Runtime nonlinearities / heads
-    "model.activation": ["silu", "gelu", "mish", "tanh", "relu"],
-    "model.dropout": (0.0, 0.30),
+    # ---- nonlinearities / heads ----
+    "model.activation": [
+        "silu", "gelu", "mish", "tanh",
+        "elu", "leaky_relu", "prelu", "hardswish", "softplus",
+    ],
 
-    # Model behavior flags that do NOT change the existence of loss terms
+    # Wider dropout band for regularization on larger models
+    "model.dropout": (0.0, 0.10),
+
+    # Behavior flags (do NOT remove losses entirely, so still comparable curriculum)
     "model.dynamics_residual": [True, False],
     "model.decoder_condition_on_g": [True, False],
-    "model.predict_logit_delta": [True, False],
-    # NOTE:
-    #   model.vae_mode is FIXED in the base config (do not sweep AE vs VAE).
-    #   model.allow_partial_simplex is FIXED in the base config (don't sweep mass conservation policy).
+    #"model.predict_logit_delta": [True, False],
 
-    # -------------------------
-    # training.* (optimizer only)
-    # -------------------------
-    "training.lr": ("log", 3e-5, 3e-3),
-    "training.weight_decay": ("log", 1e-7, 1e-3),
-    # NOTE:
-    #   training.batch_size is FIXED in base config, not swept.
-    #   training.beta_kl is FIXED in base config because vae_mode is fixed.
+    # ---- training.* (optimizer scalars) ----
+    "training.lr": ("log", 1e-5, 1e-3),
+    "training.weight_decay": ("log", 1e-7, 3e-3),
 
-    # -------------------------
-    # auxiliary_losses.* (strength only)
-    # -------------------------
-    # rollout_enabled / horizon / TF schedule / warmup_epochs are FIXED in base config
-    "training.auxiliary_losses.rollout_weight": ("log", 1e-4, 5e-2),
+    # ---- auxiliary loss strengths ----
+    # rollout_enabled/horizon/etc. remain fixed in base cfg for apples-to-apples.
+    #"training.auxiliary_losses.rollout_weight": ("log", 5e-5, 1e-1),
 
-    # semigroup.enabled / warmup_epochs are FIXED in base config
-    "training.auxiliary_losses.semigroup.weight": ("log", 1e-5, 1e-2),
+    # semigroup.enabled / warmup_epochs also stay fixed in base cfg.
+    #"training.auxiliary_losses.semigroup.weight": ("log", 1e-6, 3e-2),
 
-    # lightning.* stays out of sweep
+    # ---- KL reg (only matters if model.vae_mode=True in base cfg) ----
+    "training.beta_kl": ("log", 1e-5, 5e-2),
 }
 
 
-# -------------------- UTILS --------------------
+# -------------------- HELPER FUNCS --------------------
 
 def _runtime_dtype_from_cfg(cfg: Dict[str, Any]) -> torch.dtype:
     """
-    Map dataset.storage_dtype -> runtime dtype used for dataset buffers.
-    Matches main() logic.
+    Map dataset.storage_dtype -> runtime dtype for dataset buffers.
+    Mirrors main() logic.
     """
     storage_dtype_str = str(cfg.get("dataset", {}).get("storage_dtype", "float32")).lower()
-
     if storage_dtype_str in ("bf16", "bfloat16"):
         return torch.bfloat16
     if storage_dtype_str in ("fp16", "float16", "half"):
@@ -141,6 +182,9 @@ def _runtime_dtype_from_cfg(cfg: Dict[str, Any]) -> torch.dtype:
 
 
 def _get(cfg: Dict[str, Any], dotted: str, default=None):
+    """
+    Safe dotted get, e.g. _get(cfg, "training.lr").
+    """
     cur = cfg
     for k in dotted.split("."):
         if not isinstance(cur, dict) or k not in cur:
@@ -150,6 +194,9 @@ def _get(cfg: Dict[str, Any], dotted: str, default=None):
 
 
 def _set(cfg: Dict[str, Any], dotted: str, value):
+    """
+    Safe dotted set, creates nested dicts as needed.
+    """
     parts = dotted.split(".")
     cur = cfg
     for k in parts[:-1]:
@@ -158,15 +205,21 @@ def _set(cfg: Dict[str, Any], dotted: str, value):
 
 
 def _suggest(trial: optuna.Trial, name: str, space):
+    """
+    Interpret a SWEEP entry and call trial.suggest_* appropriately.
+    """
+    # Categorical
     if isinstance(space, list):
         return trial.suggest_categorical(name, space)
 
+    # Uniform / Int or Float
     if isinstance(space, tuple) and len(space) == 2:
         lo, hi = space
         if isinstance(lo, int) and isinstance(hi, int):
             return trial.suggest_int(name, lo, hi)
         return trial.suggest_float(name, float(lo), float(hi))
 
+    # Log-uniform float
     if isinstance(space, tuple) and len(space) == 3 and space[0] == "log":
         _, lo, hi = space
         return trial.suggest_float(name, float(lo), float(hi), log=True)
@@ -176,23 +229,15 @@ def _suggest(trial: optuna.Trial, name: str, space):
 
 def _apply_sweep(trial: optuna.Trial, base_cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Sample trial config from SWEEP, then apply sanity cleanup:
-      - Gate beta_kl on vae_mode
-      - Clamp teacher forcing schedule using fixed curriculum
-      - Clamp rollout warmup to <= total epochs
-      - Force val_batch_size if missing
-
-    IMPORTANT:
-    We do NOT:
-      - zero out rollout_weight if rollout_enabled==False
-      - zero out semigroup.weight if semigroup.enabled==False
-      - overwrite rollout_horizon, warmup_epochs, TF mode, etc.
-    Because those are fixed in the base config specifically to keep trials
-    apples-to-apples. Every trial must train under the same curriculum.
+    Sample trial config from SWEEP, then apply cleanup rules:
+      - Respect fixed curriculum (teacher forcing schedule, rollout warmups).
+      - Clamp those schedules so they're valid for the trial's total epochs.
+      - Gate beta_kl off if VAE mode is disabled.
+      - Ensure val_batch_size is set.
     """
     cfg = copy.deepcopy(base_cfg)
 
-    # 1) Sample all sweep parameters for this trial
+    # 1) Sample hyperparams for this trial
     for key, space in SWEEP.items():
         if space is None:
             continue
@@ -202,18 +247,19 @@ def _apply_sweep(trial: optuna.Trial, base_cfg: Dict[str, Any]) -> Dict[str, Any
         except Exception as e:
             raise RuntimeError(f"Sampling {key} failed: {e}")
 
-    # 2) beta_kl only matters if vae_mode is on
+    # 2) beta_kl only matters if VAE mode is on
     vae_on = bool(_get(cfg, "model.vae_mode", False))
     if (not vae_on) and ("training.beta_kl" in SWEEP):
+        # Reset to whatever base config had (often 0.0 for plain AE)
         _set(cfg, "training.beta_kl", _get(base_cfg, "training.beta_kl", 0.0))
 
-    # 3) Clamp teacher forcing schedule / rollout warmup using the fixed curriculum
+    # 3) clamp teacher forcing schedule / rollout warmup
     total_epochs = int(_get(cfg, "training.epochs", 50))
 
     start_p = float(_get(cfg, "training.auxiliary_losses.rollout_teacher_forcing.start_p", 1.0))
-    end_p = float(_get(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_p", 0.0))
+    end_p   = float(_get(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_p", 0.0))
 
-    # enforce monotone decay: start_p >= end_p
+    # enforce monotone decay (start >= end)
     if start_p < end_p:
         start_p, end_p = end_p, start_p
 
@@ -224,37 +270,34 @@ def _apply_sweep(trial: optuna.Trial, base_cfg: Dict[str, Any]) -> Dict[str, Any
     _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.start_p", start_p)
     _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_p", end_p)
 
-    # end_epoch can't exceed total epochs
-    end_epoch = int(_get(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_epoch", total_epochs))
-    if end_epoch > total_epochs:
-        end_epoch = total_epochs
-    _set(cfg, "training.auxiliary_losses.rollout_teacher_forcing.end_epoch", end_epoch)
-
-    # rollout warmup shouldn't last longer than total training
     warmup_epochs = int(_get(cfg, "training.auxiliary_losses.rollout_warmup_epochs", 0))
-    if warmup_epochs > total_epochs:
-        warmup_epochs = total_epochs
+    warmup_epochs = max(0, min(warmup_epochs, total_epochs))
     _set(cfg, "training.auxiliary_losses.rollout_warmup_epochs", warmup_epochs)
 
-    # 4) Force val batch size if missing
-    bs = int(_get(cfg, "training.batch_size", 512))
-    _set(cfg, "training.val_batch_size", int(_get(cfg, "training.val_batch_size", bs)))
+    semi_warmup = int(_get(cfg, "training.auxiliary_losses.semigroup.warmup_epochs", 0))
+    semi_warmup = max(0, min(semi_warmup, total_epochs))
+    _set(cfg, "training.auxiliary_losses.semigroup.warmup_epochs", semi_warmup)
+
+    # Ensure validation batch size falls back to train batch size if unset.
+    bs_train = int(_get(cfg, "training.batch_size", 512))
+    bs_val   = int(_get(cfg, "training.val_batch_size", bs_train))
+    _set(cfg, "training.val_batch_size", bs_val)
 
     return cfg
 
 
-def _make_loaders_for_trial(
+def _build_trial_dataloaders(
     cfg_trial: Dict[str, Any],
     train_ds,
     val_ds,
     logger: logging.Logger,
-) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+):
     """
-    Wrap the (persistent) dataset objects in DataLoaders configured for this trial.
-    Deterministic order (shuffle=False) so each trial sees data in the same sequence.
+    Build train/val dataloaders for this trial using the trial's batch_size,
+    num_workers, etc. Does NOT mutate the shared datasets.
     """
-    dcfg = cfg_trial.get("dataset", {})
-    tcfg = cfg_trial.get("training", {})
+    dcfg = copy.deepcopy(cfg_trial.get("dataset", {}))
+    tcfg = copy.deepcopy(cfg_trial.get("training", {}))
 
     bs_tr = int(tcfg.get("batch_size", 512))
     bs_va = int(tcfg.get("val_batch_size", bs_tr))
@@ -271,7 +314,7 @@ def _make_loaders_for_trial(
     train_loader = create_dataloader(
         dataset=train_ds,
         batch_size=bs_tr,
-        shuffle=False,  # keep deterministic for comparability
+        shuffle=False,  # deterministic
         num_workers=nw,
         pin_memory=bool(dcfg.get("pin_memory", False)),
         prefetch_factor=pf_tr,
@@ -306,35 +349,63 @@ def _make_loaders_for_trial(
 
 def _resolve_monitor_key(cfg: Dict[str, Any]) -> str:
     """
-    Decide which metric Trainer should treat as the key Optuna metric,
-    WITHOUT editing trainer.py.
-
+    Trainer's key validation metric (optuna_monitor).
     Priority:
       1. env var TUNE_VAL_METRIC
       2. cfg["training"]["optuna_monitor"]
       3. fallback "val"
-
-    Whatever we return here is passed into Trainer(optuna_monitor=...).
-    Trainer is responsible for:
-      - logging that metric
-      - tracking best value
-      - returning that best value from .train()
     """
     env_choice = os.getenv("TUNE_VAL_METRIC", "").strip()
     if env_choice:
         return env_choice
 
-    cfg_choice = (
-        cfg.get("training", {})
-        .get("optuna_monitor", "")
-    )
+    cfg_choice = cfg.get("training", {}).get("optuna_monitor", "")
     if isinstance(cfg_choice, str) and cfg_choice.strip():
         return cfg_choice.strip()
 
     return "val"
 
 
-# -------------------- OBJECTIVE --------------------
+def _prepare_accumulation(cfg_run: Dict[str, Any], train_loader) -> None:
+    """
+    Resolve accumulate_grad_batches="auto" to an int and stamp it into both:
+      cfg_run["training"]["accumulate_grad_batches"]
+      cfg_run["lightning"]["accumulate_grad_batches"]
+    """
+    default_accum = (
+        1
+        if (
+            train_loader.batch_size is None
+            or len(train_loader) == 0
+            or train_loader.batch_size >= 1024
+        )
+        else 2
+    )
+    tcfg = cfg_run.setdefault("training", {})
+    accum_raw = tcfg.get("accumulate_grad_batches", "auto")
+    accum = _parse_int_or_auto(accum_raw, default_accum)
+    tcfg["accumulate_grad_batches"] = accum
+    cfg_run.setdefault("lightning", {})["accumulate_grad_batches"] = accum
+
+
+def _best_so_far(study: optuna.study.Study) -> float | None:
+    """
+    Safely get the best value from completed trials, if any.
+    Returns None if we don't have a finite best yet.
+    """
+    try:
+        if not study.trials:
+            return None
+        val = float(study.best_trial.value)
+        if math.isfinite(val):
+            return val
+        return None
+    except Exception:
+        # covers the case "no completed trials yet"
+        return None
+
+
+# -------------------- OBJECTIVE FACTORY --------------------
 
 def _make_objective(
     base_cfg: Dict[str, Any],
@@ -344,100 +415,184 @@ def _make_objective(
     train_ds,
     val_ds,
     logger: logging.Logger,
+    study: optuna.study.Study,
 ):
     """
-    Optuna objective factory.
+    Two-stage objective:
 
-    Each trial:
-      1. Re-seeds deterministically (base_seed + trial.number).
-      2. Samples cfg_trial via _apply_sweep (architecture/optimizer/weights only).
-      3. Resets dataset RNG/index maps so every trial sees the same sampling schedule.
-      4. Builds loaders with that cfg_trial.
-      5. Resolves accumulate_grad_batches for Lightning.
-      6. Builds model + Trainer, runs training.
-      7. Returns the best value of `monitor_key` as reported by Trainer.train().
+      Stage A ("probe"):
+        - Train for PROBE_EPOCHS (capped by full budget).
+        - Measure best validation metric.
+        - Log it.
+        - Prune if it's clearly worse than the running best.
+
+      Stage B ("full"):
+        - Warm start only model weights from Stage A.
+        - DO NOT restore optimizer/scheduler/epoch state.
+        - Train to full epochs with a clean LR schedule.
+        - Return best validation metric from the full run.
+
+    Optuna will treat that return value as trial.value.
     """
+
+    # We hold the best (lowest) probe score we've seen so far across trials.
+    # Use a 1-element list so we can mutate it inside `objective`.
+    best_probe_so_far = [None]  # type: list[float | None]
 
     def objective(trial: optuna.Trial) -> float:
         try:
-            # deterministic per-trial seed
-            base_seed = int(base_cfg.get("system", {}).get("seed", 42))
-            trial_seed = base_seed + int(trial.number)
-            seed_everything(trial_seed)
+            #
+            # 1) Repro seeding + sample hyperparams
+            #
+            seed_everything(int(base_cfg["system"]["seed"]) + int(trial.number))
+            cfg_trial_full = _apply_sweep(trial, base_cfg)
 
+            #
+            # 2) Per-trial work dir
+            #
             trial_dir = study_root / f"trial_{trial.number:03d}"
             trial_dir.mkdir(parents=True, exist_ok=True)
+            dump_json(trial_dir / "trial_config.sampled.json", cfg_trial_full)
 
-            # sample HPs for this trial
-            cfg_trial = _apply_sweep(trial, base_cfg)
-
-            # set per-trial work_dir in config
-            paths_trial = cfg_trial.setdefault("paths", {})
-            paths_trial["work_dir"] = str(trial_dir)
-
-            # reset dataset sampling so each trial starts identically
-            if hasattr(train_ds, "set_epoch"):
-                try:
-                    train_ds.set_epoch(0)
-                except Exception as e:
-                    logger.warning(f"train_ds.set_epoch(0) failed: {e}")
-            if hasattr(val_ds, "set_epoch"):
-                try:
-                    val_ds.set_epoch(0)
-                except Exception as e:
-                    logger.warning(f"val_ds.set_epoch(0) failed: {e}")
-
-            # loaders for this trial
-            data_logger = logger.getChild(f"trial{trial.number:03d}.data")
-            train_loader, val_loader = _make_loaders_for_trial(
-                cfg_trial, train_ds, val_ds, data_logger
+            #
+            # 3) Build loaders for this trial
+            #
+            trial_logger_data = logger.getChild(f"trial{trial.number:03d}.data")
+            train_loader_full, val_loader_full = _build_trial_dataloaders(
+                cfg_trial_full, train_ds, val_ds, trial_logger_data
             )
 
-            # resolve gradient accumulation ("auto" allowed in config)
-            default_accum = (
-                1
-                if (
-                    train_loader.batch_size is None
-                    or len(train_loader) == 0
-                    or train_loader.batch_size >= 1024
-                )
-                else 2
-            )
-            tcfg = cfg_trial.setdefault("training", {})
-            accum_raw = tcfg.get("accumulate_grad_batches", "auto")
-            accum = _parse_int_or_auto(accum_raw, default_accum)
-            tcfg["accumulate_grad_batches"] = accum
-            cfg_trial.setdefault("lightning", {})["accumulate_grad_batches"] = accum
+            # stamp accumulate_grad_batches so Trainer sees a concrete int
+            _prepare_accumulation(cfg_trial_full, train_loader_full)
 
-            # build model for this trial
-            model_logger = logger.getChild(f"trial{trial.number:03d}.model")
-            model = build_model(cfg_trial, device, model_logger)
+            #
+            # 4) Build the full model now (will be warm-started later)
+            #
+            model_logger_full = logger.getChild(f"trial{trial.number:03d}.model.full")
+            model_full = build_model(cfg_trial_full, device, model_logger_full)
 
-            # Trainer run for this trial
-            run = Trainer(
-                model=model,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                cfg=cfg_trial,
+            # remember the full epoch budget
+            orig_epochs = int(_get(cfg_trial_full, "training.epochs", 50))
+
+            #
+            # ---------------- STAGE A: PROBE ----------------
+            #
+            cfg_probe = copy.deepcopy(cfg_trial_full)
+            probe_epochs = min(PROBE_EPOCHS, orig_epochs)
+            _set(cfg_probe, "training.epochs", probe_epochs)
+            _set(cfg_probe, "lightning.resume_from", None)
+
+            model_logger_probe = logger.getChild(f"trial{trial.number:03d}.model.probe")
+            model_probe = build_model(cfg_probe, device, model_logger_probe)
+
+            run_probe = Trainer(
+                model=model_probe,
+                train_loader=train_loader_full,
+                val_loader=val_loader_full,
+                cfg=cfg_probe,
                 work_dir=trial_dir,
                 device=device,
-                logger=logger.getChild(f"trial{trial.number:03d}.trainer"),
-                optuna_trial=trial,            # pruning callback inside Trainer
-                optuna_monitor=monitor_key,    # <- chosen metric name
+                logger=logger.getChild(f"trial{trial.number:03d}.trainer.probe"),
+                optuna_trial=None,          # we do our own pruning after probe
+                optuna_monitor=monitor_key,
             )
 
-            best_val = float(run.train())
+            # best validation metric from the short probe run
+            best_val_probe = float(run_probe.train())
 
-            # record + save cfg snapshot
-            trial.set_user_attr("best_val_loss", best_val)
-            dump_json(trial_dir / "trial_config.final.json", cfg_trial)
+            dump_json(trial_dir / "trial_config.probe.json", cfg_probe)
+            trial.set_user_attr("best_val_probe", best_val_probe)
+            trial.report(best_val_probe, step=probe_epochs)
 
-            return best_val
+            #
+            # Log heartbeat: probe score, current bar, prune threshold
+            #
+            bp_current = best_probe_so_far[0]
+            if bp_current is None:
+                prune_threshold_str = "N/A"
+                best_probe_str = "inf"
+            else:
+                prune_threshold_str = f"{bp_current * PRUNE_FACTOR:.4e}"
+                best_probe_str = f"{bp_current:.4e}"
+
+            logger.info(
+                f"[trial {trial.number:03d}] "
+                f"probe_val={best_val_probe:.4e} | "
+                f"best_probe_so_far={best_probe_str} | "
+                f"prune_threshold={prune_threshold_str}"
+            )
+
+            #
+            # ---------------- PRUNE DECISION ----------------
+            #
+            if bp_current is None:
+                # first good probe establishes the bar
+                best_probe_so_far[0] = best_val_probe
+            else:
+                threshold = bp_current * PRUNE_FACTOR
+                # prune if bad or non-finite
+                if (not math.isfinite(best_val_probe)) or (best_val_probe > threshold):
+                    raise optuna.TrialPruned(
+                        f"Probe {best_val_probe:.4g} is not competitive vs "
+                        f"best_probe_so_far {bp_current:.4g} "
+                        f"(threshold {threshold:.4g})"
+                    )
+                # tighten the bar if we beat it
+                if math.isfinite(best_val_probe) and (best_val_probe < bp_current):
+                    best_probe_so_far[0] = best_val_probe
+
+            #
+            # ---------------- STAGE B: FULL ----------------
+            #
+            # Warm-start model_full with just the weights from Stage A.
+            # We do NOT resume optimizer/scheduler state, so LR schedule is clean.
+            #
+            best_model_pt = trial_dir / "best_model.pt"
+            if best_model_pt.exists():
+                try:
+                    state = torch.load(best_model_pt, map_location="cpu")
+                    sd = state.get("model", {})
+                    missing, unexpected = model_full.load_state_dict(sd, strict=False)
+                    if missing or unexpected:
+                        logger.warning(
+                            f"[trial {trial.number:03d}] Warm start: "
+                            f"{len(missing)} missing, {len(unexpected)} unexpected keys"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[trial {trial.number:03d}] Warm start failed: {e}"
+                    )
+
+            # Force clean Stage B run
+            _set(cfg_trial_full, "lightning.resume_from", None)
+            _set(cfg_trial_full, "training.epochs", orig_epochs)
+
+            run_full = Trainer(
+                model=model_full,
+                train_loader=train_loader_full,
+                val_loader=val_loader_full,
+                cfg=cfg_trial_full,
+                work_dir=trial_dir,
+                device=device,
+                logger=logger.getChild(f"trial{trial.number:03d}.trainer.full"),
+                optuna_trial=trial,          # optional pruning callback (can be silenced if annoying)
+                optuna_monitor=monitor_key,
+            )
+
+            best_val_full = float(run_full.train())
+
+            dump_json(trial_dir / "trial_config.final.json", cfg_trial_full)
+            trial.set_user_attr("best_val_full", best_val_full)
+
+            # Optuna's objective value
+            return best_val_full
 
         except optuna.TrialPruned:
+            # Signal Optuna that this trial was intentionally pruned, not crashed.
             raise
         except Exception as e:
-            logger.error(f"Trial {trial.number} failed: {e}", exc_info=True)
+            # Hard failure: return +inf so Optuna treats it as terrible.
+            logger.error(f"Trial {trial.number} crashed: {e}", exc_info=True)
             return float("inf")
 
     return objective
@@ -449,60 +604,93 @@ def main():
     setup_logging(None)
     logger = logging.getLogger("tune")
 
-    # Load config and global seed
+    # Silence Lightning / Fabric "rank_zero_info" and "rank_zero_warn" noise
+    for name in (
+        "pytorch_lightning",
+        "lightning",
+        "lightning.pytorch",
+        "lightning_fabric",
+        "lightning.pytorch.utilities.rank_zero",
+    ):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+    # ----- load + seed -----
     cfg = load_json_config(str(CONFIG_PATH))
     cfg.setdefault("system", {})["seed"] = int(cfg["system"].get("seed", 42))
     seed_everything(int(cfg["system"]["seed"]))
 
-    # work_dir base
+    # ----- work_dir base -----
     paths = cfg.setdefault("paths", {})
     base = Path(paths.get("work_dir", GLOBAL_WORK_DIR)).expanduser().resolve()
     paths["work_dir"] = str(base)
     base.mkdir(parents=True, exist_ok=True)
 
-    # study dir
+    # study root dir
     study_root = base / "tuning" / STUDY_NAME
     study_root.mkdir(parents=True, exist_ok=True)
 
-    # hw/runtime setup
+    # ----- bail if study already exists -----
+    storage_path = study_root / "optuna_study.db"
+    if storage_path.exists():
+        logger.error(
+            "Refusing to run because study already exists at %s. "
+            "This prevents mixing old trials with a new sweep definition.",
+            storage_path,
+        )
+        raise SystemExit(1)
+
+    # ----- hardware/runtime setup -----
     device = setup_device()
     optimize_hardware(cfg.get("system", {}), device)
     runtime_dtype = _runtime_dtype_from_cfg(cfg)
 
-    # make sure data is prepared + cfg is hydrated
+    # ----- data prep -----
     processed_dir = ensure_preprocessed_data(cfg, logger.getChild("pre"))
     assert processed_dir.exists(), "Processed data directory must exist."
+
+    # snapshot hydrated cfg for reproducibility
     dump_json(study_root / "config.hydrated.json", cfg)
 
-    # build datasets ONCE; reuse objects across trials
+    # Build datasets ONCE; reuse for all trials
     train_ds, val_ds, _, _ = build_datasets_and_loaders(
         cfg, device, runtime_dtype, logger.getChild("data.init")
     )
 
-    # resolve which metric to optimize (flexible, no trainer.py edit needed)
+    # ----- metric selection -----
     monitor_key = _resolve_monitor_key(cfg)
 
-    # Optuna study (sqlite so it's inspectable and resumable)
-    storage = f"sqlite:///{study_root / 'optuna_study.db'}"
+    # ----- Optuna study setup -----
+    storage = f"sqlite:///{storage_path}"
     study = optuna.create_study(
         study_name=STUDY_NAME,
         storage=storage,
-        load_if_exists=True,
+        load_if_exists=False,  # we just bailed if it exists
         direction="minimize",
         sampler=optuna.samplers.TPESampler(seed=int(cfg["system"]["seed"])),
+        # Mild built-in pruner. Real cutoff happens in our probe logic.
         pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=5,
-            n_warmup_steps=5,
+            n_startup_trials=1,
+            n_warmup_steps=1,
         ),
     )
 
-    objective = _make_objective(cfg, monitor_key, study_root, device, train_ds, val_ds, logger)
+    objective = _make_objective(
+        base_cfg=cfg,
+        monitor_key=monitor_key,
+        study_root=study_root,
+        device=device,
+        train_ds=train_ds,
+        val_ds=val_ds,
+        logger=logger,
+        study=study,
+    )
+
     study.optimize(objective, n_trials=N_TRIALS)
 
-    # dump best config
+    # ----- dump best config -----
     best = study.best_trial
     logging.getLogger().info(
-        f"best #{best.number} loss={best.value:.6e} params={best.params}"
+        f"BEST TRIAL #{best.number} loss={best.value:.6e} params={best.params}"
     )
     src = study_root / f"trial_{best.number:03d}" / "trial_config.final.json"
     if src.exists():

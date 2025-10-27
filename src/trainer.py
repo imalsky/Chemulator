@@ -493,6 +493,8 @@ class EpochSummaryLineCallback(Callback):
         if math.isnan(train_v):
             train_v = _getf("train_mse")
         if math.isnan(train_v):
+            train_v = _getf("train")
+        if math.isnan(train_v):
             train_v = float(getattr(pl_module, "_last_train_metric", float("nan")))
 
         val_v = _getf("val")  # total validation loss you log
@@ -911,7 +913,6 @@ class AutoEncoderModule(LightningModule):
         return _masked_mse(y_pred, y_tgt, rmask)
 
     def _compute_semigroup_loss(self, y_i: torch.Tensor, g: torch.Tensor) -> Optional[torch.Tensor]:
-        """Optional semigroup consistency; returns loss or None."""
         try:
             d = self.model.dynamics
             log_min = float(d.dt_log_min.item())
@@ -923,16 +924,30 @@ class AutoEncoderModule(LightningModule):
         B = y_i.shape[0]
         ln10 = math.log(10.0)
 
-        dt_tot_norm = torch.rand(B, device=y_i.device, dtype=torch.float32)  # [B]
-        dt_tot_phys = torch.exp((log_min + dt_tot_norm * rng) * ln10)        # [B]
-        u = torch.rand(B, device=y_i.device, dtype=torch.float32)            # [B]
-        dt_a_phys = u * dt_tot_phys
-        dt_b_phys = dt_tot_phys - dt_a_phys
+        # sample total dt in normalized space
+        dt_tot_norm = torch.rand(B, device=y_i.device, dtype=torch.float32)  # [B] in [0,1)
+        dt_tot_phys = torch.exp((log_min + dt_tot_norm * rng) * ln10)  # [B] physical
 
+        # random split
+        u = torch.rand(B, device=y_i.device, dtype=torch.float32)  # [B] in [0,1)
+        dt_a_phys = u * dt_tot_phys  # [B]
+        dt_b_phys = dt_tot_phys - dt_a_phys  # [B]
+
+        # avoid log(0), renormalize each chunk, clamp to [0,1]
         tiny = torch.finfo(dt_tot_phys.dtype).tiny
         dt_a_norm = (torch.log(dt_a_phys.clamp_min(tiny)) / ln10 - log_min) / rng
         dt_b_norm = (torch.log(dt_b_phys.clamp_min(tiny)) / ln10 - log_min) / rng
 
+        dt_a_norm = dt_a_norm.clamp_(0.0, 1.0)
+        dt_b_norm = dt_b_norm.clamp_(0.0, 1.0)
+        dt_tot_norm = dt_tot_norm.clamp_(0.0, 1.0)
+
+        # match model precision so torch.cat(...) inside step() doesn't dtype-mismatch
+        dt_a_norm = dt_a_norm.to(y_i.dtype)
+        dt_b_norm = dt_b_norm.to(y_i.dtype)
+        dt_tot_norm = dt_tot_norm.to(y_i.dtype)
+
+        # semigroup consistency
         y_a = self.model.step(y_i, dt_a_norm, g)
         y_ab = self.model.step(y_a, dt_b_norm, g)
         y_total = self.model.step(y_i, dt_tot_norm, g)
