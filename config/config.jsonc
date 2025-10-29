@@ -71,23 +71,22 @@
   // MODEL
   // ===============================
   "model": {
-    // Architecture
-    "latent_dim": 128,
-    "encoder_hidden": [256, 512, 1024, 1536],
-    "dynamics_hidden":[1536, 2048, 1536],
-    "decoder_hidden": [1536, 1024, 512, 256],
+  // Architecture
+  "latent_dim": 64,
+  "encoder_hidden": [128, 512, 1536],
+  "dynamics_hidden": [1536, 2048, 1536],
+  "decoder_hidden": [1536, 512, 128],
 
-    "vae_mode": true,
+  "vae_mode": true,
 
-    // Act/Dropout
-    "activation": "silu",
-    "dropout": 0.025,
+  // Act/Dropout
+  "activation": "silu",
+  "dropout": 0.0,
 
-    // Behavior (matches current model.py)
-    "dynamics_residual": false,
-    "decoder_condition_on_g": false,      // FiLM gating on P,T
-    "predict_logit_delta": false,        // residual in logit (nat-log prob) space before softmax
-    "allow_partial_simplex": false       // set true only if predicting a subset that must sum to 1
+  // Behavior
+  "predict_logit_delta": false,         // don't accumulate residual logit corrections
+  "contractive_dynamics": true,         // << TURN THIS ON FOR STABILITY
+  "contractive_alpha_max": 0.8        // must be in (0,1); lower = slower but more stable
   },
 
   // ===============================
@@ -100,7 +99,7 @@
     "pairs_per_traj": 16,
     "pairs_per_traj_val": 16,
 
-    "beta_kl": 1e-3,
+    "beta_kl": 1e-4,
 
     // Splits for preprocessing (required by preprocessor)
     "val_fraction": 0.1,
@@ -134,8 +133,8 @@
     // Aux losses (names/structure that trainer reads)
     "auxiliary_losses": {
       "rollout_enabled": true,
-      "rollout_weight": 0.25,
-      "rollout_horizon": 8,
+      "rollout_weight": 0.5,
+      "rollout_horizon": 16,
       "rollout_warmup_epochs": 10,
       "rollout_teacher_forcing": {
         "mode": "linear",

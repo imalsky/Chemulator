@@ -1,33 +1,25 @@
 #!/usr/bin/env python3
 """
-Neural Dynamics Autoencoder (Softmax head, cheap global conditioning, optional VAE)
-===================================================================================
+Stable Autoregressive Autoencoder for Chemical Kinetics
+========================================================
 
-- Single, strict output head: **softmax** over species (exact simplex).
-- Optional **logit-delta** composition (predict_logit_delta=True) adds decoder
-  output to the *natural-log probabilities* of the base state before softmax.
-  This preserves positivity and ∑=1 while allowing residual updates.
-- **Cheap decoder conditioning on globals (g)** via FiLM: a single Linear(g)->(γ,β)
-  modulates latent z as z' = (1 + α·tanh(γ)) ⊙ z + β before the decoder.
-  Enable via config: model.decoder_condition_on_g: true|false
-- **Optional VAE encoder**: set model.vae_mode: true|false in config. When enabled,
-  the encoder outputs (μ, logσ²) and reparameterizes z; the per-batch KL term is
-  stored on self.kl_loss for the trainer to consume.
-- Interfaces preserved for trainer:
-    forward(y_i, dt_norm, g)          -> [B, K, S_out]  (independent offsets)
-    step(y, dt_step_norm, g)          -> [B, S_out]     (single-step, teacher forcing)
-    rollout_vectorized(y0, g, dt_seq) -> [B, K, S_out]  (sequential K-step rollout)
+A neural dynamics autoencoder designed for long-term stable autoregressive rollout
+of chemical kinetics systems. Features:
 
-Inputs/targets are in **normalized space**. Species targets use "log-standard":
+- Softmax output head ensuring exact conservation (species sum to 1)
+- Optional contractive latent dynamics for guaranteed convergence
+- Optional VAE encoder for regularized latent space
+- Optional logit-delta composition for incremental updates
+- Normalized log-space operations for numerical stability
+
+The model operates in normalized log10 space where species concentrations are:
     z = (log10(x) - log_mean) / log_std
 
-This module outputs in the same normalized space. Internally the softmax head:
-    logits            -> log_p = log_softmax(logits)
-    log10_p           = log_p / ln(10)
-    normalized_output = (log10_p - log_mean) / log_std
+Key design choices for stability:
+1. Contractive dynamics: z' = z + α(g,dt) * (z_eq(g) - z) where α ∈ (0, α_max]
+2. Softmax head: Ensures positivity and conservation
+3. Log-space operations: Avoids numerical underflow
 """
-
-from __future__ import annotations
 
 import json
 import math
@@ -40,633 +32,723 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# -------------------------
-# Small helpers
-# -------------------------
+# -------------------------------------------------------------------------
+# Helper Components
+# -------------------------------------------------------------------------
+
 def get_activation(name: Union[str, nn.Module]) -> nn.Module:
     """
-    Returns a torch.nn activation module by name (case-insensitive).
-    Includes practical extras beyond ReLU/GELU/SiLU/Tanh.
+    Returns an activation module by name.
+
+    Supports: relu, gelu, silu/swish, mish, elu, tanh, identity
     """
     if isinstance(name, nn.Module):
         return name
+
     key = str(name).strip().lower()
 
-    # Common
-    if key in ("relu",):
-        return nn.ReLU(inplace=True)
-    if key in ("relu6",):
-        return nn.ReLU6(inplace=True)
-    if key in ("gelu",):
-        return nn.GELU()  # PyTorch's default approximate=True on CUDA
-    if key in ("silu", "swish"):
-        return nn.SiLU(inplace=True)
-    if key in ("tanh",):
-        return nn.Tanh()
-    if key in ("elu",):
-        return nn.ELU(inplace=True)
-    if key in ("selu",):
-        return nn.SELU()
-    if key in ("mish",):
-        return nn.Mish()
-    if key in ("leaky_relu", "lrelu", "leaky-relu", "leakyrelu"):
-        return nn.LeakyReLU(negative_slope=0.01, inplace=True)
-    if key in ("prelu",):
-        return nn.PReLU(num_parameters=1, init=0.25)
-    if key in ("hardswish", "hard_swish"):
-        return nn.Hardswish()
-    if key in ("softplus",):
-        return nn.Softplus()
-    if key in ("softsign",):
-        return nn.Softsign()
-    if key in ("identity", "none", ""):
-        return nn.Identity()
+    activations = {
+        'relu': lambda: nn.ReLU(inplace=True),
+        'gelu': lambda: nn.GELU(),
+        'silu': lambda: nn.SiLU(inplace=True),
+        'swish': lambda: nn.SiLU(inplace=True),
+        'mish': lambda: nn.Mish(),
+        'elu': lambda: nn.ELU(inplace=True),
+        'tanh': lambda: nn.Tanh(),
+        'identity': lambda: nn.Identity(),
+        'none': lambda: nn.Identity(),
+    }
+
+    if key in activations:
+        return activations[key]()
 
     raise ValueError(f"Unknown activation: {name}")
 
 
-
 class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: Sequence[int], out_dim: int,
-                 activation: Union[str, nn.Module] = "silu", dropout: float = 0.0):
+    """
+    Multi-layer perceptron with configurable activation and dropout.
+    """
+
+    def __init__(
+            self,
+            in_dim: int,
+            hidden_dims: Sequence[int],
+            out_dim: int,
+            activation: Union[str, nn.Module] = "silu",
+            dropout: float = 0.0,
+    ):
         super().__init__()
-        acts = []
-        last = in_dim
-        for h in hidden:
-            acts += [nn.Linear(last, h), get_activation(activation)]
-            if dropout and dropout > 0:
-                acts.append(nn.Dropout(p=float(dropout)))
-            last = h
-        acts.append(nn.Linear(last, out_dim))
-        self.net = nn.Sequential(*acts)
+
+        layers = []
+        dims = [in_dim] + list(hidden_dims)
+
+        # Build hidden layers
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(get_activation(activation))
+            if dropout > 0:
+                layers.append(nn.Dropout(p=dropout))
+
+        # Output layer (no activation)
+        layers.append(nn.Linear(dims[-1], out_dim))
+
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
-# -------------------------
-# Encoder / Dynamics / Decoder
-# -------------------------
+# -------------------------------------------------------------------------
+# Core Model Components
+# -------------------------------------------------------------------------
+
 class Encoder(nn.Module):
     """
-    Encoder: [y, g] -> z
+    Encoder: [y, g] -> z (latent representation)
 
-    - Deterministic when vae_mode=False
-    - VAE when vae_mode=True (returns KL term alongside z)
+    Supports both deterministic and VAE modes:
+    - Deterministic: outputs z directly
+    - VAE: outputs (z, kl_divergence) via reparameterization trick
     """
-    def __init__(self, state_dim: int, global_dim: int, hidden_dims: Sequence[int],
-                 latent_dim: int, activation: Union[str, nn.Module], dropout: float = 0.0,
-                 vae_mode: bool = False):
+
+    def __init__(
+            self,
+            state_dim: int,
+            global_dim: int,
+            hidden_dims: Sequence[int],
+            latent_dim: int,
+            activation: Union[str, nn.Module] = "silu",
+            dropout: float = 0.0,
+            vae_mode: bool = False,
+    ):
         super().__init__()
-        self.vae_mode = bool(vae_mode)
-        out_dim = latent_dim * 2 if self.vae_mode else latent_dim
-        self.latent_dim = int(latent_dim)
-        self.net = MLP(state_dim + global_dim, list(hidden_dims), out_dim, activation, dropout)
+
+        self.vae_mode = vae_mode
+        self.latent_dim = latent_dim
+
+        # VAE outputs both mean and log-variance
+        out_dim = latent_dim * 2 if vae_mode else latent_dim
+
+        self.net = MLP(
+            state_dim + global_dim,
+            list(hidden_dims),
+            out_dim,
+            activation,
+            dropout
+        )
 
     def forward(self, y: torch.Tensor, g: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            y: [B, S] - normalized species concentrations
+            g: [B, G] - global parameters (P, T)
+
+        Returns:
+            z: [B, Z] - latent representation
+            kl: Optional scalar KL divergence (VAE mode only)
+        """
         x = torch.cat([y, g], dim=-1)
         h = self.net(x)
+
         if not self.vae_mode:
             return h, None
-        # Split and reparameterize
+
+        # VAE: split into mean and log-variance
         mu, logvar = torch.chunk(h, 2, dim=-1)
+
+        # Reparameterization trick
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         z = mu + eps * std
-        # Per-batch KL
-        kl = (-0.5 * (1 + logvar - mu.square() - logvar.exp()).sum(dim=-1)).mean()
+
+        # KL divergence from N(0,1) prior (per-batch scalar)
+        kl = -0.5 * torch.sum(1.0 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+        kl = kl.mean()  # Average over batch
+
         return z, kl
 
 
 class LatentDynamics(nn.Module):
     """
-    Residual latent flow-map: z' = z + f([z, dt_norm, g])  (if residual=True)
-    If residual=False, z' = f([z, dt_norm, g]).
-    dt_norm is a normalized scalar in [0, 1] corresponding to log10(dt_phys) normalized.
-    """
-    def __init__(self, latent_dim: int, global_dim: int, hidden_dims: Sequence[int],
-                 activation: Union[str, nn.Module], dropout: float = 0.0,
-                 residual: bool = True, dt_stats: Optional[Dict[str, float]] = None):
-        super().__init__()
-        self.residual = bool(residual)
-        self.latent_dim = int(latent_dim)
-        self.global_dim = int(global_dim)
-        self.net = MLP(latent_dim + 1 + global_dim, list(hidden_dims), latent_dim, activation, dropout)
+    Latent space dynamics: z_t -> z_{t+dt}
 
-        self.dt_stats = dt_stats or {}
-        self.register_buffer("dt_log_min", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("dt_log_max", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("ln10", torch.tensor(math.log(10.0), dtype=torch.float32))
+    Two modes:
+    1. Residual MLP: z' = z + f(z, dt, g) - flexible but may drift
+    2. Contractive: z' = z + α(g,dt) * (z_eq(g) - z) - guaranteed convergence
 
-        # ---- Validate Δt log-range so offsets->steps work correctly ----
-        log_min = self.dt_stats.get("log_min", None)
-        log_max = self.dt_stats.get("log_max", None)
-
-        use_defaults = False
-        if log_min is None or log_max is None:
-            warnings.warn(
-                "[LatentDynamics] dt_stats missing 'log_min'/'log_max'. "
-                "Falling back to defaults (-9, 9). This can degrade semigroup/rollout losses.",
-                RuntimeWarning
-            )
-            use_defaults = True
-        else:
-            try:
-                log_min = float(log_min); log_max = float(log_max)
-            except Exception:
-                warnings.warn(
-                    "[LatentDynamics] dt_stats values not numeric; overriding with (-9, 9).",
-                    RuntimeWarning
-                )
-                use_defaults = True
-
-        if use_defaults:
-            log_min, log_max = -9.0, 9.0
-
-        if not (math.isfinite(log_min) and math.isfinite(log_max)) or log_max <= log_min:
-            warnings.warn(
-                "[LatentDynamics] Invalid Δt log-bounds; overriding with (-9, 9).",
-                RuntimeWarning
-            )
-            log_min, log_max = -9.0, 9.0
-
-        self.dt_log_min.fill_(float(log_min))
-        self.dt_log_max.fill_(float(log_max))
-        self.dt_range = float(log_max - log_min)
-
-    def _concat(self, z: torch.Tensor, dt_norm_scalar: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        if dt_norm_scalar.ndim == 1:
-            dt_norm_scalar = dt_norm_scalar.unsqueeze(-1)  # [B,1]
-        return torch.cat([z, dt_norm_scalar, g], dim=-1)
-
-    def forward(self, z: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        """
-        z:        [B, Z]
-        dt_norm:  [B, K]
-        g:        [B, G]
-        Returns:  [B, K, Z]
-        """
-        B, K = dt_norm.shape
-        z_rep = z.unsqueeze(1).expand(B, K, self.latent_dim)     # [B,K,Z]
-        dt_flat = dt_norm.reshape(B * K, 1)                      # [BK,1]
-        z_flat = z_rep.reshape(B * K, self.latent_dim)           # [BK,Z]
-        g_flat = g.unsqueeze(1).expand(B, K, self.global_dim).reshape(B * K, self.global_dim)  # [BK,G]
-        f_in = torch.cat([z_flat, dt_flat, g_flat], dim=-1)      # [BK,Z+1+G]
-        dz = self.net(f_in).reshape(B, K, self.latent_dim)       # [B,K,Z]
-        if self.residual:
-            return z_rep + dz
-        return dz
-
-    def step(self, z: torch.Tensor, dt_step_norm: Union[torch.Tensor, float], g: torch.Tensor) -> torch.Tensor:
-        """
-        Single-step dynamics in latent space.
-        z: [B,Z]; dt_step_norm: float or [B] or [B,1]; g: [B,G]
-        Returns: [B,Z]
-        """
-        if not torch.is_tensor(dt_step_norm):
-            dt_step_norm = torch.tensor(dt_step_norm, dtype=z.dtype, device=z.device)
-        if dt_step_norm.ndim == 1:
-            dt_step_norm = dt_step_norm.unsqueeze(-1)  # [B,1]
-        f_in = torch.cat([z, dt_step_norm, g], dim=-1) # [B,Z+1+G]
-        dz = self.net(f_in)                            # [B,Z]
-        if self.residual:
-            return z + dz
-        return dz
-
-
-# -------------------------
-# FiLM from globals (decoder-side)
-# -------------------------
-class FiLMFromGlobals(nn.Module):
-    """Apply z' = (1 + α·tanh(γ)) ⊙ z + β with a single linear projection from g."""
-    def __init__(self, global_dim: int, latent_dim: int, alpha: float = 0.1):
-        super().__init__()
-        self.proj = nn.Linear(global_dim, 2 * latent_dim, bias=True)
-        self.alpha = float(alpha)
-
-    def compute_affine(self, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (γ̃, β) where γ̃ = 1 + α·tanh(γ). Shapes: both [B, Z]."""
-        gamma_beta = self.proj(g)  # [B,2Z]
-        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
-        gamma = 1.0 + self.alpha * torch.tanh(gamma)
-        return gamma, beta
-
-    def forward(self, z: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        """Broadcast (γ̃,β) over time if needed and apply the affine."""
-        gamma, beta = self.compute_affine(g)        # [B,Z], [B,Z]
-        if z.ndim == 3:
-            gamma = gamma.unsqueeze(1)              # [B,1,Z]
-            beta = beta.unsqueeze(1)                # [B,1,Z]
-        return gamma * z + beta
-
-
-# -------------------------
-# Full Model
-# -------------------------
-class FlowMapAutoencoder(nn.Module):
-    """
-    Neural Dynamics Autoencoder (Softmax head, cheap global conditioning, optional VAE)
-
-    - Strict softmax head over species → exact simplex, then log10 + per-key normalize.
-    - Optional logit-delta composition (predict_logit_delta=True) adds decoder logits
-      in log-probability space to the base state before softmax.
-    - Cheap decoder conditioning via FiLM: Linear(g)->(γ,β) and z' = (1 + α·tanh(γ)) ⊙ z + β.
-    - Optional VAE encoder; per-batch KL stored on self.kl_loss.
-    - Trainer detects model.encode / model.decode for efficient rollout paths.
+    Contractive mode ensures global stability by pulling the state toward
+    a learned equilibrium z_eq(g) with rate α ∈ (0, α_max].
     """
 
     def __init__(
-        self,
-        state_dim_in: int,
-        state_dim_out: int,
-        global_dim: int,
-        latent_dim: int,
-        encoder_hidden: Sequence[int],
-        dynamics_hidden: Sequence[int],
-        decoder_hidden: Sequence[int],
-        activation: Union[str, nn.Module] = "silu",
-        dropout: float = 0.0,
-        dynamics_residual: bool = True,
-        target_idx: Optional[torch.Tensor] = None,  # indices into species_in forming species_out
-        target_log_mean: Optional[Sequence[float]] = None,
-        target_log_std: Optional[Sequence[float]] = None,
-        allow_partial_simplex: bool = False,
-        dt_stats: Optional[Dict[str, float]] = None,
-        # New options:
-        decoder_condition_on_g: bool = True,
-        predict_logit_delta: bool = False,
-        # VAE toggle:
-        vae_mode: bool = False,
+            self,
+            latent_dim: int,
+            global_dim: int,
+            hidden_dims: Sequence[int],
+            activation: Union[str, nn.Module] = "silu",
+            dropout: float = 0.0,
+            dt_stats: Optional[Dict[str, float]] = None,
+            contractive: bool = False,
+            contractive_alpha_max: float = 0.95,
     ):
         super().__init__()
-        self.S_in = int(state_dim_in)
-        self.S_out = int(state_dim_out)
-        self.global_dim = int(global_dim)
-        self.latent_dim = int(latent_dim)
 
-        if self.S_out != self.S_in and not allow_partial_simplex:
+        self.latent_dim = latent_dim
+        self.global_dim = global_dim
+        self.contractive = contractive
+
+        # Validate contractive parameters
+        if contractive:
+            if not (0.0 < contractive_alpha_max < 1.0):
+                raise ValueError(
+                    f"contractive_alpha_max must be in (0,1) for stability, got {contractive_alpha_max}"
+                )
+
+        self.alpha_max = contractive_alpha_max
+
+        # Standard residual dynamics network (always created for compatibility)
+        self.net = MLP(
+            latent_dim + 1 + global_dim,  # [z, dt_norm, g]
+            list(hidden_dims),
+            latent_dim,
+            activation,
+            dropout
+        )
+
+        # Contractive mode components
+        if contractive:
+            # Equilibrium predictor: g -> z_eq
+            self.eq_head = nn.Linear(global_dim, latent_dim, bias=True)
+
+            # Convergence rate predictor: [g, dt] -> α ∈ (0, α_max]
+            self.alpha_head = nn.Linear(global_dim + 1, 1, bias=True)
+
+        # Time normalization statistics
+        self.dt_stats = dt_stats or {}
+        self.register_buffer("dt_log_min", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("dt_log_max", torch.tensor(0.0, dtype=torch.float32))
+
+        # Validate and set dt bounds
+        log_min = self.dt_stats.get("log_min", -9.0)
+        log_max = self.dt_stats.get("log_max", 9.0)
+
+        if not (math.isfinite(log_min) and math.isfinite(log_max) and log_max > log_min):
+            warnings.warn(
+                f"Invalid dt log bounds ({log_min}, {log_max}), using defaults (-9, 9)",
+                RuntimeWarning
+            )
+            log_min, log_max = -9.0, 9.0
+
+        self.dt_log_min.fill_(log_min)
+        self.dt_log_max.fill_(log_max)
+
+    def forward(self, z: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """
+        Multi-step dynamics (vectorized over K timesteps).
+
+        Args:
+            z: [B, Z] - current latent state
+            dt_norm: [B, K] - normalized timesteps
+            g: [B, G] - global parameters
+
+        Returns:
+            z_next: [B, K, Z] - predicted states at each timestep
+        """
+        B, K = dt_norm.shape
+
+        if not self.contractive:
+            # Standard residual dynamics
+            z_rep = z.unsqueeze(1).expand(B, K, self.latent_dim)
+            dt_flat = dt_norm.reshape(B * K, 1)
+            z_flat = z_rep.reshape(B * K, self.latent_dim)
+            g_flat = g.unsqueeze(1).expand(B, K, self.global_dim).reshape(B * K, self.global_dim)
+
+            x = torch.cat([z_flat, dt_flat, g_flat], dim=-1)
+            dz = self.net(x).reshape(B, K, self.latent_dim)
+
+            return z_rep + dz  # Residual connection
+
+        # Contractive dynamics: z' = z + α * (z_eq - z)
+        # Compute equilibrium once (independent of dt)
+        z_eq = self.eq_head(g)  # [B, Z]
+        z_eq_expanded = z_eq.unsqueeze(1).expand(B, K, self.latent_dim)
+
+        # Compute per-step convergence rates
+        g_expanded = g.unsqueeze(1).expand(B, K, self.global_dim)  # view
+        dt_expanded = dt_norm.unsqueeze(-1)  # [B, K, 1]
+
+        alpha_input = torch.cat([
+            g_expanded.reshape(B * K, self.global_dim),
+            dt_expanded.reshape(B * K, 1)
+        ], dim=-1)
+
+        alpha = torch.sigmoid(self.alpha_head(alpha_input)) * self.alpha_max  # [BK, 1]
+        # Avoid accidental freeze at exactly zero
+        alpha = alpha.clamp_min(1e-6)
+        alpha = alpha.reshape(B, K, 1)  # [B, K, 1] for broadcasting
+
+        # Apply contraction
+        z_current = z.unsqueeze(1).expand(B, K, self.latent_dim)
+        z_next = z_current + alpha * (z_eq_expanded - z_current)
+
+        return z_next
+
+    def step(self, z: torch.Tensor, dt_step_norm: Union[torch.Tensor, float], g: torch.Tensor) -> torch.Tensor:
+        """
+        Single-step dynamics.
+
+        Args:
+            z: [B, Z] - current latent state
+            dt_step_norm: scalar or [B] or [B, 1] - normalized timestep
+            g: [B, G] - global parameters
+
+        Returns:
+            z_next: [B, Z] - next latent state
+        """
+        # Robustly coerce dt_step_norm to [B,1]
+        if not torch.is_tensor(dt_step_norm):
+            dt_step_norm = torch.tensor(dt_step_norm, dtype=z.dtype, device=z.device)
+        if dt_step_norm.ndim == 0:
+            dt_step_norm = dt_step_norm.expand(z.shape[0]).unsqueeze(-1)  # [B,1]
+        elif dt_step_norm.ndim == 1:
+            # If shape is [B] or [1], make [B,1] by broadcasting
+            if dt_step_norm.shape[0] == 1 and z.shape[0] > 1:
+                dt_step_norm = dt_step_norm.expand(z.shape[0]).unsqueeze(-1)
+            else:
+                dt_step_norm = dt_step_norm.unsqueeze(-1)
+        # else assume already [B,1]
+
+        if not self.contractive:
+            # Standard residual dynamics
+            x = torch.cat([z, dt_step_norm, g], dim=-1)
+            dz = self.net(x)
+            return z + dz  # Residual connection
+
+        # Contractive dynamics
+        z_eq = self.eq_head(g)  # [B, Z]
+        alpha_input = torch.cat([g, dt_step_norm], dim=-1)
+        alpha = torch.sigmoid(self.alpha_head(alpha_input)) * self.alpha_max  # [B, 1]
+        alpha = alpha.clamp_min(1e-6)
+        return z + alpha * (z_eq - z)
+
+
+class Decoder(nn.Module):
+    """
+    Decoder: z -> logits over species
+
+    Maps latent representation to unnormalized log-probabilities (logits)
+    which will be processed by a softmax head.
+    """
+
+    def __init__(
+            self,
+            latent_dim: int,
+            hidden_dims: Sequence[int],
+            out_dim: int,
+            activation: Union[str, nn.Module] = "silu",
+            dropout: float = 0.0,
+    ):
+        super().__init__()
+
+        self.net = MLP(latent_dim, list(hidden_dims), out_dim, activation, dropout)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z: [..., Z] - latent representation(s)
+
+        Returns:
+            logits: [..., S] - unnormalized log-probabilities
+        """
+        return self.net(z)
+
+
+# -------------------------------------------------------------------------
+# Main Autoencoder Model
+# -------------------------------------------------------------------------
+
+class FlowMapAutoencoder(nn.Module):
+    """
+    Complete autoencoder for chemical kinetics with stable rollout.
+
+    Architecture:
+        Encoder: (y, g) -> z
+        Dynamics: z_t -> z_{t+dt}
+        Decoder: z -> logits
+        Head: softmax -> log10 -> normalize
+
+    Key features:
+    - Softmax output ensures conservation (species sum to 1)
+    - Optional contractive dynamics for guaranteed convergence
+    - Optional VAE regularization
+    - Optional logit-delta mode for incremental updates
+    - All operations in log-space for numerical stability
+    """
+
+    def __init__(
+            self,
+            state_dim_in: int,
+            state_dim_out: int,
+            global_dim: int,
+            latent_dim: int,
+            encoder_hidden: Sequence[int],
+            dynamics_hidden: Sequence[int],
+            decoder_hidden: Sequence[int],
+            activation: Union[str, nn.Module] = "silu",
+            dropout: float = 0.0,
+            target_idx: Optional[torch.Tensor] = None,
+            target_log_mean: Optional[Sequence[float]] = None,
+            target_log_std: Optional[Sequence[float]] = None,
+            dt_stats: Optional[Dict[str, float]] = None,
+            predict_logit_delta: bool = False,
+            contractive_dynamics: bool = False,
+            contractive_alpha_max: float = 0.95,
+            vae_mode: bool = False,
+    ):
+        super().__init__()
+
+        self.S_in = state_dim_in
+        self.S_out = state_dim_out
+        self.global_dim = global_dim
+        self.latent_dim = latent_dim
+        self.predict_logit_delta = predict_logit_delta
+        self.vae_mode = vae_mode
+        self.kl_loss: Optional[torch.Tensor] = None  # set during encode/forward/step when VAE
+
+        # Validate configuration
+        if self.S_out != self.S_in:
             raise ValueError(
-                "Softmax head requires S_out == S_in for full simplex. "
-                "Set allow_partial_simplex=True ONLY if you intentionally want a subset that sums to 1."
+                f"Softmax head requires S_out ({self.S_out}) == S_in ({self.S_in}) for conservation"
             )
 
-        # Stats for normalization <-> physical (log10)
         if target_log_mean is None or target_log_std is None:
-            raise ValueError("target_log_mean and target_log_std are required for softmax head")
+            raise ValueError("target_log_mean and target_log_std are required for normalization")
+
+        # Register normalization statistics as buffers
         self.register_buffer("log_mean", torch.tensor(target_log_mean, dtype=torch.float32))
         self.register_buffer("log_std", torch.clamp(torch.tensor(target_log_std, dtype=torch.float32), min=1e-10))
         self.register_buffer("ln10", torch.tensor(math.log(10.0), dtype=torch.float32))
         self.register_buffer("ln10_inv", torch.tensor(1.0 / math.log(10.0), dtype=torch.float32))
+
         if target_idx is not None:
             self.register_buffer("target_idx", target_idx)
         else:
-            self.target_idx = None  # type: ignore
-        self.dt_stats = dt_stats or {}
+            self.target_idx = None  # vestigial; kept for compatibility
 
-        # Modules
-        self.encoder = Encoder(self.S_in, self.global_dim, list(encoder_hidden), self.latent_dim, activation, dropout,
-                               vae_mode=vae_mode)
-        self.dynamics = LatentDynamics(self.latent_dim, self.global_dim, list(dynamics_hidden), activation, dropout,
-                                       residual=dynamics_residual, dt_stats=dt_stats)
-        self.decoder = Decoder(self.latent_dim, list(decoder_hidden), self.S_out, activation, dropout)
+        # Initialize model components
+        self.encoder = Encoder(
+            self.S_in, self.global_dim, encoder_hidden,
+            self.latent_dim, activation, dropout, vae_mode
+        )
 
-        # FiLM (decoder-side) conditioning from globals
-        self.decoder_condition_on_g = bool(decoder_condition_on_g)
-        self.film = FiLMFromGlobals(self.global_dim, self.latent_dim) if self.decoder_condition_on_g else None
+        self.dynamics = LatentDynamics(
+            self.latent_dim, self.global_dim, dynamics_hidden,
+            activation, dropout, dt_stats,
+            contractive_dynamics, contractive_alpha_max
+        )
 
-        # Head behavior
-        self.predict_logit_delta = bool(predict_logit_delta)
+        self.decoder = Decoder(
+            self.latent_dim, decoder_hidden,
+            self.S_out, activation, dropout
+        )
 
-        # KL tracker (for VAE mode)
-        self.kl_loss: Optional[torch.Tensor] = None
+    # -------------------------------------------------------------------------
+    # Normalization helpers (for numerical stability)
+    # -------------------------------------------------------------------------
 
-        # Gentle init for stability with logit deltas
-        with torch.no_grad():
-            last = [m for m in self.decoder.net.modules() if isinstance(m, nn.Linear)][-1]
-            last.weight.mul_(0.1)
-            if last.bias is not None:
-                last.bias.zero_()
-
-    # ---- Head utilities (float32 numerics; cast back at the end) ----
     def _softmax_head_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """Softmax → log10 → normalize with per-key stats. Numerics in float32."""
-        if not torch.isfinite(logits).all():
-            warnings.warn("[FlowMapAutoencoder] Non-finite logits detected before softmax.", RuntimeWarning)
-        log_p = F.log_softmax(logits, dim=-1)                 # natural log p
-        log_p_f = log_p.float()
-        log10_p = log_p_f * self.ln10_inv                     # float32
-        z_f = (log10_p - self.log_mean) / self.log_std        # float32
-        if not torch.isfinite(z_f).all():
-            warnings.warn("[FlowMapAutoencoder] Non-finite normalized outputs after head.", RuntimeWarning)
-        return z_f.to(dtype=logits.dtype)
+        """
+        Convert logits to normalized concentrations via softmax.
+
+        Pipeline: logits -> log_softmax -> log10 -> normalize
+        All operations in log-space for stability.
+        """
+        # Compute log probabilities with numerical stability
+        log_p = F.log_softmax(logits.float(), dim=-1)
+        log_p = torch.clamp(log_p, min=-50.0)  # Floor at ~1e-22 probability
+
+        # Convert to log10 space
+        log10_p = log_p * self.ln10_inv
+
+        # Apply normalization
+        z_normalized = (log10_p - self.log_mean) / self.log_std
+
+        return z_normalized.to(dtype=logits.dtype)
 
     def _head_from_logprobs(self, log_p: torch.Tensor) -> torch.Tensor:
-        """Given natural log-probabilities, return normalized z; numerics in float32."""
-        if not torch.isfinite(log_p).all():
-            warnings.warn("[FlowMapAutoencoder] Non-finite log-probabilities provided to head.", RuntimeWarning)
-        log10_p = log_p.float() * self.ln10_inv               # float32
-        z_f = (log10_p - self.log_mean) / self.log_std        # float32
-        if not torch.isfinite(z_f).all():
-            warnings.warn("[FlowMapAutoencoder] Non-finite normalized outputs after logprob head.", RuntimeWarning)
-        return z_f.to(dtype=log_p.dtype)
+        """
+        Convert natural log probabilities to normalized concentrations.
+        """
+        log_p = torch.clamp(log_p.float(), min=-50.0)
+        log10_p = log_p * self.ln10_inv
+        z_normalized = (log10_p - self.log_mean) / self.log_std
+        return z_normalized.to(dtype=log_p.dtype)
 
     def _denorm_to_logp(self, y_norm: torch.Tensor) -> torch.Tensor:
-        """Normalized y → natural log-probabilities; numerics in float32."""
-        y_f = y_norm.float()
-        log10_p = y_f * self.log_std + self.log_mean          # float32
-        return log10_p * self.ln10                             # float32
+        """
+        Convert normalized concentrations back to natural log probabilities.
+        """
+        log10_p = y_norm.float() * self.log_std + self.log_mean
+        return log10_p * self.ln10
 
-    # ---- Convenience wrappers used by the trainer (NO decorators) ----
+    # -------------------------------------------------------------------------
+    # Public interfaces
+    # -------------------------------------------------------------------------
+
     def encode(self, y: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
-        Encode state + globals into latent z.
-        - Works for both deterministic and VAE encoders.
-        - Updates self.kl_loss when VAE is enabled.
-        Shapes:
-          y: [B, S_in], g: [B, G] -> z: [B, Z]
-        """
-        out = self.encoder(y, g)
-        if isinstance(out, (tuple, list)):
-            z, kl = out
-            self.kl_loss = kl
-            return z
-        self.kl_loss = None
-        return out
+        Encode state into latent representation.
 
-    def decode(self, z: torch.Tensor, g: torch.Tensor, return_logits: bool = False) -> torch.Tensor:
-        """
-        Decode latent (optionally FiLM-conditioned by g) into species.
-        - If return_logits=False (default): returns normalized outputs (softmax/log10-normalized head).
-        - If return_logits=True: returns raw decoder logits.
-        Accepts both [B, Z] and [B, K, Z] and broadcasts FiLM as needed.
-        """
-        if self.decoder_condition_on_g:
-            z = self.film(z, g)   # supports 2D or 3D z
-        logits = self.decoder(z)  # [B,(K,) S_out]
-        return logits if return_logits else self._softmax_head_from_logits(logits)
+        NOTE (compat): Returns ONLY z so downstream code does not change.
+        When vae_mode=True, also sets self.kl_loss for the trainer to consume.
 
-    # ---- Core APIs ----
-    def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        """
-        Vectorized independent offsets:
-            y_i:     [B, S_in]   (normalized)
-            dt_norm: [B, K]      (offsets from anchor; normalized)
-            g:       [B, G]
+        Args:
+            y: [B, S] - normalized species concentrations
+            g: [B, G] - global parameters
 
         Returns:
-            [B, K, S_out] (normalized)
-
-        Side effect:
-            - Caches encoder latent z0 and FiLM affine so rollout_vectorized() can
-              reuse them in the same training_step without re-encoding y_i.
+            z: [B, Z] - latent representation
         """
+        z, kl = self.encoder(y, g)
+        # Maintain backward compatibility: stash KL if present
+        self.kl_loss = kl
+        return z
 
-        # Encode anchor once (handles VAE mode and updates self.kl_loss)
-        enc_out = self.encoder(y_i, g)  # tuple(z, kl) in both deterministic & VAE modes
-        if isinstance(enc_out, (tuple, list)):
-            z_i, self.kl_loss = enc_out
-        else:
-            z_i, self.kl_loss = enc_out, None
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Decode latent to logits.
 
-        # Cache latent for rollout loss reuse (will be cleared in training_step)
-        self._cached_rollout_z0 = z_i  # [B, Z], still requires grad
+        Args:
+            z: [..., Z] - latent representation
 
-        # Propagate latent over all requested offsets at once
-        z_k = self.dynamics(z_i, dt_norm, g)  # [B, K, Z]
+        Returns:
+            logits: [..., S] - unnormalized log-probabilities
+        """
+        return self.decoder(z)
 
-        # Decoder-side FiLM conditioning
-        if self.decoder_condition_on_g:
-            # Compute FiLM affine once and cache it for rollout_vectorized
-            gamma_adj, beta = self.film.compute_affine(g)  # [B, Z], [B, Z]
-            self._cached_rollout_film = (gamma_adj, beta)
+    def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """
+        Predict states at multiple future timesteps (training mode).
 
-            # Broadcast FiLM over time dimension [B,K,Z]
-            z_k = gamma_adj.unsqueeze(1) * z_k + beta.unsqueeze(1)
-        else:
-            self._cached_rollout_film = None
+        Args:
+            y_i: [B, S] - initial normalized state
+            dt_norm: [B, K] - normalized timestep offsets
+            g: [B, G] - global parameters
 
-        # Decode all K steps at once
-        logits = self.decoder(z_k)  # [B, K, S_out]
+        Returns:
+            y_pred: [B, K, S] - predicted normalized states
+        """
+        # Encode initial state
+        z0 = self.encode(y_i, g)  # sets self.kl_loss if VAE
 
-        # Plain softmax head path
+        # Propagate dynamics
+        Z_seq = self.dynamics(z0, dt_norm, g)  # [B, K, Z]
+
+        # Decode to species
         if not self.predict_logit_delta:
-            return self._softmax_head_from_logits(logits)  # [B, K, S_out]
+            # Direct prediction mode
+            logits = self.decoder(Z_seq)  # [B, K, S]
+            return self._softmax_head_from_logits(logits)
 
-        # --- logit-delta head path ---
-        # Compose decoder logits with base distribution in log-probability space.
-        base = y_i if self.S_out == self.S_in else y_i.index_select(1, self.target_idx)
-        base_logp = self._denorm_to_logp(base)  # [B, S_out] (natural log p_base)
-        log_q = F.log_softmax(logits, dim=-1).float()  # [B, K, S_out]
-        combined = base_logp.unsqueeze(1) + log_q  # [B, K, S_out]
-        log_p = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
+        # Logit-delta mode: incremental updates in probability space
+        base_logp = self._denorm_to_logp(y_i)  # [B, S]
 
-        if not torch.isfinite(log_p).all():
-            warnings.warn(
-                "[FlowMapAutoencoder] Non-finite combined log-probs in forward().",
-                RuntimeWarning,
-            )
+        outs = []
+        for k in range(dt_norm.shape[1]):
+            z_k = Z_seq[:, k, :]  # [B, Z]
+            logits_k = self.decoder(z_k)  # [B, S]
 
-        return self._head_from_logprobs(log_p)  # [B, K, S_out] normalized
+            # Combine base and delta in log-probability space
+            log_q = F.log_softmax(logits_k.float(), dim=-1)
+            log_q = torch.clamp(log_q, min=-50.0)
 
-    def step(self, y: torch.Tensor, dt_step_norm: Union[torch.Tensor, float], g: torch.Tensor,
-             film_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
+            combined = base_logp + log_q
+            log_p = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
+
+            outs.append(self._head_from_logprobs(log_p))
+
+        return torch.stack(outs, dim=1)  # [B, K, S]
+
+    def step(self, y: torch.Tensor, dt_step_norm: Union[torch.Tensor, float], g: torch.Tensor) -> torch.Tensor:
         """
-        Single teacher-forced step:
-            y:            [B, S_in]  (normalized)
-            dt_step_norm: float or [B] or [B,1]
-            g:            [B, G]
-            film_cache:   optional (gamma_tilde, beta) to avoid recomputing FiLM
-        Returns:          [B, S_out] (normalized)
+        Single autoregressive step (teacher forcing).
+
+        Args:
+            y: [B, S] - current normalized state
+            dt_step_norm: timestep to next state
+            g: [B, G] - global parameters
+
+        Returns:
+            y_next: [B, S] - predicted next state
         """
-        z, self.kl_loss = self.encoder(y, g)                   # [B,Z]
-        z_next = self.dynamics.step(z, dt_step_norm, g)        # [B,Z]
-        if self.decoder_condition_on_g:
-            if film_cache is None:
-                gamma_adj, beta = self.film.compute_affine(g)  # [B,Z], [B,Z]
-            else:
-                gamma_adj, beta = film_cache
-            z_next = gamma_adj * z_next + beta                 # [B,Z]
-        logits = self.decoder(z_next)                          # [B,S_out]
+        # Encode current state (also sets self.kl_loss if VAE)
+        z = self.encode(y, g)
+
+        # Single dynamics step
+        z = self.dynamics.step(z, dt_step_norm, g)
+
+        # Decode
+        logits = self.decoder(z)  # [B, S]
 
         if not self.predict_logit_delta:
             return self._softmax_head_from_logits(logits)
 
-        # Compose base and decoder in log-prob space
-        base = y if self.S_out == self.S_in else y.index_select(1, self.target_idx)
-        base_logp = self._denorm_to_logp(base)                 # [B,S_out]
-        log_q = F.log_softmax(logits, dim=-1).float()          # [B,S_out]
-        combined = base_logp + log_q                           # [B,S_out]
+        # Logit-delta mode
+        base_logp = self._denorm_to_logp(y)
+        log_q = F.log_softmax(logits.float(), dim=-1)
+        log_q = torch.clamp(log_q, min=-50.0)
+
+        combined = base_logp + log_q
         log_p = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
 
-        if not torch.isfinite(log_p).all():
-            warnings.warn("[FlowMapAutoencoder] Non-finite combined log-probs in step().", RuntimeWarning)
+        return self._head_from_logprobs(log_p)
 
-        return self._head_from_logprobs(log_p)                 # [B,S_out] (normalized)
-
+    @torch.no_grad()
     def rollout_vectorized(
             self,
             y0: torch.Tensor,
             g: torch.Tensor,
-            dt_steps_norm: torch.Tensor,
-            z0: Optional[torch.Tensor] = None,
-            film_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            dt_seq_norm: torch.Tensor
     ) -> torch.Tensor:
         """
-        Sequential latent rollout over a horizon, with a single batched decode when possible.
+        Efficient autoregressive rollout for inference (no gradients).
 
         Args:
-            y0:            [B, S_in]   (normalized anchor state)
-            g:             [B, G]
-            dt_steps_norm: [B, K]      per-step normalized increments (>=0, strictly forward)
-            z0:            Optional precomputed latent for y0 from this same batch
-                           (cached in forward()). If provided, we DO NOT re-run
-                           the encoder or touch self.kl_loss here.
-            film_cache:    Optional (gamma_adj, beta) from FiLM.compute_affine(g),
-                           cached in forward() to avoid recomputing FiLM.
+            y0: [B, S] - initial normalized state
+            g: [B, G] - global parameters (constant over rollout)
+            dt_seq_norm: [B, K] - sequence of normalized timesteps
 
         Returns:
-            [B, K, S_out] (normalized)
+            trajectory: [B, K, S] - predicted states at each timestep
         """
+        B, K = dt_seq_norm.shape
 
-        # Initial latent state
-        if z0 is None:
-            enc_out = self.encoder(y0, g)
-            if isinstance(enc_out, (tuple, list)):
-                z, self.kl_loss = enc_out
-            else:
-                z, self.kl_loss = enc_out, None
-        else:
-            z = z0
-            # We intentionally do NOT overwrite self.kl_loss here.
+        # Encode initial state once
+        z = self.encode(y0, g)
 
-        B, K = dt_steps_norm.shape
-        use_delta = bool(self.predict_logit_delta)
+        # Build latent trajectory
+        z_trajectory = []
+        for k in range(K):
+            z = self.dynamics.step(z, dt_seq_norm[:, k], g)
+            z_trajectory.append(z)
 
-        # FiLM affine for decoder
-        gamma_adj = beta = None
-        if self.decoder_condition_on_g:
-            if film_cache is None:
-                gamma_adj, beta = self.film.compute_affine(g)  # [B, Z], [B, Z]
-            else:
-                gamma_adj, beta = film_cache  # [B, Z], [B, Z]
+        Z_seq = torch.stack(z_trajectory, dim=1)  # [B, K, Z]
 
-        # -------- fast path: no logit-delta head --------
-        if not use_delta:
-            z_steps = []
-            for k in range(K):
-                z = self.dynamics.step(z, dt_steps_norm[:, k], g)  # [B, Z]
-                z_steps.append(z)
-            Z_seq = torch.stack(z_steps, dim=1)  # [B, K, Z]
+        # Decode all states at once
+        logits = self.decoder(Z_seq)  # [B, K, S]
 
-            if self.decoder_condition_on_g:
-                Z_seq = gamma_adj.unsqueeze(1) * Z_seq + beta.unsqueeze(1)  # [B, K, Z]
+        if not self.predict_logit_delta:
+            return self._softmax_head_from_logits(logits)
 
-            logits = self.decoder(Z_seq)  # [B, K, S_out]
-            return self._softmax_head_from_logits(logits)  # [B, K, S_out]
-
-        # -------- logit-delta path (autoregressive in prob space) --------
-        outs = []
-        base = y0 if (self.S_out == self.S_in) else y0.index_select(1, self.target_idx)
-        cur_logp = self._denorm_to_logp(base).float()  # [B, S_out]
+        # Logit-delta mode: autoregressive in probability space
+        trajectory = []
+        current_logp = self._denorm_to_logp(y0)  # [B, S]
 
         for k in range(K):
-            z = self.dynamics.step(z, dt_steps_norm[:, k], g)  # [B, Z]
+            log_q = F.log_softmax(logits[:, k, :].float(), dim=-1)
+            log_q = torch.clamp(log_q, min=-50.0)
 
-            if self.decoder_condition_on_g:
-                z_dec = gamma_adj * z + beta  # [B, Z]
-                logits = self.decoder(z_dec)  # [B, S_out]
-            else:
-                logits = self.decoder(z)  # [B, S_out]
+            combined = current_logp + log_q
+            current_logp = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
 
-            log_q = F.log_softmax(logits, dim=-1).float()  # [B, S_out]
-            combined = cur_logp + log_q
-            cur_logp = combined - torch.logsumexp(combined, dim=-1, keepdim=True)
+            trajectory.append(self._head_from_logprobs(current_logp))
 
-            outs.append(self._head_from_logprobs(cur_logp))  # [B, S_out]
-
-        return torch.stack(outs, dim=1)  # [B, K, S_out]
+        return torch.stack(trajectory, dim=1)  # [B, K, S]
 
 
-# -------------------------
-# Decoder
-# -------------------------
-class Decoder(nn.Module):
-    """
-    Deterministic decoder: z -> logits over species.
-    """
-    def __init__(self, latent_dim: int, hidden_dims: Sequence[int], out_dim: int,
-                 activation: Union[str, nn.Module] = "silu", dropout: float = 0.0):
-        super().__init__()
-        acts = []
-        last = latent_dim
-        for h in hidden_dims:
-            acts += [nn.Linear(last, h), get_activation(activation)]
-            if dropout and dropout > 0:
-                acts.append(nn.Dropout(p=float(dropout)))
-            last = h
-        acts.append(nn.Linear(last, out_dim))
-        self.net = nn.Sequential(*acts)
+# -------------------------------------------------------------------------
+# Factory function
+# -------------------------------------------------------------------------
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z)
-
-
-# -------------------------
-# Factory
-# -------------------------
 def create_model(config: dict) -> FlowMapAutoencoder:
-    data_cfg = config.get("data", {})
-    species_vars = list(data_cfg.get("species_variables") or [])
-    global_vars = list(data_cfg.get("global_variables", []))
-    if not species_vars:
-        raise KeyError("data.species_variables required")
+    """
+    Create model from configuration dictionary.
 
-    target_vars = list(data_cfg.get("target_species") or species_vars)
+    Expected config structure:
+    - data.species_variables: list of species names
+    - data.global_variables: list of global variable names (e.g., ["P", "T"])
+    - data.target_species: optional subset of species to predict
+    - model.latent_dim: latent space dimension
+    - model.encoder_hidden: list of hidden layer sizes for encoder
+    - model.dynamics_hidden: list of hidden layer sizes for dynamics
+    - model.decoder_hidden: list of hidden layer sizes for decoder
+    - model.activation: activation function name
+    - model.dropout: dropout probability
+    - model.predict_logit_delta: whether to use incremental updates
+    - model.contractive_dynamics: whether to use contractive dynamics
+    - model.contractive_alpha_max: maximum contraction rate
+    - model.vae_mode: whether to use VAE encoder
+    """
+    # Parse data configuration
+    data_cfg = config.get("data", {})
+    species_vars = list(data_cfg.get("species_variables", []))
+    if not species_vars:
+        raise KeyError("data.species_variables is required")
+
+    global_vars = list(data_cfg.get("global_variables", []))
+    target_vars = list(data_cfg.get("target_species", species_vars))
+
+    # Map species names to indices
     name_to_idx = {name: i for i, name in enumerate(species_vars)}
     try:
         target_idx = [name_to_idx[name] for name in target_vars]
     except KeyError as e:
-        raise KeyError(f"target_species contains unknown name: {e.args[0]!r}")
+        raise KeyError(f"target_species contains unknown species: {e.args[0]}")
 
-    mcfg = config.get("model", {})
+    # Parse model configuration
+    model_cfg = config.get("model", {})
     state_dim_in = len(species_vars)
     state_dim_out = len(target_vars)
     global_dim = len(global_vars)
-    latent_dim = int(mcfg.get("latent_dim", 128))
-    encoder_hidden = mcfg.get("encoder_hidden", [256, 256])
-    dynamics_hidden = mcfg.get("dynamics_hidden", [256, 256])
-    decoder_hidden = mcfg.get("decoder_hidden", [128, 256])
-    activation = mcfg.get("activation", "silu")
-    dropout = float(mcfg.get("dropout", 0.0))
-    dynamics_residual = bool(mcfg.get("dynamics_residual", True))
-    allow_partial_simplex = bool(mcfg.get("allow_partial_simplex", False))
 
-    # New flags
-    decoder_condition_on_g = bool(mcfg.get("decoder_condition_on_g", True))
-    predict_logit_delta = bool(mcfg.get("predict_logit_delta", False))
-    vae_mode = bool(mcfg.get("vae_mode", False))
+    # Architecture parameters
+    latent_dim = int(model_cfg.get("latent_dim", 128))
+    encoder_hidden = model_cfg.get("encoder_hidden", [256, 512, 256])
+    dynamics_hidden = model_cfg.get("dynamics_hidden", [256, 512, 256])
+    decoder_hidden = model_cfg.get("decoder_hidden", [256, 512, 256])
+    activation = model_cfg.get("activation", "silu")
+    dropout = float(model_cfg.get("dropout", 0.0))
 
-    # Load normalization manifest to get per-species log stats and dt stats
-    target_log_mean, target_log_std, dt_stats = None, None, None
-    paths = config.get("paths", {})
-    norm_path = Path(paths.get("processed_data_dir", "data/processed")) / "normalization.json"
+    # Model behavior flags
+    predict_logit_delta = bool(model_cfg.get("predict_logit_delta", False))
+    contractive_dynamics = bool(model_cfg.get("contractive_dynamics", False))
+    contractive_alpha_max = float(model_cfg.get("contractive_alpha_max", 0.95))
+    vae_mode = bool(model_cfg.get("vae_mode", False))
+
+    # Load normalization statistics
+    paths_cfg = config.get("paths", {})
+    processed_dir = Path(paths_cfg.get("processed_data_dir", "data/processed"))
+    norm_path = processed_dir / "normalization.json"
 
     if not norm_path.exists():
         raise FileNotFoundError(f"normalization.json not found at {norm_path}")
 
     with open(norm_path, "r") as f:
         manifest = json.load(f)
-    if "dt" in manifest:
-        dt_stats = {"log_min": float(manifest["dt"]["log_min"]), "log_max": float(manifest["dt"]["log_max"])}
-    stats = manifest.get("per_key_stats", {})
-    target_log_mean, target_log_std = [], []
-    for name in target_vars:
-        if name not in stats:
-            raise KeyError(f"Target species '{name}' not in normalization stats")
-        s = stats[name]
-        target_log_mean.append(float(s.get("log_mean", 0.0)))
-        target_log_std.append(float(s.get("log_std", 1.0)))
 
+    # Extract time statistics
+    dt_stats = None
+    if "dt" in manifest:
+        dt_stats = {
+            "log_min": float(manifest["dt"]["log_min"]),
+            "log_max": float(manifest["dt"]["log_max"])
+        }
+
+    # Extract species normalization statistics
+    per_key_stats = manifest.get("per_key_stats", {})
+    target_log_mean = []
+    target_log_std = []
+
+    for name in target_vars:
+        if name not in per_key_stats:
+            raise KeyError(f"Species '{name}' not found in normalization statistics")
+
+        stats = per_key_stats[name]
+        target_log_mean.append(float(stats.get("log_mean", 0.0)))
+        target_log_std.append(float(stats.get("log_std", 1.0)))
+
+    # Create model
     return FlowMapAutoencoder(
         state_dim_in=state_dim_in,
         state_dim_out=state_dim_out,
@@ -677,14 +759,13 @@ def create_model(config: dict) -> FlowMapAutoencoder:
         decoder_hidden=decoder_hidden,
         activation=activation,
         dropout=dropout,
-        dynamics_residual=dynamics_residual,
-        target_idx=torch.tensor(target_idx, dtype=torch.long),
+        target_idx=torch.tensor(target_idx, dtype=torch.long) if target_idx else None,
         target_log_mean=target_log_mean,
         target_log_std=target_log_std,
-        allow_partial_simplex=allow_partial_simplex,
         dt_stats=dt_stats,
-        decoder_condition_on_g=decoder_condition_on_g,
         predict_logit_delta=predict_logit_delta,
+        contractive_dynamics=contractive_dynamics,
+        contractive_alpha_max=contractive_alpha_max,
         vae_mode=vae_mode,
     )
 
