@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Dict, Any, List, Sequence, Optional
 
 import torch
-
+import warnings
 
 class NormalizationHelper:
     """
@@ -98,33 +98,52 @@ class NormalizationHelper:
 
         return self._denormalize_columns(x, keys)
 
+    import warnings
+    import torch
+
     def normalize_dt_from_phys(self, dt_phys: torch.Tensor) -> torch.Tensor:
         """
-        Normalize physical time differences to [0,1].
-        Uses log-min-max transform from dt spec.
+        Map physical Δt (in seconds) to the [0,1] normalized range used by the model.
 
-        Args:
-            dt_phys: Physical time differences
+        Steps:
+        1. clamp dt_phys to epsilon to avoid log10(0)
+        2. take log10
+        3. affine map [log_min, log_max] -> [0,1]
+        4. clamp final result to [0,1]
 
-        Returns:
-            Normalized dt tensor in [0, 1]
+        Added: warn if any input Δt lies outside the training range.
         """
-        if self.dt_spec is None:
-            raise ValueError("dt normalization spec required but not found in manifest")
-
-        # Always use dt spec (no fallback)
+        # training-time stats from manifest
         log_min = float(self.dt_spec["log_min"])
         log_max = float(self.dt_spec["log_max"])
 
-        # Log transform with floor
+        # protect against log10(0)
         dt_safe = torch.clamp(dt_phys, min=self.epsilon)
+
+        # log10 seconds
         dt_log = torch.log10(dt_safe)
 
-        # Normalize to [0,1]
-        denominator = max(log_max - log_min, 1e-12)
-        dt_norm = (dt_log - log_min) / denominator
+        # OOD check BEFORE clamping
+        # anything with log10(dt) below log_min or above log_max is out-of-support
+        ood_mask = (dt_log < log_min) | (dt_log > log_max)
+        if torch.any(ood_mask):
+            # fraction of offending elements (as % of all elements in this call)
+            ood_frac = ood_mask.float().mean().item() * 100.0
+            warnings.warn(
+                f"[normalize_dt_from_phys] {ood_frac:.2f}% of Δt values fall outside "
+                f"training range [{log_min:.3f}, {log_max:.3f}] in log10(s). "
+                "They will be clamped.",
+                RuntimeWarning,
+            )
 
-        return torch.clamp(dt_norm, 0.0, 1.0)
+        # affine normalize
+        denom = max(log_max - log_min, 1e-12)
+        dt_norm = (dt_log - log_min) / denom  # expected in [0,1] if in-range
+
+        # final clamp to [0,1] for model consumption
+        dt_norm = torch.clamp(dt_norm, 0.0, 1.0)
+
+        return dt_norm
 
     def denormalize_dt_to_phys(
             self,

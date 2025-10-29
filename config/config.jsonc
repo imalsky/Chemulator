@@ -3,8 +3,8 @@
   // PATHS
   // ===============================
   "paths": {
-    "processed_data_dir": "data/processed_medium",
-    "work_dir": "models/v3",
+    "processed_data_dir": "data/processed",
+    "work_dir": "models/big",
     "raw_data_files": []
   },
   // ===============================
@@ -35,7 +35,7 @@
   "dataset": {
     // Multi-Δt targets per anchor
     "multi_time_per_anchor": true,
-    "times_per_anchor": 8,
+    "times_per_anchor": 64,
     "share_times_across_batch": true,
 
     // Time sampling / grid fast-paths
@@ -72,19 +72,19 @@
   // ===============================
   "model": {
     // Architecture
-    "latent_dim": 512,
-    "encoder_hidden": [1024, 1024, 1024, 1024],
-    "dynamics_hidden":[1024, 1024, 1024, 1024],
-    "decoder_hidden": [1024, 1024, 1024, 1024],
+    "latent_dim": 128,
+    "encoder_hidden": [256, 512, 1024, 1536],
+    "dynamics_hidden":[1536, 2048, 1536],
+    "decoder_hidden": [1536, 1024, 512, 256],
 
     "vae_mode": true,
 
     // Act/Dropout
     "activation": "silu",
-    "dropout": 0.0,
+    "dropout": 0.025,
 
     // Behavior (matches current model.py)
-    "dynamics_residual": true,
+    "dynamics_residual": false,
     "decoder_condition_on_g": false,      // FiLM gating on P,T
     "predict_logit_delta": false,        // residual in logit (nat-log prob) space before softmax
     "allow_partial_simplex": false       // set true only if predicting a subset that must sum to 1
@@ -95,12 +95,12 @@
   // ===============================
   "training": {
     // Batching / sampling (used by main.build_datasets_and_loaders and preprocessor)
-    "batch_size": 32768,
-    "val_batch_size": 32768,
-    "pairs_per_traj": 8,
-    "pairs_per_traj_val": 8,
+    "batch_size": 2048,
+    "val_batch_size": 2048,
+    "pairs_per_traj": 16,
+    "pairs_per_traj_val": 16,
 
-    "beta_kl": 0.002,
+    "beta_kl": 1e-3,
 
     // Splits for preprocessing (required by preprocessor)
     "val_fraction": 0.1,
@@ -116,34 +116,32 @@
     "min_lr": 1e-8,
     "weight_decay": 1e-5,
     "warmup_epochs": 10,
-    "epochs": 50,
-    "gradient_clip": 5.0,
+    "epochs": 200,
+    "gradient_clip": 10.0,
 
     // Loss
     "loss_mode": "adaptive_stiff", //"adaptive_stiff"
     "adaptive_stiff_loss": {
+      "lambda_mse": 0.25,
       "lambda_phys": 1.0,
-      "lambda_mse": 1.0,
-      "epsilon_phys": 1e-30,
-      "time_edge_gain": 1.0,     // ← ADD THIS LINE
-      "rel_cap": 10.0             // ← Also move this here (cleanup)
+      "time_edge_gain": 1.0
     },
 
-    "ema": { "enable": false, "decay": 0.9999},            // EMA callback (minimal)
-    "swa": { "enable": false, "epoch_start": 0.8 },       // SWA callback (optional)
-    "model_soup": { "enable": false, "top_k": 3 },         // Average best-k ckpts post-fit
+    "ema": { "enable": true, "decay": 0.9999},            // EMA callback (minimal)
+    "swa": { "enable": true, "epoch_start": 0.8 },         // SWA callback (optional)
+    "model_soup": { "enable": true, "top_k": 3 },         // Average best-k ckpts post-fit
 
     // Aux losses (names/structure that trainer reads)
     "auxiliary_losses": {
       "rollout_enabled": true,
-      "rollout_weight": 0.1,
-      "rollout_horizon": 3,
-      "rollout_warmup_epochs": 5,
+      "rollout_weight": 0.25,
+      "rollout_horizon": 8,
+      "rollout_warmup_epochs": 10,
       "rollout_teacher_forcing": {
         "mode": "linear",
         "start_p": 1.0,
         "end_p": 0.0,
-        "end_epoch": 5
+        "end_epoch": 10
       },
       "semigroup": {
         "enabled": true,

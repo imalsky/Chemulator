@@ -69,7 +69,7 @@ def get_activation(name: Union[str, nn.Module]) -> nn.Module:
         return nn.SELU()
     if key in ("mish",):
         return nn.Mish()
-    if key in ("leaky_relu", "lrelu", "leaky-relu"):
+    if key in ("leaky_relu", "lrelu", "leaky-relu", "leakyrelu"):
         return nn.LeakyReLU(negative_slope=0.01, inplace=True)
     if key in ("prelu",):
         return nn.PReLU(num_parameters=1, init=0.25)

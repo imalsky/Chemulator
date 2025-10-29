@@ -89,7 +89,7 @@ STUDY_NAME = "v1"                           # tunes live in {work_dir}/tuning/{S
 N_TRIALS = 100                              # target trials
 
 PROBE_EPOCHS = 10                            # epochs to "audition" a trial
-PRUNE_FACTOR = 1.5                          # prune if probe_loss > best_so_far * PRUNE_FACTOR
+PRUNE_FACTOR = 1.0                          # prune if probe_loss > best_so_far * PRUNE_FACTOR
 
 # Delete or comment any entry below to SKIP searching it.
 # Interpretation rules:

@@ -9,7 +9,7 @@ Trainer for Stable LPV Koopman Autoencoder
 - Rollout horizon warmup.
 - Cosine LR with linear warmup; AdamW; manual gradient clipping (fused-optimizer safe).
 - Lightning checkpointing + best model export.
-- Adaptive stiff loss (fractional physical + MSE normalized), device-safe.
+- Adaptive stiff loss (per-decade log10 + MSE normalized), device-safe.
 - End-of-epoch one-line summary: epoch, train/val, ||g||, ||p||, lr, TF, H.
 
 Config toggles:
@@ -74,29 +74,46 @@ MAX_RESIDUAL = 1e4
 
 class AdaptiveStiffLoss(nn.Module):
     """
-    Adaptive loss for stiff chemical systems.
+    Adaptive stiff-system loss (old-style chem loss, no elemental conservation).
 
-    total = λ_mse * MSE(z-space) + λ_phys * mean_s( |pred_phys - true_phys| / (|true_phys| + eps_phys) )
+    We combine:
+      • phys_term  = mean over species of |pred_log10 - true_log10|
+                     (per-decade absolute error in log10 space)
+      • mse_term   = mean over species of (pred_z - true_z)^2
+                     (stabilizer in normalized space so gradients don't vanish)
 
-    Features restored from the old trainer:
-      • Species weights based on dynamic log-range (stabilizes influence across species)
-      • Time-dependent weights that emphasize trajectory edges (t≈0 and t≈1)
+    Then:
+        total = lambda_mse * mse_term + lambda_phys * phys_term
 
-    Fast path (no full denorm) supports per-species log normalizations:
+    Extra behavior (kept from old trainer):
+      • Species weights: species with larger dynamic log-range get higher weight,
+        but clipped into [0.5, 2.0] and renormalized.
+      • Time weights: emphasize the stiff parts of the trajectory (t≈0 and t≈1)
+        via a U-shaped weight w(t) with gain >= 1.0.
+      • Masking: only average over valid (batch, time) entries.
+
+    Notes:
+    - This matches the old ("use_fractional=False") path.
+      We are NOT doing fractional |Δy|/|y_true| here.
+    - We completely drop elemental conservation.
+
+    Args (same interface the Lightning trainer already uses):
+      manifest: normalization.json dict with:
+          manifest["per_key_stats"][species_key] -> stats dict
+          manifest["normalization_methods"][species_key] -> "log-standard" or "log-min-max"
+      species_keys: ordered list of species (must match model output dim S)
+      lambda_phys: weight for phys_term
+      lambda_mse:  weight for mse_term (called lambda_z in the old code)
+      epsilon_phys: kept for parity with current call signature; not used here
+      rel_cap: kept for parity; not used in per-decade mode
+      time_edge_gain: >1 boosts t≈0 and t≈1
+      device: torch device
+
+    We precompute fast-path buffers so we can go z -> log10(x) analytically:
       - "log-standard":   z = (log10(x) - log_mean) / log_std
+                          => log10(x) = log_mean + log_std * z
       - "log-min-max":    z = (log10(x) - log_min) / (log_max - log_min)
-
-    Args:
-      manifest: normalization manifest with keys:
-          - "per_key_stats": {key: {...}}
-          - "normalization_methods": {key: "log-standard"|"log-min-max"|...}
-      species_keys: list of species names (order must match model outputs)
-      lambda_phys: weight for fractional physical error term
-      lambda_mse:  weight for normalized-space MSE stabilizer
-      epsilon_phys: small constant in denominator of fractional error
-      rel_cap: optional clamp for fractional error (cap extreme outliers)
-      time_edge_gain: gain ≥ 1.0; w(t)=1+(g-1)*(1-4t(1-t)) → g at t=0,1 and 1 at t=0.5
-      device: torch device for internal buffers
+                          => log10(x) = log_min + (log_max - log_min) * z
     """
 
     def __init__(
@@ -116,16 +133,20 @@ class AdaptiveStiffLoss(nn.Module):
             raise TypeError("[AdaptiveStiffLoss] manifest must be a dict")
         if "per_key_stats" not in manifest or "normalization_methods" not in manifest:
             raise KeyError("[AdaptiveStiffLoss] manifest must contain 'per_key_stats' and 'normalization_methods'")
-
         if not species_keys:
             raise RuntimeError("[AdaptiveStiffLoss] species_keys is empty")
 
         self.manifest = manifest
         self.species_keys = list(species_keys)
+
         self.lambda_phys = float(lambda_phys)
         self.lambda_mse  = float(lambda_mse)
+
+        # These exist in the call signature already. We keep them for compatibility
+        # even though the per-decade loss doesn't actually use them.
         self.eps_phys    = float(epsilon_phys)
         self.rel_cap     = float(rel_cap) if rel_cap is not None else None
+
         self.time_edge_gain = float(time_edge_gain)
         self.device = torch.device(device) if device is not None else torch.device("cpu")
 
@@ -134,7 +155,10 @@ class AdaptiveStiffLoss(nn.Module):
         if not isinstance(per_key_stats, dict) or not isinstance(norm_methods, dict):
             raise TypeError("[AdaptiveStiffLoss] 'per_key_stats' and 'normalization_methods' must both be dicts.")
 
-        # Build fast-path parameters and species weights
+        # We'll build:
+        #   _log_scale_vec[s] : multiplier for z -> log10(x)
+        #   _log_bias_vec[s]  : bias      for z -> log10(x)
+        # and w_species[s]    : species weight ~ sqrt(dynamic range in log space)
         log_scales: list[float] = []
         log_biases: list[float] = []
         log_mins: list[float] = []
@@ -150,55 +174,62 @@ class AdaptiveStiffLoss(nn.Module):
             method = str(norm_methods[key]).strip().lower()
 
             if method == "log-standard":
+                # Expect log_mean / log_std
                 if "log_mean" not in stats or "log_std" not in stats:
                     raise KeyError(f"[AdaptiveStiffLoss] '{key}' missing log_mean/log_std for log-standard")
+
                 log_mean = float(stats["log_mean"])
                 log_std  = float(stats["log_std"])
-                if not (math.isfinite(log_mean) and math.isfinite(log_std) and log_std > 0):
+                if not (math.isfinite(log_mean) and math.isfinite(log_std) and log_std > 0.0):
                     raise ValueError(f"[AdaptiveStiffLoss] invalid log_mean/log_std for '{key}'")
 
-                # For fast path:
-                #   log10(x) = log_mean + log_std * z
+                # z = (log10(x) - log_mean)/log_std
+                # => log10(x) = log_mean + log_std * z
                 log_bias  = log_mean
                 log_scale = log_std
-                # For species weighting (log-range), prefer provided min/max if present:
+
+                # For weighting, prefer explicit min/max if present
                 lo = float(stats.get("log_min", log_mean - 3.0 * log_std))
                 hi = float(stats.get("log_max", log_mean + 3.0 * log_std))
 
             elif method == "log-min-max":
+                # Expect log_min / log_max
                 if "log_min" not in stats or "log_max" not in stats:
                     raise KeyError(f"[AdaptiveStiffLoss] '{key}' missing log_min/log_max for log-min-max")
+
                 lo = float(stats["log_min"])
                 hi = float(stats["log_max"])
                 if not (math.isfinite(lo) and math.isfinite(hi) and hi > lo):
                     raise ValueError(f"[AdaptiveStiffLoss] invalid log_min/log_max for '{key}'")
 
-                # For fast path:
-                #   log10(x) = log_min + (log_max - log_min) * z
+                # z = (log10(x) - lo)/(hi - lo)
+                # => log10(x) = lo + (hi - lo) * z
                 log_bias  = lo
                 log_scale = hi - lo
 
             else:
                 raise RuntimeError(
                     f"[AdaptiveStiffLoss] Species '{key}' uses unsupported method '{method}'. "
-                    f"Only 'log-standard' and 'log-min-max' are supported by the fast path."
+                    f"Only 'log-standard' and 'log-min-max' are supported."
                 )
 
             if not (math.isfinite(log_bias) and math.isfinite(log_scale) and log_scale > 0.0):
-                raise ValueError(f"[AdaptiveStiffLoss] non-finite/invalid bias/scale for '{key}': "
-                                 f"bias={log_bias}, scale={log_scale}")
+                raise ValueError(
+                    f"[AdaptiveStiffLoss] non-finite/invalid bias/scale for '{key}': "
+                    f"bias={log_bias}, scale={log_scale}"
+                )
 
             log_scales.append(log_scale)
             log_biases.append(log_bias)
             log_mins.append(lo)
             log_maxs.append(hi)
 
-        # Register constant buffers for vectorized fast path
+        # Buffers so this module can live on the same device as the LightningModule
         self.register_buffer("_ln10", torch.tensor(math.log(10.0), dtype=torch.float32))
         self.register_buffer("_log_scale_vec", torch.tensor(log_scales, dtype=torch.float32))
         self.register_buffer("_log_bias_vec",  torch.tensor(log_biases, dtype=torch.float32))
 
-        # Species weights based on dynamic range (in log-space)
+        # Species weights ~ sqrt(dynamic range in log10 space), normalized and clipped
         log_min_t = torch.tensor(log_mins, dtype=torch.float32)
         log_max_t = torch.tensor(log_maxs, dtype=torch.float32)
         log_range = torch.clamp(log_max_t - log_min_t, min=1e-6)
@@ -207,24 +238,32 @@ class AdaptiveStiffLoss(nn.Module):
         w_species = torch.clamp(w_species, 0.5, 2.0)
         self.register_buffer("w_species", w_species)
 
-        # Fallback helper for full denormalization (only used if shapes mismatch)
+        # Fallback helper for slow path (in case shapes don't line up)
         from normalizer import NormalizationHelper
         self._norm_helper = NormalizationHelper(self.manifest, device=self.device)
 
-        # Flag to allow fast path when last-dim matches #species
+        # Fast path is allowed when the last dim of preds matches len(species_keys)
         self._fast_ok = True
 
-        # Final validation
-        for name, buf in [("_log_scale_vec", self._log_scale_vec),
-                          ("_log_bias_vec",  self._log_bias_vec),
-                          ("w_species",       self.w_species)]:
+        # Sanity check buffers
+        for name, buf in [
+            ("_log_scale_vec", self._log_scale_vec),
+            ("_log_bias_vec",  self._log_bias_vec),
+            ("w_species",      self.w_species),
+        ]:
             if not torch.isfinite(buf).all():
                 raise RuntimeError(f"[AdaptiveStiffLoss] Non-finite values in buffer '{name}'")
 
     # --------------------------- internals ---------------------------
 
     def _time_weights(self, t01: torch.Tensor) -> torch.Tensor:
-        """U-shaped weights: returns `gain` at 0 and 1, and 1 at 0.5."""
+        """
+        U-shaped weight curve:
+           t=0   -> gain = time_edge_gain
+           t=0.5 -> gain = 1
+           t=1   -> gain = time_edge_gain
+        If time_edge_gain <= 1.0 we just return 1 everywhere.
+        """
         if self.time_edge_gain <= 1.0:
             return torch.ones_like(t01)
         return 1.0 + (self.time_edge_gain - 1.0) * (1.0 - 4.0 * t01 * (1.0 - t01))
@@ -239,87 +278,117 @@ class AdaptiveStiffLoss(nn.Module):
         mask: Optional[torch.Tensor] = None,
         return_components: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute loss components and combine them.
 
-        # Promote to float32 for stable reductions
+        Inputs:
+          pred_norm : model prediction in normalized z-space  [B,K,S] or [B,S]
+          true_norm : target in normalized z-space            [B,K,S] or [B,S]
+          t_norm    : normalized time / offset for weighting [B,K] or [B,K,1] or [B]
+          mask      : optional validity mask over [B,K] or [B] (1=use, 0=ignore)
+
+        Returns:
+          total loss (scalar) if return_components=False
+          OR dict { "total", "mse", "frac" } if return_components=True
+              NOTE: "frac" here is the physics/per-decade term, not a fractional error.
+        """
+
+        # Promote to float32 for stable math
         pz = pred_norm.float()
         tz = true_norm.float()
         if pz.shape[-1] != tz.shape[-1]:
-            raise ValueError(f"[AdaptiveStiffLoss] pred/true last dim mismatch: {pz.shape[-1]} vs {tz.shape[-1]}")
+            raise ValueError(
+                f"[AdaptiveStiffLoss] pred/true last dim mismatch: {pz.shape[-1]} vs {tz.shape[-1]}"
+            )
 
-        # 1) MSE in normalized space (per-sample: average over species)
-        mse_per_sample = (pz - tz).square().mean(dim=-1)  # shape = pred_norm.shape[:-1]
+        # 1) MSE in z-space (stabilizer)
+        # per-sample = mean over species dimension S -> shape [...,] e.g. [B,K]
+        mse_per_sample = (pz - tz).square().mean(dim=-1)
 
-        # 2) Fractional |Δ| / (|true| + eps) in physical space
+        # 2) Physics term: per-decade MAE in log10 space
+        # Fast path: analytic z -> log10(x) using buffers
         if self._fast_ok and self._log_scale_vec.numel() == pz.shape[-1]:
-            # Compute log10(true) and Δlog10 = (pz - tz) * scale
-            lnt = tz * self._log_scale_vec + self._log_bias_vec         # [..., S]
-            dlt = (pz - tz) * self._log_scale_vec                        # [..., S]
+            # log10(x_pred) and log10(x_true)
+            pred_log10 = pz * self._log_scale_vec + self._log_bias_vec   # [..., S]
+            true_log10 = tz * self._log_scale_vec + self._log_bias_vec   # [..., S]
 
-            # true_phys = 10^lnt ; pred_phys - true_phys = true_phys * (10^dlt - 1)
-            true_phys = torch.exp(lnt * self._ln10)
-            delta_factor = torch.exp(dlt * self._ln10) - 1.0
+            # absolute per-decade error
+            phys_err_species = (pred_log10 - true_log10).abs()           # [..., S]
 
-            numer = (true_phys * delta_factor.abs())                     # [..., S]
-            denom = true_phys.abs() + self.eps_phys                      # [..., S]
-            frac  = numer / denom
         else:
-            # Fallback: compute in physical units via helper
-            # Ensure helper is initialized on correct device for any internal tensors
+            # Slow path: go to physical space with the helper, then take log10
             from normalizer import NormalizationHelper
             self._norm_helper = NormalizationHelper(self.manifest, device=pz.device)
 
-            pred_phys = self._norm_helper.denormalize(pz, self.species_keys)
-            true_phys = self._norm_helper.denormalize(tz, self.species_keys)
-            frac = (pred_phys - true_phys).abs() / (true_phys.abs() + self.eps_phys)
+            pred_phys = self._norm_helper.denormalize(pz, self.species_keys)  # [..., S]
+            true_phys = self._norm_helper.denormalize(tz, self.species_keys)  # [..., S]
 
-        # Numerical safety + optional cap
-        frac = torch.nan_to_num(frac, nan=0.0, posinf=1e6, neginf=0.0)
-        if self.rel_cap is not None:
-            frac = frac.clamp_max(self.rel_cap)
+            # avoid log10(0) → clamp to ~1e-45 like the old trainer did
+            min_val = 10.0 ** (-45.0)
+            pred_log10 = torch.log10(torch.clamp(pred_phys, min=min_val))
+            true_log10 = torch.log10(torch.clamp(true_phys, min=min_val))
 
-        # Apply species weights before reducing across species
-        if self.w_species.numel() == frac.shape[-1]:
-            frac = frac * self.w_species
+            phys_err_species = (pred_log10 - true_log10).abs()           # [..., S]
 
-        frac_per_sample = frac.mean(dim=-1)  # shape = pred_norm.shape[:-1]
+        # Numerical safety
+        phys_err_species = torch.nan_to_num(phys_err_species, nan=0.0, posinf=1e6, neginf=0.0)
 
-        # 3) Optional time weights (expect shape broadcastable to per-sample losses)
+        # 2a) Species weights (same idea as old trainer)
+        if self.w_species.numel() == phys_err_species.shape[-1]:
+            phys_err_species = phys_err_species * self.w_species  # [..., S]
+
+        # Reduce over species to get per-(batch,time) scalar
+        phys_per_sample = phys_err_species.mean(dim=-1)  # shape [...,] e.g. [B,K]
+
+        # 3) Optional time weighting (U-shaped boost near stiff regions)
         if t_norm is not None:
             t = t_norm
-            if t.ndim == frac_per_sample.ndim + 1 and t.shape[-1] == 1:
+            # squeeze trailing singleton if we got [B,K,1]
+            if t.ndim == phys_per_sample.ndim + 1 and t.shape[-1] == 1:
                 t = t.squeeze(-1)
-            # Broadcast to per-sample shape if needed
-            while t.ndim < frac_per_sample.ndim:
+            # broadcast to match per-sample shape if needed
+            while t.ndim < phys_per_sample.ndim:
                 t = t.unsqueeze(-1)
-            t01 = torch.clamp(t, 0.0, 1.0).to(dtype=frac_per_sample.dtype, device=frac_per_sample.device)
-            wt = self._time_weights(t01)
-            mse_per_sample  = mse_per_sample * wt
-            frac_per_sample = frac_per_sample * wt
 
-        # 4) Optional mask over per-sample elements (e.g., [B,K])
+            t01 = torch.clamp(t, 0.0, 1.0).to(
+                dtype=phys_per_sample.dtype,
+                device=phys_per_sample.device,
+            )
+            wt = self._time_weights(t01)
+
+            mse_per_sample  = mse_per_sample  * wt
+            phys_per_sample = phys_per_sample * wt
+
+        # 4) Mask over [B,K] (or [B]) entries if provided
         if mask is not None:
             m = mask
-            if m.ndim == frac_per_sample.ndim + 1 and m.shape[-1] == 1:
+            if m.ndim == phys_per_sample.ndim + 1 and m.shape[-1] == 1:
                 m = m.squeeze(-1)
-            while m.ndim < frac_per_sample.ndim:
+            while m.ndim < phys_per_sample.ndim:
                 m = m.unsqueeze(-1)
-            m = m.to(dtype=frac_per_sample.dtype, device=frac_per_sample.device)
+            m = m.to(dtype=phys_per_sample.dtype, device=phys_per_sample.device)
+
             denom = m.sum().clamp_min(1.0)
             mse_scalar  = (mse_per_sample  * m).sum() / denom
-            frac_scalar = (frac_per_sample * m).sum() / denom
+            phys_scalar = (phys_per_sample * m).sum() / denom
         else:
             mse_scalar  = mse_per_sample.mean()
-            frac_scalar = frac_per_sample.mean()
+            phys_scalar = phys_per_sample.mean()
 
-        total = self.lambda_mse * mse_scalar + self.lambda_phys * frac_scalar
+        # 5) Combine
+        total = self.lambda_mse * mse_scalar + self.lambda_phys * phys_scalar
 
         if return_components:
             return {
                 "total": total,
-                "mse": mse_scalar.detach(),
-                "frac": frac_scalar.detach(),
+                "mse":  mse_scalar.detach(),
+                # Lightning logs this under "frac_phys". It's *not* fractional now;
+                # it's the per-decade phys term from the old trainer.
+                "frac": phys_scalar.detach(),
             }
+
         return total
+
 
 # --------------------------- Utilities ---------------------------
 

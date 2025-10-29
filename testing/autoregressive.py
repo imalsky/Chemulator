@@ -14,6 +14,13 @@ prints total time, preds, and time/pred. Colors are per-species and consistent
 for GT/anchor/predictions.
 
 NOTE: Normalizer.denormalize uses float64; MPS lacks float64, so we denormalize on CPU.
+
+IMPORTANT SHAPE CONTRACT:
+The exported model (gm) expects:
+    y:  [B, S_in]
+    dt: [B, 1]        <-- 2D, NOT [B,1,1]
+    g:  [B, G]
+We enforce that here.
 """
 
 from __future__ import annotations
@@ -43,7 +50,7 @@ def _find_repo(start: Path) -> Path:
     return start.resolve().parent.parent  # fallback
 
 REPO = _find_repo(Path(__file__).resolve())
-MODEL_DIR = REPO / "models/koopman-v2"   # <- adjust if needed
+MODEL_DIR = REPO / "models" / "2"   # <- adjust if needed
 
 # Artifact names
 GPU_BASENAME = "export_k1_gpu.pt2"
@@ -63,7 +70,7 @@ except Exception:
 # =============================================================================
 
 # Trajectory to visualize
-SAMPLE_IDX: int = 2
+SAMPLE_IDX: int = 6
 
 # Prediction mode
 PLOT_MODE: Literal["full_direct", "const_direct", "profile_autoreg"] = "profile_autoreg"
@@ -73,7 +80,7 @@ DEVICE_STR: Literal["auto","mps","cuda","cpu"] = "auto"
 
 # Numerical guards
 CLIP_MIN_FEED: float = 1e-30   # floor for any physical value fed into model
-DT_EPS_NORM: float = 5e-4      # clamp normalized dt away from exact 0/1
+DT_EPS_NORM: float = 1e-5      # clamp normalized dt away from exact 0/1
 Z_CLIP_FOR_FB: Tuple[float, float] | None = None  # e.g., (-8, 8) to clamp latent pre-denorm
 
 # Mode B grid
@@ -236,10 +243,20 @@ def load_everything() -> LoadedData:
 
     # Probe S_out & mapping (build inputs on artifact device/dtype)
     in_index = {n: i for i, n in enumerate(in_names)}
-    y0_probe = norm.normalize(torch.from_numpy(y_traj[0:1]), in_names).to(art.device, art.dtype)
-    g_probe  = norm.normalize(torch.from_numpy(g_vec[None, :]), globals_v).to(art.device, art.dtype)
+    y0_probe = norm.normalize(
+        torch.from_numpy(y_traj[0:1]),
+        in_names
+    ).to(art.device, art.dtype)
+
+    g_probe = norm.normalize(
+        torch.from_numpy(g_vec[None, :]),
+        globals_v
+    ).to(art.device, art.dtype)
+
     with torch.inference_mode():
-        out_probe = gm(y0_probe, torch.tensor([1.0], device=art.device, dtype=art.dtype).view(1,1,1), g_probe)
+        # IMPORTANT: dt must be [B,1] because export traced with shape [B,1]
+        dt_probe = torch.tensor([1.0], device=art.device, dtype=art.dtype).view(1, 1)
+        out_probe = gm(y0_probe, dt_probe, g_probe)
     out_probe = _coerce_pred_shape(out_probe)
 
     S_out = int(out_probe.shape[-1])
@@ -293,20 +310,32 @@ def _dt_bounds_from_manifest(norm: NormalizationHelper) -> tuple[float, float]:
         return 10.0 ** float(s.get("log_min", -3.0)), 10.0 ** float(s.get("log_max", 8.0))
     return 1e-3, 1e8
 
-def _norm_globals(norm: NormalizationHelper, g_vec: np.ndarray, keys: List[str], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    return norm.normalize(torch.from_numpy(g_vec[None, :]), keys).to(device, dtype)
+def _norm_globals(norm: NormalizationHelper, g_vec: np.ndarray, keys: List[str],
+                  device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return norm.normalize(
+        torch.from_numpy(g_vec[None, :]),
+        keys
+    ).to(device, dtype)
 
-def _norm_state(norm: NormalizationHelper, y_phys: np.ndarray, keys: List[str], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def _norm_state(norm: NormalizationHelper, y_phys: np.ndarray, keys: List[str],
+                device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return norm.normalize(
         torch.from_numpy(np.maximum(y_phys, CLIP_MIN_FEED)[None, :]).to(torch.float32),
         keys,
     ).to(device, dtype)
 
-def _norm_dt(norm: NormalizationHelper, dt_phys: np.ndarray | float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def _norm_dt(norm: NormalizationHelper, dt_phys: np.ndarray | float,
+             device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Normalize physical dt(s) to the model's expected normalized range.
+
+    Returns shape [B,1] to match the export contract.
+    """
     v = np.asarray(dt_phys, dtype=np.float32).reshape(-1)
     dt_hat = norm.normalize_dt_from_phys(torch.tensor(v, dtype=torch.float32))
-    dt_hat = torch.clamp(dt_hat, DT_EPS_NORM, 1.0 - DT_EPS_NORM).to(device, dtype)
-    return dt_hat.view(-1, 1, 1)
+    dt_hat = torch.clamp(dt_hat, DT_EPS_NORM, 1.0 - DT_EPS_NORM)
+    dt_hat = dt_hat.to(device, dtype)
+    return dt_hat.view(-1, 1)  # [B,1]
 
 # =============================================================================
 # Prediction helpers (batched/non-AR and stepwise/AR)
@@ -315,6 +344,10 @@ def _norm_dt(norm: NormalizationHelper, dt_phys: np.ndarray | float, device: tor
 def batch_predict_from_anchor(
     data: LoadedData, y_anchor_phys: np.ndarray, dt_list: np.ndarray
 ) -> np.ndarray:
+    """
+    Non-autoregressive: predict y(t0 + Δt_k) for many Δt in parallel,
+    always conditioning on the SAME anchor state y_anchor_phys at t0.
+    """
     K = int(len(dt_list))
     if K == 0:
         return np.zeros((0, len(data.out_names)), dtype=np.float32)
@@ -322,7 +355,7 @@ def batch_predict_from_anchor(
     dev, dtp = data.artifact.device, data.artifact.dtype
     g_norm = _norm_globals(data.norm, data.g_vec, data.globals_names, dev, dtp).expand(K, -1)
     y_in_norm = _norm_state(data.norm, y_anchor_phys, data.in_names, dev, dtp).expand(K, -1)
-    dt_b = _norm_dt(data.norm, dt_list, dev, dtp)
+    dt_b = _norm_dt(data.norm, dt_list, dev, dtp)  # [K,1]
 
     # warmup
     for _ in range(WARMUP_STEPS):
@@ -343,9 +376,13 @@ def batch_predict_from_anchor(
 def predict_next_from_current_AR(
     data: LoadedData, y_curr_phys: np.ndarray, g_norm: torch.Tensor, dt_phys: float
 ) -> np.ndarray:
+    """
+    Autoregressive 1-step: given CURRENT physical state y_curr_phys,
+    predict y_next after dt_phys and return it in physical space.
+    """
     dev, dtp = data.artifact.device, data.artifact.dtype
-    y_in_norm = _norm_state(data.norm, y_curr_phys, data.in_names, dev, dtp)
-    dt_b = _norm_dt(data.norm, float(dt_phys), dev, dtp)  # [1,1,1]
+    y_in_norm = _norm_state(data.norm, y_curr_phys, data.in_names, dev, dtp)  # [1,S_in]
+    dt_b = _norm_dt(data.norm, float(dt_phys), dev, dtp)                      # [1,1]
     with torch.inference_mode():
         z = _coerce_pred_shape(data.gm(y_in_norm, dt_b, g_norm))
         if Z_CLIP_FOR_FB is not None:
@@ -362,6 +399,10 @@ def predict_next_from_current_AR(
 # =============================================================================
 
 def run_mode_full_direct(data: LoadedData) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    MODE A:
+    For each GT timestamp t[k], predict directly from y(t0) with Δt = t[k]-t[0].
+    """
     t = data.t_phys
     dt_list = (t[1:] - t[0]).astype(np.float64)
     y0 = data.y_traj[0].copy()
@@ -369,15 +410,28 @@ def run_mode_full_direct(data: LoadedData) -> Tuple[np.ndarray, np.ndarray]:
     return dt_list, y_pred.astype(np.float64)
 
 def run_mode_const_direct(data: LoadedData) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    MODE B:
+    Predict on a constant-Δt grid from CONST_START_DT..CONST_END_DT.
+    """
     step = max(float(CONST_STEP_DT), float(data.dt_min_phys))
     if CONST_END_DT < CONST_START_DT + step:
         raise ValueError("CONST_END_DT must be >= CONST_START_DT + effective step.")
-    grid = np.arange(float(CONST_START_DT) + step, float(CONST_END_DT) + 1e-30, step, dtype=float)
+    grid = np.arange(
+        float(CONST_START_DT) + step,
+        float(CONST_END_DT) + 1e-30,
+        step,
+        dtype=float
+    )
     y0 = data.y_traj[0].copy()
     y_pred = batch_predict_from_anchor(data, y0, grid.astype(np.float32))
     return grid, y_pred.astype(np.float64)
 
 def run_mode_profile_autoreg(data: LoadedData) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    MODE C:
+    Walk forward autoregressively with the SAME dt spacing as the GT profile.
+    """
     t, y, g = data.t_phys, data.y_traj, data.g_vec
     i_start = 0 if AR_START_INDEX is None else int(AR_START_INDEX)
     i_end   = (len(t) - 1) if AR_END_INDEX is None else int(AR_END_INDEX)
@@ -386,14 +440,20 @@ def run_mode_profile_autoreg(data: LoadedData) -> Tuple[np.ndarray, np.ndarray]:
     if not (i_start + 1 <= i_end < len(t)):
         raise ValueError("AR_END_INDEX must be within [i_start+1, M-1].")
 
-    g_norm = _norm_globals(data.norm, g, data.globals_names, data.artifact.device, data.artifact.dtype)
+    g_norm = _norm_globals(data.norm, g, data.globals_names,
+                           data.artifact.device, data.artifact.dtype)
 
     y_curr = np.maximum(y[i_start].copy(), CLIP_MIN_FEED)
     t_anchor = float(t[i_start])
 
     # warmup
     for _ in range(WARMUP_STEPS):
-        _ = predict_next_from_current_AR(data, y_curr, g_norm, float(max(t[i_start+1]-t[i_start], data.dt_min_phys)))
+        _ = predict_next_from_current_AR(
+            data,
+            y_curr,
+            g_norm,
+            float(max(t[i_start+1]-t[i_start], data.dt_min_phys))
+        )
 
     pred_dt: List[float] = []
     pred_phys: List[np.ndarray] = []
@@ -401,9 +461,11 @@ def run_mode_profile_autoreg(data: LoadedData) -> Tuple[np.ndarray, np.ndarray]:
     for k in range(i_start, i_end):
         dt_phys = float(t[k + 1] - t[k])
         y_next = predict_next_from_current_AR(data, y_curr, g_norm, dt_phys)
+
         pred_dt.append(float(t[k + 1] - t_anchor))
         pred_phys.append(y_next)
 
+        # Update current state for next step (autoregressive feedback)
         if data.identity_map:
             y_curr = np.maximum(y_next, CLIP_MIN_FEED)
         else:
@@ -434,28 +496,39 @@ def plot_all(data: LoadedData, pred_dt: np.ndarray, pred_phys: np.ndarray, mode_
             gt_full[:, j_out] = y[:, j_in]
     gt_full = np.clip(gt_full, 1e-30, None)
 
-    xmin = PLOT_XMIN if PLOT_XMIN is not None else (max(1e-12, dt_gt[1] * 0.5) if len(dt_gt) > 1 else 1e-12)
+    xmin = PLOT_XMIN if PLOT_XMIN is not None else (
+        max(1e-12, dt_gt[1] * 0.5) if len(dt_gt) > 1 else 1e-12
+    )
     xmax = PLOT_XMAX if PLOT_XMAX is not None else float(dt_gt[-1])
-    ymin = PLOT_YMIN if PLOT_YMIN is not None else max(1e-30, float(np.nanmin(gt_full[gt_full > 0]) * 0.5))
+    ymin = PLOT_YMIN if PLOT_YMIN is not None else max(
+        1e-30,
+        float(np.nanmin(gt_full[gt_full > 0]) * 0.5)
+    )
     ymax = PLOT_YMAX if PLOT_YMAX is not None else float(np.nanmax(gt_full) * 1.2)
 
     m_gt = (dt_gt >= xmin) & (dt_gt <= xmax)
 
     fig, ax = plt.subplots(figsize=(12, 6))
 
+    # Ground truth curves
     for nm in out_names:
         c = color_map[nm]
         j_in = in_index[nm]
         j_out = out_names.index(nm)
-        ax.loglog(dt_gt[m_gt], gt_full[m_gt, j_out], '-', lw=1.8, alpha=0.9, color=c)
-        start_val = float(np.clip(y[0, j_in], 1e-30, None))
-        #ax.loglog([xmin], [start_val], marker='x', mec=c, mfc='none', mew=1.6, ms=7, linestyle='none')
+        ax.loglog(dt_gt[m_gt], gt_full[m_gt, j_out],
+                  '-', lw=1.8, alpha=0.9, color=c)
+        # If you want to mark the anchor value, uncomment:
+        # start_val = float(np.clip(y[0, j_in], 1e-30, None))
+        # ax.loglog([xmin], [start_val],
+        #           marker='x', mec=c, mfc='none', mew=1.6, ms=7, linestyle='none')
 
+    # Predictions
     if pred_dt.size and pred_phys.size:
         pred_phys = np.clip(pred_phys, 1e-30, None)
         for j_out, nm in enumerate(out_names):
             c = color_map[nm]
-            ax.loglog(pred_dt, pred_phys[:, j_out], 'o-', lw=1.2, ms=5, mfc='none', mec=c, color=c)
+            ax.loglog(pred_dt, pred_phys[:, j_out],
+                      'o-', lw=1.2, ms=5, mfc='none', mec=c, color=c)
 
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
@@ -463,20 +536,29 @@ def plot_all(data: LoadedData, pred_dt: np.ndarray, pred_phys: np.ndarray, mode_
     ax.set_ylabel("Species Abundance")
     ax.grid(False)
 
+    # Legend by species, ordered by max abundance
     order = np.argsort(np.max(gt_full, axis=0))[::-1]
-    legend_handles = [Line2D([0], [0], color=base_colors[idx], lw=2.0, alpha=0.9) for idx in order]
+    legend_handles = [
+        Line2D([0], [0], color=base_colors[idx], lw=2.0, alpha=0.9)
+        for idx in order
+    ]
     legend_labels = [out_names[idx] for idx in order]
-    leg1 = ax.legend(legend_handles, legend_labels, loc='center left', bbox_to_anchor=(1.01, 0.6),
-                     title='Species', fontsize=10, title_fontsize=11)
+    leg1 = ax.legend(
+        legend_handles, legend_labels,
+        loc='center left', bbox_to_anchor=(1.01, 0.6),
+        title='Species', fontsize=10, title_fontsize=11
+    )
     ax.add_artist(leg1)
 
     style_handles = [
-        #Line2D([0], [0], color='black', marker='x', lw=0, label='Start (anchor)'),
         Line2D([0], [0], color='black', lw=2.0, ls='-', label='Ground Truth'),
         Line2D([0], [0], color='black', marker='o', lw=1.2, label='Prediction'),
     ]
-    ax.legend(handles=style_handles, loc='center left', bbox_to_anchor=(1.01, 0.2),
-              fontsize=10, title_fontsize=11)
+    ax.legend(
+        handles=style_handles,
+        loc='center left', bbox_to_anchor=(1.01, 0.2),
+        fontsize=10, title_fontsize=11
+    )
 
     fig.tight_layout()
     out_dir = MODEL_DIR / "plots"
@@ -509,6 +591,7 @@ def main():
         pred_dt, pred_phys = run_mode_profile_autoreg(data)
     else:
         raise ValueError(f"Unknown PLOT_MODE: {PLOT_MODE}")
+
     # Ensure device work is finished before stopping timer
     if data.artifact.device.type == "cuda":
         torch.cuda.synchronize()
@@ -523,12 +606,19 @@ def main():
 
     out_path = plot_all(data, pred_dt, pred_phys, PLOT_MODE)
 
-    print(f"Mode: {PLOT_MODE}  |  Type: {type_desc}  |  Artifact: {data.artifact.label}"
-          f"  |  Device: {data.artifact.device}  |  DType: {data.artifact.dtype}")
-    print(f"[TIMER] type={PLOT_MODE}, preds={K}, elapsed_total={ms_total:.2f} ms, time_per_pred={ms_per:.3f} ms")
+    print(
+        f"Mode: {PLOT_MODE}  |  Type: {type_desc}  |  Artifact: {data.artifact.label}"
+        f"  |  Device: {data.artifact.device}  |  DType: {data.artifact.dtype}"
+    )
+    print(
+        f"[TIMER] type={PLOT_MODE}, preds={K}, "
+        f"elapsed_total={ms_total:.2f} ms, time_per_pred={ms_per:.3f} ms"
+    )
     print(f"dt_min_phys={data.dt_min_phys:g}s, dt_max_phys={data.dt_max_phys:g}s")
     if K:
-        print(f"Pred Δt: min={pred_dt.min():.3g}, max={pred_dt.max():.3g}, K={K}")
+        print(
+            f"Pred Δt: min={pred_dt.min():.3g}, max={pred_dt.max():.3g}, K={K}"
+        )
     print(f"Plot saved: {out_path}")
 
 if __name__ == "__main__":
