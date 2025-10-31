@@ -239,7 +239,6 @@ class DataPreprocessor:
     """
     Main preprocessing pipeline for converting HDF5 to NPZ shards.
     Uses MPI for parallel processing on HPC systems.
-    FIXED: Now creates fewer, larger shards by buffering across files.
     """
 
     def __init__(
@@ -780,7 +779,7 @@ class DataPreprocessor:
 
     def _write_shards_and_collect_stats_parallel(self) -> Dict[str, RunningStatistics]:
         """
-        FIXED: Write NPZ shards with global buffers across files to create fewer shards.
+        Write NPZ shards with global buffers across files to create fewer shards.
 
         Returns:
             Dictionary of statistics for each variable (aggregated across all ranks)
@@ -818,7 +817,7 @@ class DataPreprocessor:
         if self.comm:
             self.comm.Barrier()
 
-        # FIXED: Global buffers that persist across all files
+        # Global buffers that persist across all files
         global_buffers = {
             "train": {"x0": [], "g": [], "t": [], "y": []},
             "validation": {"x0": [], "g": [], "t": [], "y": []},
@@ -887,7 +886,7 @@ class DataPreprocessor:
                 local_train_stats, flush_buffer_if_full
             )
 
-        # FIXED: Final flush of any remaining trajectories
+        # Final flush of any remaining trajectories
         for split_name in ("train", "validation", "test"):
             buffer = global_buffers[split_name]
             if buffer["x0"]:  # If there's anything left

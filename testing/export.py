@@ -7,7 +7,7 @@ import torch, torch.nn.functional as F
 # ---------------- paths ----------------
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-WORK_DIR = ROOT / "models" / "2"
+WORK_DIR = ROOT / "models" / "1_big"
 CONFIG_PATH = WORK_DIR / "config.json"
 OUT_PATH = WORK_DIR / "export_k1_cpu.pt2"
 

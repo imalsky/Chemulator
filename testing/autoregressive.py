@@ -7,7 +7,7 @@ Plots the ENTIRE ground-truth (GT) profile and overlays predictions in one of 3 
 
   MODE A: "full_direct"      Direct-from-anchor at each GT timestamp (batched).
   MODE B: "const_direct"     Direct-from-anchor on a constant-Δt grid (batched).
-  MODE C: "profile_autoreg"  Autoregressive, step sizes match the GT profile.
+  MODE C: "profile_autoreg"  Autoregressive, step sizes match the GT profile (with optional per-step bounds).
 
 Auto-selects CPU/GPU artifact (and its dtype), keeps tensors on that device, and
 prints total time, preds, and time/pred. Colors are per-species and consistent
@@ -21,6 +21,10 @@ The exported model (gm) expects:
     dt: [B, 1]        <-- 2D, NOT [B,1,1]
     g:  [B, G]
 We enforce that here.
+
+Δt bounds:
+You can constrain prediction step sizes with DT_MIN_USER / DT_MAX_USER at the top.
+If None, dataset/normalization bounds are used.
 """
 
 from __future__ import annotations
@@ -50,7 +54,7 @@ def _find_repo(start: Path) -> Path:
     return start.resolve().parent.parent  # fallback
 
 REPO = _find_repo(Path(__file__).resolve())
-MODEL_DIR = REPO / "models" / "2"   # <- adjust if needed
+MODEL_DIR = REPO / "models" / "big"   # <- adjust if needed
 
 # Artifact names
 GPU_BASENAME = "export_k1_gpu.pt2"
@@ -70,7 +74,7 @@ except Exception:
 # =============================================================================
 
 # Trajectory to visualize
-SAMPLE_IDX: int = 6
+SAMPLE_IDX: int = 5
 
 # Prediction mode
 PLOT_MODE: Literal["full_direct", "const_direct", "profile_autoreg"] = "profile_autoreg"
@@ -80,13 +84,17 @@ DEVICE_STR: Literal["auto","mps","cuda","cpu"] = "auto"
 
 # Numerical guards
 CLIP_MIN_FEED: float = 1e-30   # floor for any physical value fed into model
-DT_EPS_NORM: float = 1e-5      # clamp normalized dt away from exact 0/1
+DT_EPS_NORM: float = 1e-3      # clamp normalized dt away from exact 0/1
 Z_CLIP_FOR_FB: Tuple[float, float] | None = None  # e.g., (-8, 8) to clamp latent pre-denorm
+
+# User-overridable per-step Δt bounds (seconds); None => dataset/normalization bounds
+DT_MIN_USER: float = None
+DT_MAX_USER: float = None
 
 # Mode B grid
 CONST_START_DT: float = 0.0
 CONST_END_DT: float   = 1.0e4
-CONST_STEP_DT: float  = 1.0e-1   # raised to dt_min_phys if smaller
+CONST_STEP_DT: float  = 1.0e-1   # will be clamped into effective [dt_min, dt_max]
 
 # Mode C segment (None => full profile)
 AR_START_INDEX: int | None = None
@@ -310,6 +318,21 @@ def _dt_bounds_from_manifest(norm: NormalizationHelper) -> tuple[float, float]:
         return 10.0 ** float(s.get("log_min", -3.0)), 10.0 ** float(s.get("log_max", 8.0))
     return 1e-3, 1e8
 
+def _effective_dt_bounds(data: LoadedData) -> Tuple[float, float]:
+    """
+    Returns the effective physical Δt bounds after applying user overrides,
+    validated so min < max.
+    """
+    lo = float(data.dt_min_phys)
+    hi = float(data.dt_max_phys)
+    if DT_MIN_USER is not None:
+        lo = max(lo, float(DT_MIN_USER))
+    if DT_MAX_USER is not None:
+        hi = min(hi, float(DT_MAX_USER))
+    if not (lo < hi):
+        raise ValueError(f"Invalid Δt bounds after overrides: min={lo}, max={hi}")
+    return lo, hi
+
 def _norm_globals(norm: NormalizationHelper, g_vec: np.ndarray, keys: List[str],
                   device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return norm.normalize(
@@ -325,13 +348,19 @@ def _norm_state(norm: NormalizationHelper, y_phys: np.ndarray, keys: List[str],
     ).to(device, dtype)
 
 def _norm_dt(norm: NormalizationHelper, dt_phys: np.ndarray | float,
-             device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+             device: torch.device, dtype: torch.dtype,
+             clamp_bounds: Tuple[float, float] | None = None) -> torch.Tensor:
     """
     Normalize physical dt(s) to the model's expected normalized range.
 
     Returns shape [B,1] to match the export contract.
+    If clamp_bounds is provided, clamp in *physical* space before normalization.
     """
     v = np.asarray(dt_phys, dtype=np.float32).reshape(-1)
+    if clamp_bounds is not None:
+        lo, hi = clamp_bounds
+        np.clip(v, lo, hi, out=v)
+
     dt_hat = norm.normalize_dt_from_phys(torch.tensor(v, dtype=torch.float32))
     dt_hat = torch.clamp(dt_hat, DT_EPS_NORM, 1.0 - DT_EPS_NORM)
     dt_hat = dt_hat.to(device, dtype)
@@ -355,7 +384,10 @@ def batch_predict_from_anchor(
     dev, dtp = data.artifact.device, data.artifact.dtype
     g_norm = _norm_globals(data.norm, data.g_vec, data.globals_names, dev, dtp).expand(K, -1)
     y_in_norm = _norm_state(data.norm, y_anchor_phys, data.in_names, dev, dtp).expand(K, -1)
-    dt_b = _norm_dt(data.norm, dt_list, dev, dtp)  # [K,1]
+
+    # Enforce physical dt bounds here
+    dt_bounds = _effective_dt_bounds(data)
+    dt_b = _norm_dt(data.norm, dt_list, dev, dtp, clamp_bounds=dt_bounds)  # [K,1]
 
     # warmup
     for _ in range(WARMUP_STEPS):
@@ -382,7 +414,8 @@ def predict_next_from_current_AR(
     """
     dev, dtp = data.artifact.device, data.artifact.dtype
     y_in_norm = _norm_state(data.norm, y_curr_phys, data.in_names, dev, dtp)  # [1,S_in]
-    dt_b = _norm_dt(data.norm, float(dt_phys), dev, dtp)                      # [1,1]
+    dt_b = _norm_dt(data.norm, float(dt_phys), dev, dtp,
+                    clamp_bounds=_effective_dt_bounds(data))                 # [1,1]
     with torch.inference_mode():
         z = _coerce_pred_shape(data.gm(y_in_norm, dt_b, g_norm))
         if Z_CLIP_FOR_FB is not None:
@@ -401,36 +434,49 @@ def predict_next_from_current_AR(
 def run_mode_full_direct(data: LoadedData) -> Tuple[np.ndarray, np.ndarray]:
     """
     MODE A:
-    For each GT timestamp t[k], predict directly from y(t0) with Δt = t[k]-t[0].
+    For each GT timestamp t[k], predict directly from y(t0) with Δt = t[k]-t[0],
+    but only for Δt within the effective [min,max] bounds.
     """
     t = data.t_phys
-    dt_list = (t[1:] - t[0]).astype(np.float64)
+    dt_all = (t[1:] - t[0]).astype(np.float64)
+    lo, hi = _effective_dt_bounds(data)
+    m = (dt_all >= lo) & (dt_all <= hi)
+    dt_list = dt_all[m].astype(np.float32)
+
     y0 = data.y_traj[0].copy()
-    y_pred = batch_predict_from_anchor(data, y0, dt_list.astype(np.float32))
-    return dt_list, y_pred.astype(np.float64)
+    y_pred = batch_predict_from_anchor(data, y0, dt_list)
+    return dt_list.astype(np.float64), y_pred.astype(np.float64)
 
 def run_mode_const_direct(data: LoadedData) -> Tuple[np.ndarray, np.ndarray]:
     """
     MODE B:
-    Predict on a constant-Δt grid from CONST_START_DT..CONST_END_DT.
+    Predict on a constant-Δt grid with step clamped to the effective [min,max] per-step bounds.
+    The absolute Δt values (from the anchor) are truncated at the max bound.
     """
-    step = max(float(CONST_STEP_DT), float(data.dt_min_phys))
-    if CONST_END_DT < CONST_START_DT + step:
-        raise ValueError("CONST_END_DT must be >= CONST_START_DT + effective step.")
-    grid = np.arange(
-        float(CONST_START_DT) + step,
-        float(CONST_END_DT) + 1e-30,
-        step,
-        dtype=float
-    )
+    lo, hi = _effective_dt_bounds(data)
+    # Per-step size must lie within [lo, hi]
+    step = float(CONST_STEP_DT)
+    step = max(step, lo)
+    step = min(step, hi)
+
+    # Absolute Δt grid from anchor: start at 'step', end at min(CONST_END_DT, hi)
+    start = max(float(CONST_START_DT), step)
+    end   = min(float(CONST_END_DT), hi)
+    if end < start + 1e-30:
+        raise ValueError("CONST_END_DT too small after applying Δt bounds.")
+
+    grid = np.arange(start, end + 1e-30, step, dtype=float)
+
     y0 = data.y_traj[0].copy()
     y_pred = batch_predict_from_anchor(data, y0, grid.astype(np.float32))
-    return grid, y_pred.astype(np.float64)
+    return grid.astype(np.float64), y_pred.astype(np.float64)
 
 def run_mode_profile_autoreg(data: LoadedData) -> Tuple[np.ndarray, np.ndarray]:
     """
     MODE C:
-    Walk forward autoregressively with the SAME dt spacing as the GT profile.
+    Walk forward autoregressively with the GT *count* of steps, but use per-step
+    Δt clamped to the effective [min,max]. The x-axis is cumulative sum of the
+    *used* (clamped) Δt values (i.e., no longer forced to GT times).
     """
     t, y, g = data.t_phys, data.y_traj, data.g_vec
     i_start = 0 if AR_START_INDEX is None else int(AR_START_INDEX)
@@ -440,29 +486,30 @@ def run_mode_profile_autoreg(data: LoadedData) -> Tuple[np.ndarray, np.ndarray]:
     if not (i_start + 1 <= i_end < len(t)):
         raise ValueError("AR_END_INDEX must be within [i_start+1, M-1].")
 
+    lo, hi = _effective_dt_bounds(data)
     g_norm = _norm_globals(data.norm, g, data.globals_names,
                            data.artifact.device, data.artifact.dtype)
 
     y_curr = np.maximum(y[i_start].copy(), CLIP_MIN_FEED)
-    t_anchor = float(t[i_start])
 
-    # warmup
+    # warmup with first effective step
+    dt_first = float(t[i_start + 1] - t[i_start])
+    dt_first = min(max(dt_first, lo), hi)
     for _ in range(WARMUP_STEPS):
-        _ = predict_next_from_current_AR(
-            data,
-            y_curr,
-            g_norm,
-            float(max(t[i_start+1]-t[i_start], data.dt_min_phys))
-        )
+        _ = predict_next_from_current_AR(data, y_curr, g_norm, dt_first)
 
     pred_dt: List[float] = []
     pred_phys: List[np.ndarray] = []
+    cum_t = 0.0
 
     for k in range(i_start, i_end):
-        dt_phys = float(t[k + 1] - t[k])
-        y_next = predict_next_from_current_AR(data, y_curr, g_norm, dt_phys)
+        dt_raw = float(t[k + 1] - t[k])
+        dt_used = min(max(dt_raw, lo), hi)
 
-        pred_dt.append(float(t[k + 1] - t_anchor))
+        y_next = predict_next_from_current_AR(data, y_curr, g_norm, dt_used)
+        cum_t += dt_used
+
+        pred_dt.append(cum_t)
         pred_phys.append(y_next)
 
         # Update current state for next step (autoregressive feedback)
@@ -578,7 +625,7 @@ def main():
     type_desc = {
         "full_direct": "direct-from-anchor (non-AR, full profile, batched)",
         "const_direct": "direct-from-anchor (non-AR, constant Δt grid, batched)",
-        "profile_autoreg": "autoregressive (profile-matched steps)",
+        "profile_autoreg": "autoregressive (profile-matched steps with bounds)",
     }[PLOT_MODE]
 
     # Timed prediction pass
@@ -614,7 +661,8 @@ def main():
         f"[TIMER] type={PLOT_MODE}, preds={K}, "
         f"elapsed_total={ms_total:.2f} ms, time_per_pred={ms_per:.3f} ms"
     )
-    print(f"dt_min_phys={data.dt_min_phys:g}s, dt_max_phys={data.dt_max_phys:g}s")
+    lo, hi = _effective_dt_bounds(data)
+    print(f"dt_bounds_eff=[{lo:g}, {hi:g}] s  (dataset=[{data.dt_min_phys:g}, {data.dt_max_phys:g}])")
     if K:
         print(
             f"Pred Δt: min={pred_dt.min():.3g}, max={pred_dt.max():.3g}, K={K}"

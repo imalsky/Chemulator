@@ -150,7 +150,7 @@ class FlowMapPairsDataset(Dataset):
         self.norm = NormalizationHelper(manifest, device=self._stage_device)
         self.epsilon = float(getattr(self.norm, "epsilon", 1e-30))
 
-        # FIXED: Get species variables BEFORE any scanning/metadata operations
+        # Get species variables before any scanning/metadata operations
         data_cfg = self.cfg.get("data", {})
         self.species_vars = list(data_cfg.get("species_variables", []))
         if not self.species_vars:
@@ -650,12 +650,6 @@ class FlowMapPairsDataset(Dataset):
                         "i": [B]       anchor indices
                         "j": [B, K]    target absolute indices (clamped to T-1)
             mask:     [B, K]           True where j < T (valid), False where clamped
-
-        IMPORTANT FIX:
-        Offsets are now sorted ascending per batch element (monotonic forward time).
-        This ensures:
-          - No negative "step" in rollout.
-          - Sequential rollout in the trainer matches temporal order.
         """
 
         # Ensure idx_list is a LongTensor on the dataset's device
