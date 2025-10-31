@@ -4,7 +4,7 @@
   // ===============================
   "paths": {
     "processed_data_dir": "data/processed_medium",
-    "work_dir": "models/big",
+    "work_dir": "models/v1",
     "raw_data_files": []
   },
   // ===============================

@@ -8,9 +8,9 @@ from pathlib import Path
 # =======================
 # Globals (edit here)
 # =======================
-SAMPLE_IDX = 7
+SAMPLE_IDX = 2
 DEVICE_PREF = "auto"          # "auto" | "cuda" | "mps" | "cpu"
-MODEL_DIR = "models/1_big"
+MODEL_DIR = "models/big"
 GPU_BASENAME = "export_k1_gpu.pt2"
 CPU_BASENAME = "export_k1_cpu.pt2"
 WARMUP_STEPS = 5

@@ -597,9 +597,16 @@ class AutoEncoderModule(LightningModule):
 
         # ---- no teacher forcing: use model.rollout_vectorized ----
         if tf_prob < 1e-8:
+            # AFTER (trainer.py)
             cached_z0 = getattr(self.model, "_cached_rollout_z0", None)
-            # Positional call for dt_steps_norm → works with both model variants
-            y_pred = self.model.rollout_vectorized(y_i, g, dt_steps_norm, z0=cached_z0)  # [B,H,S]
+            roll_fn = getattr(self.model, "rollout_vectorized")
+            try:
+                # Newer models: (y0, g, dt_steps_norm, z0, [film_cache])
+                y_pred = roll_fn(y_i, g, dt_steps_norm, cached_z0)  # [B,H,S]
+            except TypeError:
+                # Older models: (y0, g, dt_steps_norm)
+                y_pred = roll_fn(y_i, g, dt_steps_norm)  # [B,H,S]
+
             y_tgt = y_j[:, :H, :]
             rmask = mask[:, :H] if mask is not None else None
             if self.use_adaptive_stiff and self.criterion is not None:
