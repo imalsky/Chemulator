@@ -24,7 +24,7 @@ CKPT_MONITOR: str = "val_loss"
 CKPT_MODE: str = "min"
 LOG_EVERY_N_STEPS: int = 200
 ENABLE_CHECKPOINTING: bool = True
-ENABLE_PROGRESS_BAR: bool = False  # Lightning progress bar on/off (global toggle)
+ENABLE_PROGRESS_BAR: bool = False
 ENABLE_MODEL_SUMMARY: bool = False
 DETECT_ANOMALY: bool = False
 INFERENCE_MODE: bool = True
@@ -87,7 +87,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
-from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 
 # ------------------------------ Adaptive Loss --------------------------------
@@ -293,13 +293,15 @@ class ModelTask(pl.LightningModule):
             y_i, dt_norm, y_j, g, _aux = batch
             k_mask = None
         if self._target_idx is not None:
-            y_j = y_j.index_select(dim=-1, index=self._target_idx.to(y_j.device))
-        # Keep dt_norm shape as provided ([B,K,1] preferred)
+            idx = self._target_idx.to(y_j.device)
+            y_j = y_j.index_select(dim=-1, index=idx)
         return y_i, dt_norm, y_j, g, k_mask
 
     def training_step(self, batch, batch_idx: int):
         y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
         pred = self(y_i, dt_in, g)
+        if self._target_idx is not None:
+            pred = pred.index_select(dim=-1, index=self._target_idx.to(pred.device))
         if pred.shape != y_j.shape:
             raise RuntimeError(f"Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
 
@@ -321,6 +323,8 @@ class ModelTask(pl.LightningModule):
     def validation_step(self, batch, batch_idx: int):
         y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
         pred = self(y_i, dt_in, g)
+        if self._target_idx is not None:
+            pred = pred.index_select(dim=-1, index=self._target_idx.to(pred.device))
         comps = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
         self.log("val_loss", comps["total"], on_step=False, on_epoch=True, prog_bar=True)
         self.log("val_phys", comps["phys"], on_step=False, on_epoch=True, prog_bar=False)
@@ -333,25 +337,50 @@ class ModelTask(pl.LightningModule):
     # ------------------------------ optim/schedule ----------------------------
 
     def configure_optimizers(self):
-        # Fused AdamW when supported
-        fused_ok = False
+        # Detect fused AdamW support
         try:
-            fused_ok = (torch.cuda.is_available() and "fused" in inspect.signature(torch.optim.AdamW).parameters)
+            has_fused_flag = ("fused" in inspect.signature(torch.optim.AdamW).parameters)
         except Exception:
-            fused_ok = False
-        opt = torch.optim.AdamW(
-            self.parameters(), lr=self.lr, weight_decay=self.weight_decay, **({"fused": True} if fused_ok else {})
-        )
+            has_fused_flag = False
 
+        # Effective gradient clip value from Trainer (falls back to config)
+        clip_val = 0.0
+        tr = getattr(self, "trainer", None)
+        if tr is not None:
+            clip_val = float(getattr(tr, "gradient_clip_val", 0.0) or 0.0)
+        else:
+            clip_val = float(self.cfg.get("training", {}).get("gradient_clip", 0.0) or 0.0)
+
+        # Allow fused when:
+        #  - CUDA build supports it, and
+        #  - (clipping is OFF) OR (we are NOT under FP16 AMP plugin)
+        is_fp16_amp = False
+        try:
+            from pytorch_lightning.plugins.precision.amp import AMPPrecisionPlugin
+            is_fp16_amp = isinstance(getattr(self.trainer, "precision_plugin", None), AMPPrecisionPlugin) and \
+                          getattr(self.trainer.precision_plugin, "precision", None) in ("16-mixed", "16-true")
+        except Exception:
+            pass
+
+        use_fused = torch.cuda.is_available() and has_fused_flag and (clip_val == 0.0 or not is_fp16_amp)
+
+        opt_kwargs = dict(lr=self.lr, weight_decay=self.weight_decay)
+        if use_fused:
+            opt_kwargs["fused"] = True
+
+        opt = torch.optim.AdamW(self.parameters(), **opt_kwargs)
+
+        # LR schedule: linear warmup -> cosine
         scheds = []
         if self.warmup_epochs > 0:
-            scheds.append(LinearLR(opt, start_factor=WARMUP_START_FACTOR, end_factor=1.0, total_iters=self.warmup_epochs))
-        t_max = max(1, (self.trainer.max_epochs or 1) - self.warmup_epochs)
+            scheds.append(LinearLR(opt, start_factor=WARMUP_START_FACTOR, total_iters=max(1, self.warmup_epochs)))
+        t_max = max(1, (getattr(self.trainer, "max_epochs", 1) or 1) - self.warmup_epochs)
         scheds.append(CosineAnnealingLR(opt, T_max=t_max, eta_min=self.min_lr))
-        scheduler = scheds[0] if len(scheds) == 1 else SequentialLR(opt,
-                                                                    schedulers=scheds,
-                                                                    milestones=[self.warmup_epochs])
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "monitor": CKPT_MONITOR}}
+
+        scheduler = scheds[0] if len(scheds) == 1 else SequentialLR(opt, schedulers=scheds, milestones=[self.warmup_epochs])
+
+        return {"optimizer": opt,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "monitor": CKPT_MONITOR}}
 
 
 # ------------------------------ Epoch drive callback --------------------------
@@ -463,7 +492,6 @@ class EpochSummaryCallback(Callback):
         self._t0 = time.perf_counter()
 
     def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        # If there is no validation, print after train epoch
         try:
             nval = trainer.num_val_batches
             if isinstance(nval, (list, tuple)):
@@ -475,7 +503,6 @@ class EpochSummaryCallback(Callback):
             self._emit(trainer)
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        # If there is validation, print after validation epoch
         if self._printed_epoch != trainer.current_epoch:
             self._emit(trainer)
 
@@ -521,12 +548,26 @@ class Trainer:
         self.limit_val_batches = int(tcfg.get("max_val_batches", DEF_MAX_VAL_BATCHES) or 0)
 
     def _precision_from_cfg(self) -> str:
-        mp = str(self.cfg.get("mixed_precision", {}).get("mode", "")).lower()
-        if mp in ("bf16", "bfloat16"):
-            return "bf16-mixed"
-        if mp in ("fp16", "16", "float16"):
-            return "16-mixed"
-        return "32-true"
+        # Accept both aliases and explicit Lightning strings
+        mp = str(self.cfg.get("mixed_precision", {}).get("mode", "32-true")).lower().strip()
+        aliases = {
+            # BF16
+            "bf16": "bf16-mixed",
+            "bfloat16": "bf16-mixed",
+            "bf16-mixed": "bf16-mixed",
+            "bfloat16-mixed": "bf16-mixed",
+            # FP16
+            "fp16": "16-mixed",
+            "float16": "16-mixed",
+            "16": "16-mixed",
+            "16-mixed": "16-mixed",
+            # FP32 / none
+            "none": "32-true",
+            "fp32": "32-true",
+            "32": "32-true",
+            "32-true": "32-true",
+        }
+        return aliases.get(mp, "32-true")
 
     def _accelerator_from_device(self) -> str:
         if self.device.type == "cuda":
@@ -609,14 +650,14 @@ class Trainer:
             max_epochs=self.epochs,
             accelerator=accelerator,
             devices=PL_DEVICES,
-            precision=precision,
+            precision=precision,  # "bf16-mixed" from your config is honored
             gradient_clip_val=self.grad_clip if self.grad_clip > 0 else 0.0,
             accumulate_grad_batches=max(1, self.accumulate),
             logger=csv_logger,
             callbacks=[ckpt_cb, lr_cb, epoch_cb, summary_cb],
             enable_checkpointing=ENABLE_CHECKPOINTING,
             enable_progress_bar=ENABLE_PROGRESS_BAR,
-            benchmark=bench_cfg,  # aligned with hardware.optimize_hardware
+            benchmark=bench_cfg,
             log_every_n_steps=LOG_EVERY_N_STEPS,
             enable_model_summary=ENABLE_MODEL_SUMMARY,
             detect_anomaly=DETECT_ANOMALY,

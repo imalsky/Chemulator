@@ -220,7 +220,7 @@ def build_datasets_and_loaders(
     max_steps = int(max_steps) if (max_steps is not None) else None
     base_seed = int(cfg.get("system", {}).get("seed", 42))
 
-    preload_to_gpu = bool(dataset_cfg.get("preload_train_to_gpu", True))
+    preload_to_gpu = bool(dataset_cfg.get("preload_to_gpu", True))
 
     train_dataset = FlowMapPairsDataset(
         processed_root=processed_dir, split="train", config=cfg,

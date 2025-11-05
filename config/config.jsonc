@@ -29,7 +29,7 @@
 
   "mixed_precision": {
   // AMP precision: "bf16", "fp16", or "none"
-  "mode": "bf16"
+  "mode": "bf16-mixed"
   },
 
   "data": {
@@ -67,7 +67,7 @@
   // Compress NPZ shards (smaller, slower I/O)
   "npz_compressed": false,
   // Workers for preprocessing (I/O bound)
-  "num_workers": 50,
+  "num_workers": 32,
   // Trajectories per output shard
   "trajectories_per_shard": 65536,
   // Drop t=0 row when exporting shards
@@ -78,8 +78,8 @@
 
   "dataset": {
   // Global training batch size
-  "batch_size_train": 4096,
-  // Avoid full shard scan; trust metadata files
+  "batch_size_train": 16384,
+  // Avoid full shard scan for the preprocessed data; trust metadata files
   "skip_scan": true,
   // Skip time-grid monotonicity checks
   "skip_validate_grids": true,
@@ -88,29 +88,31 @@
   // Return K targets per anchor (K=times_per_anchor)
   "multi_time_per_anchor": true,
   // K: number of target steps per anchor when multi_time_per_anchor
-  "times_per_anchor": 8,
+  "times_per_anchor": 64,
   // Use same offsets for entire batch
   "share_times_across_batch": false,
   // Sample offsets uniformly then fit anchors
-  "uniform_offset_sampling": false,
+  "uniform_offset_sampling_strict": false,
+  // assume all the times are the same
+  "assume_shared_grid": true,
   // Δt clamp floor before normalization
   "dt_epsilon": 1e-30,
 
   // DataLoader workers
-  "num_workers": 0,
+  "num_workers": 8,
   // Keep workers alive between epochs
-  "persistent_workers": false,
+  "persistent_workers": true,
   // Pin memory for faster H2D copies (use only when CPU-staged)
-  "pin_memory": false,
+  "pin_memory": true,
   // Prefetch batches per worker
-  "prefetch_factor": 2,
-  // Stage entire train set to GPU at init
-  "preload_train_to_gpu": true
+  "prefetch_factor": 4,
+  // Stage entire set to GPU at init
+  "preload_to_gpu": false
   },
 
   "model": {
   // Latent channel count for autoencoder
-  "latent_dim": 64,
+  "latent_dim": 128,
   // Encoder MLP hidden sizes
   "encoder_hidden": [512, 512, 512],
   // Dynamics MLP hidden sizes
@@ -139,7 +141,7 @@
   // Total epochs to train
   "epochs": 100,
   // Clip grad-norm at this value (0 = disabled)
-  "gradient_clip": 10.0,
+  "gradient_clip": 0.0,
   // Gradient accumulation steps
   "accumulate_grad_batches": 1,
   // Enable torch.compile for the Lightning module
@@ -174,7 +176,7 @@
   // Maximum j−i offset for targets (null = T-1)
   "max_steps": null,
   // Anchors per trajectory per epoch
-  "pairs_per_traj": 8,
+  "pairs_per_traj": 24,
 
   "adaptive_stiff_loss": {
     // Weight for physical-space term
