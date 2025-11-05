@@ -35,7 +35,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 # VULCAN filename format: vul-T{T}KlogP{log10(barye):.1f}-NCHO-solar_hot_ini.vul
 # Pressure conversions: 1 bar = 1e6 barye → logP=6.0; 1 mbar = 1e3 barye → logP=3.0
 
-PROFILE = "2000K_1mbar"
+PROFILE = "1000K_1mbar"
 
 PROFILES: Dict[str, Dict[str, float]] = {
     "2000K_1bar": {"T_K": 2000.0, "P_bar": 1.0},
@@ -51,7 +51,7 @@ PROFILES: Dict[str, Dict[str, float]] = {
 REPO_ROOT = Path("/Users/imalsky/Desktop/Chemulator")
 SRC_DIR = REPO_ROOT / "src"
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
-MODEL_DIR = REPO_ROOT / "models" / "big"
+MODEL_DIR = REPO_ROOT / "models" / "v1"
 VULCAN_DIR = Path("/Users/imalsky/Desktop/Chemistry_Project/Vulcan/0D_full_NCHO/solar")
 
 # ============================================================================

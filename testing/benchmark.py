@@ -18,7 +18,7 @@ import torch
 import matplotlib.pyplot as plt
 
 # ====== GLOBALS ======
-MODEL_SUBDIR = "models/big"     # exporter target dir
+MODEL_SUBDIR = "models/v1"     # exporter target dir
 BENCH_K: int = 1                # used for BK exports; CPU K1 ignores
 
 WARMUP_STEPS: int = 10
@@ -36,13 +36,13 @@ PREFER_AOTI: Dict[str, bool] = {"CPU": False, "GPU": True, "MPS": False}
 
 # Match your export.py filenames
 RAW_EXPORT = {
-    "CPU": "export_k1_cpu.pt2",        # K1
-    "GPU": "export_k_dyn_gpu.pt2",     # BK
-    "MPS": "export_k_dyn_mps.pt2",     # BK
+    "CPU": "export_k1_cpu.pt2",     # K1
+    "GPU": "export_bk_gpu.pt2",     # BK
+    "MPS": "export_bk_mps.pt2",     # BK
 }
 AOTI_EXPORT = {
-    "GPU": "export_k_dyn_gpu.aoti",    # BK
-    "MPS": "export_k_dyn_mps.aoti",    # BK (not preferred)
+    "GPU": "export_bk_gpu.aoti",    # BK
+    "MPS": "export_bk_mps.aoti",    # BK
 }
 
 # MPS safety
@@ -118,16 +118,25 @@ def _dims_from_normalization(norm_path: Path) -> Tuple[int, int]:
     return S_in, G
 
 def _make_inputs(sig: str, B: int, K: int, S_in: int, G: int, dtype: torch.dtype, device: str):
+    """
+    Inputs must match how the module was exported:
+
+    - K1 export  -> y[B,S], dt[B,1],   g[B,G]
+    - BK export  -> y[B,S], dt[B,K,1], g[B,G]   (y has no K dim; K lives in dt)
+
+    (Your export.py uses the new model directly; no BK wrapper.)
+    """
+    y  = torch.randn(B, S_in, dtype=dtype, device=device).contiguous()                 # [B,S]
+    g  = (torch.randn(B, G, dtype=dtype, device=device).contiguous()                   # [B,G]
+          if G > 0 else torch.empty(B, 0, dtype=dtype, device=device))
+
     if sig == "K1":
-        y  = torch.randn(B, S_in, dtype=dtype, device=device).contiguous()
-        dt = torch.randn(B, 1,   dtype=dtype, device=device).contiguous()
-        g  = torch.randn(B, G,   dtype=dtype, device=device).contiguous() if G > 0 else torch.empty(B, 0, dtype=dtype, device=device)
-        return (y, dt, g)
+        dt = torch.randn(B, 1, dtype=dtype, device=device).contiguous()                # [B,1]
     else:
-        y  = torch.randn(B, K, S_in, dtype=dtype, device=device).contiguous()
-        dt = torch.randn(B, K, 1,   dtype=dtype, device=device).contiguous()
-        g  = torch.randn(B, K, G,   dtype=dtype, device=device).contiguous() if G > 0 else torch.empty(B, K, 0, dtype=dtype, device=device)
-        return (y, dt, g)
+        dt = torch.randn(B, K, 1, dtype=dtype, device=device).contiguous()             # [B,K,1]
+
+    return (y, dt, g)
+
 
 # ====== Main ======
 def main():

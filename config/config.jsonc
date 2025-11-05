@@ -88,7 +88,7 @@
   // Return K targets per anchor (K=times_per_anchor)
   "multi_time_per_anchor": true,
   // K: number of target steps per anchor when multi_time_per_anchor
-  "times_per_anchor": 64,
+  "times_per_anchor": 32,
   // Use same offsets for entire batch
   "share_times_across_batch": false,
   // Sample offsets uniformly then fit anchors
@@ -114,11 +114,11 @@
   // Latent channel count for autoencoder
   "latent_dim": 128,
   // Encoder MLP hidden sizes
-  "encoder_hidden": [512, 512, 512],
+  "encoder_hidden": [1024, 1024, 1024],
   // Dynamics MLP hidden sizes
-  "dynamics_hidden": [512, 512, 512],
+  "dynamics_hidden": [1024, 1024, 1024],
   // Decoder MLP hidden sizes
-  "decoder_hidden": [512, 512, 512],
+  "decoder_hidden": [1024, 1024, 1024],
   // Nonlinearity for MLPs
   "activation": "leakyrelu",
   // Dropout rate in MLPs
@@ -126,13 +126,13 @@
   // Use VAE encoder with KL term
   "vae_mode": true,
   // Predict Δz and add to z (residual dynamics)
-  "dynamics_residual": false,
+  "dynamics_residual": true,
   // Decoder predicts Δy in z-space
-  "predict_delta": false,
+  "predict_delta": true,
   // Decoder predicts Δlog10(y) in physical space
   "predict_delta_log_phys": false,
   // Use log-softmax head for simplex outputs
-  "softmax_head": true,
+  "softmax_head": false,
   // Allow softmax on subset of species
   "allow_partial_simplex": false
   },
@@ -176,7 +176,7 @@
   // Maximum j−i offset for targets (null = T-1)
   "max_steps": null,
   // Anchors per trajectory per epoch
-  "pairs_per_traj": 24,
+  "pairs_per_traj": 16,
 
   "adaptive_stiff_loss": {
     // Weight for physical-space term

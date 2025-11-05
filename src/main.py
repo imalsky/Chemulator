@@ -47,15 +47,6 @@ DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config.jsonc"
 GLOBAL_SEED = 42
 GLOBAL_WORK_DIR = REPO_ROOT / "models" / "autoencoder-flowmap"
 VALIDATION_SEED_OFFSET = 1337
-CONFIG_SNAPSHOT_FILENAME = "config.snapshot.json"
-
-
-# --------------------------------------------------------------------------------------
-# Small helpers
-# --------------------------------------------------------------------------------------
-
-def _norm(p: Union[str, Path]) -> Path:
-    return Path(p).expanduser().resolve()
 
 # --------------------------------------------------------------------------------------
 # Hydration from processed artifacts
