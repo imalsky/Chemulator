@@ -1,0 +1,27 @@
+# Ignore everything inside the data folder
+data/*
+!data/.gitkeep
+
+
+plots/*
+plots/
+
+logs/*
+logs/
+
+
+# Exclude older code that I want to keep just in case
+old_code/
+
+old/*
+old/
+
+models/*
+models/
+
+tuning_results/
+test/models/
+*.pt
+*.ckpt
+*.tfevents*
+.DS_Store

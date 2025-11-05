@@ -1,0 +1,342 @@
+#!/bin/bash
+# --- PBS ---
+#PBS -N gh200_train_job
+#PBS -q gpu_long
+#PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
+#PBS -l walltime=120:00:00
+#PBS -W group_list=s2458
+#PBS -j oe
+# --- end PBS ---
+
+set -euo pipefail
+
+########################################
+# Debug / dev toggles
+########################################
+DEBUG=${DEBUG:-0}        # 1 = heavy debug (sync kernels, short run, FP32)
+SAN=${SAN:-0}            # 1 = run under compute-sanitizer (very slow)
+
+set +u
+if [ "$DEBUG" -eq 1 ]; then
+  export CUDA_LAUNCH_BLOCKING=1
+  export TORCH_SHOW_CPP_STACKTRACES=1
+  export PYTORCH_JIT=0
+  export PYTHONFAULTHANDLER=1
+  export CUDA_MODULE_LOADING=EAGER
+  export CUDA_CACHE_DISABLE=1
+  export CUBLAS_WORKSPACE_CONFIG=:4096:8
+  export NVIDIA_TF32_OVERRIDE=0
+  export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+  PRECISION_ARG="--precision 32-true"
+  LIMIT_ARGS="--max_steps 1 --limit_train_batches 1 --limit_val_batches 0 --num_sanity_val_steps 0"
+  set -x
+else
+  PRECISION_ARG=""
+  LIMIT_ARGS=""
+fi
+set -u
+
+# If requested, wrap python with compute-sanitizer (memcheck)
+RUNNER=()
+if [ "$SAN" -eq 1 ]; then
+  RUNNER=(compute-sanitizer --tool memcheck --leak-check full --report-api-errors yes --show-backtrace yes --error-exitcode=99)
+fi
+
+########################################
+# Figure out project root + logging
+########################################
+# Priority:
+#   1. USER sets PROJECT_ROOT when calling qsub:
+#        qsub -v PROJECT_ROOT=/nobackupp17/imalsky/Chemulator2 run.pbs
+#   2. Fallback to PBS_O_WORKDIR (the dir qsub was run from)
+#
+# This makes the script portable between clones.        ### NEW
+########################################
+cd -P "${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
+export ROOT="$(/bin/pwd -P)"
+
+mkdir -p "$ROOT/logs"
+LOG="$ROOT/logs/${PBS_JOBNAME:-job}.${PBS_JOBID:-$$}.log"
+exec > >(stdbuf -oL -eL tee -a "$LOG") 2>&1
+
+echo "#####################################################"
+echo "Job starting on $(hostname) at $(date)"
+echo "#####################################################"
+echo "Using ROOT=$ROOT"
+
+########################################
+# Environment (modules + conda)
+########################################
+echo "Setting up environment..."
+module purge
+module use -a /swbuild/analytix/tools/modulefiles
+module load miniconda3/gh2
+
+CONDA_BASE=$(conda info --base)
+# shellcheck disable=SC1090
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+
+set +e
+conda activate pyt2_7_gh
+ACT_RC=$?
+set -e
+conda env-log log -n pyt2_7_gh >/dev/null 2>&1 || true
+if [ $ACT_RC -ne 0 ] || [ -z "${CONDA_PREFIX:-}" ] || [[ "${CONDA_PREFIX##*/}" != "pyt2_7_gh" ]]; then
+  echo "ERROR: failed to activate conda env 'pyt2_7_gh'"; exit 2
+fi
+echo "Conda env: $CONDA_PREFIX"
+PY="$(command -v python)"
+echo "Python: $PY"
+
+########################################
+# Stability & FS toggles
+########################################
+export HDF5_USE_FILE_LOCKING=FALSE
+export PYTHONNOUSERSITE=1      # we don't trust ~/.local on the cluster
+ulimit -c unlimited || true
+
+########################################
+# Project paths and vendor logic
+########################################
+SRC="$ROOT/src"
+
+# 1. Global vendor cache (shared across repos)          ### NEW
+GLOBAL_VENDOR_BASE=${GLOBAL_VENDOR_BASE:-/nobackupp17/imalsky/vendor_pkgs}
+
+# 2. Repo-local fallback (.deps inside this checkout)
+LOCAL_VENDOR="$ROOT/.deps"
+
+# Choose which vendor dir we’ll actually use.
+if [ -d "$GLOBAL_VENDOR_BASE" ]; then
+  VENDOR="$GLOBAL_VENDOR_BASE"
+  echo "Using GLOBAL vendor dir: $VENDOR"
+else
+  VENDOR="$LOCAL_VENDOR"
+  echo "Using LOCAL vendor dir:  $VENDOR"
+fi
+
+mkdir -p "$VENDOR"
+
+# Figure out site-packages path for this conda env.
+SITE_PKGS="$("$PY" - <<'PY'
+import site
+cands = [p for p in site.getsitepackages() if p.endswith("site-packages")]
+print(cands[0] if cands else site.getsitepackages()[0])
+PY
+)"
+
+# PYTHONPATH search order:
+#   1. conda env site-packages    -> torch/lightning/etc from cluster env
+#   2. $VENDOR                    -> shared vendored wheels (optuna, numpy, h5py, ...)
+#   3. $ROOT                      -> allow `import config`, etc.
+#   4. $SRC                       -> our code
+export PYTHONPATH="$SITE_PKGS:$VENDOR:$ROOT:$SRC:${PYTHONPATH:-}"
+echo "PYTHONPATH=$PYTHONPATH"
+
+########################################
+# Ensure critical vendor wheels exist
+# (only in the chosen $VENDOR)
+########################################
+echo "Cleaning any stale NumPy in $VENDOR ..."
+rm -rf "$VENDOR/numpy" "$VENDOR"/numpy-*.dist-info "$VENDOR"/numpy.libs || true
+
+echo "Checking NumPy..."
+"$PY" - <<'PY' || true
+import numpy, sys
+print("numpy present:", numpy.__version__, "from", numpy.__file__)
+PY
+
+if ! "$PY" - <<'PY'
+ok=True
+try:
+    import numpy, sys
+    print("numpy present:", numpy.__version__, "from", numpy.__file__)
+except Exception as e:
+    print("numpy import failed pre-install:", repr(e)); ok=False
+import sys; sys.exit(0 if ok else 1)
+PY
+then
+  echo "Installing numpy==1.26.4 into $VENDOR ..."
+  "$PY" -m pip install --no-cache-dir --only-binary=:all: \
+    --target "$VENDOR" --no-deps --upgrade --force-reinstall "numpy==1.26.4"
+fi
+
+"$PY" - <<'PY'
+import importlib, numpy as np
+m = importlib.import_module('numpy.core._multiarray_umath')
+print("numpy:", np.__version__, "from", np.__file__)
+print("_multiarray_umath loaded from:", m.__file__)
+PY
+
+echo "Checking h5py..."
+"$PY" - <<'PY' || true
+import h5py, sys
+print("h5py present:", h5py.__version__, "from", h5py.__file__)
+PY
+
+if ! "$PY" - <<'PY'
+ok=True
+try:
+    import h5py, sys
+    print("h5py present:", h5py.__version__, "from", h5py.__file__)
+except Exception as e:
+    print("h5py import failed pre-install:", repr(e)); ok=False
+import sys; sys.exit(0 if ok else 1)
+PY
+then
+  echo "Installing h5py wheel into $VENDOR ..."
+  "$PY" -m pip install --no-cache-dir --only-binary=:all: \
+    --no-deps --target "$VENDOR" "h5py>=3.9,<3.15"
+  "$PY" - <<'PY'
+import h5py
+print("h5py (vendored):", h5py.__version__, "from", h5py.__file__)
+PY
+fi
+
+########################################
+# Make sure optuna is vendored too      ### NEW
+########################################
+echo "Checking optuna..."
+if ! "$PY" - <<'PY'
+ok=True
+try:
+    import optuna, sys
+    print("optuna present:", optuna.__version__, "from", optuna.__file__)
+except Exception as e:
+    print("optuna import failed pre-install:", repr(e)); ok=False
+import sys; sys.exit(0 if ok else 1)
+PY
+then
+  echo "Installing optuna into $VENDOR ..."
+  "$PY" -m pip install --no-cache-dir --upgrade \
+    --target "$VENDOR" "optuna>=4.4.0,<5"
+  "$PY" - <<'PY'
+import optuna
+print("optuna vendored:", optuna.__version__, "from", optuna.__file__)
+PY
+fi
+
+########################################
+# Print Torch/CUDA build info
+########################################
+"$PY" - <<'PY'
+import torch, os
+print("Torch:", torch.__version__, "CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("Device count:", torch.cuda.device_count())
+    print("Device name:", torch.cuda.get_device_name(0))
+print(
+    "TF32 (matmul, cudnn):",
+    torch.backends.cuda.matmul.allow_tf32,
+    torch.backends.cnn.allow_tf32 if hasattr(torch.backends, "cnn") else torch.backends.cudnn.allow_tf32
+)
+try:
+    import torch.backends.cuda
+    torch.__config__.show()
+except Exception as e:
+    print("torch.__config__.show() failed:", e)
+PY
+nvidia-smi || true
+
+########################################
+# Phase A: decide preprocess vs hydrate
+########################################
+echo "Phase A: deciding preprocess vs hydrate…"
+DECISION_OUT="$("$PY" - <<'PY'
+from pathlib import Path
+import os
+from utils import load_json_config
+
+ROOT = Path(os.environ["ROOT"]).resolve()
+cfg  = load_json_config(ROOT / "config" / "config.jsonc")
+
+pdir_cfg = cfg["paths"]["processed_data_dir"]
+proc_dir = (ROOT / pdir_cfg).resolve() if not Path(pdir_cfg).is_absolute() else Path(pdir_cfg).resolve()
+
+print(f"Processed dir (from config): {pdir_cfg}")
+print(f"Resolved processed dir: {proc_dir}")
+
+norm = proc_dir / "normalization.json"
+if norm.exists():
+    print(f"Found {norm} — skipping preprocessing.")
+    print("SKIP=1")
+else:
+    print("Normalization manifest not found — will run preprocessing.")
+    print("SKIP=0")
+print(f"PROC_DIR={proc_dir}")
+PY
+)"
+
+echo "$DECISION_OUT"
+eval "$(echo "$DECISION_OUT" | egrep '^(SKIP|PROC_DIR)=' )"
+
+export SKIP
+export PROC_DIR
+
+# Optional override from qsub env:
+#   qsub -v FORCE_SKIP_PREPROCESS=1 ...
+if [ "${FORCE_SKIP_PREPROCESS:-0}" -eq 1 ]; then
+  echo "FORCE_SKIP_PREPROCESS=1 — skipping preprocessing."
+  SKIP=1
+fi
+
+if [ "${SKIP:-0}" -eq 1 ]; then
+  "$PY" - <<'PY' || true
+from pathlib import Path
+import os, glob
+proc_dir = Path(os.environ["PROC_DIR"])
+n_train = len(glob.glob(str(proc_dir / "train" / "*.npz")))
+n_val   = len(glob.glob(str(proc_dir / "validation" / "*.npz")))
+n_test  = len(glob.glob(str(proc_dir / "test" / "*.npz")))
+print(f"Hydrate check: train={n_train}, val={n_val}, test={n_test} under {proc_dir}")
+PY
+fi
+
+########################################
+# Phase A: PREPROCESS (MPI) — only if SKIP==0
+########################################
+if [ "${SKIP:-0}" -eq 0 ]; then
+  echo "Phase A: Preprocessing with MPI (32 ranks)…"
+  cat > .preprocess.py <<'PY'
+from pathlib import Path
+from utils import load_json_config, setup_logging
+from preprocessor import DataPreprocessor
+cfg = load_json_config(Path("config/config.jsonc"))
+setup_logging()
+DataPreprocessor(cfg).run()
+PY
+
+  export OMP_NUM_THREADS=2
+  export MKL_NUM_THREADS=2
+  export OPENBLAS_NUM_THREADS=2
+  export NUMEXPR_NUM_THREADS=2
+  mpiexec -np 32 -genvall "$PY" ./.preprocess.py || { echo "Preprocess failed"; exit 3; }
+  unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS
+else
+  echo "Phase A: Skipped (hydrating from processed artifacts)."
+fi
+
+########################################
+# Quick GPU sanity before train
+########################################
+echo "---------------------------------"
+echo "GPU check before training:"
+"$PY" - <<'PY'
+import torch
+print("CUDA available:", torch.cuda.is_available())
+print("Device count:", torch.cuda.device_count())
+print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A")
+PY
+echo "---------------------------------"
+
+########################################
+# Phase B: TRAIN
+########################################
+echo "Phase B: Training single-process…"
+##/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/tune.py
+/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/main.py
+
+
+echo "#####################################################"
+echo "Job finished at $(date)"
+echo "#####################################################"
