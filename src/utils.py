@@ -297,47 +297,58 @@ def resolve_precision_and_dtype(
         logger: Optional[logging.Logger] = None
 ) -> Tuple[Union[str, int], 'torch.dtype']:
     """
-    Resolve Lightning precision string and runtime dtype from configuration.
-
-    Determines both the PyTorch Lightning precision mode and the actual
-    runtime dtype for datasets, with special handling for CPU devices.
-
-    Args:
-        cfg: Configuration dictionary
-        device: Target compute device
-        logger: Optional logger for diagnostics
+    Resolve Lightning precision and runtime dtype from configuration.
 
     Returns:
-        Tuple of (lightning_precision, runtime_dtype) where:
-        - lightning_precision: "bf16-mixed", "16-mixed", or 32
-        - runtime_dtype: torch.dtype for dataset operations
+        pl_precision: Lightning precision spec (e.g., "bf16-mixed", "16-mixed", or 32)
+        runtime_dtype: torch.dtype to use for dataset/tensors (e.g., torch.bfloat16)
     """
-    if torch is None:
-        raise ImportError("PyTorch required for precision resolution")
+    # --- Read user intent (very forgiving to key names) -----------------------
+    mp_cfg = cfg.get("mixed_precision", {}) or {}
+    mode = (
+        mp_cfg.get("mode")
+        or mp_cfg.get("precision")
+        or cfg.get("precision")
+        or "bf16"  # default
+    )
+    mode = str(mode).lower().strip()
 
-    # Extract mixed precision mode
-    mp_mode = str(cfg.get("mixed_precision", {}).get("mode", "")).strip().lower()
-
-    # Determine Lightning precision and AMP dtype
-    if mp_mode in ("bf16", "bfloat16", "bf16-mixed"):
+    # --- Map to Lightning precision + AMP dtype -------------------------------
+    # Lightning precision field and corresponding "AMP dtype" used for runtime dtype
+    if mode in {"bf16", "bfloat16", "bf16-mixed", "bfloat16-mixed"}:
         pl_precision = "bf16-mixed"
         amp_dtype = torch.bfloat16
-    elif mp_mode in ("fp16", "float16", "16", "16-mixed"):
+    elif mode in {"fp16", "float16", "16-mixed", "fp16-mixed"}:
         pl_precision = "16-mixed"
         amp_dtype = torch.float16
-    else:
+    elif mode in {"fp32", "float32", "32"}:
         pl_precision = 32
         amp_dtype = torch.float32
+    else:
+        # Unknown => safe default
+        pl_precision = "bf16-mixed"
+        amp_dtype = torch.bfloat16
 
-    # Check for dataset-specific dtype override
+    # --- Dataset/runtime dtype override via config ----------------------------
     dataset_dtype_str = cfg.get("dataset", {}).get("storage_dtype")
     runtime_dtype = _map_storage_dtype(dataset_dtype_str) or amp_dtype
 
-    # Force FP32 on CPU for performance and compatibility
-    if getattr(device, "type", str(device)) == "cpu":
+    # --- Hard safety overrides by device -------------------------------------
+    dev_type = getattr(device, "type", str(device))
+
+    # Force FP32 on CPU
+    if dev_type == "cpu":
         runtime_dtype = torch.float32
+        pl_precision = 32
         if logger:
-            logger.info("CPU device detected - forcing FP32 for dataset operations")
+            logger.info("CPU detected — forcing FP32 (Lightning=32, Dataset=float32).")
+
+    # Force FP32 on Apple MPS (avoid BF16/FP16 matmul asserts)
+    if dev_type == "mps":
+        runtime_dtype = torch.float32
+        pl_precision = 32
+        if logger:
+            logger.info("MPS detected — forcing FP32 (Lightning=32, Dataset=float32).")
 
     if logger:
         logger.info(f"Precision config: Lightning={pl_precision}, Dataset={runtime_dtype}")

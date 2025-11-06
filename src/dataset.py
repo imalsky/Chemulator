@@ -462,8 +462,10 @@ def collate_flowmap(batch: Sequence[_Index], dataset: FlowMapPairsDataset):
     return dataset.collate_batch(batch)
 
 
+from torch.utils.data import DataLoader
+
 def create_dataloader(
-    dataset: FlowMapPairsDataset,
+    dataset: "FlowMapPairsDataset",
     batch_size: int,
     shuffle: bool,
     num_workers: int,
@@ -471,6 +473,20 @@ def create_dataloader(
     pin_memory: bool,
     prefetch_factor: int,
 ) -> DataLoader:
+    # Auto-override when data are already on GPU
+    try:
+        dev_type = getattr(dataset, "device", None)
+        dev_type = getattr(dev_type, "type", "cpu")
+    except Exception:
+        dev_type = "cpu"
+
+    if dev_type != "cpu":
+        num_workers = 0
+        persistent_workers = False
+        pin_memory = False
+        # prefetch_factor is ignored when num_workers == 0; keep a placeholder int
+        prefetch_factor = 2
+
     kwargs = dict(
         batch_size=int(batch_size),
         shuffle=bool(shuffle),
@@ -483,6 +499,7 @@ def create_dataloader(
     )
     if kwargs["prefetch_factor"] is None:
         kwargs.pop("prefetch_factor", None)
+
     return DataLoader(dataset, **kwargs)
 
 # --------------------------------------------------------------------------------------

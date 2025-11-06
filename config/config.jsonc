@@ -5,7 +5,7 @@
   // List of raw HDF5 files (optional; auto-detect if empty)
   "raw_data_files": [],
   // Directory for logs/checkpoints/exports
-  "work_dir": "models/v1",
+  "work_dir": "models/elu",
   // Delete existing work_dir before start
   "overwrite": true
   },
@@ -90,9 +90,9 @@
   // K: number of target steps per anchor when multi_time_per_anchor
   "times_per_anchor": 32,
   // Use same offsets for entire batch
-  "share_times_across_batch": false,
+  "share_times_across_batch": true,
   // Sample offsets uniformly then fit anchors
-  "uniform_offset_sampling_strict": false,
+  "uniform_offset_sampling_strict": true,
   // assume all the times are the same
   "assume_shared_grid": true,
   // Δt clamp floor before normalization
@@ -112,15 +112,15 @@
 
   "model": {
   // Latent channel count for autoencoder
-  "latent_dim": 128,
+  "latent_dim": 512,
   // Encoder MLP hidden sizes
-  "encoder_hidden": [1024, 1024, 1024],
+  "encoder_hidden": [1024, 1024, 1024, 1024],
   // Dynamics MLP hidden sizes
-  "dynamics_hidden": [1024, 1024, 1024],
+  "dynamics_hidden": [256, 256, 256, 256, 256],
   // Decoder MLP hidden sizes
-  "decoder_hidden": [1024, 1024, 1024],
+  "decoder_hidden": [1024, 1024, 1024, 1024],
   // Nonlinearity for MLPs
-  "activation": "leakyrelu",
+  "activation": "elu",
   // Dropout rate in MLPs
   "dropout": 0.0,
   // Use VAE encoder with KL term
@@ -128,7 +128,7 @@
   // Predict Δz and add to z (residual dynamics)
   "dynamics_residual": true,
   // Decoder predicts Δy in z-space
-  "predict_delta": true,
+  "predict_delta": false,
   // Decoder predicts Δlog10(y) in physical space
   "predict_delta_log_phys": false,
   // Use log-softmax head for simplex outputs
@@ -145,17 +145,17 @@
   // Gradient accumulation steps
   "accumulate_grad_batches": 1,
   // Enable torch.compile for the Lightning module
-  "torch_compile": true,
+  "torch_compile": false,
   // Initial learning rate
   "lr": 1e-4,
   // Cosine schedule minimum learning rate
-  "min_lr": 1e-06,
+  "min_lr": 1e-6,
   // Linear warmup epochs before cosine
   "warmup_epochs": 10,
   // Weight decay for AdamW
-  "weight_decay": 3e-05,
+  "weight_decay": 0.00625,
   // Weight on KL divergence (if VAE encoder)
-  "beta_kl": 1e-3,
+  "beta_kl": 0.75,
   // Limit training steps per epoch (0 = no limit)
   "max_train_steps_per_epoch": 0,
   // Limit validation batches per epoch (0 = no limit)
@@ -182,7 +182,7 @@
     // Weight for physical-space term
     "lambda_phys": 1.0,
     // Weight for z-space term
-    "lambda_z": 0.1,
+    "lambda_z": 0.5,
     // Fractional loss denominator floor
     "epsilon_phys": 1e-25,
     // Use fractional MAE in physical space

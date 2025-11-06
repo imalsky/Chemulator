@@ -663,14 +663,21 @@ class DataPreprocessor:
         time_candidates = []
 
         if self.comm and self.size > 1:
-            # MPI parallel scanning
             self._scan_files_mpi(time_candidates)
         else:
-            # Serial scanning (no multiprocessing fallback since we removed ProcessPoolExecutor)
             self._scan_files_serial(time_candidates)
 
-        # Validate canonical time grid
-        self._validate_canonical_time(time_candidates)
+        # NEW: gather time candidates to root so rank 0 always validates a global list
+        if self.comm:
+            gathered = self.comm.gather(time_candidates, root=0)
+            if self.rank == 0:
+                time_candidates = [tc for lst in gathered for tc in lst]
+
+        # Validate only on rank 0, then broadcast
+        if not self.comm or self.rank == 0:
+            self._validate_canonical_time(time_candidates)
+        if self.comm:
+            self._canonical_time = self.comm.bcast(getattr(self, "_canonical_time", None), root=0)
 
     def _scan_files_mpi(self, time_candidates: List[np.ndarray]) -> None:
         """Scan files in parallel using MPI."""
