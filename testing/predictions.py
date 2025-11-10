@@ -20,14 +20,14 @@ plt.style.use('science.mplstyle')
 
 # ---------------- Paths & settings ----------------
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models/delta"
+MODEL_DIR = REPO / "models/4"
 EP_FILENAME = "export_k1_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))
 from utils import load_json_config as load_json, seed_everything
 from normalizer import NormalizationHelper
 
-SAMPLE_IDX = 1
+SAMPLE_IDX = 2
 Q_COUNT = 100
 XMIN, XMAX = 1e-3, 1e8
 
@@ -201,7 +201,7 @@ def main():
     print(f"NaN in pred? {np.isnan(y_pred).any()}")
 
     # Plot solid vs dashed for selected species
-    out_png = MODEL_DIR / "plots" / f"pred_vs_gt_{SAMPLE_IDX}.png"
+    out_png = MODEL_DIR / "plots" / f"pred_{SAMPLE_IDX}.png"
     plot_results(t_phys, y[:, :len(species)], t_sel, y_pred, species, PLOT_SPECIES, out_png)
 
     # Simple error metric on sampled points

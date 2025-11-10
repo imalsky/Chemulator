@@ -1,53 +1,53 @@
 {
   "paths": {
-  // Directory containing processed shards
-  "processed_data_dir": "data/processed",
-  // List of raw HDF5 files (optional; auto-detect if empty)
-  "raw_data_files": [],
-  // Directory for logs/checkpoints/exports
-  "work_dir": "models/elu",
-  // Delete existing work_dir before start
-  "overwrite": true
+    // Directory containing processed shards
+    "processed_data_dir": "data/processed",
+    // List of raw HDF5 files (optional; auto-detect if empty)
+    "raw_data_files": [],
+    // Directory for logs/checkpoints/exports
+    "work_dir": "models/v1",
+    // Delete existing work_dir before start
+    "overwrite": true
   },
 
   "system": {
-  // Enable cuDNN autotuning (faster, non-deterministic convs)
-  "cudnn_benchmark": true,
-  // Force deterministic operations (slower)
-  "deterministic": false,
-  // Model parameter dtype (FP32 recommended)
-  "dtype": "float32",
-  // On-disk NPZ dtype for preprocessing output
-  "io_dtype": "float32",
-  // Allow TF32 tensor cores on Ampere/Hopper
-  "tf32": true,
-  // Max OpenMP threads for CPU ops
-  "omp_num_threads": 8,
-  // Global RNG seed
-  "seed": 42
+    // Enable cuDNN autotuning (faster, non-deterministic convs)
+    "cudnn_benchmark": true,
+    // Force deterministic operations (slower)
+    "deterministic": false,
+    // Model parameter dtype (FP32 recommended)
+    "dtype": "float32",
+    // On-disk NPZ dtype for preprocessing output
+    "io_dtype": "float32",
+    // Allow TF32 tensor cores on Ampere/Hopper
+    "tf32": true,
+    // Max OpenMP threads for CPU ops
+    "omp_num_threads": 8,
+    // Global RNG seed
+    "seed": 42
   },
 
   "mixed_precision": {
-  // AMP precision: "bf16", "fp16", or "none"
-  "mode": "bf16-mixed"
+    // AMP precision: "bf16", "fp16", or "none"
+    "mode": "bf16"
   },
 
   "data": {
-  // Global inputs (e.g., P, T)
-  "global_variables": ["P", "T"],
-  // Name of the time column in raw files
-  "time_variable": "t_time",
-  // Species list; hydrated from artifacts if empty
-  "species_variables": [],
-  // Subset of species to predict; empty = all
-  "target_species": []
+    // Global inputs (e.g., P, T)
+    "global_variables": ["P", "T"],
+    // Name of the time column in raw files
+    "time_variable": "t_time",
+    // Species list; hydrated from artifacts if empty
+    "species_variables": [],
+    // Subset of species to predict; empty = all
+    "target_species": []
   },
 
   "normalization": {
-  // Default normalization for unspecified keys
-  "default_method": "log-standard",
-  // Small positive floor for log transforms
-  "epsilon": 1e-30,
+    // Default normalization for unspecified keys
+    "default_method": "log-standard",
+    // Small positive floor for log transforms
+    "epsilon": 1e-30,
     // Per-key normalization methods
     "methods": {
       "P": "log-min-max",
@@ -55,140 +55,140 @@
       "dt": "log-min-max",
       "t_time": "log-min-max"
     },
-  // Minimum stddev to avoid division blow-up
-  "min_std": 1e-10
+    // Minimum stddev to avoid division blow-up
+    "min_std": 1e-10
   },
 
   "preprocessing": {
-  // Read chunk length for HDF5 (0 = full)
-  "hdf5_chunk_size": 0,
-  // Drop profiles with any value below this (<=0 keeps all)
-  "min_value_threshold": 0,
-  // Compress NPZ shards (smaller, slower I/O)
-  "npz_compressed": false,
-  // Workers for preprocessing (I/O bound)
-  "num_workers": 32,
-  // Trajectories per output shard
-  "trajectories_per_shard": 65536,
-  // Drop t=0 row when exporting shards
-  "skip_first_timestep": false,
-  // reuse the data if possible
-  "overwrite_data": false
+    // Read chunk length for HDF5 (0 = full)
+    "hdf5_chunk_size": 0,
+    // Drop profiles with any value below this (<=0 keeps all)
+    "min_value_threshold": 0,
+    // Compress NPZ shards (smaller, slower I/O)
+    "npz_compressed": false,
+    // Workers for preprocessing (I/O bound)
+    "num_workers": 16,
+    // Trajectories per output shard
+    "trajectories_per_shard": 65536,
+    // Drop t=0 row when exporting shards
+    "skip_first_timestep": false,
+    // reuse the data if possible
+    "overwrite_data": false
   },
 
   "dataset": {
-  // Global training batch size
-  "batch_size_train": 16384,
-  // Avoid full shard scan for the preprocessed data; trust metadata files
-  "skip_scan": true,
-  // Skip time-grid monotonicity checks
-  "skip_validate_grids": true,
-  // Precompute normalized Δt table for shared grids
-  "precompute_dt_table": true,
-  // Return K targets per anchor (K=times_per_anchor)
-  "multi_time_per_anchor": true,
-  // K: number of target steps per anchor when multi_time_per_anchor
-  "times_per_anchor": 32,
-  // Use same offsets for entire batch
-  "share_times_across_batch": true,
-  // Sample offsets uniformly then fit anchors
-  "uniform_offset_sampling_strict": true,
-  // assume all the times are the same
-  "assume_shared_grid": true,
-  // Δt clamp floor before normalization
-  "dt_epsilon": 1e-30,
+    // Global training batch size
+    "batch_size_train": 16384,
+    // Avoid full shard scan for the preprocessed data; trust metadata files
+    "skip_scan": true,
+    // Skip time-grid monotonicity checks
+    "skip_validate_grids": true,
+    // Precompute normalized Δt table for shared grids
+    "precompute_dt_table": true,
+    // Return K targets per anchor (K=times_per_anchor)
+    "multi_time_per_anchor": true,
+    // K: number of target steps per anchor when multi_time_per_anchor
+    "times_per_anchor": 64,
+    // Use same offsets for entire batch
+    "share_times_across_batch": false,
+    // Sample offsets uniformly then fit anchors
+    "uniform_offset_sampling_strict": false,
+    // assume all the times are the same
+    "assume_shared_grid": false,
+    // Δt clamp floor before normalization
+    "dt_epsilon": 1e-30,
 
-  // DataLoader workers
-  "num_workers": 8,
-  // Keep workers alive between epochs
-  "persistent_workers": true,
-  // Pin memory for faster H2D copies (use only when CPU-staged)
-  "pin_memory": true,
-  // Prefetch batches per worker
-  "prefetch_factor": 4,
-  // Stage entire set to GPU at init
-  "preload_to_gpu": false
+    // DataLoader workers
+    "num_workers": 8,
+    // Keep workers alive between epochs
+    "persistent_workers": true,
+    // Pin memory for faster H2D copies (use only when CPU-staged)
+    "pin_memory": true,
+    // Prefetch batches per worker
+    "prefetch_factor": 4,
+    // Stage entire set to GPU at init
+    "preload_to_gpu": false
   },
 
   "model": {
-  // Latent channel count for autoencoder
-  "latent_dim": 512,
-  // Encoder MLP hidden sizes
-  "encoder_hidden": [1024, 1024, 1024, 1024],
-  // Dynamics MLP hidden sizes
-  "dynamics_hidden": [256, 256, 256, 256, 256],
-  // Decoder MLP hidden sizes
-  "decoder_hidden": [1024, 1024, 1024, 1024],
-  // Nonlinearity for MLPs
-  "activation": "elu",
-  // Dropout rate in MLPs
-  "dropout": 0.0,
-  // Use VAE encoder with KL term
-  "vae_mode": true,
-  // Predict Δz and add to z (residual dynamics)
-  "dynamics_residual": true,
-  // Decoder predicts Δy in z-space
-  "predict_delta": false,
-  // Decoder predicts Δlog10(y) in physical space
-  "predict_delta_log_phys": false,
-  // Use log-softmax head for simplex outputs
-  "softmax_head": false,
-  // Allow softmax on subset of species
-  "allow_partial_simplex": false
+    // Latent channel count for autoencoder
+    "latent_dim": 256,
+    // Encoder MLP hidden sizes
+    "encoder_hidden": [1024, 1024, 1024],
+    // Dynamics MLP hidden sizes
+    "dynamics_hidden": [1024, 1024, 1024],
+    // Decoder MLP hidden sizes
+    "decoder_hidden": [1024, 1024, 1024],
+    // Nonlinearity for MLPs
+    "activation": "elu",
+    // Dropout rate in MLPs
+    "dropout": 0.0,
+    // Use VAE encoder with KL term
+    "vae_mode": false,
+    // Predict Δz and add to z (residual dynamics)
+    "dynamics_residual": true,
+    // Decoder predicts Δy in z-space
+    "predict_delta": true,
+    // Decoder predicts Δlog10(y) in physical space
+    "predict_delta_log_phys": false,
+    // Use log-softmax head for simplex outputs
+    "softmax_head": false,
+    // Allow softmax on subset of species
+    "allow_partial_simplex": false
   },
 
   "training": {
-  // Total epochs to train
-  "epochs": 100,
-  // Clip grad-norm at this value (0 = disabled)
-  "gradient_clip": 0.0,
-  // Gradient accumulation steps
-  "accumulate_grad_batches": 1,
-  // Enable torch.compile for the Lightning module
-  "torch_compile": false,
-  // Initial learning rate
-  "lr": 1e-4,
-  // Cosine schedule minimum learning rate
-  "min_lr": 1e-6,
-  // Linear warmup epochs before cosine
-  "warmup_epochs": 10,
-  // Weight decay for AdamW
-  "weight_decay": 0.00625,
-  // Weight on KL divergence (if VAE encoder)
-  "beta_kl": 0.75,
-  // Limit training steps per epoch (0 = no limit)
-  "max_train_steps_per_epoch": 0,
-  // Limit validation batches per epoch (0 = no limit)
-  "max_val_batches": 0,
-  // Checkpoint path to resume from (optional)
-  "resume": false,
-  // Allow auto-resume from config/env/CLI
-  "auto_resume": false,
+    // Total epochs to train
+    "epochs": 100,
+    // Clip grad-norm at this value (0 = disabled)
+    "gradient_clip": 0.0,
+    // Gradient accumulation steps
+    "accumulate_grad_batches": 1,
+    // Enable torch.compile for the Lightning module
+    "torch_compile": true,
+    // Initial learning rate
+    "lr": 1e-4,
+    // Cosine schedule minimum learning rate
+    "min_lr": 1e-6,
+    // Linear warmup epochs before cosine
+    "warmup_epochs": 10,
+    // Weight decay for AdamW
+    "weight_decay": 3e-5,
+    // Weight on KL divergence (if VAE encoder)
+    "beta_kl": 0.0015,
+    // Limit training steps per epoch (0 = no limit)
+    "max_train_steps_per_epoch": 0,
+    // Limit validation batches per epoch (0 = no limit)
+    "max_val_batches": 0,
+    // Checkpoint path to resume from (optional)
+    "resume": null,
+    // Allow auto-resume from config/env/CLI
+    "auto_resume": false,
 
-  // Subsample fraction of trajectories during preprocessing
-  "use_fraction": 1.0,
-  // Validation fraction for preprocessing split
-  "val_fraction": 0.1,
-  // Test fraction for preprocessing split
-  "test_fraction": 0.1,
-  // Minimum j−i offset for targets
-  "min_steps": 1,
-  // Maximum j−i offset for targets (null = T-1)
-  "max_steps": null,
-  // Anchors per trajectory per epoch
-  "pairs_per_traj": 16,
+    // Subsample fraction of trajectories during preprocessing
+    "use_fraction": 1.0,
+    // Validation fraction for preprocessing split
+    "val_fraction": 0.1,
+    // Test fraction for preprocessing split
+    "test_fraction": 0.1,
+    // Minimum j−i offset for targets
+    "min_steps": 1,
+    // Maximum j−i offset for targets (null = T-1)
+    "max_steps": 99,
+    // Anchors per trajectory per epoch
+    "pairs_per_traj": 4,
 
-  "adaptive_stiff_loss": {
-    // Weight for physical-space term
-    "lambda_phys": 1.0,
-    // Weight for z-space term
-    "lambda_z": 0.5,
-    // Fractional loss denominator floor
-    "epsilon_phys": 1e-25,
-    // Use fractional MAE in physical space
-    "use_fractional": false,
-    // Upweight near-edge times within [0,1]
-    "time_edge_gain": 1.0
+    "adaptive_stiff_loss": {
+      // Weight for physical-space term
+      "lambda_phys": 1.0,
+      // Weight for z-space term
+      "lambda_z": 0.5,
+      // Fractional loss denominator floor
+      "epsilon_phys": 1e-30,
+      // Use fractional MAE in physical space
+      "use_fractional": false,
+      // Upweight near-edge times within [0,1]
+      "time_edge_gain": 1.0
     }
   }
 }
