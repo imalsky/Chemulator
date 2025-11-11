@@ -1,431 +1,179 @@
 #!/usr/bin/env python3
-"""
-MiniChem-anchored single-shot predictions at K log-spaced Δt (no autoregression),
-with MiniChem truth interpolated on a log-time axis using a shape-preserving cubic (PCHIP),
-and plotted on a Δt axis.
-
-- Anchor y0 from MiniChem at absolute time T0 (INTERPOLATED at T0 with the same scheme)
-- Δt grid = logspace(DT_MIN, T_FINAL - T0) with K_POINTS samples
-- Single batched call to exported model (K=1 export signature)
-- FEED_MIN merged with learned floor, then simplex projection before normalization
-- Plot: solid = MiniChem truth (PCHIP-interpolated, renormalized to output-subset simplex, vs Δt)
-        empty circles = predictions at Δt grid (same subset)
-        hollow square = anchor at Δt = XMIN_DT
-"""
-
+# Minimal HDF5→model “single-shot” plot using SEED_1 and the first timestep as the anchor.
 from __future__ import annotations
+import json, math, re, sys
 from pathlib import Path
-from typing import Dict, List, Tuple
-import json, pickle, sys, math
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
+import numpy as np, torch, h5py, matplotlib.pyplot as plt
 
-plt.style.use("science.mplstyle")
+# --------------------------- CONFIG ---------------------------
+REPO_ROOT = Path("/Users/imalsky/Desktop/Chemulator")
+SRC_DIR   = REPO_ROOT / "src"
+PROCESSED = REPO_ROOT / "data" / "processed"          # contains normalization.json
+MODEL_DIR = REPO_ROOT / "models" / "4"                # contains *.pt2 export
+H5_PATH   = Path("/Users/imalsky/Desktop/test.h5")    # HDF5 truth file
 
-# ---------- Paths ----------
-REPO_ROOT     = Path("/Users/imalsky/Desktop/Chemulator")
-SRC_DIR       = REPO_ROOT / "src"
-PROCESSED_DIR = REPO_ROOT / "data" / "processed"
-MODEL_DIR     = REPO_ROOT / "models" / "big"
-VULCAN_PATH   = Path("/Users/imalsky/Desktop/Chemistry_Project/Vulcan/0D_full_NCHO/solar/vul-T1000KlogP3.0-NCHO-solar_hot_ini.vul")
+PLOT_SPECIES = ['H2O','CH4','CO','CO2','NH3','HCN','N2','C2H2']
+DT_MIN, DT_MAX, K = 1e-3, 1e8, 50
+YMIN, YMAX = 1e-30, 2.0
+OUT_DIR = MODEL_DIR / "plots"; OUT_DIR.mkdir(parents=True, exist_ok=True)
+# --------------------------------------------------------------
 
-# ---------- Time window (absolute) & Δt grid ----------
-T0        = 1.0e-3                 # absolute anchor time (s)
-T_FINAL   = T0 + 1.0e8             # absolute final time (s)
-DT_MIN    = 1.0e-3                 # minimum Δt (s) for the logspace grid
-K_POINTS  = 50                     # number of Δt samples (log-spaced)
-
-# ---------- Δt-axis limits ----------
-XMIN_DT   = DT_MIN                 # lower bound (Δt, s) on log axis (>0)
-XMAX_DT   = 1e18                   # upper bound (Δt, s)
-
-# ---------- Inputs & plotting knobs ----------
-FEED_MIN   = 1e-15                 # min abundance fed into the model (merged with learned floor)
-T_K        = 1000.0                # global T (K)
-P_Pa       = 100.0                 # global P (Pa)
-P_barye    = P_Pa * 10.0           # global P (barye)
-PLOT_SPECIES: List[str] = ['H2','H2O','CH4','CO','CO2','NH3','HCN','N2','C2H2','H','CH3','OH','O']
-PLOT_FLOOR = 1e-30
-
-# ---------- Interpolation options ----------
-# method: 'pchip' (shape-preserving cubic, linear abundance) | 'linear' | 'pchip_logy' (cubic on log10 abundance)
-INTERP_METHOD = "pchip"
-INTERP_EPS    = 1e-300   # floor to keep log-time/log-y safe
-
-# ---------- Repo imports ----------
-if str(SRC_DIR) not in sys.path:
-    sys.path.append(str(SRC_DIR))
+if str(SRC_DIR) not in sys.path: sys.path.append(str(SRC_DIR))
 from normalizer import NormalizationHelper  # type: ignore
 
-# ---------- Helpers ----------
-def read_json(p: Path) -> Dict:
-    return json.loads(p.read_text())
-
-def load_manifest_and_norm() -> Tuple[Dict, NormalizationHelper]:
-    man_path = PROCESSED_DIR / "normalization.json"
-    if not man_path.exists():
-        raise FileNotFoundError(f"Missing {man_path}")
-    manifest = read_json(man_path)
-    return manifest, NormalizationHelper(manifest)
-
-def get_meta_lists(manifest: Dict) -> Tuple[List[str], List[str], List[str]]:
+def load_norm():
+    manifest = json.loads((PROCESSED / "normalization.json").read_text())
+    norm = NormalizationHelper(manifest)
     meta = manifest.get("meta", {})
-    in_names: List[str] = list(meta.get("species_variables") or manifest.get("species_variables") or [])
-    if not in_names:
-        raise RuntimeError("species_variables missing in normalization.json")
+    in_names = list(meta.get("species_variables") or manifest.get("species_variables") or [])
+    gvars    = list(meta.get("global_variables")  or manifest.get("global_variables")  or [])
+    assert in_names, "species_variables missing in normalization.json"
     in_bases = [n[:-10] if n.endswith("_evolution") else n for n in in_names]
-    gvars: List[str] = list(meta.get("global_variables") or manifest.get("global_variables") or [])
-    return in_names, in_bases, gvars
+    return norm, in_names, in_bases, gvars
 
-def find_export(model_dir: Path) -> Path:
-    for name in ("export_k1_cpu.pt2", "export_k1.pt2", "complete_model_exported_k1.pt2", "complete_model_exported.pt2"):
-        p = model_dir / name
-        if p.exists():
-            return p
-    raise FileNotFoundError(f"No exported model found in {model_dir}")
-
-def load_minichem(p: Path):
-    if not p.exists():
-        raise FileNotFoundError(f"MiniChem/VULCAN file not found: {p}")
-    with open(p, "rb") as h:
-        d = pickle.load(h)
-    t = np.asarray(d["variable"]["t_time"], dtype=float)     # [T]
-    Y = np.asarray(d["variable"]["y_time"], dtype=float)     # [T, layer, S]
-    names = list(d["variable"]["species"])
-    den = np.maximum(Y[:, 0, :].sum(axis=-1), 1e-30)         # include He in denom
-    MR  = Y[:, 0, :] / den[:, None]                          # mixing ratios
-    return {"t": t, "MR": MR, "names": names}
-
-def infer_training_floor(norm: NormalizationHelper, var_names: List[str]) -> np.ndarray:
-    z = torch.zeros(1, len(var_names), dtype=torch.float32)
-    eff = norm.denormalize(norm.normalize(z, var_names), var_names).numpy().reshape(-1)
-    return np.maximum(np.nan_to_num(eff, nan=0.0, posinf=0.0, neginf=0.0), 1e-30).astype(np.float64)
-
-def map_from_dict_ordered(keys: List[str], val_by_key: Dict[str, float]) -> np.ndarray:
-    return np.array([max(val_by_key.get(k, 0.0), 0.0) for k in keys], dtype=np.float64)
-
-def project_to_training_simplex(vec: np.ndarray, floor_vec: np.ndarray) -> np.ndarray:
-    v = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False)
-    v = np.maximum(v, floor_vec)
-    s = float(v.sum())
-    v = (np.full_like(v, 1.0/len(v)) if (not np.isfinite(s) or s <= 0) else (v / s))
-    return v.astype(np.float32)
-
-def safe_denorm(norm: NormalizationHelper, y_norm: torch.Tensor, names: List[str], manifest: Dict) -> np.ndarray:
-    arr = norm.denormalize(y_norm, names).cpu().numpy()
-    eps = float((manifest.get("normalization") or {}).get("epsilon", 1e-30))
-    cap = float((manifest.get("normalization") or {}).get("clamp_value", 1e10))
-    return np.clip(np.nan_to_num(arr, nan=eps, posinf=cap, neginf=eps), eps, cap)
-
-# ---------- Robust preparation of MiniChem time series ----------
-def _dedupe_and_sort_times(t: np.ndarray, Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Ensure strictly increasing time grid; average values at duplicate times, sort by time."""
-    t = np.asarray(t, dtype=np.float64)
-    Y = np.asarray(Y, dtype=np.float64)
-    order = np.argsort(t)
-    t_sorted = t[order]
-    Y_sorted = Y[order]
-
-    uniq_vals, idx_start = np.unique(t_sorted, return_index=True)
-    # average across duplicates
-    t_out = []
-    y_out = []
-    for i, t_val in enumerate(uniq_vals):
-        start = idx_start[i]
-        end = idx_start[i+1] if i+1 < len(idx_start) else len(t_sorted)
-        t_out.append(t_val)
-        y_out.append(np.nanmean(Y_sorted[start:end, :], axis=0))
-    t_out = np.asarray(t_out, dtype=np.float64)
-    y_out = np.asarray(y_out, dtype=np.float64)
-    # drop non-increasing remnants if any
-    keep = np.diff(np.concatenate([[t_out[0]-1.0], t_out])) > 0.0
-    return t_out[keep], y_out[keep, :]
-
-# ---------- Shape-preserving cubic interpolation (Fritsch–Carlson, PCHIP) ----------
-def _pchip_slopes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Compute tangents m_i for monotone cubic (per 1D array y)."""
-    n = x.size
-    h = np.diff(x)
-    d = np.diff(y) / h
-    m = np.zeros_like(y)
-
-    # interior slopes via weighted harmonic mean when same sign
-    for i in range(1, n-1):
-        if d[i-1] == 0.0 or d[i] == 0.0 or np.sign(d[i-1]) != np.sign(d[i]):
-            m[i] = 0.0
-        else:
-            w1 = 2*h[i] + h[i-1]
-            w0 = h[i] + 2*h[i-1]
-            m[i] = (w0 + w1) / (w0/d[i-1] + w1/d[i])
-
-    # endpoints (Fritsch–Butland style limiting)
-    m0  = ((2*h[0] + h[1])*d[0] - h[0]*d[1]) / (h[0] + h[1]) if n > 2 else d[0]
-    if np.sign(m0) != np.sign(d[0]): m0 = 0.0
-    if (np.sign(d[0]) == np.sign(m0)) and (abs(m0) > 3*abs(d[0])): m0 = 3*d[0]
-    m[n-1] = ((2*h[-1] + h[-2])*d[-1] - h[-1]*d[-2]) / (h[-1] + h[-2]) if n > 2 else d[-1]
-    if np.sign(m[n-1]) != np.sign(d[-1]): m[n-1] = 0.0
-    if (np.sign(d[-1]) == np.sign(m[n-1])) and (abs(m[n-1]) > 3*abs(d[-1])): m[n-1] = 3*d[-1]
-    m[0] = m0
-    return m
-
-def _pchip_eval(x: np.ndarray, y: np.ndarray, m: np.ndarray, xq: np.ndarray) -> np.ndarray:
-    """Evaluate monotone cubic Hermite at xq (constant extrapolation outside domain)."""
-    x0, xN = x[0], x[-1]
-    out = np.empty_like(xq, dtype=np.float64)
-    # left/right outside: constant
-    left  = xq <= x0
-    right = xq >= xN
-    out[left]  = y[0]
-    out[right] = y[-1]
-    # interior
-    mid_mask = ~(left | right)
-    xm = xq[mid_mask]
-    # interval indices
-    k = np.searchsorted(x, xm) - 1
-    k = np.clip(k, 0, x.size - 2)
-    h  = x[k+1] - x[k]
-    t  = (xm - x[k]) / h
-    t2 = t * t
-    t3 = t2 * t
-    hmk = h
-    yk  = y[k]
-    yk1 = y[k+1]
-    mk  = m[k]
-    mk1 = m[k+1]
-    out[mid_mask] = (
-        (2*t3 - 3*t2 + 1)*yk
-        + (t3 - 2*t2 + t)*hmk*mk
-        + (-2*t3 + 3*t2)*yk1
-        + (t3 - t2)*hmk*mk1
-    )
-    return out
-
-def interp_MR_over_time(
-    t_known: np.ndarray,
-    MR_known: np.ndarray,     # [T, S] aligned with names
-    t_query: np.ndarray,      # [Q]
-    method: str = "pchip",
-    use_log_time: bool = True,
-    clip_floor: float = INTERP_EPS,
-) -> np.ndarray:
-    """
-    Interpolate species mixing ratios over time.
-    - x-axis: log10(t) if use_log_time else t
-    - y-axis: linear abundance for 'linear' and 'pchip'; log10(y) for 'pchip_logy'
-    - method: 'linear' (piecewise linear), 'pchip' (shape-preserving cubic), 'pchip_logy'
-    """
-    # Prepare x
-    t_known = np.asarray(t_known, dtype=np.float64)
-    MR_known = np.asarray(MR_known, dtype=np.float64)
-    t_query = np.asarray(t_query, dtype=np.float64)
-
-    # Keep strictly increasing time and average duplicates
-    t_known, MR_known = _dedupe_and_sort_times(t_known, MR_known)
-
-    if use_log_time:
-        xk = np.log10(np.clip(t_known, clip_floor, None))
-        xq = np.log10(np.clip(t_query, clip_floor, None))
+def load_model():
+    from torch.export import load as tload
+    order = ["export_k_dyn_gpu.pt2","export_k_dyn_mps.pt2","export_k_dyn_cpu.pt2",
+             "export_k1_gpu.pt2","export_k1_mps.pt2","export_k1_cpu.pt2"]
+    cands = [MODEL_DIR/p for p in order if (MODEL_DIR/p).exists()]
+    if not cands:
+        cands = sorted(MODEL_DIR.glob("*.pt2"), key=lambda p: p.stat().st_mtime, reverse=True)
+    assert cands, "No .pt2 export found"
+    pt2 = cands[0]
+    mod = tload(str(pt2)).module()
+    name = pt2.name.lower()
+    if ("gpu" in name or "cuda" in name) and torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif "mps" in name and torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
-        xk = t_known
-        xq = t_query
+        device = torch.device("cpu")
+    use_dyn = ("dyn" in name)
+    print(f"[model] {pt2.name}  device={device.type}  dynBK={use_dyn}")
+    return mod, device, use_dyn
 
-    Q, S = len(t_query), MR_known.shape[1]
-    out = np.empty((Q, S), dtype=np.float64)
+def pick_seed1_group(f: h5py.File) -> str:
+    cands = [k for k in f.keys() if isinstance(f[k], h5py.Group) and "SEED_1" in k]
+    assert cands, "No group with SEED_1 found in H5"
+    return sorted(cands)[0]
 
-    if method == "linear" or xk.size < 3:
-        # fallback or insufficient points for cubic
-        for j in range(S):
-            yk = np.nan_to_num(MR_known[:, j], nan=0.0)
-            out[:, j] = np.interp(xq, xk, yk, left=yk[0], right=yk[-1])
-        return np.clip(out, clip_floor, None)
+def parse_TP_from_group(gname: str):
+    # run_T_1p000000eP03_P_1p000000eP06_SEED_1 → T=1e+03 K, P=1e+06 barye
+    mT = re.search(r"T_([0-9p]+eP[0-9+-]+)", gname)
+    mP = re.search(r"P_([0-9p]+eP[0-9+-]+)", gname)
+    parse = lambda s: float(s.replace("p",".").replace("eP","e+"))
+    T_K = parse(mT.group(1)) if mT else 0.0
+    P_barye = parse(mP.group(1)) if mP else 0.0
+    return float(T_K), float(P_barye)
 
-    if method == "pchip":
-        for j in range(S):
-            yk = np.nan_to_num(MR_known[:, j], nan=0.0)
-            m  = _pchip_slopes(xk, yk)
-            out[:, j] = _pchip_eval(xk, yk, m, xq)
-        return np.clip(out, clip_floor, None)
+def load_truth_first_timestep(f: h5py.File, gname: str):
+    g = f[gname]
+    t = np.asarray(g["t_time"][...], float)                        # [T]
+    species, cols = [], []
+    for k, d in g.items():
+        if k.endswith("_evolution") and k != "t_time":
+            species.append(k[:-10])
+            cols.append(np.asarray(d[...], float))                 # [T]
+    idx = np.argsort(species); species = [species[i] for i in idx]
+    MR = np.stack([cols[i] for i in idx], axis=1)                  # [T, S]
+    y0 = MR[0].clip(min=0.0); s = y0.sum(); y0 = (y0/s) if s>0 else np.full_like(y0, 1.0/len(y0))
+    return t, MR, species, y0
 
-    if method == "pchip_logy":
-        for j in range(S):
-            yk_lin = np.clip(np.nan_to_num(MR_known[:, j], nan=0.0), clip_floor, None)
-            yk = np.log10(yk_lin)
-            m  = _pchip_slopes(xk, yk)
-            out[:, j] = np.power(10.0, _pchip_eval(xk, yk, m, xq))
-        return np.clip(out, clip_floor, None)
+def make_inputs(y0_map, in_bases, norm, in_names):
+    FEED_MIN = 1e-30
+    eff = norm.denormalize(norm.normalize(torch.zeros(1, len(in_names)), in_names), in_names).numpy().reshape(-1)
+    floor = np.maximum(np.nan_to_num(eff, nan=0.0), FEED_MIN)
+    vec = np.array([y0_map.get(b, 0.0) for b in in_bases], float)
+    vec = np.maximum(vec, floor); vec = vec/np.maximum(vec.sum(), 1e-30)
+    y0_norm = norm.normalize(torch.from_numpy(vec[None, :]).float(), in_names)
+    return vec.astype(np.float32), y0_norm
 
-    raise ValueError(f"Unknown interpolation method: {method}")
+def make_gvars(gvars, T_K, P_barye, norm):
+    if not gvars: return torch.zeros(1,0)
+    g = np.zeros((1,len(gvars)), np.float32)
+    for i,n in enumerate(gvars):
+        nl = n.lower().strip()
+        g[0,i] = P_barye if nl.startswith("p") else (T_K if nl.startswith("t") else 0.0)
+    return norm.normalize(torch.from_numpy(g), gvars).float()
 
-@torch.inference_mode()
-def call_export(fn, y_b: torch.Tensor, dt_b: torch.Tensor, g_b: torch.Tensor) -> torch.Tensor:
-    out = fn(y_b, dt_b, g_b)  # expected [B,1,S] in some exports; [B,S] in others
-    if isinstance(out, torch.Tensor):
-        return out[:, 0, :] if (out.dim() == 3 and out.size(1) == 1) else out
-    return torch.as_tensor(out)
+def run_model(fn, dev, use_dyn, y0_norm, g_norm, dt_phys, norm):
+    dt_hat = norm.normalize_dt_from_phys(torch.from_numpy(dt_phys)).view(-1,1).float()
+    with torch.inference_mode():
+        if use_dyn:  # BK signature: [1,K,S], [1,K,1], [1,K,G]
+            y = fn(y0_norm.to(dev).expand(1,len(dt_phys),-1),
+                   dt_hat.to(dev).view(1,-1,1),
+                   (g_norm.to(dev).expand(1,len(dt_phys),-1) if g_norm.numel() else torch.empty(1,len(dt_phys),0, device=dev)))
+            if isinstance(y, torch.Tensor) and y.dim()==3 and y.size(0)==1: y = y[0]
+        else:        # K1 signature: [K,S], [K,1] or [K], [K,G]
+            y = fn(y0_norm.to(dev).repeat(len(dt_phys),1),
+                   dt_hat.to(dev),
+                   (g_norm.to(dev).repeat(len(dt_phys),1) if g_norm.numel() else torch.empty(len(dt_phys),0, device=dev)))
+    return y.to("cpu")
 
-# ---------- Main ----------
-def main() -> None:
+def main():
     torch.set_num_threads(1)
+    norm, in_names, in_bases, gvars = load_norm()
+    fn, dev, use_dyn = load_model()
 
-    manifest, norm = load_manifest_and_norm()
-    in_names, in_bases, gvars = get_meta_lists(manifest)
+    with h5py.File(H5_PATH, "r") as f:
+        gname = pick_seed1_group(f)
+        T_K, P_barye = parse_TP_from_group(gname)
+        t, MR_all, species_h5, y0 = load_truth_first_timestep(f, gname)
 
-    # Load MiniChem
-    prof = load_minichem(VULCAN_PATH)
-    t_all = prof["t"].astype(np.float64)      # [T]
-    MR_all = prof["MR"].astype(np.float64)    # [T, S]
-    names_all = prof["names"]
-    name_to_idx = {n: i for i, n in enumerate(names_all)}
+    y0_map = {s: y0[i] for i, s in enumerate(species_h5)}
+    y0_simplex, y0_norm = make_inputs(y0_map, in_bases, norm, in_names)
+    g_norm = make_gvars(gvars, T_K, P_barye, norm)
 
-    # Globals (phys -> norm)
-    if gvars:
-        g_phys = np.zeros((1, len(gvars)), dtype=np.float32)
-        for i, name in enumerate(gvars):
-            n = name.strip().lower()
-            g_phys[0, i] = P_barye if n.startswith("p") else (T_K if n.startswith("t") else 0.0)
-        g_norm = norm.normalize(torch.from_numpy(g_phys), gvars).float()
-    else:
-        g_norm = torch.zeros(1, 0, dtype=torch.float32)
+    dt = np.logspace(math.log10(DT_MIN), math.log10(DT_MAX), K, dtype=np.float32)
+    y_pred_norm = run_model(fn, dev, use_dyn, y0_norm, g_norm, dt, norm)
 
-    # ---- Anchor from MiniChem @ T0 (INTERPOLATED with chosen method) ----
-    MR_T0 = interp_MR_over_time(
-        t_all, MR_all, np.array([T0], dtype=np.float64),
-        method=INTERP_METHOD, use_log_time=True, clip_floor=INTERP_EPS
-    )[0]  # [S]
-    vul0_dict = {n: float(MR_T0[name_to_idx[n]]) for n in names_all}
+    # --------- Align outputs to H5 species (robust for S_out == 1) ----------
+    cand = list(norm.manifest.get("meta", {}).get("target_species_variables")
+                or norm.manifest.get("target_species_variables") or in_names)
+    out_names = cand  # don't slice yet
+    pred_phys = norm.denormalize(y_pred_norm, out_names).cpu().numpy()
+    pred_phys = pred_phys.reshape(pred_phys.shape[0], -1)  # [K, S_out]
+    S_out = pred_phys.shape[1]
+    out_bases = [(n[:-10] if n.endswith("_evolution") else n) for n in out_names[:S_out]]
 
-    # Inputs: FEED_MIN merged with learned floor → simplex → normalize
-    floor_train = infer_training_floor(norm, in_names)
-    floor_total = np.maximum(floor_train, FEED_MIN)
-    y0_inputs_phys = map_from_dict_ordered(in_bases, vul0_dict)           # [S_in]
-    y0_simplex = project_to_training_simplex(y0_inputs_phys, floor_total)
-    y0_norm = norm.normalize(torch.from_numpy(y0_simplex[None, :]), in_names).float()  # [1,S_in]
+    present = [b for b in out_bases if b in species_h5]
+    if not present:
+        raise RuntimeError("No overlap between model outputs and H5 species.")
+    out_idx = [out_bases.index(b) for b in present]
+    h5_idx  = [species_h5.index(b)  for b in present]
 
-    # ---- Δt grids ----
-    if not (T_FINAL > T0):
-        raise ValueError("T_FINAL must be > T0.")
-    req_span = float(T_FINAL - T0)
+    pred_sub  = np.clip(pred_phys[:, out_idx], 1e-300, None)
+    pred_sub /= np.maximum(pred_sub.sum(1, keepdims=True), 1e-30)
+    truth_sub = np.clip(MR_all[:, h5_idx], 1e-300, None)
+    truth_sub /= np.maximum(truth_sub.sum(1, keepdims=True), 1e-30)
 
-    # Predictions Δt grid (K points)
-    dt_min_eff = max(DT_MIN, 1e-12)
-    dt_pred = np.logspace(math.log10(dt_min_eff), math.log10(max(dt_min_eff, req_span)),
-                          K_POINTS, dtype=np.float32)  # [K]
-    t_pred_abs = T0 + dt_pred
+    keep = [i for i,b in enumerate(present) if b in PLOT_SPECIES] or list(range(len(present)))
+    labels = [present[i] for i in keep]
+    truth_plot = truth_sub[:, keep]
+    pred_plot  = pred_sub[:, keep]
 
-    # Truth Δt grid covers entire MiniChem forward span (independent of predictions & axis limits)
-    N_TRUTH = max(256, min(2048, 6 * K_POINTS))
-    dt_truth_max = max(dt_min_eff, float(t_all.max() - T0))  # full MiniChem coverage
-    dt_truth = np.logspace(math.log10(dt_min_eff), math.log10(dt_truth_max),
-                           N_TRUTH, dtype=np.float64)  # [Q]
-    t_truth_abs = T0 + dt_truth
+    # ------------------------------- Plot -----------------------------------
+    mask = t > 0.0
+    t_abs = t[mask]; truth_plot = truth_plot[mask]
+    xmin = float(max((t_abs.min() if t_abs.size else DT_MIN), dt.min(), 1e-3))
+    xmax = float(max((t_abs.max() if t_abs.size else DT_MAX), dt.max()))
 
-    # ---- Exported model call (single shot at each Δt) ----
-    from torch.export import load as torch_export_load
-    ep = torch_export_load(str(find_export(MODEL_DIR)))
-    fn = ep.module()
-    dt_hat = norm.normalize_dt_from_phys(torch.from_numpy(dt_pred)).view(-1, 1).float()  # [K,1]
-    y_pred_norm = call_export(fn, y0_norm.repeat(len(dt_hat), 1), dt_hat, g_norm.repeat(len(dt_hat), 1))  # [K,S_out]
-
-    # Output names
-    S_out = int(y_pred_norm.shape[-1])
-    meta  = manifest.get("meta", {})
-    cand  = list(meta.get("target_species_variables") or manifest.get("target_species_variables") or [])
-    out_names = (cand if (cand and len(cand) == S_out)
-                 else (in_names if len(in_names) == S_out else in_names[:S_out]))
-    out_bases = [n[:-10] if n.endswith("_evolution") else n for n in out_names]
-
-    # Denorm predictions
-    y_pred_phys = safe_denorm(norm, y_pred_norm, out_names, manifest)  # [K,S_out]
-
-    # ---- MiniChem truth interpolation on requested window (subset = outputs∩MiniChem) ----
-    present_idx = [name_to_idx[b] for b in out_bases if b in name_to_idx]
-    present_bases = [b for b in out_bases if b in name_to_idx]
-    if not present_idx:
-        raise RuntimeError("None of the model output species are present in the MiniChem profile.")
-
-    MR_sub_truth = MR_all[:, np.array(present_idx, dtype=int)]  # [T, M]
-    MR_truth_interp = interp_MR_over_time(
-        t_all, MR_sub_truth, t_truth_abs,
-        method=INTERP_METHOD, use_log_time=True, clip_floor=INTERP_EPS
-    )  # [Q, M]
-    print(f"[INFO] MiniChem truth interpolated with method='{INTERP_METHOD}' on log-time axis (shape-preserving if 'pchip').")
-
-    # Renormalize both truth and preds to the subset simplex (no-He over outputs)
-    truth_den = np.maximum(MR_truth_interp.sum(axis=1, keepdims=True), 1e-30)
-    truth_simplex = MR_truth_interp / truth_den                                       # [Q, M]
-
-    mask_out_sub = [b in present_bases for b in out_bases]
-    pred_sub = y_pred_phys[:, np.where(mask_out_sub)[0]]                              # [K, M]
-    pred_den = np.maximum(pred_sub.sum(axis=1, keepdims=True), 1e-30)
-    pred_simplex = pred_sub / pred_den                                                # [K, M]
-
-    # Species filter
-    if PLOT_SPECIES:
-        keep = [i for i, b in enumerate(present_bases) if b in PLOT_SPECIES]
-    else:
-        keep = list(range(len(present_bases)))
-    if not keep:
-        raise RuntimeError("Requested PLOT_SPECIES not present in outputs/MiniChem.")
-
-    labels = [present_bases[i] for i in keep]
-    truth_plot = truth_simplex[:, keep]                                               # [Q, m]
-    pred_plot  = np.clip(pred_simplex[:, keep], PLOT_FLOOR, None)                     # [K, m]
-
-    # Also compute y0 on outputs (at T0) for anchor marker
-    in_idx_by_base = {b: j for j, b in enumerate(in_bases)}
-    y0_on_outputs = np.array([y0_simplex[in_idx_by_base[b]] if b in in_idx_by_base else np.nan
-                              for b in present_bases], dtype=np.float64)
-    y0_on_outputs = y0_on_outputs[keep]
-
-    # ---------- Plot on Δt axis (log–log) ----------
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlim(XMIN_DT, XMAX_DT)
-    ax.set_xlabel("Δt since anchor (s)")
-    ax.set_ylabel("Abundance (no-He simplex over model outputs)")
+    fig, ax = plt.subplots(figsize=(9,5.5))
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlim(xmin, xmax); ax.set_ylim(YMIN, YMAX)
+    ax.set_xlabel("Time (s)"); ax.set_ylabel("Abundance")
 
     colors = plt.cm.tab20(np.linspace(0, 0.95, len(keep)))
+    for i, c in enumerate(colors):
+        ax.plot(t_abs, truth_plot[:, i], '-', lw=1.8, alpha=0.95, color=c)
+        ax.plot(dt,    pred_plot[:,  i], 'o',  ms=4,  mfc='none', mec=c, mew=1.0, alpha=0.95)
 
-    # Solid truth vs Δt (dense grid)
-    for i, col in enumerate(colors):
-        ax.plot(dt_truth, np.clip(truth_plot[:, i], PLOT_FLOOR, None),
-                '-', lw=1.8, alpha=0.95, color=col)
-
-    # Anchor marker at Δt = XMIN_DT (hollow square)
-    for i, col in enumerate(colors):
-        y0v = y0_on_outputs[i]
-        if np.isfinite(y0v):
-            ax.plot([XMIN_DT], [max(y0v, PLOT_FLOOR)], marker='s', mfc='none', mec=col, ms=6, mew=1.2, linestyle='none')
-
-    # Predictions as empty circles at Δt grid
-    for i, col in enumerate(colors):
-        ax.plot(dt_pred, pred_plot[:, i], linestyle='none',
-                marker='o', mfc='none', mec=col, ms=4.0, mew=1.0, alpha=0.95)
-
-    # Legends
-    order = np.argsort(np.max(truth_plot, axis=0))[::-1]
-    species_handles = [Line2D([0], [0], color=colors[i], lw=2.0) for i in order]
-    species_labels  = [labels[i] for i in order]
-    leg1 = ax.legend(handles=species_handles, labels=species_labels,
-                     loc='center left', bbox_to_anchor=(1.01, 0.62),
-                     title='Species', fontsize=10)
-    ax.add_artist(leg1)
-    style_handles = [
-        Line2D([0], [0], color='black', lw=2.0, ls='-', label='MiniChem truth (interpolated)'),
-        Line2D([0], [0], color='black', lw=0.0, ls='none', marker='o', mfc='none', mec='black', label='Prediction'),
-        Line2D([0], [0], color='black', lw=0.0, ls='none', marker='s', mfc='none', mec='black', label='Anchor'),
-    ]
-    ax.legend(handles=style_handles, loc='center left', bbox_to_anchor=(1.01, 0.18), fontsize=10)
-
+    ax.legend([plt.Line2D([0],[0], color=colors[i], lw=2.0) for i in range(len(labels))],
+              labels, loc='best', fontsize=9)
     fig.tight_layout()
-    out_png = MODEL_DIR / "plots" / "single_shot_minichem_deltat_interp_circles.png"
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Plot saved: {out_png}")
+    out = OUT_DIR / f"h5_single_shot_seed1_{gname.replace('/','_')}.png"
+    fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"[ok] saved → {out}")
 
 if __name__ == "__main__":
     main()

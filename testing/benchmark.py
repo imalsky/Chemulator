@@ -18,7 +18,7 @@ import torch
 import matplotlib.pyplot as plt
 
 # ====== GLOBALS ======
-MODEL_SUBDIR = "models/4"     # exporter target dir
+MODEL_SUBDIR = "models/best"     # exporter target dir
 BENCH_K: int = 1                # used for BK exports; CPU K1 ignores
 
 WARMUP_STEPS: int = 10
@@ -32,7 +32,7 @@ MAX_POW2_BATCH_BY_TAG: Dict[str, Optional[int]] = {
 }
 
 # Prefer AOTI only on GPU (Apple MPS AOTI is brittle with addmm/as_strided)
-PREFER_AOTI: Dict[str, bool] = {"CPU": False, "GPU": True, "MPS": False}
+PREFER_AOTI: Dict[str, bool] = {"CPU": False, "GPU": True, "MPS": True}
 
 # Match your export.py filenames
 RAW_EXPORT = {
@@ -87,18 +87,22 @@ def _artifact_candidates(tag: str) -> List[Path]:
     return [WORK_DIR / n for n in names if (WORK_DIR / n).exists()]
 
 def _is_aoti(p: Path) -> bool:
-    return p.suffix == "" and p.name.endswith(".aoti")
+    return p.suffix == ".aoti" or (p.is_dir() and p.name.endswith(".aoti"))
+
 
 def _load_callable(p: Path):
-    if _is_aoti(p):
+    # Choose loader based on the artifact type
+    if p.suffix == ".pt2":
+        from torch.export import load as torch_export_load
+        ep = torch_export_load(str(p))
+        return ep.module(), False  # (module, is_aoti=False)
+    else:
+        # AOTI: file or directory
         try:
             from torch._inductor import aot_load_package
         except Exception as e:
             raise RuntimeError(f"AOTI loader unavailable: {e}")
-        return aot_load_package(str(p)), True
-    from torch.export import load as torch_export_load
-    ep = torch_export_load(str(p))
-    return ep.module(), False
+        return aot_load_package(str(p)), True  # (module, is_aoti=True)
 
 def _signature_from_name(p: Path) -> str:
     nm = p.name.lower()

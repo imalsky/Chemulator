@@ -30,7 +30,7 @@ import torch.nn.functional as F  # noqa: F401  (may be used by Torch export)
 # Project root assumed one level above this file's parent (…/<repo>/{src,models,...})
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-WORK_DIR = ROOT / "models" / "4"
+WORK_DIR = ROOT / "models" / "best"
 CONFIG_PATH = WORK_DIR / "config.json"
 
 # Export artifacts
@@ -190,7 +190,32 @@ def optimize_inference(model: nn.Module) -> nn.Module:
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
+    # Make Dropout a hard no-op (eval already disables it; setting p=0 removes tiny overhead)
+    for m in model.modules():
+        if isinstance(m, nn.Dropout):
+            m.p = 0.0
     return model
+
+
+def _ensure_autoencoder_only(model: nn.Module) -> None:
+    """
+    Guardrail: error out if the model is configured as a VAE.
+    Checks common flags found in the Encoder and at top-level if present.
+    """
+    flags = []
+    if hasattr(model, "vae_mode"):
+        try:
+            flags.append(bool(getattr(model, "vae_mode")))
+        except Exception:
+            pass
+    enc = getattr(model, "encoder", None)
+    if enc is not None and hasattr(enc, "vae_mode"):
+        try:
+            flags.append(bool(getattr(enc, "vae_mode")))
+        except Exception:
+            pass
+    if any(flags):
+        raise RuntimeError("VAE mode detected. This exporter supports autoencoder-only. Disable 'vae_mode' in your config.")
 
 
 # --------------------------------------------------------------------------------------
@@ -413,6 +438,9 @@ def main() -> None:
     # Load config and build model
     cfg_json = json.loads(CONFIG_PATH.read_text())
     base = create_model(cfg_json).eval().cpu()
+
+    # Autoencoder-only guard (fail fast if VAE enabled)
+    _ensure_autoencoder_only(base)
 
     # Find and load checkpoint
     ckpt = find_ckpt(WORK_DIR)

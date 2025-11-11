@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py — Flow-map training entrypoint (Lightning-backed)
-
+main.py
 - JSON/JSONC config loading
 - Hardware + reproducibility setup
 - Preprocess if needed, then hydrate cfg.data.* from artifacts
@@ -13,16 +12,16 @@ main.py — Flow-map training entrypoint (Lightning-backed)
 from __future__ import annotations
 
 import os
-# Resolve duplicate OpenMP on macOS (harmless elsewhere)
+
+# Resolve duplicate OpenMP on macOS
+# I should get rid of this, but my mac envs are messy
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import json
 import logging
-import shutil
-import argparse
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
-
+from typing import Any, Dict, Optional, Tuple
+import time
 import torch
 
 from utils import (
@@ -33,24 +32,17 @@ from utils import (
     resolve_precision_and_dtype,
 )
 from hardware import setup_device, optimize_hardware
-from preprocessor import DataPreprocessor
 from dataset import FlowMapPairsDataset, create_dataloader
 from model import create_model
-from trainer import Trainer  # Lightning-backed
-
-# --------------------------------------------------------------------------------------
-# Constants
-# --------------------------------------------------------------------------------------
+from trainer import Trainer
+import shutil
+from preprocessor import DataPreprocessor
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config.jsonc"
 GLOBAL_SEED = 42
 GLOBAL_WORK_DIR = REPO_ROOT / "models" / "autoencoder-flowmap"
 VALIDATION_SEED_OFFSET = 1337
-
-# --------------------------------------------------------------------------------------
-# Hydration from processed artifacts
-# --------------------------------------------------------------------------------------
 
 def hydrate_config_from_processed(
     cfg: Dict[str, Any],
@@ -66,8 +58,6 @@ def hydrate_config_from_processed(
 
     norm_path = processed_dir / "normalization.json"
     summary_path = processed_dir / "preprocessing_summary.json"
-    index_path = processed_dir / "shard_index.json"
-    report_path = processed_dir / "preprocess_report.json"
 
     def _load_json(p: Path) -> Optional[Dict[str, Any]]:
         if p.exists():
@@ -80,8 +70,6 @@ def hydrate_config_from_processed(
 
     manifest = _load_json(norm_path)
     summary = _load_json(summary_path)
-    index = _load_json(index_path)
-    report = _load_json(report_path)
 
     meta = (manifest or {}).get("meta", {}) if manifest else {}
     species = meta.get("species_variables") or (summary or {}).get("species_variables")
@@ -90,7 +78,6 @@ def hydrate_config_from_processed(
     if not species:
         raise RuntimeError("[hydrate] Unable to determine species_variables")
 
-    # target_species: artifacts > valid cfg > all species
     targets = (meta.get("target_species") if meta else None) or (manifest or {}).get("target_species")
     if targets is None:
         targets = (summary or {}).get("target_species")
@@ -129,67 +116,67 @@ def hydrate_config_from_processed(
 
     return processed_dir
 
-# --------------------------------------------------------------------------------------
-# Preprocessing (ensure artifacts exist, then hydrate cfg)
-# --------------------------------------------------------------------------------------
-
 def ensure_preprocessed_data(cfg, logger):
     """
     Reuse processed data if complete; otherwise run the preprocessor.
-    Completeness = normalization.json, preprocessing_summary.json, shard_index.json,
-    and at least one shard in each of train/validation/test.
-
-    NOTE: Processed-data overwrite is controlled by cfg.preprocessing.overwrite_data
-          (NOT cfg.paths.overwrite, which only applies to the work_dir).
     """
-    paths = cfg.get("paths", {})
-    processed_dir = Path(paths.get("processed_data_dir", "data/processed")).resolve()
-    # *** THE ONLY BEHAVIOR CHANGE: use preprocessing.overwrite_data ***
+    processed_dir = Path(cfg.get("paths", {}).get("processed_data_dir", "data/processed")).resolve()
     overwrite_data = bool(cfg.get("preprocessing", {}).get("overwrite_data", False))
 
-    req_files = [
-        processed_dir / "normalization.json",
-        processed_dir / "preprocessing_summary.json",
-        processed_dir / "shard_index.json",
-    ]
+    req_files = [processed_dir / "normalization.json",
+                 processed_dir / "preprocessing_summary.json",
+                 processed_dir / "shard_index.json"]
     have_required = all(p.exists() for p in req_files)
     have_splits = all(
         (processed_dir / split).exists() and any((processed_dir / split).glob("*.npz"))
         for split in ("train", "validation", "test")
     )
+    preprocessing_needed = overwrite_data or not (have_required and have_splits)
 
-    # Reuse path when complete and not forcing overwrite
+    # Detect multi-rank / multi-GPU (robust)
+    ws_vals = [os.getenv(k) for k in ("WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE")]
+    multi = any(v and v.isdigit() and int(v) > 1 for v in ws_vals)
+
+    cvd = (os.getenv("CUDA_VISIBLE_DEVICES") or "").strip()
+    if cvd:
+        if len([t for t in cvd.split(",") if t.strip() != ""]) > 1:
+            multi = True
+
+    try:
+        multi = multi or (torch.cuda.is_available() and torch.cuda.device_count() > 1)
+    except Exception:
+        pass
+
+    if preprocessing_needed and multi:
+        logger.warning("Preprocessing is required but multiple GPUs/ranks are requested")
+        raise SystemExit(2)
+
+    # Fast path: reuse existing artifacts (hydrate cfg.data non-destructively if snapshot exists)
     if have_required and have_splits and not overwrite_data:
-        # hydrate cfg.data from the saved snapshot if available (non-destructive)
         snap = processed_dir / "config.snapshot.json"
         if snap.exists():
             try:
-                with snap.open("r") as f:
-                    snap_cfg = json.load(f)
+                snap_cfg = json.loads(snap.read_text(encoding="utf-8"))
                 data_snap = snap_cfg.get("data", {})
                 data_cfg = cfg.setdefault("data", {})
                 for k in ("species_variables", "global_variables", "time_variable", "target_species"):
                     if data_snap.get(k) and not data_cfg.get(k):
                         data_cfg[k] = data_snap[k]
                 logger.info("[pre] Reusing existing preprocessed data at %s", processed_dir)
-                logger.info("[pre] Injected cfg.data keys from snapshot (non-destructive)")
             except Exception as e:
                 logger.warning("[pre] Reusing existing data but failed to read config.snapshot.json: %s", e)
-                logger.info("[pre] Proceeding without hydration; downstream may still work via manifests")
         else:
             logger.info("[pre] Reusing existing preprocessed data at %s", processed_dir)
         return processed_dir
 
-    # If overwrite_data is set, blow away the directory and rebuild
+    # Single-GPU/CPU preprocessing
     if overwrite_data and processed_dir.exists():
         logger.warning("Deleting existing processed dir: %s", processed_dir)
         shutil.rmtree(processed_dir, ignore_errors=True)
 
-    # Run preprocessor (will raise if dir exists & not empty and overwrite_data is False)
     dp = DataPreprocessor(cfg, logger=logger.getChild("pre"))
     dp.run()
     return processed_dir
-
 
 # --------------------------------------------------------------------------------------
 # Datasets + DataLoaders (single set of knobs)
@@ -291,17 +278,14 @@ def build_model(cfg: Dict[str, Any], logger: logging.Logger) -> torch.nn.Module:
 # Training entrypoint
 # --------------------------------------------------------------------------------------
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    """Main training entrypoint with fixed config handling."""
-    parser = argparse.ArgumentParser(description="Flow-map training")
-    parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG_PATH), help="Path to config.jsonc")
-    args = parser.parse_args(argv)
-
-    # Load config
-    cfg_path = Path(args.config).expanduser().resolve()
+def main() -> None:
+    """Main training entrypoint (rank-0 writes; N GPU safe)."""
+    # ------------------------------- Load config -------------------------------
+    # Optional env override; otherwise use DEFAULT_CONFIG_PATH
+    cfg_path_str = os.getenv("FLOWMAP_CONFIG", str(DEFAULT_CONFIG_PATH))
+    cfg_path = Path(cfg_path_str).expanduser().resolve()
     cfg = load_json_config(cfg_path)
 
-    # Validate early
     if "paths" not in cfg or "processed_data_dir" not in cfg["paths"]:
         raise KeyError("cfg.paths.processed_data_dir is required")
 
@@ -309,48 +293,138 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     cfg.setdefault("dataset", {})
     cfg.setdefault("mixed_precision", {"mode": "bf16"})
 
-    # Setup work dir
+    # ----------------------- Rank/env + work_dir prepare -----------------------
     work_dir = Path(cfg.get("paths", {}).get("work_dir", GLOBAL_WORK_DIR)).expanduser().resolve()
+    overwrite = bool(cfg.get("paths", {}).get("overwrite", False))
 
-    # Setup logging first
-    setup_logging(log_file=work_dir / "train.log", level=logging.INFO)
+    # Robust rank detection across MPI stacks
+    rank_env = (
+        os.getenv("RANK")
+        or os.getenv("PMI_RANK")
+        or os.getenv("OMPI_COMM_WORLD_RANK")
+        or os.getenv("MV2_COMM_WORLD_RANK")
+        or "0"
+    )
+    try:
+        global_rank = int(rank_env)
+    except Exception:
+        global_rank = 0
+
+    if global_rank == 0:
+        # Only rank-0 mutates the work directory
+        if work_dir.exists() and overwrite:
+            print(f"[main] Deleting existing work dir: {work_dir}", flush=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        # Sentinel so other ranks can safely proceed
+        try:
+            (work_dir / ".ready").write_text("ok", encoding="utf-8")
+        except Exception:
+            pass
+    else:
+        # Wait up to ~60s for rank-0 to prepare the directory
+        for _ in range(600):
+            if work_dir.exists() and (work_dir / ".ready").exists():
+                break
+            time.sleep(0.1)
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+    # ----------------------------- Logging setup ------------------------------
+    # Rank-0 logs to file; workers log to console only (no file writes)
+    if global_rank == 0:
+        setup_logging(log_file=work_dir / "train.log", level=logging.INFO)
+    else:
+        setup_logging(level=logging.INFO)
     logger = logging.getLogger("main")
-
-    # Handle overwrite AFTER logger is ready (applies to work_dir only)
-    if work_dir.exists() and bool(cfg.get("paths", {}).get("overwrite", False)):
-        logger.warning(f"Deleting existing work dir: {work_dir}")
-        shutil.rmtree(work_dir)
-
-    work_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Work directory: {work_dir}")
 
-    # Seed and hardware setup
+    # -------------------------- Repro + device setup ---------------------------
     seed_everything(int(cfg["system"]["seed"]))
     device = setup_device()
+    if device.type == "cuda":
+        # Prefer LOCAL_RANK (OpenMPI sets OMPI_COMM_WORLD_LOCAL_RANK), else CUDA_LOCAL_RANK, else 0
+        local_rank = int(os.getenv("LOCAL_RANK",
+                           os.getenv("OMPI_COMM_WORLD_LOCAL_RANK",
+                           os.getenv("CUDA_LOCAL_RANK", "0"))))
+        torch.cuda.set_device(local_rank)
+        try:
+            dev_name = torch.cuda.get_device_name(local_rank)
+        except Exception:
+            dev_name = "unknown"
+        logger.info(f"Set CUDA device to local_rank={local_rank} ({dev_name})")
+
     optimize_hardware(cfg.get("system", {}), device, logger)
 
-    # Precision + runtime dtype resolution
+    # -------------------- Precision + runtime dtype resolve --------------------
     pl_precision, runtime_dtype = resolve_precision_and_dtype(cfg, device, logger)
     logger.info(f"Resolved Lightning precision={pl_precision}; dataset runtime dtype={runtime_dtype}")
 
-    # Preprocess if needed, then hydrate cfg from artifacts
-    processed_dir = ensure_preprocessed_data(cfg, logger)
+    # ------------------- Preprocessing (rank-0 only writes) -------------------
+    if global_rank == 0:
+        processed_dir = ensure_preprocessed_data(cfg, logger)
+        try:
+            (work_dir / ".data.ready").write_text("ok", encoding="utf-8")
+        except Exception:
+            pass
+    else:
+        # Exit immediately (no wait) if preprocessing would be required in a multi-GPU/multi-rank launch
+        processed_dir = Path(cfg.get("paths", {}).get("processed_data_dir", "data/processed")).resolve()
+        req_files = [
+            processed_dir / "normalization.json",
+            processed_dir / "preprocessing_summary.json",
+            processed_dir / "shard_index.json",
+        ]
+        have_required = all(p.exists() for p in req_files)
+        have_splits = all(
+            (processed_dir / split).exists() and any((processed_dir / split).glob("*.npz"))
+            for split in ("train", "validation", "test")
+        )
+        overwrite_data = bool(cfg.get("preprocessing", {}).get("overwrite_data", False))
+        preprocessing_needed = overwrite_data or not (have_required and have_splits)
+
+        # Compact multi-rank / multi-GPU detection
+        ws_vals = [os.getenv(k) for k in ("WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE")]
+        multi = any(v and v.isdigit() and int(v) > 1 for v in ws_vals)
+
+        cvd = (os.getenv("CUDA_VISIBLE_DEVICES") or "").strip()
+        if cvd:
+            if len([t for t in cvd.split(",") if t.strip() != ""]) > 1:
+                multi = True
+        try:
+            multi = multi or (torch.cuda.is_available() and torch.cuda.device_count() > 1)
+        except Exception:
+            pass
+
+        if preprocessing_needed and multi:
+            logger.warning( "Preprocessing is required but multiple GPUs/ranks are requested")
+            raise SystemExit(2)
+
+        # Otherwise, safe to wait for rank-0 to finish (single-GPU preprocessing)
+        for _ in range(36000):
+            if (work_dir / ".data.ready").exists():
+                break
+            time.sleep(0.1)
+        processed_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
+
     assert processed_dir.exists(), "Processed data dir must exist after preprocessing/hydration"
 
-    # Single config save after all hydration is complete
-    dump_json(work_dir / "config.json", cfg)
-    logger.info("Saved final hydrated config")
+    # Get all the config info
+    hydrate_config_from_processed(cfg, logger, processed_dir)
 
-    # Build datasets/loaders
+    if global_rank == 0:
+        dump_json(work_dir / "config.json", cfg)
+        logger.info("Saved final hydrated config")
+    else:
+        logger.info("Config hydrated (rank>0; no file write)")
+
     train_ds, val_ds, train_loader, val_loader = build_datasets_and_loaders(
         cfg=cfg, device=device, runtime_dtype=runtime_dtype, logger=logger
     )
     validate_dataloaders(train_loader=train_loader, val_loader=val_loader, logger=logger)
 
-    # Build model
+    # Build the model
     model = build_model(cfg, logger)
 
-    # Train
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -361,7 +435,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         logger=logger.getChild("trainer"),
     )
     best_val_loss = trainer.train()
-    logger.info(f"Training complete. Best val loss: {best_val_loss:.6e}")
+    if global_rank == 0:
+        logger.info(f"Training complete. Best val loss: {best_val_loss:.6e}")
+    else:
+        logger.info("Training complete (rank>0).")
 
 if __name__ == "__main__":
     main()

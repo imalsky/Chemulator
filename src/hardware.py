@@ -11,9 +11,6 @@ Configurable via cfg["system"]:
   - cudnn_benchmark: bool   cuDNN autotune (disabled if deterministic=True)
   - deterministic: bool     force deterministic algorithms (slower)
   - omp_num_threads: int    sets OMP_NUM_THREADS and (best-effort) torch CPU threads
-
-This module is the **single source of truth** for TF32/cudnn/determinism.
-Do not duplicate these toggles elsewhere (e.g., in the Trainer).
 """
 
 from __future__ import annotations
@@ -27,7 +24,6 @@ import torch
 def setup_device() -> torch.device:
     """
     Select the compute device with proper priority handling.
-    Fixed: MPS check is now reachable.
     """
     # Check CUDA first (highest priority)
     if torch.cuda.is_available():
@@ -41,12 +37,9 @@ def setup_device() -> torch.device:
     # Fallback to CPU
     return torch.device("cpu")
 
-
-
 def optimize_hardware(system_cfg: Dict, device: torch.device, logger: logging.Logger) -> None:
     """
     Apply hardware optimizations with better error handling.
-    Fixed: Important failures now logged at warning level.
     """
     tf32 = bool(system_cfg.get("tf32", True))
     deterministic = bool(system_cfg.get("deterministic", False))

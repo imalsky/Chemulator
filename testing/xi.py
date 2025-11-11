@@ -53,7 +53,7 @@ PROFILES_TO_PLOT: List[str] = [
 REPO_ROOT = Path("/Users/imalsky/Desktop/Chemulator")
 SRC_DIR = REPO_ROOT / "src"
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
-MODEL_DIR = REPO_ROOT / "models" / "4"
+MODEL_DIR = REPO_ROOT / "models" / "best"
 VULCAN_DIR = Path("/Users/imalsky/Desktop/Chemistry_Project/Vulcan/0D_full_NCHO/solar")
 OUT_DIR = MODEL_DIR / "plots"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -76,7 +76,7 @@ XMAX = 1e18
 # Species / Data Config
 # ============================================================================
 
-FEED_MIN = 1.0e-30
+FEED_MIN = 1.0e-15
 PLOT_SPECIES: List[str] = ['H2', 'H2O', 'CH4', 'CO', 'CO2', 'NH3', 'HCN', 'N2', 'C2H2', 'H', 'CH3', 'OH', 'O']
 PLOT_SPECIES: List[str] = ['H2O', 'CH4', 'CO', 'CO2', 'NH3', 'HCN', 'N2', 'C2H2']
 

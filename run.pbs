@@ -1,9 +1,10 @@
 #!/bin/bash
 # --- PBS ---
 #PBS -N gh200_train_job
-#PBS -q gpu_long
-#PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
-#PBS -l walltime=120:00:00
+#PBS -q gpu_normal
+#####PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
+#PBS -l select=8:ncpus=48:ngpus=1:mem=400gb:model=gh200
+#PBS -l walltime=10:00:00
 #PBS -W group_list=s2458
 #PBS -j oe
 # --- end PBS ---
@@ -332,11 +333,129 @@ echo "---------------------------------"
 ########################################
 # Phase B: TRAIN
 ########################################
-echo "Phase B: Training single-process…"
-##/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/tune.py
-/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/main.py
+####echo "Phase B: Training single-process…"
+####/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/tune.py
+####/usr/bin/env time -v "${RUNNER[@]}" "$PY" -u src/main.py
 
+echo "Phase B: Training with MPICH env:// (one Python per GPU per node)…"
 
-echo "#####################################################"
-echo "Job finished at $(date)"
-echo "#####################################################"
+DEBUG="${DEBUG:-0}"
+
+# Nodes / GPUs
+NNODES=$(sort -u "$PBS_NODEFILE" | wc -l)
+# Count physical GPUs only (avoid MIG); default to 1 if nvidia-smi is absent
+PPN=$(nvidia-smi -L 2>/dev/null | awk "/^GPU [0-9]+:/{c++} END{print (c?c:1)}")
+
+# Rendezvous — unique per job
+MASTER_ADDR=$(head -n1 "$PBS_NODEFILE")
+MASTER_PORT=$((10000 + (${PBS_JOBID//[!0-9]/} % 40000)))
+
+TOTAL_RANKS=$((NNODES * PPN))
+echo "Training plan:"
+echo "  NNODES       = ${NNODES}"
+echo "  PPN (GPUs)   = ${PPN}"
+echo "  TOTAL_RANKS  = ${TOTAL_RANKS}"
+echo "  MASTER       = ${MASTER_ADDR}:${MASTER_PORT}"
+echo "  PY           = ${PY:-python}"
+echo "  DEBUG        = ${DEBUG}"
+
+# Export vars that remote ranks need
+export ROOT MASTER_ADDR MASTER_PORT PPN DEBUG
+
+# ————————————————————————————————————————————————————————————————
+# Per-NODE preflight: catch arch/env mismatches before spawning all ranks
+# (e.g., GH200 aarch64 node trying to import x86_64 PyTorch)
+# ————————————————————————————————————————————————————————————————
+echo "[preflight] Per-node torch import check…"
+mpiexec -n "$NNODES" -ppn 1 -f "$PBS_NODEFILE" \
+  -genvlist ROOT,PATH,LD_LIBRARY_PATH,PYTHONPATH,CONDA_PREFIX,PY,DEBUG \
+  bash -lc '
+    set -euo pipefail
+    cd "$ROOT"
+    echo "[node $(hostname)] uname -m=$(uname -m) PY=${PY:-python}"
+
+    # Harden env so user site-packages or random $CWD don’t shadow
+    export PYTHONNOUSERSITE=1
+    export LD_LIBRARY_PATH="${CONDA_PREFIX:+${CONDA_PREFIX}/lib:}${LD_LIBRARY_PATH:-}"
+
+    # Fail fast if a stray torch/ exists under $ROOT or $ROOT/src
+    if [ -d "$ROOT/torch" ] || [ -d "$ROOT/src/torch" ]; then
+      echo "FATAL: Found a local torch/ package under $ROOT or $ROOT/src — remove/rename it."
+      exit 41
+    fi
+
+    "${PY:-python}" - << "PY"
+import sys, platform
+print("  python:", sys.executable)
+print("  arch:", platform.machine())
+try:
+    import torch
+    print("  torch.__file__:", getattr(torch, "__file__", None))
+    # This raises if C extensions can’t load
+    import torch._C
+    print("  torch._C: OK")
+    import os
+    cuda_ver = getattr(getattr(torch, "version", None), "cuda", None)
+    print("  torch.version:", torch.__version__, "cuda:", cuda_ver)
+    print("  CUDA available:", torch.cuda.is_available())
+except Exception as e:
+    print("  FATAL: torch import failed:", repr(e))
+    sys.exit(42)
+PY
+  '
+PRE_OK=$?
+if [ $PRE_OK -ne 0 ]; then
+  echo "[preflight] FAILED on one or more nodes."
+  echo "Likely causes: (1) architecture mismatch (e.g., GH200 aarch64 node with x86_64 PyTorch wheel),"
+  echo "               (2) stray 'torch/' directory shadowing site-packages, or"
+  echo "               (3) missing conda libs on LD_LIBRARY_PATH."
+  echo "Fix: use an aarch64-compatible PyTorch on GH200, or target x86_64 GPU nodes, and ensure no local 'torch/'."
+  exit 42
+fi
+echo "[preflight] All nodes: torch import OK."
+
+# ————————————————————————————————————————————————————————————————
+# Multi-rank launch
+# ————————————————————————————————————————————————————————————————
+mpiexec -n "$TOTAL_RANKS" -ppn "$PPN" -f "$PBS_NODEFILE" \
+  -genvlist ROOT,MASTER_ADDR,MASTER_PORT,PPN,DEBUG,PATH,LD_LIBRARY_PATH,PYTHONPATH,CONDA_PREFIX,PY \
+  bash -lc '
+    set -euo pipefail
+    [ "${DEBUG:-0}" = "1" ] && set -x
+    cd "$ROOT"
+
+    # Map MPICH (Hydra) env to torch.distributed env://
+    export RANK="${PMI_RANK}"
+    export WORLD_SIZE="${PMI_SIZE}"
+    export LOCAL_RANK="${PMI_LOCAL_RANK:-0}"
+
+    # Pin each local process to its GPU (modulo PPN)
+    export CUDA_VISIBLE_DEVICES="$(( LOCAL_RANK % (PPN>0?PPN:1) ))"
+
+    # Harden Python import environment
+    export PYTHONNOUSERSITE=1
+    export LD_LIBRARY_PATH="${CONDA_PREFIX:+${CONDA_PREFIX}/lib:}${LD_LIBRARY_PATH:-}"
+
+    echo "[rank ${RANK}/${WORLD_SIZE}] host=$(hostname) local_rank=${LOCAL_RANK} cuda_dev=${CUDA_VISIBLE_DEVICES} master=${MASTER_ADDR}:${MASTER_PORT}"
+
+    # Per-rank quick torch check (prints wheel path + device count)
+    "${PY:-python}" - << "PY"
+import sys
+print("  python:", sys.executable)
+try:
+    import torch, torch._C
+    print("  torch:", getattr(torch, "__file__", None))
+    print("  devices:", torch.cuda.device_count(), "cuda_available:", torch.cuda.is_available())
+except Exception as e:
+    print("  FATAL: torch._C import failed:", repr(e))
+    sys.exit(43)
+PY
+
+    # Optional NCCL debug knobs
+    # export TORCH_DISTRIBUTED_DEBUG=DETAIL
+    # export NCCL_DEBUG=INFO
+    # export NCCL_SOCKET_IFNAME=^lo,docker0
+    # export NCCL_IB_DISABLE=1
+
+    exec "${PY:-python}" -u src/main.py
+  '

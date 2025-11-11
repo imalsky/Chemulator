@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
 Flow-map Autoencoder Model (efficiency-tuned, architecture preserved)
-
-- In-place activations where safe
-- Single-instantiated LogSoftmax for simplex head
-- Gentle output init on residual branches
-- Fully vectorized over K for dt inputs
 """
 
 from __future__ import annotations
@@ -15,10 +10,6 @@ from typing import Sequence, Optional, Tuple, Dict, Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-
-# ------------------------------ Activations ----------------------------------
 
 ACTIVATION_ALIASES = {
     "leakyrelu": "LeakyReLU",
@@ -63,14 +54,10 @@ def _fresh_activation(template: nn.Module) -> nn.Module:
         return nn.SiLU(inplace=True)
     if c == "elu":
         return nn.ELU(inplace=True)
-    return template.__class__()  # GELU/Tanh/etc.
-
-
-# --------------------------------- MLP ---------------------------------------
-
+    return template.__class__()
 
 class MLP(nn.Module):
-    """Multi-layer perceptron (supports broadcasting on leading dims)."""
+    """Multi-layer perceptron"""
 
     def __init__(
         self,
@@ -96,13 +83,8 @@ class MLP(nn.Module):
         # nn.Linear supports arbitrary leading dims; no reshape needed.
         return self.network(x)
 
-
-# ---------------------------- Encoder Network --------------------------------
-
-
 class Encoder(nn.Module):
     """Encoder: [y_i, g] -> z (supports VAE)."""
-
     def __init__(
         self,
         state_dim: int,
@@ -147,10 +129,6 @@ class Encoder(nn.Module):
         z = mu + eps * std
         kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
         return z, kl
-
-
-# ------------------------- Latent Dynamics Network ---------------------------
-
 
 class LatentDynamics(nn.Module):
     """Latent dynamics: (z_i, dt, g) -> z_j (vectorized over K)."""
@@ -204,10 +182,6 @@ class LatentDynamics(nn.Module):
         dz = self.network(x)  # [B,K,Z]
         return (z_exp + dz) if self.residual else dz
 
-
-# ---------------------------- Decoder Network --------------------------------
-
-
 class Decoder(nn.Module):
     """Decoder: z -> y (broadcast over K)."""
 
@@ -233,10 +207,6 @@ class Decoder(nn.Module):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         # Accepts [B,K,Z] (or [B,Z]); nn.Linear handles leading dims.
         return self.network(z)
-
-
-# -------------------------- Main Autoencoder Model ---------------------------
-
 
 class FlowMapAutoencoder(nn.Module):
     """
@@ -265,13 +235,11 @@ class FlowMapAutoencoder(nn.Module):
         dropout: float = 0.0,
         vae_mode: bool = False,
         dynamics_residual: bool = True,
-        # pipeline compatibility
         predict_delta: bool = True,
         predict_delta_log_phys: bool = False,
         target_idx: Optional[torch.Tensor] = None,
         target_log_mean: Optional[Sequence[float]] = None,
         target_log_std: Optional[Sequence[float]] = None,
-        # simplex head
         softmax_head: bool = False,
         allow_partial_simplex: bool = False,
     ):
@@ -314,9 +282,9 @@ class FlowMapAutoencoder(nn.Module):
             self.register_buffer("ln10", torch.tensor(math.log(10.0), dtype=torch.float32), persistent=True)
             self._logsoftmax = nn.LogSoftmax(dim=-1) if self.softmax_head else None
         else:
-            self.log_mean = None  # type: ignore[assignment]
-            self.log_std = None   # type: ignore[assignment]
-            self.ln10 = None      # type: ignore[assignment]
+            self.log_mean = None
+            self.log_std = None
+            self.ln10 = None
             self._logsoftmax = None
 
         # Activation
@@ -351,7 +319,7 @@ class FlowMapAutoencoder(nn.Module):
         # Gentle decoder init for residual heads
         if self.predict_delta or self.predict_delta_log_phys:
             with torch.no_grad():
-                lin_out: nn.Linear = self.decoder.network.network[-1]  # type: ignore[assignment]
+                lin_out: nn.Linear = self.decoder.network.network[-1]
                 nn.init.zeros_(lin_out.bias)
                 lin_out.weight.mul_(0.1)
 
@@ -428,13 +396,9 @@ class FlowMapAutoencoder(nn.Module):
             i = int((m_sd - l_sd).abs().argmax())
             raise ValueError(f"log_std mismatch at {i}")
 
-
-# ------------------------------ Factory --------------------------------------
-
 def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = None) -> FlowMapAutoencoder:
     """
     Build FlowMapAutoencoder from config.
-    Accepts an optional logger to match main.py's call site; behavior is unchanged otherwise.
     """
     import json
     from pathlib import Path

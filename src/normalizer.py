@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Normalization Module
-=====================
-Centralized normalization.
-Key focus: Consistent dt normalization to [0,1] using log-min-max.
+normalizer.py
 """
 
 from __future__ import annotations
@@ -18,7 +15,6 @@ R_TOLERANCE = 1e-6
 class NormalizationHelper:
     """
     Manages normalization using preprocessed statistics.
-    All dt values normalized to [0,1] using log-min-max transform.
     """
 
     def __init__(
@@ -36,7 +32,7 @@ class NormalizationHelper:
               - dt: {'log_min': float, 'log_max': float} for Δt log10 bounds
               - epsilon: small positive floor used for log transforms (default 1e-30)
               - min_std: minimum std clamp for 'standard' normalization (default 1e-10)
-            device: Optional torch.device for any tensors created internally (not required)
+            device: Optional torch.device for any tensors created internally
         """
         self.manifest = manifest or {}
         self.device = device
@@ -49,23 +45,17 @@ class NormalizationHelper:
         self.epsilon = float(self.manifest.get("epsilon", 1e-30))
         self.min_std = float(self.manifest.get("min_std", 1e-10))
 
-        # Δt (physical seconds) normalization spec is REQUIRED
+        # Δt
         self.dt_spec = self.manifest.get("dt", None)
         if self.dt_spec is None:
-            raise ValueError(
-                "dt normalization spec missing from manifest. "
-                "Re-run preprocessing to generate normalization.json with a 'dt' block "
-                "containing {'log_min': ..., 'log_max': ...}."
-            )
+            raise ValueError("dt normalization spec missing")
 
         # Validate dt-spec and derive physical bounds used by the dataset
         try:
             log_min = float(self.dt_spec["log_min"])
             log_max = float(self.dt_spec["log_max"])
         except Exception as e:
-            raise ValueError(
-                "Malformed dt spec; expected {'log_min': <float>, 'log_max': <float>}."
-            ) from e
+            raise ValueError("Bad dt spec; expected {'log_min': <float>, 'log_max': <float>}.") from e
 
         # Derived physical Δt bounds (seconds). Clamp lower bound by epsilon to stay > 0 for logs.
         self.dt_min_phys: float = max(10.0 ** log_min, float(self.epsilon))
@@ -78,13 +68,6 @@ class NormalizationHelper:
     ) -> torch.Tensor:
         """
         Normalize data using per-variable methods.
-
-        Args:
-            x: Input tensor of shape [..., len(keys)]
-            keys: Variable names for each column
-
-        Returns:
-            Normalized tensor with same shape as input
         """
         if x.ndim == 1:
             # Handle 1D input as single column
@@ -101,13 +84,6 @@ class NormalizationHelper:
     ) -> torch.Tensor:
         """
         Inverse normalization operation.
-
-        Args:
-            x: Normalized tensor of shape [..., len(keys)]
-            keys: Variable names for each column
-
-        Returns:
-            Denormalized tensor with same shape as input
         """
         if x.ndim == 1:
             if len(keys) != 1:
@@ -119,7 +95,6 @@ class NormalizationHelper:
     def normalize_dt_from_phys(self, dt_phys: torch.Tensor) -> torch.Tensor:
         """
         Normalize physical Δt (seconds) to [0,1] using log10 + min-max from the dt-spec.
-        Emits a warning for values outside the (toleranced) training range, then clamps.
         """
         if not torch.is_floating_point(dt_phys):
             dt_phys = dt_phys.float()
@@ -129,7 +104,6 @@ class NormalizationHelper:
         log_max = float(self.dt_spec["log_max"])
         range_log = max(log_max - log_min, MIN_RANGE_EPSILON)
 
-        # --- use helper's physical bounds so this matches dataset fill (1-line change) ---
         phys_min, phys_max = self.dt_min_phys, self.dt_max_phys
 
         # Tolerate tiny round-off near bounds
@@ -167,13 +141,6 @@ class NormalizationHelper:
     ) -> torch.Tensor:
         """
         Convert normalized dt back to physical units.
-        Inverse of normalize_dt_from_phys.
-
-        Args:
-            dt_norm: Normalized dt in [0,1]
-
-        Returns:
-            Physical time differences
         """
         log_min = float(self.dt_spec["log_min"])
         log_max = float(self.dt_spec["log_max"])

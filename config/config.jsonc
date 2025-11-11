@@ -5,9 +5,9 @@
     // List of raw HDF5 files (optional; auto-detect if empty)
     "raw_data_files": [],
     // Directory for logs/checkpoints/exports
-    "work_dir": "models/v1",
+    "work_dir": "models/best",
     // Delete existing work_dir before start
-    "overwrite": true
+    "overwrite": false
   },
 
   "system": {
@@ -88,7 +88,7 @@
     // Return K targets per anchor (K=times_per_anchor)
     "multi_time_per_anchor": true,
     // K: number of target steps per anchor when multi_time_per_anchor
-    "times_per_anchor": 64,
+    "times_per_anchor": 80,
     // Use same offsets for entire batch
     "share_times_across_batch": false,
     // Sample offsets uniformly then fit anchors
@@ -112,15 +112,15 @@
 
   "model": {
     // Latent channel count for autoencoder
-    "latent_dim": 256,
+    "latent_dim": 1024,
     // Encoder MLP hidden sizes
-    "encoder_hidden": [1024, 1024, 1024],
+    "encoder_hidden": [1536, 1536],
     // Dynamics MLP hidden sizes
-    "dynamics_hidden": [1024, 1024, 1024],
+    "dynamics_hidden": [1536, 1536],
     // Decoder MLP hidden sizes
-    "decoder_hidden": [1024, 1024, 1024],
+    "decoder_hidden": [1536, 1536],
     // Nonlinearity for MLPs
-    "activation": "elu",
+    "activation": "silu",
     // Dropout rate in MLPs
     "dropout": 0.0,
     // Use VAE encoder with KL term
@@ -139,7 +139,7 @@
 
   "training": {
     // Total epochs to train
-    "epochs": 100,
+    "epochs": 200,
     // Clip grad-norm at this value (0 = disabled)
     "gradient_clip": 0.0,
     // Gradient accumulation steps
@@ -153,7 +153,7 @@
     // Linear warmup epochs before cosine
     "warmup_epochs": 10,
     // Weight decay for AdamW
-    "weight_decay": 3e-5,
+    "weight_decay": 1e-5,
     // Weight on KL divergence (if VAE encoder)
     "beta_kl": 0.0015,
     // Limit training steps per epoch (0 = no limit)
@@ -176,7 +176,7 @@
     // Maximum j−i offset for targets (null = T-1)
     "max_steps": 99,
     // Anchors per trajectory per epoch
-    "pairs_per_traj": 4,
+    "pairs_per_traj": 8,
 
     "adaptive_stiff_loss": {
       // Weight for physical-space term
@@ -184,11 +184,8 @@
       // Weight for z-space term
       "lambda_z": 0.5,
       // Fractional loss denominator floor
-      "epsilon_phys": 1e-30,
-      // Use fractional MAE in physical space
-      "use_fractional": false,
-      // Upweight near-edge times within [0,1]
-      "time_edge_gain": 1.0
+      "epsilon_phys": 1e-20
     }
   }
 }
+
