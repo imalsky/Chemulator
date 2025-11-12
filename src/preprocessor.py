@@ -6,10 +6,10 @@ Parallel preprocessing pipeline for converting raw HDF5 trajectory data into
 training-ready sharded NPZ files. Uses MPI for efficient distributed scanning
 and processing of large trajectory databases.
 
-Key Features:
+Features:
 - MPI-based parallel file scanning and statistics computation
 - Profile-level quality filtering (drops entire trajectories below thresholds)
-- Normalization statistics with Welford's algorithm (numerically stable)
+- Normalization statistics
 - Time grid validation and uniformity detection
 - Deterministic train/val/test splitting with configurable ratios
 - Sharded NPZ output for efficient batch loading during training
@@ -21,12 +21,6 @@ Quality Control:
 - Time grid validation: Ensures monotonic, consistent time grids per file
 - NaN filtering: Removes trajectories with missing or invalid data
 - Dimension consistency: Validates all species variables are present
-
-Performance:
-- MPI scales linearly with number of processes (tested up to 100+ nodes)
-- Memory-efficient chunked HDF5 reading for large datasets
-- Parallel statistics accumulation with minimal communication overhead
-- Progress tracking with estimated time to completion
 
 Output: Sharded NPZ files organized by split (train/val/test) with metadata
 including normalization statistics, dt ranges, and data quality reports.
@@ -40,14 +34,18 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+import math
+import hashlib
+from pathlib import Path
+import logging
 import numpy as np
 
 try:
     import h5py
-except ImportError:
-    h5py = None
+except Exception as e:
+    raise RuntimeError("h5py is required but not available") from e
 
 try:
     from mpi4py import MPI
@@ -63,7 +61,6 @@ from preprocessor_utils import (
     get_normalization_flags
 )
 
-
 def scan_hdf5_file_worker(
         path_str: str,
         species_vars: list,
@@ -71,12 +68,10 @@ def scan_hdf5_file_worker(
         time_key: str,
         min_value_threshold: float,
         chunk_size: int,
-        # Optional scan controls
         scan_fraction_per_file: float | None = None,
         scan_max_groups: int | None = None,
         seed: int = 0,
         return_modal_time: bool = True,
-        # Conflict logging controls
         log_conflicting_times: bool = True,
         max_conflict_examples: int = 3,
         logger_name: str = "main.pre",
@@ -88,16 +83,6 @@ def scan_hdf5_file_worker(
       time_candidate: np.ndarray | None (modal grid if mixed)
       progress_stats: dict
     """
-    import math
-    import hashlib
-    from pathlib import Path
-    import logging
-    import numpy as np
-    try:
-        import h5py  # type: ignore
-    except Exception as e:
-        raise RuntimeError("h5py is required but not available") from e
-
     logger = logging.getLogger(logger_name)
 
     def _hash_rank(s: str, seed_val: int) -> float:
@@ -136,14 +121,13 @@ def scan_hdf5_file_worker(
         "groups_missing_time": 0,
         "groups_nonpositive_dt": 0,
         "groups_below_min_value": 0,
-        "groups_nan_time": 0,            # NEW: counts any non-finite time vectors
+        "groups_nan_time": 0,
         "min_forward_dt": None,
-        # Mixed-grid diagnostics:
         "time_grids_detected": 0,
         "time_grid_modal_count": 0,
         "time_conflicts_logged": 0,
-        "examples_nonpositive": [],      # [(group, j, t[j], t[j+1]), ...]
-        "examples_nan_time": [],         # NEW: up to 5 group names with NaN time
+        "examples_nonpositive": [],
+        "examples_nan_time": [],
     }
     progress_stats: dict = {"total_groups": 0, "groups_processed": 0}
 
@@ -179,7 +163,7 @@ def scan_hdf5_file_worker(
             # Load time vector as float64
             time_data = np.array(grp[time_key][...], dtype=np.float64).reshape(-1)
 
-            # NEW: reject any non-finite times outright
+            # Reject any non-finite times outright
             if not np.all(np.isfinite(time_data)):
                 file_report["groups_nan_time"] += 1
                 if len(file_report["examples_nan_time"]) < 5:
@@ -206,7 +190,7 @@ def scan_hdf5_file_worker(
                     )
                 continue
 
-            # Optional: below-min-value screening across species
+            # Below-min-value screening across species
             below_min = False
             if min_value_threshold > 0:
                 for key in species_vars:
@@ -239,7 +223,7 @@ def scan_hdf5_file_worker(
         file_report["min_forward_dt"] = (None if global_min_forward == float("inf") else float(global_min_forward))
         file_report["groups_valid"] = len(valid_groups)
 
-        # ----- Canonical / conflicting time grids handling & logging -----
+        # Conflicting time grids handling & logging -----
         time_candidate = None
         if len(time_vectors) > 0:
             # Bucket by exact equality (hash of raw bytes)
@@ -305,7 +289,7 @@ def scan_hdf5_file_worker(
         if file_report["groups_nan_time"] > 0:
             samples = "; ".join(file_report["examples_nan_time"])
             logger.warning(
-                f"[time-grid sanitize] Dropped {file_report['groups_nan_time']} group(s) with non-finite time in {path.name}. "
+                f"Dropped {file_report['groups_nan_time']} with non-finite time in {path.name}. "
                 f"Examples: {samples}"
             )
 
@@ -317,7 +301,6 @@ def scan_hdf5_file_worker(
 class DataPreprocessor:
     """
     Main preprocessing pipeline for converting HDF5 to NPZ shards.
-    Uses MPI for parallel processing on HPC systems.
     """
 
     def __init__(
@@ -327,10 +310,6 @@ class DataPreprocessor:
     ):
         """
         Initialize preprocessor.
-
-        Args:
-            config: Configuration dictionary
-            logger: Logger instance
         """
         self.cfg = config
         self.logger = logger or logging.getLogger("preprocessor")
@@ -428,27 +407,19 @@ class DataPreprocessor:
             preproc_cfg, ["npz_compressed"], required=True
         ))
 
-        # CHANGED: Default to 4096 trajectories per shard for much fewer files
-        self.traj_per_shard = int(load_config_value(
-            preproc_cfg, ["trajectories_per_shard"], default=4096
-        ))
+        # Default to 4096 trajectories per shard for much fewer files
+        self.traj_per_shard = int(load_config_value(preproc_cfg, ["trajectories_per_shard"], default=4096))
 
         self.hdf5_chunk_size = int(load_config_value(
             preproc_cfg, ["hdf5_chunk_size"], default=DEFAULT_HDF5_CHUNK_SIZE
         ))
-        self.min_value_threshold = float(load_config_value(
-            preproc_cfg, ["min_value_threshold"], required=True
-        ))
+        self.min_value_threshold = float(load_config_value(preproc_cfg, ["min_value_threshold"], required=True))
 
-        # NEW: Skip first timestep option
-        self.skip_first_timestep = bool(load_config_value(
-            preproc_cfg, ["skip_first_timestep"], default=False
-        ))
+        # Skip first timestep option
+        self.skip_first_timestep = bool(load_config_value(preproc_cfg, ["skip_first_timestep"], default=False))
 
         # Worker configuration - use exactly what's in config (no ProcessPool; MPI or serial only)
-        requested_workers = int(load_config_value(
-            preproc_cfg, ["num_workers"], default=0
-        ))
+        requested_workers = int(load_config_value(preproc_cfg, ["num_workers"], default=0))
 
         if self.comm and self.size > 1:
             # In MPI mode, num_workers is ignored; use all MPI ranks
@@ -484,8 +455,6 @@ class DataPreprocessor:
     def _auto_detect_species_variables(self) -> List[str]:
         """
         Auto-detect species variables from the first HDF5 file.
-        Species are identified as datasets (not attributes) that are arrays.
-        Excludes the time variable and any global variables.
         """
         if not self.raw_files:
             raise ValueError("No raw data files to detect species from")
@@ -542,7 +511,7 @@ class DataPreprocessor:
         if self.rank != 0:
             return
 
-        # Raw files: allow auto-detect upstream; but if still empty, fail.
+        # Raw files: allow autodetect upstream; but if still empty, fail.
         if len(self.raw_files) == 0:
             raise ValueError("No raw data files specified")
 
@@ -667,7 +636,7 @@ class DataPreprocessor:
         else:
             self._scan_files_serial(time_candidates)
 
-        # NEW: gather time candidates to root so rank 0 always validates a global list
+        # Gather time candidates to root so rank 0 always validates a global list
         if self.comm:
             gathered = self.comm.gather(time_candidates, root=0)
             if self.rank == 0:
@@ -702,7 +671,7 @@ class DataPreprocessor:
             )
             local_results.append(result)
 
-        # IMPORTANT: each rank contributes its own time candidates locally.
+        # Each rank contributes its own time candidates locally.
         for _, _, time_candidate, _ in local_results:
             if time_candidate is not None:
                 time_candidates.append(time_candidate)
@@ -734,9 +703,7 @@ class DataPreprocessor:
                     self._valid_group_names[file_report["file"]] = valid_groups
 
                     # Clean logging against the new keys
-                    self.logger.info(
-                        f"File {Path(file_report['file']).name}: {n_valid} valid / {n_total} total"
-                    )
+                    self.logger.info(f"File {Path(file_report['file']).name}: {n_valid} valid / {n_total} total")
 
         # Broadcast results to all ranks
         self._drop_report = self.comm.bcast(self._drop_report, root=0)
@@ -770,7 +737,6 @@ class DataPreprocessor:
             overall["n_valid"] += n_valid
             overall["n_dropped"] += n_dropped
             overall["n_below_threshold"] += n_below
-            # overall["n_nan"] is accumulated later during NaN screening
 
             # Keep a consistent key (absolute path string)
             self._valid_group_names[file_report["file"]] = valid_groups
@@ -841,16 +807,6 @@ class DataPreprocessor:
     def _compute_dt_specification(self, time_grid: np.ndarray) -> Dict[str, float]:
         """
         Compute centralized dt normalization specification from a canonical time grid.
-
-        Returns:
-            {
-              "method": "log-min-max",
-              "log_min": float,
-              "log_max": float,
-              # extra audit fields:
-              "k1_min": float,
-              "k1_max": float,
-            }
         """
         import logging
         log = self.logger or logging.getLogger("preprocessor")
@@ -863,13 +819,11 @@ class DataPreprocessor:
         if not ALLOW_EQUAL_TIMEPOINTS:
             if np.any(diffs1 <= 0.0):
                 j = int(np.where(diffs1 <= 0.0)[0][0])
-                raise ValueError(f"Nonpositive forward step in canonical grid at j={j} "
-                                 f"(t[j], t[j+1])=({t[j]}, {t[j + 1]})")
+                raise ValueError(f"Nonpositive forward step in canonical grid at j={j}")
         else:
             if np.any(diffs1 < -float(TIME_DECREASE_TOLERANCE)):
                 j = int(np.where(diffs1 < -float(TIME_DECREASE_TOLERANCE))[0][0])
-                raise ValueError(f"Decreasing time step beyond tolerance at j={j} "
-                                 f"(t[j], t[j+1])=({t[j]}, {t[j + 1]})")
+                raise ValueError(f"Decreasing time step beyond tolerance at j={j}")
 
         # k=1 diagnostics
         k1_min = float(diffs1.min())
@@ -888,7 +842,6 @@ class DataPreprocessor:
 
         for k in range(k_min, k_max + 1):
             dtk = t[k:] - t[:-k]  # [T-k]
-            # Strictly positive by earlier checks; still guard with epsilon
             dtk_min = float(np.min(dtk))
             dtk_max = float(np.max(dtk))
             dt_min_all = min(dt_min_all, dtk_min)
@@ -914,11 +867,8 @@ class DataPreprocessor:
     def _write_shards_and_collect_stats_parallel(self) -> Dict[str, RunningStatistics]:
         """
         Write NPZ shards with global buffers across files to create fewer shards.
-
-        Returns:
-            Dictionary of statistics for each variable (aggregated across all ranks)
         """
-        seed = self.seed  # Use the seed from config for deterministic hashing
+        seed = self.seed
 
         # Initialize statistics accumulators for training data only
         all_keys = list(dict.fromkeys(self.species_vars + self.global_vars + [self.time_key]))
@@ -966,7 +916,7 @@ class DataPreprocessor:
         for path_str in self.raw_files:
             valid_groups = self._valid_group_names.get(str(path_str), [])
             if valid_groups:
-                # CHANGED: Don't chunk within files - process all groups at once
+                # Don't chunk within files - process all groups at once
                 work_items.append((path_str, valid_groups))
 
         # Distribute work items across ranks
@@ -1115,8 +1065,6 @@ class DataPreprocessor:
     ) -> None:
         """
         Add a file's trajectories to global buffers.
-
-        This replaces the old _process_chunk_to_shards method.
         """
         # Deterministic shuffling using deterministic_hash for reproducibility
         file_hash_seed = int(deterministic_hash(path.name, seed) * 2 ** 32)
@@ -1156,7 +1104,8 @@ class DataPreprocessor:
                 # Load species matrix with full original length
                 species_matrix_full = self._read_species_matrix(group, T_full)
 
-                # NOW skip first timestep if requested
+                # Skip first timestep if requested
+                # Probably don't do this
                 if self.skip_first_timestep:
                     time_data = time_data_full[1:]
                     species_matrix = species_matrix_full[1:, :]
@@ -1168,7 +1117,7 @@ class DataPreprocessor:
 
                 # Validate after skipping
                 if T < 2:
-                    continue  # Need at least 2 timesteps after skipping
+                    continue
 
                 if not np.isfinite(species_matrix).all():
                     continue
@@ -1208,12 +1157,6 @@ class DataPreprocessor:
     def _merge_statistics(self, all_stats: List[Dict[str, RunningStatistics]]) -> Dict[str, RunningStatistics]:
         """
         Merge statistics from multiple ranks using Welford's algorithm.
-
-        Args:
-            all_stats: List of statistics dictionaries from each rank
-
-        Returns:
-            Merged statistics dictionary
         """
         if not all_stats:
             return {}

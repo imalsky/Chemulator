@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 Utility Functions Module
-========================
-Core utilities for logging, configuration, seeding, and JSON/JSONC I/O.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ import numpy as np
 try:
     import torch
 except ImportError:
-    torch = None  # type: ignore[assignment]
+    torch = None
 
 # Module-level state for logging configuration
 _logging_configured = False
@@ -32,12 +30,6 @@ def setup_logging(
 ) -> None:
     """
     Configure root logger with console and optional file output.
-
-    Ensures idempotent behavior - multiple calls won't duplicate handlers.
-
-    Args:
-        log_file: Optional path for log file output
-        level: Logging level (default: INFO)
     """
     global _logging_configured
     root_logger = logging.getLogger()
@@ -77,13 +69,7 @@ def setup_logging(
 
 def seed_everything(seed: int = 42) -> None:
     """
-    Set random seeds for reproducible experiments.
-
-    Seeds Python's random, NumPy, and PyTorch (if available).
-    Note: Does not enforce deterministic algorithms - see hardware.optimize_hardware().
-
-    Args:
-        seed: Random seed value
+    Set random seeds
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -108,15 +94,6 @@ def seed_everything(seed: int = 42) -> None:
 def strip_jsonc_comments(text: str) -> str:
     """
     Remove comments from JSONC (JSON with Comments).
-
-    Handles both block comments (/* ... */) and line comments (// ...).
-    Preserves quoted strings and escape sequences.
-
-    Args:
-        text: JSONC text with comments
-
-    Returns:
-        JSON text with comments removed
     """
     # Remove block comments first
     block_comment_pattern = re.compile(r"/\*.*?\*/", re.DOTALL)
@@ -168,20 +145,6 @@ def strip_jsonc_comments(text: str) -> str:
 def load_json_config(path: Union[str, os.PathLike]) -> dict:
     """
     Load JSON or JSONC configuration file.
-
-    Attempts loading in order of efficiency:
-    1. Standard JSON (fastest)
-    2. JSON5 library if available (best JSONC support)
-    3. Regex-based comment stripping (fallback)
-
-    Args:
-        path: Path to JSON/JSONC file
-
-    Returns:
-        Parsed configuration dictionary
-
-    Raises:
-        ValueError: If file cannot be parsed
     """
     file_path = Path(path)
 
@@ -211,18 +174,7 @@ def load_json_config(path: Union[str, os.PathLike]) -> dict:
 
 def dump_json(path: Union[str, os.PathLike], obj: Any, indent: int = 2) -> None:
     """
-    Atomically write JSON with consistent formatting.
-
-    Features:
-    - Atomic writes via temp file + rename
-    - Sorted keys for diff-friendly output
-    - UTF-8 encoding with Unix line endings
-    - Automatic directory creation
-
-    Args:
-        path: Output file path
-        obj: Object to serialize
-        indent: Indentation level (default: 2 spaces)
+    Write JSON with consistent formatting.
     """
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,15 +193,13 @@ def dump_json(path: Union[str, os.PathLike], obj: Any, indent: int = 2) -> None:
     try:
         with open(temp_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(json_text)
-            f.write("\n")  # Ensure trailing newline
+            f.write("\n")
             f.flush()
-            os.fsync(f.fileno())  # Force write to disk
+            os.fsync(f.fileno())
 
-        # Atomic rename (on POSIX systems)
         temp_path.replace(file_path)
 
     except Exception:
-        # Clean up temp file on error
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
         raise
@@ -258,17 +208,6 @@ def dump_json(path: Union[str, os.PathLike], obj: Any, indent: int = 2) -> None:
 def _map_storage_dtype(name: Optional[str]) -> Optional['torch.dtype']:
     """
     Map dtype string to PyTorch dtype.
-
-    Supported formats:
-    - bfloat16: "bf16", "bfloat16"
-    - float16: "fp16", "float16", "half", "16"
-    - float32: "fp32", "float32", "32"
-
-    Args:
-        name: Dtype string or None
-
-    Returns:
-        Corresponding torch.dtype or None if unknown
     """
     if torch is None or not name:
         return None
@@ -298,12 +237,7 @@ def resolve_precision_and_dtype(
 ) -> Tuple[Union[str, int], 'torch.dtype']:
     """
     Resolve Lightning precision and runtime dtype from configuration.
-
-    Returns:
-        pl_precision: Lightning precision spec (e.g., "bf16-mixed", "16-mixed", or 32)
-        runtime_dtype: torch.dtype to use for dataset/tensors (e.g., torch.bfloat16)
     """
-    # --- Read user intent (very forgiving to key names) -----------------------
     mp_cfg = cfg.get("mixed_precision", {}) or {}
     mode = (
         mp_cfg.get("mode")
@@ -313,7 +247,6 @@ def resolve_precision_and_dtype(
     )
     mode = str(mode).lower().strip()
 
-    # --- Map to Lightning precision + AMP dtype -------------------------------
     # Lightning precision field and corresponding "AMP dtype" used for runtime dtype
     if mode in {"bf16", "bfloat16", "bf16-mixed", "bfloat16-mixed"}:
         pl_precision = "bf16-mixed"
@@ -329,11 +262,9 @@ def resolve_precision_and_dtype(
         pl_precision = "bf16-mixed"
         amp_dtype = torch.bfloat16
 
-    # --- Dataset/runtime dtype override via config ----------------------------
     dataset_dtype_str = cfg.get("dataset", {}).get("storage_dtype")
     runtime_dtype = _map_storage_dtype(dataset_dtype_str) or amp_dtype
 
-    # --- Hard safety overrides by device -------------------------------------
     dev_type = getattr(device, "type", str(device))
 
     # Force FP32 on CPU

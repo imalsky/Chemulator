@@ -377,25 +377,6 @@ class FlowMapAutoencoder(nn.Module):
 
         return y_pred
 
-    @torch.no_grad()
-    def check_stat_consistency(self, loss_log_mean: torch.Tensor, loss_log_std: torch.Tensor) -> None:
-        """Verify model vs loss normalization stats (when relevant)."""
-        if not (self.softmax_head or self.predict_delta_log_phys):
-            return
-        if self.log_mean is None or self.log_std is None:
-            raise RuntimeError("Model requires stats but buffers missing")
-        m_mu = self.log_mean.detach().cpu().reshape(-1)
-        m_sd = self.log_std.detach().cpu().reshape(-1)
-        l_mu = loss_log_mean.detach().cpu().reshape(-1)
-        l_sd = loss_log_std.detach().cpu().reshape(-1)
-        rtol, atol = 1e-6, 1e-9
-        if not torch.allclose(m_mu, l_mu, rtol=rtol, atol=atol):
-            i = int((m_mu - l_mu).abs().argmax())
-            raise ValueError(f"log_mean mismatch at {i}")
-        if not torch.allclose(m_sd, l_sd, rtol=rtol, atol=atol):
-            i = int((m_sd - l_sd).abs().argmax())
-            raise ValueError(f"log_std mismatch at {i}")
-
 def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = None) -> FlowMapAutoencoder:
     """
     Build FlowMapAutoencoder from config.

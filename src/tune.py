@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 """
-tune.py — Optuna hyperparameter search (GPU-efficient, early-gated, with per-epoch prints)
-
-Key features:
-- Early prune vs global best
-- Per-epoch console output restored + “best-so-far” print at every epoch.
-- Clean per-trial work dirs; guarded best-config saver.
-- GPU throughput defaults: preload_to_gpu, pin=False, bf16-mixed.
-- Suppress noisy warnings without breaking Lightning’s epoch table.
-
-All configuration is in the GLOBALS section below; no argparse.
-Comment out any `trial.suggest_*` line to freeze that hyperparameter.
+tune.py — Optuna hyperparameter search
 """
 
 from __future__ import annotations
@@ -43,13 +33,12 @@ import os, warnings, logging, csv, shutil, json, threading, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# ---- quiet common sources *before* heavy imports (NO early torch import)
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"        # silence TF/XLA if present
 os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"     # suppress C++/c10 INFO/WARN
 os.environ["NCCL_DEBUG"] = "WARN"               # avoid NCCL info spam
-# Critical: forcibly neutralize any cluster-set TORCH_LOGS that breaks torch._logging
+
 os.environ.pop("TORCH_LOGS", None)
 os.environ.pop("TORCH_LOGS_REGEX", None)   # harmless if absent
 import optuna
@@ -189,6 +178,7 @@ def _find_metrics_csv(root: Path) -> Optional[Path]:
     for p in candidates:
         if p.exists():
             return p
+
     # fall back: first found in subtree
     for p in root.rglob("metrics.csv"):
         return p
@@ -218,8 +208,6 @@ def _read_val_at_epoch(metrics_csv: Path, epoch_index_zero_based: int) -> Option
                             pass
     return last_match
 
-
-# ---------- Live per-epoch printer (tail metrics.csv in a thread) -------------
 class _EpochTailer:
     def __init__(self, run_dir: Path, tag: str):
         self.run_dir = Path(run_dir)
@@ -311,7 +299,6 @@ def _train_once(
     # Hardware + precision
     seed_everything(int(cfg.get("system", {}).get("seed", BASE_SEED)))
 
-    # >>> FIX: ensure a real torch.device, not a string
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
@@ -342,7 +329,7 @@ def _train_once(
         val_loader=val_loader,
         cfg=cfg,
         work_dir=work_dir,
-        device=device,                 # <— now a torch.device
+        device=device,
         logger=log.getChild(tag),
     )
     best_val = float(trainer.train())
@@ -352,9 +339,6 @@ def _train_once(
     v = _read_val_at_epoch(metrics_csv, epoch_index_zero_based=EARLY_GATE_EPOCHS - 1)
     return best_val, v
 
-
-
-# ------------------------------- objective -----------------------------------
 def _objective(
     trial: optuna.Trial,
     base_cfg: Dict[str, Any],
@@ -395,7 +379,6 @@ def _objective(
         if v < _GLOBAL_E_BEST["value"]:
             _GLOBAL_E_BEST["value"] = float(v)
 
-    # ---------- Phase B: full training for this trial ----------
     cfg_full = _apply_trial_cfg(base_cfg, trial, trial_epochs=trial_epochs)
     cfg_full.setdefault("paths", {})
     cfg_full["paths"]["work_dir"] = str(trial_root / "s2")
@@ -411,12 +394,9 @@ def _objective(
     log.info("Trial %d best val: %.6e", trial.number, best_val)
     return float(best_val)
 
-
-# --------------------------- on-new-best callback -----------------------------
 def _best_config_saver(work_root: Path, study_name: str):
     """
     On new study best, copy hydrated config + params to <WORK_BASE_DIR>/<STUDY_NAME>/best/.
-    Guarded so it does nothing until the first COMPLETE trial exists.
     """
     best_dir = (work_root / study_name / "best")
     best_dir.mkdir(parents=True, exist_ok=True)
@@ -462,7 +442,7 @@ def run() -> None:
         pruner=optuna.pruners.NopPruner(),
     )
 
-    objective = lambda trial: _objective(  # noqa: E731
+    objective = lambda trial: _objective(
         trial=trial,
         base_cfg=base_cfg,
         work_root=work_root,

@@ -1,29 +1,19 @@
 #!/usr/bin/env python3
 """
-trainer.py — Lightning trainer with adaptive stiff loss (no MPS)
+trainer.py
 
-Fast path:
 - CSV-only logging; checkpoints: best.ckpt / last.ckpt in work_dir
 - AMP precision from cfg (bf16/fp16/fp32); TF32/cudnn handled in hardware.optimize_hardware
-- Optional torch.compile (Inductor) with sane defaults
-- Fused AdamW when available; zero_grad(set_to_none=True)
+- Optional torch.compile (Inductor)
 - Cosine schedule with warmup
 - Vectorized K handling; optional K-mask reduction
-- Epoch callback to drive dataset.set_epoch(...) (anchors/offsets are dataset-controlled)
 
-Dataset contract: (y_i, dt_norm[B,K,1], y_j[B,K,S], g[B,G], aux{...}[, k_mask[B,K]])
-
-Requested changes applied previously:
-- Removed time-edge weighting (time_edge_gain) completely.
-- Removed fractional physical loss (use_fractional); physical loss is MAE in log10-physical space.
-
-This revision:
-- Print epoch summary at on_fit_epoch_end to ensure val metrics exist on multi-GPU.
+Dataset structure: (y_i, dt_norm[B,K,1], y_j[B,K,S], g[B,G], aux{...}[, k_mask[B,K]])
 """
 
 from __future__ import annotations
 
-# ============================== GLOBAL CONSTANTS ==============================
+# ============================== CONSTANTS =====================================
 
 # Checkpointing / logging
 CKPT_FILENAME_BEST: str = "best"
@@ -35,7 +25,9 @@ ENABLE_PROGRESS_BAR: bool = False
 ENABLE_MODEL_SUMMARY: bool = False
 DETECT_ANOMALY: bool = False
 INFERENCE_MODE: bool = True
-LR_LOGGING_INTERVAL: str = "epoch"   # for LearningRateMonitor
+LR_LOGGING_INTERVAL: str = "epoch"
+
+OUTPUT_INTERVAL: int = 0
 
 # Training defaults (used when cfg keys absent)
 DEF_EPOCHS: int = 100
@@ -59,11 +51,10 @@ COMPILE_FULLGRAPH: bool = False
 # AdaptiveStiffLoss defaults / numerics
 LOSS_LAMBDA_PHYS: float = 1.0
 LOSS_LAMBDA_Z: float = 0.1
-LOSS_EPS_PHYS: float = 1e-20  # retained for compatibility; not used now that fractional loss is removed
+LOSS_EPS_PHYS: float = 1e-20
 LOG_STD_CLAMP_MIN: float = 1e-10
 W_SPECIES_CLAMP_MIN: float = 0.5
 W_SPECIES_CLAMP_MAX: float = 2.0
-LOG10_TO_LIN_MIN: float = -45.0
 
 # Resume behavior
 ENV_RESUME_VAR: str = "RESUME"
@@ -74,7 +65,7 @@ SPECIES_RANGE_EPS: float = 1e-6
 W_SPECIES_MEAN_EPS: float = 1e-12
 WARMUP_START_FACTOR: float = 0.1
 
-# ============================================================================
+# ============================== IMPORTS =======================================
 
 import os
 PL_DEVICES: int = int(os.getenv("PL_DEVICES", "1"))
@@ -93,17 +84,12 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torchmetrics import MeanMetric
 
-
-# ------------------------------ Adaptive Loss --------------------------------
+# ============================== LOSS ==========================================
 
 class AdaptiveStiffLoss(nn.Module):
     """
-    Adaptive loss for stiff systems in log-normalized space (no atomic penalty).
-    - Physical component: MAE in log10-physical space (ALWAYS; fractional disabled).
-    - Stabilizer component: MSE in z-space.
-    - No time-edge weighting (removed).
+    Loss function: MSE in z plus MAE in log10-physical space with species weighting.
     """
     def __init__(
         self,
@@ -114,7 +100,7 @@ class AdaptiveStiffLoss(nn.Module):
         *,
         lambda_phys: float = LOSS_LAMBDA_PHYS,
         lambda_z: float = LOSS_LAMBDA_Z,
-        epsilon_phys: float = LOSS_EPS_PHYS,  # kept for signature compatibility; unused
+        epsilon_phys: float = LOSS_EPS_PHYS,  # retained for signature compatibility (unused)
     ) -> None:
         super().__init__()
         # Buffers for Lightning device moves
@@ -132,19 +118,19 @@ class AdaptiveStiffLoss(nn.Module):
         # Scalars
         self.lambda_phys = float(lambda_phys)
         self.lambda_z = float(lambda_z)
-        self.eps_phys = float(epsilon_phys)  # not used with MAE log-phys (retained for compat)
+        self.eps_phys = float(epsilon_phys)
 
     @torch.no_grad()
     def _z_to_log10(self, z: torch.Tensor) -> torch.Tensor:
         return z * self.log_stds + self.log_means
 
     def forward(
-            self,
-            pred_z: torch.Tensor,  # [B,K,S]
-            true_z: torch.Tensor,  # [B,K,S]
-            t_norm: torch.Tensor,  # [B,K] or [B,K,1] (unused; kept for signature compatibility)
-            mask: Optional[torch.Tensor] = None,  # [B,K] (optional)
-            return_components: bool = False,
+        self,
+        pred_z: torch.Tensor,  # [B,K,S]
+        true_z: torch.Tensor,  # [B,K,S]
+        t_norm: torch.Tensor,  # [B,K] or [B,K,1] (unused here; kept for API)
+        mask: Optional[torch.Tensor] = None,  # [B,K] (optional)
+        return_components: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         # Stabilizer in z-space
         loss_z = (pred_z - true_z) ** 2  # [B,K,S]
@@ -180,11 +166,10 @@ class AdaptiveStiffLoss(nn.Module):
             return {"total": total, "phys": phys, "z": zstb}
         return total
 
-
-# --------------------------- LightningModule wrapper --------------------------
+# ============================== LIGHTNING TASK ================================
 
 class ModelTask(pl.LightningModule):
-    """Generic LightningModule wrapping the model and adaptive stiff loss."""
+    """LightningModule wrapping the model and adaptive stiff loss."""
     def __init__(self, model: nn.Module, cfg: Dict[str, Any], work_dir: Path) -> None:
         super().__init__()
         self.model = model
@@ -203,11 +188,6 @@ class ModelTask(pl.LightningModule):
 
         # Build loss from normalization manifest (no atomic term)
         self.criterion = self._build_loss()
-
-        # Weighted, distributed-safe epoch metrics for validation
-        self.val_loss_epoch = MeanMetric(sync_on_compute=True)
-        self.val_phys_epoch = MeanMetric(sync_on_compute=True)
-        self.val_z_epoch = MeanMetric(sync_on_compute=True)
 
         # Save compact hparams for repro
         self.save_hyperparameters({
@@ -259,7 +239,7 @@ class ModelTask(pl.LightningModule):
             log_maxs.append(float(s.get("log_max", 0.0)))
 
         loss_cfg = self.cfg.get("training", {}).get("adaptive_stiff_loss", {})
-        # Note: use_fractional and time_edge_gain intentionally ignored/removed.
+
         return AdaptiveStiffLoss(
             log_means=torch.tensor(log_means, dtype=torch.float32),
             log_stds=torch.tensor(log_stds, dtype=torch.float32),
@@ -267,13 +247,11 @@ class ModelTask(pl.LightningModule):
             species_log_max=torch.tensor(log_maxs, dtype=torch.float32),
             lambda_phys=float(loss_cfg.get("lambda_phys", LOSS_LAMBDA_PHYS)),
             lambda_z=float(loss_cfg.get("lambda_z", LOSS_LAMBDA_Z)),
-            epsilon_phys=float(loss_cfg.get("epsilon_phys", LOSS_EPS_PHYS)),  # retained, but unused
+            epsilon_phys=float(loss_cfg.get("epsilon_phys", LOSS_EPS_PHYS)),
         )
 
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         return self.model(y_i, dt_norm, g)
-
-    # --------------------------------- steps ---------------------------------
 
     def _unpack(self, batch):
         # (y_i, dt_norm, y_j, g, aux[, k_mask])
@@ -287,11 +265,11 @@ class ModelTask(pl.LightningModule):
             y_j = y_j.index_select(dim=-1, index=idx)
         return y_i, dt_norm, y_j, g, k_mask
 
+    # --------------------------- optim / sched --------------------------------
 
     def configure_optimizers(self):
         """
         AdamW (+ fused when safe) with Linear warmup -> Cosine.
-        Returns ([optimizer], [scheduler_dict]) for broad PL compatibility.
         """
         # Detect fused AdamW support
         try:
@@ -340,11 +318,12 @@ class ModelTask(pl.LightningModule):
         # Return tuple/list form (avoids edge-case mis-detection on some PL builds)
         return [optimizer], [{"scheduler": scheduler, "interval": "epoch", "monitor": CKPT_MONITOR}]
 
+    # --------------------------- steps / metrics ------------------------------
+
     def training_step(self, batch, batch_idx: int):
         y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
         pred = self(y_i, dt_in, g)
-        if self._target_idx is not None:
-            pred = pred.index_select(dim=-1, index=self._target_idx.to(pred.device))
+
         if pred.shape != y_j.shape:
             raise RuntimeError(f"Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
 
@@ -356,11 +335,12 @@ class ModelTask(pl.LightningModule):
             kl = getattr(self.model, "kl_loss", None)
             if kl is not None:
                 loss = loss + self.beta_kl * kl
-                self.log("train_kl", self.beta_kl * kl, on_step=True, on_epoch=True, prog_bar=False)
+                self.log("train_kl", self.beta_kl * kl, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_phys", comps["phys"], on_step=False, on_epoch=True, prog_bar=False)
-        self.log("train_z", comps["z"], on_step=False, on_epoch=True, prog_bar=False)
+        # Sync at epoch granularity to avoid per-step all-reduce overhead
+        self.log("train_loss", loss,          on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("train_phys", comps["phys"], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("train_z",    comps["z"],    on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx: int):
@@ -374,8 +354,6 @@ class ModelTask(pl.LightningModule):
         # Unpack and forward
         y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
         pred = self(y_i, dt_in, g)
-        if self._target_idx is not None:
-            pred = pred.index_select(dim=-1, index=self._target_idx.to(pred.device))
 
         # Shape sanity
         if pred.shape != y_j.shape:
@@ -404,13 +382,10 @@ class ModelTask(pl.LightningModule):
 
         if int(valid_pairs.item()) == 0:
             B, K, S = y_j.shape
-            raise ValueError(
-                f"[val] Zero valid [B,K] pairs in batch {batch_idx} (B={B}, K={K}, S={S}). "
-                f"Check k_mask construction or dataset filtering."
-            )
+            raise ValueError(f"[val] Zero valid [B,K] pairs in batch {batch_idx} (B={B}, K={K}, S={S}).")
 
-        S = torch.tensor(y_j.shape[-1], device=y_j.device, dtype=torch.float32)
-        weight = (valid_pairs.to(torch.float32) * S).to(torch.float64)  # scalar
+        S = torch.tensor(y_j.shape[-1], device=y_j.device, dtype=torch.float64)
+        weight = valid_pairs.to(torch.float64) * S
 
         # Local accumulators
         self._v_sum += (total.to(torch.float64) * weight)
@@ -421,26 +396,15 @@ class ModelTask(pl.LightningModule):
         return total  # scalar for Lightning bookkeeping
 
     def on_validation_epoch_start(self) -> None:
-        """
-        Initialize DDP-safe weighted accumulators. Use float64 for stability.
-        Must live on the LightningModule (not a Callback) so it's called
-        before any validation_step on every rank.
-        """
         dev = self.device if hasattr(self, "device") else next(self.parameters()).device
         self._v_sum = torch.zeros((), dtype=torch.float64, device=dev)       # sum(weight * total)
         self._v_wsum = torch.zeros((), dtype=torch.float64, device=dev)      # sum(weight)
         self._v_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)  # sum(weight * phys)
         self._v_z_sum = torch.zeros((), dtype=torch.float64, device=dev)     # sum(weight * z)
 
-    # In class ModelTask(pl.LightningModule)
     def on_validation_epoch_end(self) -> None:
         """
         Finalize and log sample-weighted validation metrics once per epoch.
-
-        - Skips sanity-check pass.
-        - All-reduces accumulators across ranks if DDP is initialized.
-        - If global weight is zero (no val batches anywhere), skip logging.
-        - Logs plain scalars (already reduced); avoids TorchMetrics compute() on empty state.
         """
         tr = getattr(self, "trainer", None)
         if tr is not None and getattr(tr, "sanity_checking", False):
@@ -486,8 +450,7 @@ class ModelTask(pl.LightningModule):
         for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
 
-
-# ------------------------------ Epoch drive callback --------------------------
+# ============================== CALLBACKS =====================================
 
 class SetEpochCallback(Callback):
     """Ensure dataset-driven sampling is advanced per epoch."""
@@ -512,123 +475,227 @@ class SetEpochCallback(Callback):
                 pass
 
 
-# ------------------------------ Epoch summary callback ------------------------
-
 class EpochSummaryCallback(Callback):
     """
-    Short, nicely-justified epoch summary to stdout.
+    Epoch summary + heartbeat that works under external DDP.
+    - Emits on env rank 0 (independent of PL's internal state).
+    - Starts a background heartbeat earlier than the first batch (unless disabled).
+    - Writes to stdout and to <work_dir>/train.log.
     Columns: train_loss | val_loss | lr | time
-
-    Prints at on_fit_epoch_end so that val metrics are guaranteed to be present.
     """
-    def __init__(self) -> None:
+    def __init__(self, heartbeat_s: float | None = None) -> None:
         super().__init__()
         self._printed_header = False
         self._t0: Optional[float] = None
-        self._printed_epoch = -1
+        self._next_emit_at: Optional[float] = None
+        self._hb_stop = None
+        self._hb_thread = None
+        self._trainer_ref = None  # weakref to PL trainer
+        # Disable periodic heartbeat when None/NaN/<=0
+        self._heartbeat_s = None if heartbeat_s is None else float(heartbeat_s)
+        self._logfile: Optional[Path] = None
 
+    # -------- rank gating via env (works even before PL initializes) ---------
+    @staticmethod
+    def _is_rank_zero_env() -> bool:
+        env = os.environ
+        for key in ("RANK", "WORLD_RANK", "OMPI_COMM_WORLD_RANK", "PMI_RANK"):
+            if key in env:
+                try:
+                    return int(env[key]) == 0
+                except Exception:
+                    return False
+        return True  # single-process
+
+    # -------------------------------- formatting -----------------------------
     def _fmt_secs(self, seconds: float) -> str:
         if seconds is None or not math.isfinite(seconds) or seconds < 0:
             return "--:--"
-        m = int(seconds // 60)
-        s = int(seconds % 60)
+        m = int(seconds // 60); s = int(seconds % 60)
         return f"{m:02d}:{s:02d}"
 
     def _header(self) -> str:
-        return (
-            "EPOCH | "
-            f"{'train':>11} | "
-            f"{'val':>11} | "
-            f"{'lr':>10} | "
-            f"{'time':>8}"
-        )
+        return "EPOCH | " + " | ".join([f"{'train':>11}", f"{'val':>11}", f"{'lr':>10}", f"{'time':>8}"])
 
     def _sep(self) -> str:
-        return (
-            "----- | "
-            + " | ".join([
-                "-" * 11,
-                "-" * 11,
-                "-" * 10,
-                "-" * 8,
-            ])
-        )
+        return "----- | " + " | ".join(["-"*11, "-"*11, "-"*10, "-"*8])
 
-    def _get_metric(self, trainer: pl.Trainer, key_candidates: list[str]) -> float:
-        # More robust on multi-GPU: consult both callback_metrics and logged_metrics.
+    def _get_metric(self, trainer: Optional[pl.Trainer], keys: list[str]) -> float:
+        if trainer is None:
+            return float("nan")
         merged = {}
-        try:
-            merged.update(trainer.callback_metrics or {})
-        except Exception:
-            pass
-        try:
-            merged.update(trainer.logged_metrics or {})
-        except Exception:
-            pass
-
-        for k in key_candidates:
+        for src in (getattr(trainer, "callback_metrics", None), getattr(trainer, "logged_metrics", None)):
+            if src:
+                try:
+                    merged.update(src)
+                except Exception:
+                    pass
+        for k in keys:
             if k in merged:
                 v = merged[k]
                 try:
-                    v = float(v.detach().cpu().item()) if torch.is_tensor(v) else float(v)
-                    return v
+                    return float(v.detach().cpu().item()) if torch.is_tensor(v) else float(v)
                 except Exception:
                     continue
         return float("nan")
 
-    def _emit(self, trainer: pl.Trainer) -> None:
-        # Skip sanity check pass and silence non-zero ranks
-        if getattr(trainer, "sanity_checking", False):
+    def _emit(self, trainer: Optional[pl.Trainer]) -> None:
+        # Gate on PL's global-zero if available and via environment
+        if trainer is not None and hasattr(trainer, "is_global_zero") and not trainer.is_global_zero:
             return
-        if not getattr(trainer, "is_global_zero", False):
+        if not self._is_rank_zero_env():
+            return
+        # Skip Lightning's sanity validation step
+        if trainer is not None and getattr(trainer, "sanity_checking", False):
             return
 
         if not self._printed_header:
-            print(self._header(), flush=True)
+            msg_h = self._header()
+            print(msg_h, flush=True)
             print(self._sep(), flush=True)
+            self._append_file(msg_h + "\n" + self._sep())
             self._printed_header = True
 
-        epoch = trainer.current_epoch
+        epoch = getattr(trainer, "current_epoch", 0) if trainer is not None else 0
+
+        if trainer is not None and getattr(trainer, "global_step", 0) == 0:
+            return
+
         train_v = self._get_metric(trainer, ["train_loss", "train_loss_epoch", "train"])
-        val_v = self._get_metric(trainer, ["val_loss", "val"])
+        val_raw = self._get_metric(trainer, ["val_loss", "val"])
+
+        # 2) If nothing landed yet for this epoch, skip this tick
+        have_train = math.isfinite(train_v)
+        have_val = math.isfinite(val_raw)
+        if not have_train and not have_val:
+            return
+
+        val_str = f"{val_raw:>11.3e}" if have_val else f"{'—':>11}"
 
         try:
-            lr = float(trainer.optimizers[0].param_groups[0]["lr"])
+            lr = float(trainer.optimizers[0].param_groups[0]["lr"]) if trainer else float("nan")
         except Exception:
             lr = float("nan")
 
         elapsed = (time.perf_counter() - self._t0) if self._t0 is not None else float("nan")
-        line = (
-            f"E{epoch:04d} | "
-            f"{train_v:>11.3e} | "
-            f"{val_v:>11.3e} | "
-            f"{lr:>10.3e} | "
-            f"{self._fmt_secs(elapsed):>8}"
-        )
+        line = f"E{epoch:04d} | {train_v:>11.3e} | {val_str} | {lr:>10.3e} | {self._fmt_secs(elapsed):>8}"
         print(line, flush=True)
-        self._printed_epoch = epoch
+        self._append_file(line)
+
+    def _append_file(self, text: str) -> None:
+        try:
+            if self._logfile is not None:
+                with self._logfile.open("a") as f:
+                    f.write(text + ("\n" if not text.endswith("\n") else ""))
+        except Exception:
+            pass  # never crash on logging
+
+    def _start_heartbeat(self, trainer: Optional[pl.Trainer]) -> None:
+        import threading, weakref
+        # Always (re)point the weakref to the latest trainer, even if the thread already exists.
+        self._trainer_ref = weakref.ref(trainer) if trainer is not None else (lambda: None)
+
+        # If the thread is already running, don't start another one.
+        if self._hb_thread is not None:
+            return
+
+        # When disabled (None/NaN/<=0), do not start the thread and do not schedule emits.
+        if (self._heartbeat_s is None) or (not math.isfinite(self._heartbeat_s)) or (self._heartbeat_s <= 0.0):
+            if self._t0 is None:
+                self._t0 = time.perf_counter()
+            self._next_emit_at = None
+            return
+
+        self._hb_stop = threading.Event()
+        if self._t0 is None:
+            self._t0 = time.perf_counter()
+        self._next_emit_at = self._t0 + float(self._heartbeat_s)
+
+        def _loop():
+            while not self._hb_stop.wait(5.0):
+                tr = None
+                try:
+                    tr = self._trainer_ref() if callable(self._trainer_ref) else None
+                except Exception:
+                    tr = None
+                if self._next_emit_at is not None and time.perf_counter() >= self._next_emit_at:
+                    self._emit(tr if isinstance(tr, pl.Trainer) else None)
+                    self._next_emit_at = time.perf_counter() + float(self._heartbeat_s)
+
+        self._hb_thread = threading.Thread(target=_loop, daemon=True)
+        self._hb_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        try:
+            if self._hb_stop is not None:
+                self._hb_stop.set()
+            if self._hb_thread is not None:
+                self._hb_thread.join(timeout=0.2)
+        except Exception:
+            pass
+        finally:  # noqa: E305
+            self._hb_stop = None
+            self._hb_thread = None
+            self._trainer_ref = None
+
+    def start_early(self) -> None:
+        """Allow starting the heartbeat before PL constructs/initializes."""
+        self._start_heartbeat(trainer=None)
+
+    # ---------------------------- PL hook wiring ------------------------------
+    def on_before_fit(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # Determine log file once we have module/trainer
+        try:
+            root = Path(getattr(pl_module, "work_dir", None) or getattr(trainer, "default_root_dir", "."))
+            self._logfile = (root if isinstance(root, Path) else Path(root)) / "train.log"
+        except Exception:
+            self._logfile = None
+        self._start_heartbeat(trainer)
+
+    # Back-compat for older PL
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self._logfile is None:
+            try:
+                root = Path(getattr(pl_module, "work_dir", None) or getattr(trainer, "default_root_dir", "."))
+                self._logfile = (root if isinstance(root, Path) else Path(root)) / "train.log"
+            except Exception:
+                self._logfile = None
+        self._start_heartbeat(trainer)
+
+    def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._emit(trainer)
+        self._stop_heartbeat()
 
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self._t0 = time.perf_counter()
+        if (self._heartbeat_s is None) or (not math.isfinite(self._heartbeat_s)) or (self._heartbeat_s <= 0.0):
+            self._next_emit_at = None
+        else:
+            self._next_emit_at = self._t0 + float(self._heartbeat_s)
 
-    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        # If no validation is configured at all, emit after training epoch.
-        try:
-            nval = trainer.num_val_batches
-            if isinstance(nval, (list, tuple)):
-                nval = sum(int(x) for x in nval)
-            nval = int(nval)
-        except Exception:
-            nval = 0
-        if nval == 0:
+    def on_train_batch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule, batch, batch_idx: int) -> None:
+        if self._next_emit_at is not None and time.perf_counter() >= self._next_emit_at:
             self._emit(trainer)
+            self._next_emit_at = time.perf_counter() + float(self._heartbeat_s)
+
+    def on_validation_batch_start(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        batch,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        if self._next_emit_at is not None and time.perf_counter() >= self._next_emit_at:
+            self._emit(trainer)
+            self._next_emit_at = time.perf_counter() + float(self._heartbeat_s)
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        # Runs after validation metrics are committed
+        # emit once more after val metrics land
         self._emit(trainer)
 
 
-# ------------------------------ External wrapper -----------------------------
+# ============================== WRAPPER =======================================
 
 class Trainer:
     """Compatibility wrapper: `from trainer import Trainer` -> .train() returns best val."""
@@ -682,12 +749,10 @@ class Trainer:
             "bfloat16": "bf16-mixed",
             "bf16-mixed": "bf16-mixed",
             "bfloat16-mixed": "bf16-mixed",
-            # FP16
             "fp16": "16-mixed",
             "float16": "16-mixed",
             "16": "16-mixed",
             "16-mixed": "16-mixed",
-            # FP32 / none
             "none": "32-true",
             "fp32": "32-true",
             "32": "32-true",
@@ -756,7 +821,10 @@ class Trainer:
             getattr(self.train_loader, "dataset", None),
             getattr(self.val_loader, "dataset", None) if self.val_loader is not None else None,
         ])
-        summary_cb = EpochSummaryCallback()
+
+        # Single, final summary callback. Start its heartbeat before PL initializes.
+        summary_cb = EpochSummaryCallback(heartbeat_s=OUTPUT_INTERVAL)
+        summary_cb.start_early()
 
         accelerator = self._accelerator_from_device()
         precision = self._precision_from_cfg()
@@ -771,32 +839,31 @@ class Trainer:
         if self.limit_val_batches > 0:
             trainer_kwargs["limit_val_batches"] = self.limit_val_batches
 
-        # External launch (mpiexec/torchrun) exports WORLD_SIZE/RANK.
+        # ---------------------- EXTERNAL DDP FIX (IMPORTANT) -------------------
+        # If we're launched externally (mpiexec/torchrun), make Lightning's
+        # world-size match the external WORLD_SIZE so DistributedSampler is correct.
         world_size = int(os.getenv("WORLD_SIZE", "1"))
         externally_launched = world_size > 1
 
-        # One process per GPU when launched externally; otherwise use configured count.
-        devices = 1 if externally_launched else PL_DEVICES
+        if externally_launched:
+            # One process per external rank (devices=1), and inform PL of global size
+            devices = 1
+            num_nodes = world_size
+        else:
+            # Single-process or PL-managed multi-GPU on this host
+            devices = PL_DEVICES
+            num_nodes = 1
 
-        # Make PL's world-size match the external launcher for sampler correctness.
-        # With devices=1 per rank, setting num_nodes=world_size yields world_size = num_nodes * devices.
-        num_nodes = world_size if externally_launched else 1
-
-        # Robust DDP strategy selection for older/newer Lightning:
-        #  - Prefer DDPStrategy with NCCL if available.
-        #  - Fallback to the string "ddp" to avoid passing unknown kwargs into torch.nn.parallel.DistributedDataParallel.
+        # DDP strategy selection
         strategy = "auto"
         if externally_launched or devices > 1:
             try:
                 from pytorch_lightning.strategies import DDPStrategy
                 try:
-                    # Newer PL: accepts process_group_backend for init_process_group
                     strategy = DDPStrategy(process_group_backend="nccl")
                 except TypeError:
-                    # Older PL: no such kwarg; use defaults (env:// is inferred from env vars)
                     strategy = DDPStrategy()
             except Exception:
-                # Very old PL or import issue: plain "ddp" string works broadly
                 strategy = "ddp"
 
         pl_trainer = pl.Trainer(
@@ -804,9 +871,9 @@ class Trainer:
             max_epochs=self.epochs,
             accelerator=accelerator,
             devices=devices,
-            num_nodes=num_nodes,                  # ensures PL's world_size matches the external world_size
+            num_nodes=num_nodes,
             strategy=strategy,
-            precision=precision,                  # e.g., "bf16-mixed"
+            precision=precision,
             gradient_clip_val=self.grad_clip if self.grad_clip > 0 else 0.0,
             accumulate_grad_batches=max(1, self.accumulate),
             logger=csv_logger,

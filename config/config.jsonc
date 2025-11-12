@@ -5,9 +5,9 @@
     // List of raw HDF5 files (optional; auto-detect if empty)
     "raw_data_files": [],
     // Directory for logs/checkpoints/exports
-    "work_dir": "models/best",
+    "work_dir": "models/recreating",
     // Delete existing work_dir before start
-    "overwrite": false
+    "overwrite": true
   },
 
   "system": {
@@ -78,7 +78,7 @@
 
   "dataset": {
     // Global training batch size
-    "batch_size_train": 16384,
+    "batch_size_train": 12288,
     // Avoid full shard scan for the preprocessed data; trust metadata files
     "skip_scan": true,
     // Skip time-grid monotonicity checks
@@ -88,7 +88,7 @@
     // Return K targets per anchor (K=times_per_anchor)
     "multi_time_per_anchor": true,
     // K: number of target steps per anchor when multi_time_per_anchor
-    "times_per_anchor": 80,
+    "times_per_anchor": 8,
     // Use same offsets for entire batch
     "share_times_across_batch": false,
     // Sample offsets uniformly then fit anchors
@@ -97,6 +97,9 @@
     "assume_shared_grid": false,
     // Δt clamp floor before normalization
     "dt_epsilon": 1e-30,
+
+    // Use the very first anchor point
+    "use_first_anchor": true,
 
     // DataLoader workers
     "num_workers": 8,
@@ -112,13 +115,13 @@
 
   "model": {
     // Latent channel count for autoencoder
-    "latent_dim": 1024,
+    "latent_dim": 512,
     // Encoder MLP hidden sizes
-    "encoder_hidden": [1536, 1536],
+    "encoder_hidden": [768, 768, 768, 768],
     // Dynamics MLP hidden sizes
-    "dynamics_hidden": [1536, 1536],
+    "dynamics_hidden": [768, 768, 768, 768],
     // Decoder MLP hidden sizes
-    "decoder_hidden": [1536, 1536],
+    "decoder_hidden": [768, 768, 768, 768],
     // Nonlinearity for MLPs
     "activation": "silu",
     // Dropout rate in MLPs
@@ -128,18 +131,18 @@
     // Predict Δz and add to z (residual dynamics)
     "dynamics_residual": true,
     // Decoder predicts Δy in z-space
-    "predict_delta": true,
+    "predict_delta": false,
     // Decoder predicts Δlog10(y) in physical space
     "predict_delta_log_phys": false,
     // Use log-softmax head for simplex outputs
-    "softmax_head": false,
+    "softmax_head": true,
     // Allow softmax on subset of species
     "allow_partial_simplex": false
   },
 
   "training": {
     // Total epochs to train
-    "epochs": 200,
+    "epochs": 100,
     // Clip grad-norm at this value (0 = disabled)
     "gradient_clip": 0.0,
     // Gradient accumulation steps
@@ -176,13 +179,13 @@
     // Maximum j−i offset for targets (null = T-1)
     "max_steps": 99,
     // Anchors per trajectory per epoch
-    "pairs_per_traj": 8,
+    "pairs_per_traj": 32,
 
     "adaptive_stiff_loss": {
       // Weight for physical-space term
       "lambda_phys": 1.0,
       // Weight for z-space term
-      "lambda_z": 0.5,
+      "lambda_z": 1.0,
       // Fractional loss denominator floor
       "epsilon_phys": 1e-20
     }

@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-Preprocessing Utilities Module
-==============================
 Helper functions and classes for data preprocessing pipeline.
 """
 
@@ -50,18 +48,6 @@ def load_config_value(
 ):
     """
     Extract nested value from configuration dictionary.
-    
-    Args:
-        config: Configuration dictionary
-        path: Sequence of keys for nested access
-        required: Whether to raise error if not found
-        default: Default value if not found
-        
-    Returns:
-        Configuration value or default
-        
-    Raises:
-        KeyError: If required and not found
     """
     current = config
     for key in path:
@@ -94,10 +80,7 @@ def deterministic_hash(text: str, seed: int) -> float:
 
 class WelfordAccumulator:
     """
-    Online statistics accumulator using Welford's algorithm.
-    
-    Computes mean, variance, min, and max in a single pass with
-    numerical stability for large datasets.
+    Statistics accumulator using Welford's algorithm.
     """
     
     __slots__ = ("count", "mean", "M2", "min_val", "max_val")
@@ -113,9 +96,6 @@ class WelfordAccumulator:
     def update(self, array: np.ndarray) -> None:
         """
         Update statistics with new data.
-        
-        Args:
-            array: Data array to incorporate
         """
         values = np.asarray(array, dtype=np.float64).reshape(-1)
         if values.size == 0:
@@ -145,15 +125,6 @@ class WelfordAccumulator:
     def finalize(self, min_std: float) -> Tuple[float, float, float, float]:
         """
         Get final statistics.
-        
-        Args:
-            min_std: Minimum standard deviation floor
-            
-        Returns:
-            Tuple of (mean, std, min, max)
-            
-        Raises:
-            RuntimeError: If no data was accumulated
         """
         if self.count <= 0:
             raise RuntimeError("No data accumulated in Welford accumulator")
@@ -182,12 +153,6 @@ class RunningStatistics:
     ):
         """
         Initialize statistics accumulator.
-        
-        Args:
-            need_mean_std: Whether to compute mean and std
-            need_min_max: Whether to compute min and max
-            need_log: Whether to compute log-domain statistics
-            epsilon: Floor value for log operations
         """
         self.need_mean_std = bool(need_mean_std)
         self.need_min_max = bool(need_min_max)
@@ -213,12 +178,6 @@ class RunningStatistics:
     def to_manifest(self, min_std: float) -> Dict[str, float]:
         """
         Export statistics to manifest format.
-        
-        Args:
-            min_std: Minimum standard deviation floor
-            
-        Returns:
-            Dictionary of statistics
         """
         output = {}
         
@@ -243,12 +202,6 @@ class RunningStatistics:
 def get_normalization_flags(method: str) -> Tuple[bool, bool, bool]:
     """
     Get flags for which statistics are needed for a normalization method.
-    
-    Args:
-        method: Normalization method name
-        
-    Returns:
-        Tuple of (need_mean_std, need_min_max, need_log)
     """
     method = str(method)
     

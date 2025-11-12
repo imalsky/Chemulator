@@ -47,6 +47,7 @@ def _canonical_split(name: str) -> str:
 @dataclass
 class _Index:
     row: int
+    is_first: bool = False
 
 class FlowMapPairsDataset(Dataset):
     """
@@ -84,6 +85,9 @@ class FlowMapPairsDataset(Dataset):
         self.multi_time = bool(dcfg.get("multi_time_per_anchor", True))
         self.K = int(dcfg.get("times_per_anchor", 1)) if self.multi_time else 1
         self.share_offsets_across_batch = bool(dcfg.get("share_times_across_batch", False))
+
+        # Enforce i=0 for the first of the pairs_per_traj samples (training only)
+        self.use_first_anchor = bool(dcfg.get("use_first_anchor", False))
 
         # Strict anchor-fit mode
         self.uniform_offset_sampling_strict = bool(dcfg.get("uniform_offset_sampling_strict", False))
@@ -272,12 +276,16 @@ class FlowMapPairsDataset(Dataset):
         # Derived length
         self.length = self.N * self.pairs_per_traj
 
+
     def __len__(self) -> int:
         return self.length
 
     def __getitem__(self, idx: int) -> _Index:
         row = int(idx % self.N)
-        return _Index(row=row)
+        # Mark the first of the pairs_per_traj samples for each trajectory
+        is_first = (idx // self.N) == 0
+        return _Index(row=row, is_first=is_first)
+
 
     def set_epoch(self, epoch: int) -> None:
         """To be called by the Trainer at each epoch boundary."""
@@ -346,8 +354,20 @@ class FlowMapPairsDataset(Dataset):
         B = len(batch)
         rows = torch.tensor([b.row for b in batch], device=self._stage_device, dtype=torch.long)  # [B]
 
-        if self.uniform_offset_sampling_strict:  # Pick i so all K offsets fit
+        # If enabled, force i=0 for the "first" sample of each trajectory (training only)
+        force_first = self.use_first_anchor and (self.split == "train")
+        first_mask = None
+        if force_first:
+            first_mask = torch.tensor(
+                [b.is_first for b in batch],
+                device=self._stage_device,
+                dtype=torch.bool,
+            )
+
+        if self.uniform_offset_sampling_strict:  # Pick i so all K offsets fit (then honor force_first)
             offs = self._sample_offsets(B)  # [B,K] or [K]
+
+            # Choose i_used so that all offsets fit, as before
             if offs.ndim == 1:
                 # Shared across batch
                 o_max = offs.max()
@@ -357,18 +377,29 @@ class FlowMapPairsDataset(Dataset):
                     size=(B,), generator=self._rng, device="cpu", dtype=torch.long,
                 )
                 i_used = i_used_cpu.to(self._stage_device, non_blocking=True)
-                j_idx = i_used.unsqueeze(1) + offs.unsqueeze(0).expand(B, -1)  # [B,K]
+                # Honor forced first-anchor
+                if first_mask is not None and first_mask.any():
+                    i_used = i_used.clone()
+                    i_used[first_mask] = 0
+                j_raw = i_used.unsqueeze(1) + offs.unsqueeze(0).expand(B, -1)  # [B,K]
             else:
                 # Per-row offsets
                 o_max = offs.max(dim=1).values  # [B]
                 i_max = (self.T - 1 - o_max).clamp_min(0)  # [B]
                 i_used_cpu = torch.floor(
-                    torch.rand((B,), generator=self._rng, device="cpu") * (
-                            i_max.to(torch.float32, copy=True).cpu() + 1.0)
+                    torch.rand((B,), generator=self._rng, device="cpu") *
+                    (i_max.to(torch.float32, copy=True).cpu() + 1.0)
                 ).to(torch.long)
                 i_used = i_used_cpu.to(self._stage_device, non_blocking=True)
-                j_idx = i_used.unsqueeze(1) + offs  # [B,K]
-            k_mask = torch.ones((B, self.K), dtype=torch.bool, device=self._stage_device)
+                # Honor forced first-anchor
+                if first_mask is not None and first_mask.any():
+                    i_used = i_used.clone()
+                    i_used[first_mask] = 0
+                j_raw = i_used.unsqueeze(1) + offs  # [B,K]
+
+            # Even in "strict" mode, clamp if we forced i=0 such that some j would exceed T-1
+            k_mask = (j_raw < self.T)  # [B,K]
+            j_idx = torch.where(k_mask, j_raw, (self.T - 1))  # [B,K]
 
         # Non-strict + deterministic val/test
         else:
@@ -432,8 +463,10 @@ class FlowMapPairsDataset(Dataset):
                 j_idx = torch.where(k_mask, j_raw, (self.T - 1))  # [B,K]
 
             else:
-                # Training keeps the original randomized behavior.
+                # Training keeps the original randomized behavior (with optional forced first anchors).
                 i_idx = self._sample_anchor_indices(B)  # [B]
+                if first_mask is not None and first_mask.any():
+                    i_idx = torch.where(first_mask, torch.zeros_like(i_idx), i_idx)
                 offs = self._sample_offsets(B)  # [B,K] or [K]
                 if offs.ndim == 1:
                     offs = offs.unsqueeze(0).expand(B, -1)
@@ -471,6 +504,7 @@ class FlowMapPairsDataset(Dataset):
         dt = dt_norm.to(dtype=self._runtime_dtype).unsqueeze(-1)  # [B,K,1]
         aux = {"i": i_used, "j": j_idx}
         return y_i, dt, y_j, g, aux, k_mask
+
 
 def collate_flowmap(batch: Sequence[_Index], dataset: FlowMapPairsDataset):
     return dataset.collate_batch(batch)
