@@ -539,8 +539,8 @@ def create_dataloader(
         persistent_workers=bool(persistent_workers) and int(num_workers) > 0,
         pin_memory=bool(pin_memory),
         prefetch_factor=int(prefetch_factor) if int(num_workers) > 0 else None,
-        drop_last=False,
-        collate_fn=lambda b: collate_flowmap(b, dataset),
+        drop_last=(getattr(dataset, "split", "") == "train"),
+        collate_fn=(dataset.collate_batch if hasattr(dataset, "collate_batch") else None),
     )
     if kwargs["prefetch_factor"] is None:
         kwargs.pop("prefetch_factor", None)

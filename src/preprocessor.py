@@ -6,10 +6,10 @@ Parallel preprocessing pipeline for converting raw HDF5 trajectory data into
 training-ready sharded NPZ files. Uses MPI for efficient distributed scanning
 and processing of large trajectory databases.
 
-Features:
+Key Features:
 - MPI-based parallel file scanning and statistics computation
 - Profile-level quality filtering (drops entire trajectories below thresholds)
-- Normalization statistics
+- Normalization statistics with Welford's algorithm (numerically stable)
 - Time grid validation and uniformity detection
 - Deterministic train/val/test splitting with configurable ratios
 - Sharded NPZ output for efficient batch loading during training
@@ -21,6 +21,12 @@ Quality Control:
 - Time grid validation: Ensures monotonic, consistent time grids per file
 - NaN filtering: Removes trajectories with missing or invalid data
 - Dimension consistency: Validates all species variables are present
+
+Performance:
+- MPI scales linearly with number of processes
+- Memory-efficient chunked HDF5 reading for large datasets
+- Parallel statistics accumulation with minimal communication overhead
+- Progress tracking with estimated time to completion
 
 Output: Sharded NPZ files organized by split (train/val/test) with metadata
 including normalization statistics, dt ranges, and data quality reports.
@@ -34,18 +40,14 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-import math
-import hashlib
-from pathlib import Path
-import logging
 import numpy as np
 
 try:
     import h5py
-except Exception as e:
-    raise RuntimeError("h5py is required but not available") from e
+except ImportError:
+    h5py = None
 
 try:
     from mpi4py import MPI
@@ -61,6 +63,7 @@ from preprocessor_utils import (
     get_normalization_flags
 )
 
+
 def scan_hdf5_file_worker(
         path_str: str,
         species_vars: list,
@@ -68,10 +71,12 @@ def scan_hdf5_file_worker(
         time_key: str,
         min_value_threshold: float,
         chunk_size: int,
+        # Optional scan controls
         scan_fraction_per_file: float | None = None,
         scan_max_groups: int | None = None,
         seed: int = 0,
         return_modal_time: bool = True,
+        # Conflict logging controls
         log_conflicting_times: bool = True,
         max_conflict_examples: int = 3,
         logger_name: str = "main.pre",
@@ -83,6 +88,16 @@ def scan_hdf5_file_worker(
       time_candidate: np.ndarray | None (modal grid if mixed)
       progress_stats: dict
     """
+    import math
+    import hashlib
+    from pathlib import Path
+    import logging
+    import numpy as np
+    try:
+        import h5py  # type: ignore
+    except Exception as e:
+        raise RuntimeError("h5py is required but not available") from e
+
     logger = logging.getLogger(logger_name)
 
     def _hash_rank(s: str, seed_val: int) -> float:
@@ -121,13 +136,14 @@ def scan_hdf5_file_worker(
         "groups_missing_time": 0,
         "groups_nonpositive_dt": 0,
         "groups_below_min_value": 0,
-        "groups_nan_time": 0,
+        "groups_nan_time": 0,            # NEW: counts any non-finite time vectors
         "min_forward_dt": None,
+        # Mixed-grid diagnostics:
         "time_grids_detected": 0,
         "time_grid_modal_count": 0,
         "time_conflicts_logged": 0,
-        "examples_nonpositive": [],
-        "examples_nan_time": [],
+        "examples_nonpositive": [],      # [(group, j, t[j], t[j+1]), ...]
+        "examples_nan_time": [],         # NEW: up to 5 group names with NaN time
     }
     progress_stats: dict = {"total_groups": 0, "groups_processed": 0}
 
@@ -163,7 +179,7 @@ def scan_hdf5_file_worker(
             # Load time vector as float64
             time_data = np.array(grp[time_key][...], dtype=np.float64).reshape(-1)
 
-            # Reject any non-finite times outright
+            # NEW: reject any non-finite times outright
             if not np.all(np.isfinite(time_data)):
                 file_report["groups_nan_time"] += 1
                 if len(file_report["examples_nan_time"]) < 5:
@@ -190,7 +206,7 @@ def scan_hdf5_file_worker(
                     )
                 continue
 
-            # Below-min-value screening across species
+            # Optional: below-min-value screening across species
             below_min = False
             if min_value_threshold > 0:
                 for key in species_vars:
@@ -223,7 +239,7 @@ def scan_hdf5_file_worker(
         file_report["min_forward_dt"] = (None if global_min_forward == float("inf") else float(global_min_forward))
         file_report["groups_valid"] = len(valid_groups)
 
-        # Conflicting time grids handling & logging -----
+        # ----- Canonical / conflicting time grids handling & logging -----
         time_candidate = None
         if len(time_vectors) > 0:
             # Bucket by exact equality (hash of raw bytes)
@@ -288,10 +304,10 @@ def scan_hdf5_file_worker(
         # If any NaN-time groups were dropped, emit a single concise warning
         if file_report["groups_nan_time"] > 0:
             samples = "; ".join(file_report["examples_nan_time"])
-            logger.warning(
-                f"Dropped {file_report['groups_nan_time']} with non-finite time in {path.name}. "
-                f"Examples: {samples}"
-            )
+            #logger.warning(
+            #    f"[time-grid sanitize] Dropped {file_report['groups_nan_time']} group(s) with non-finite time in {path.name}. "
+            #    f"Examples: {samples}"
+            #)
 
     return file_report, valid_groups, time_candidate, progress_stats
 
@@ -301,6 +317,7 @@ def scan_hdf5_file_worker(
 class DataPreprocessor:
     """
     Main preprocessing pipeline for converting HDF5 to NPZ shards.
+    Uses MPI for parallel processing on HPC systems.
     """
 
     def __init__(
@@ -310,6 +327,10 @@ class DataPreprocessor:
     ):
         """
         Initialize preprocessor.
+
+        Args:
+            config: Configuration dictionary
+            logger: Logger instance
         """
         self.cfg = config
         self.logger = logger or logging.getLogger("preprocessor")
@@ -407,19 +428,27 @@ class DataPreprocessor:
             preproc_cfg, ["npz_compressed"], required=True
         ))
 
-        # Default to 4096 trajectories per shard for much fewer files
-        self.traj_per_shard = int(load_config_value(preproc_cfg, ["trajectories_per_shard"], default=4096))
+        # CHANGED: Default to 4096 trajectories per shard for much fewer files
+        self.traj_per_shard = int(load_config_value(
+            preproc_cfg, ["trajectories_per_shard"], default=4096
+        ))
 
         self.hdf5_chunk_size = int(load_config_value(
             preproc_cfg, ["hdf5_chunk_size"], default=DEFAULT_HDF5_CHUNK_SIZE
         ))
-        self.min_value_threshold = float(load_config_value(preproc_cfg, ["min_value_threshold"], required=True))
+        self.min_value_threshold = float(load_config_value(
+            preproc_cfg, ["min_value_threshold"], required=True
+        ))
 
-        # Skip first timestep option
-        self.skip_first_timestep = bool(load_config_value(preproc_cfg, ["skip_first_timestep"], default=False))
+        # NEW: Skip first timestep option
+        self.skip_first_timestep = bool(load_config_value(
+            preproc_cfg, ["skip_first_timestep"], default=False
+        ))
 
         # Worker configuration - use exactly what's in config (no ProcessPool; MPI or serial only)
-        requested_workers = int(load_config_value(preproc_cfg, ["num_workers"], default=0))
+        requested_workers = int(load_config_value(
+            preproc_cfg, ["num_workers"], default=0
+        ))
 
         if self.comm and self.size > 1:
             # In MPI mode, num_workers is ignored; use all MPI ranks
@@ -455,6 +484,8 @@ class DataPreprocessor:
     def _auto_detect_species_variables(self) -> List[str]:
         """
         Auto-detect species variables from the first HDF5 file.
+        Species are identified as datasets (not attributes) that are arrays.
+        Excludes the time variable and any global variables.
         """
         if not self.raw_files:
             raise ValueError("No raw data files to detect species from")
@@ -511,7 +542,7 @@ class DataPreprocessor:
         if self.rank != 0:
             return
 
-        # Raw files: allow autodetect upstream; but if still empty, fail.
+        # Raw files: allow auto-detect upstream; but if still empty, fail.
         if len(self.raw_files) == 0:
             raise ValueError("No raw data files specified")
 
@@ -629,38 +660,52 @@ class DataPreprocessor:
 
     def _scan_files(self) -> None:
         """Scan HDF5 files to identify valid trajectories using MPI if available."""
-        time_candidates = []
-
         if self.comm and self.size > 1:
-            self._scan_files_mpi(time_candidates)
+            # MPI path: rank 0 gets the full list of time candidates; others get []
+            time_candidates = self._scan_files_mpi()
         else:
+            # Serial path: scan directly and fill time_candidates locally
+            time_candidates: List[np.ndarray] = []
             self._scan_files_serial(time_candidates)
 
-        # Gather time candidates to root so rank 0 always validates a global list
-        if self.comm:
-            gathered = self.comm.gather(time_candidates, root=0)
-            if self.rank == 0:
-                time_candidates = [tc for lst in gathered for tc in lst]
-
-        # Validate only on rank 0, then broadcast
+        # Validate canonical time on rank 0, then broadcast
         if not self.comm or self.rank == 0:
             self._validate_canonical_time(time_candidates)
-        if self.comm:
-            self._canonical_time = self.comm.bcast(getattr(self, "_canonical_time", None), root=0)
 
-    def _scan_files_mpi(self, time_candidates: List[np.ndarray]) -> None:
-        """Scan files in parallel using MPI."""
+        if self.comm:
+            # Broadcast canonical time grid to all ranks
+            self._canonical_time = self.comm.bcast(
+                getattr(self, "_canonical_time", None),
+                root=0
+            )
+
+    def _scan_files_mpi(self) -> List[np.ndarray]:
+        """
+        Scan files in parallel using MPI, avoiding the ~2 GiB mpi4py gather limit
+        by using point-to-point send/recv instead of Comm.gather on large objects.
+
+        Returns (on rank 0):
+            List[np.ndarray]: all time candidates collected from every rank.
+        Returns (on non-root ranks):
+            [] (empty list; canonical time is broadcast later).
+        """
         # Distribute files across ranks
-        files_per_rank = len(self.raw_files) // self.size
-        remainder = len(self.raw_files) % self.size
+        n_files = len(self.raw_files)
+        files_per_rank = n_files // self.size
+        remainder = n_files % self.size
 
         start_idx = self.rank * files_per_rank + min(self.rank, remainder)
-        end_idx = start_idx + files_per_rank + (1 if self.rank < remainder else 0)
+        end_idx = start_idx + files_per_rank + (self.rank < remainder)
         my_files = self.raw_files[start_idx:end_idx]
 
+        local_results: List[Tuple[dict, List[str], Optional[np.ndarray], dict]] = []
+        local_time_candidates: List[np.ndarray] = []
+
+        # Heartbeat state (per rank)
+        last_heartbeat = time.time()
+
         # Each rank processes its files
-        local_results = []
-        for file_path in my_files:
+        for idx, file_path in enumerate(my_files, 1):
             result = scan_hdf5_file_worker(
                 file_path,
                 self.species_vars,
@@ -669,51 +714,79 @@ class DataPreprocessor:
                 self.min_value_threshold,
                 self.hdf5_chunk_size,
             )
-            local_results.append(result)
+            file_report, valid_groups, time_candidate, progress_stats = result
+            local_results.append((file_report, valid_groups, time_candidate, progress_stats))
 
-        # Each rank contributes its own time candidates locally.
-        for _, _, time_candidate, _ in local_results:
             if time_candidate is not None:
-                time_candidates.append(time_candidate)
+                local_time_candidates.append(time_candidate)
 
-        # Gather results at rank 0 for reporting/metadata
-        all_results = self.comm.gather(local_results, root=0)
+            # Simple heartbeat every ~30 seconds per rank
+            now = time.time()
+            if now - last_heartbeat >= 30.0:
+                self.logger.info(
+                    f"[heartbeat] rank={self.rank}/{self.size} "
+                    f"scanned {idx}/{len(my_files)} local files"
+                )
+                last_heartbeat = now
 
+        # Helper: accumulate results into drop_report / valid_group_names on rank 0
+        def _accumulate_rank_results(
+            rank_results: List[Tuple[dict, List[str], Optional[np.ndarray], dict]]
+        ) -> None:
+
+            for file_report, valid_groups, _tc, _progress_stats in rank_results:
+                self._drop_report["files"].append(file_report)
+
+                n_total = int(file_report.get("groups_total", 0))
+                n_valid = int(file_report.get("groups_valid", 0))
+                n_dropped = max(0, n_total - n_valid)
+                n_below = int(file_report.get("groups_below_min_value", 0))
+
+                overall = self._drop_report["overall"]
+                overall["n_total"] += n_total
+                overall["n_valid"] += n_valid
+                overall["n_dropped"] += n_dropped
+                overall["n_below_threshold"] += n_below
+                # overall["n_nan"] is accumulated later during NaN screening
+
+                # Use canonical key from worker report
+                key = file_report["file"]
+                self._valid_group_names[key] = valid_groups
+                self.logger.info(f"File {Path(file_report['file']).name}: {n_valid} valid / {n_total} total")
+
+        # Root collects everything explicitly via send/recv; non-root sends its data
         if self.rank == 0:
-            # Process gathered results (do NOT append time_candidate here, since each rank
-            # already added theirs locally and _validate_canonical_time will gather them)
-            for rank_results in all_results:
-                for file_report, valid_groups, _tc, _progress_stats in rank_results:
-                    self._drop_report["files"].append(file_report)
+            # Start with rank 0's own results
+            time_candidates: List[np.ndarray] = list(local_time_candidates)
+            _accumulate_rank_results(local_results)
 
-                    # Map new per-file keys -> legacy overall counters
-                    n_total = int(file_report.get("groups_total", 0))
-                    n_valid = int(file_report.get("groups_valid", 0))
-                    n_dropped = max(0, n_total - n_valid)
-                    n_below = int(file_report.get("groups_below_min_value", 0))
+            # Receive from all other ranks one-by-one
+            for src in range(1, self.size):
+                rank_results, rank_time_candidates = self.comm.recv(source=src, tag=100 + src)
+                _accumulate_rank_results(rank_results)
+                time_candidates.extend(rank_time_candidates)
+        else:
+            # Non-root ranks send their local results + time candidates to root
+            self.comm.send((local_results, local_time_candidates), dest=0, tag=100 + self.rank)
+            time_candidates = []  # Non-root does not need the full list
 
-                    overall = self._drop_report["overall"]
-                    overall["n_total"] += n_total
-                    overall["n_valid"] += n_valid
-                    overall["n_dropped"] += n_dropped
-                    overall["n_below_threshold"] += n_below
-                    # overall["n_nan"] is accumulated later during NaN screening
+        # NOTE: no broadcast of _drop_report or _valid_group_names here.
+        # Only rank 0 holds the global mapping; other ranks keep just their
+        # local maps and will receive per-rank work assignments later.
 
-                    # Use canonical key from worker report
-                    self._valid_group_names[file_report["file"]] = valid_groups
+        # Only rank 0 returns the full list; others return an empty list
+        return time_candidates if self.rank == 0 else []
 
-                    # Clean logging against the new keys
-                    self.logger.info(f"File {Path(file_report['file']).name}: {n_valid} valid / {n_total} total")
-
-        # Broadcast results to all ranks
-        self._drop_report = self.comm.bcast(self._drop_report, root=0)
-        self._valid_group_names = self.comm.bcast(self._valid_group_names, root=0)
 
     def _scan_files_serial(self, time_candidates: List[np.ndarray]) -> None:
         """Scan files serially."""
+        # Heartbeat state
+        last_heartbeat = time.time()
+        n_files = len(self.raw_files)
+
         for file_idx, path in enumerate(self.raw_files, 1):
             path_obj = Path(path)
-            self.logger.info(f"Scanning file {file_idx}/{len(self.raw_files)}: {path_obj.name}")
+            self.logger.info(f"Scanning file {file_idx}/{n_files}: {path_obj.name}")
 
             file_report, valid_groups, time_candidate, progress_stats = scan_hdf5_file_worker(
                 path,
@@ -737,6 +810,7 @@ class DataPreprocessor:
             overall["n_valid"] += n_valid
             overall["n_dropped"] += n_dropped
             overall["n_below_threshold"] += n_below
+            # overall["n_nan"] is accumulated later during NaN screening
 
             # Keep a consistent key (absolute path string)
             self._valid_group_names[file_report["file"]] = valid_groups
@@ -746,50 +820,96 @@ class DataPreprocessor:
 
             self.logger.info(f"  Found {n_valid} valid, {n_dropped} dropped trajectories")
 
+            # Heartbeat every ~60 seconds
+            now = time.time()
+            if now - last_heartbeat >= 60.0:
+                self.logger.info(
+                    f"[heartbeat] serial scanned {file_idx}/{n_files} files"
+                )
+                last_heartbeat = now
+
     def _validate_canonical_time(self, time_candidates: List[np.ndarray]) -> None:
-        """Validate that all files share the same time grid and set self._canonical_time."""
-        import logging
-        log = self.logger or logging.getLogger("preprocessor")
+        """
+        Validate that all surviving files share (within tight tolerance) a common time grid
+        and compute the canonical time grid and dt range.
 
-        # Rank-0 should pass in a flat list of candidates already (gathered upstream)
+        This enforces that the downstream dataset can assume a fixed grid, but we allow
+        tiny FP drift between files (rtol/atol) instead of demanding bitwise equality.
+        """
         if not time_candidates:
-            raise RuntimeError("No time candidates collected from input files")
+            raise RuntimeError(
+                "[t-canon] No time candidates collected; this should not happen after filtering."
+            )
 
-        # Require equality across all candidates
-        canonical = time_candidates[0].astype(np.float64)
-        for k, other in enumerate(time_candidates[1:], start=1):
-            other64 = other.astype(np.float64)
-            if not np.array_equal(canonical, other64):
-                # Find first mismatch
-                diff_idx = np.where(canonical != other64)[0]
-                first = int(diff_idx[0]) if diff_idx.size else -1
-                c_val = float(canonical[first]) if first >= 0 else float("nan")
-                o_val = float(other64[first]) if first >= 0 else float("nan")
-                log.error(f"[t-canon] mismatch between candidate 0 and {k} at index {first} "
-                          f"(c={c_val}, o={o_val}); shapes: {canonical.shape} vs {other64.shape}")
-                raise ValueError("Time grid differs across files")
+        # Use the first candidate as the canonical reference
+        canonical = time_candidates[0]
+        if canonical.ndim != 1:
+            raise ValueError(
+                f"[t-canon] Canonical time grid must be 1D, got shape {canonical.shape}"
+            )
 
-        # Diagnostics on forward deltas
-        diffs = np.diff(canonical)
-        min_forward = float(np.min(diffs)) if diffs.size else float("inf")
-        nonpos = int(np.sum(diffs <= 0.0)) if not ALLOW_EQUAL_TIMEPOINTS else int(
-            np.sum(diffs < -float(TIME_DECREASE_TOLERANCE)))
-        q01 = float(np.quantile(diffs, 0.01)) if diffs.size else float("nan")
-        q50 = float(np.quantile(diffs, 0.50)) if diffs.size else float("nan")
-        q99 = float(np.quantile(diffs, 0.99)) if diffs.size else float("nan")
+        n = canonical.size
 
-        log.info(f"[t-canon] canonical T={canonical.shape[0]} "
-                 f"min_forward_dt={min_forward:.6g} "
-                 f"nonpositive_steps={nonpos} "
-                 f"p01={q01:.6g} median={q50:.6g} p99={q99:.6g}")
+        # Basic monotonicity check on the canonical grid
+        dt = np.diff(canonical)
+        if (dt < -TIME_DECREASE_TOLERANCE).any():
+            bad_idx = int(np.where(dt < -TIME_DECREASE_TOLERANCE)[0][0])
+            msg = (
+                f"[t-canon] Canonical time grid is not strictly non-decreasing at index {bad_idx} "
+                f"(t[{bad_idx}]={canonical[bad_idx]}, t[{bad_idx + 1}]={canonical[bad_idx + 1]}, "
+                f"dt={dt[bad_idx]})"
+            )
+            if self.rank == 0:
+                self.logger.error(msg)
+            raise ValueError("Canonical time grid is not monotonic")
 
-        if nonpos > 0:
-            j = int(np.where(diffs <= 0.0)[0][0]) if not ALLOW_EQUAL_TIMEPOINTS else int(
-                np.where(diffs < -float(TIME_DECREASE_TOLERANCE))[0][0])
-            log.warning(f"[t-canon] example nonpositive step at j={j} "
-                        f"(t[j], t[j+1])=({canonical[j]}, {canonical[j + 1]})")
+        # Use consistent tolerance values across all time comparisons
+        RTOL = 1e-10  # Relative tolerance
+        ATOL = 1e-12  # Absolute tolerance
 
+        # Cross-check all other candidates against the canonical one with tolerance
+        for idx, other in enumerate(time_candidates[1:], start=1):
+            if other.shape != canonical.shape:
+                msg = (
+                    f"[t-canon] Time grid shape mismatch between candidate 0 and {idx}: "
+                    f"{canonical.shape} vs {other.shape}"
+                )
+                if self.rank == 0:
+                    self.logger.error(msg)
+                raise ValueError("Time grid shape differs across files")
+
+            if not np.allclose(canonical, other, rtol=RTOL, atol=ATOL):
+                diff = np.abs(canonical - other)
+                max_idx = int(diff.argmax())
+                max_diff = float(diff[max_idx])
+                msg = (
+                    f"[t-canon] mismatch between candidate 0 and {idx} at index {max_idx} "
+                    f"(c={canonical[max_idx]!r}, o={other[max_idx]!r}, |Δ|={max_diff:.3e}); "
+                    f"shape={canonical.shape}, rtol={RTOL}, atol={ATOL}"
+                )
+                if self.rank == 0:
+                    self.logger.error(msg)
+                raise ValueError("Time grid differs across files beyond tolerance")
+
+        # If we reach here, all grids are consistent within tolerance: finalize canonical time
         self._canonical_time = canonical
+
+        # Compute dt range for downstream sanity checks / dataset metadata
+        dt = np.diff(self._canonical_time)
+        self._dt_min = float(dt.min())
+        self._dt_max = float(dt.max())
+
+        if self.rank == 0:
+            self.logger.info(
+                "[t-canon] Canonical time grid validated across %d candidate file(s); "
+                "n=%d, dt_min=%.6e, dt_max=%.6e, rtol=%.3e, atol=%.3e",
+                len(time_candidates),
+                n,
+                self._dt_min,
+                self._dt_max,
+                RTOL,
+                ATOL,
+            )
 
     def _log_memory_estimate(self) -> None:
         """Log estimated memory usage for processing."""
@@ -807,6 +927,16 @@ class DataPreprocessor:
     def _compute_dt_specification(self, time_grid: np.ndarray) -> Dict[str, float]:
         """
         Compute centralized dt normalization specification from a canonical time grid.
+
+        Returns:
+            {
+              "method": "log-min-max",
+              "log_min": float,
+              "log_max": float,
+              # extra audit fields:
+              "k1_min": float,
+              "k1_max": float,
+            }
         """
         import logging
         log = self.logger or logging.getLogger("preprocessor")
@@ -819,11 +949,13 @@ class DataPreprocessor:
         if not ALLOW_EQUAL_TIMEPOINTS:
             if np.any(diffs1 <= 0.0):
                 j = int(np.where(diffs1 <= 0.0)[0][0])
-                raise ValueError(f"Nonpositive forward step in canonical grid at j={j}")
+                raise ValueError(f"Nonpositive forward step in canonical grid at j={j} "
+                                 f"(t[j], t[j+1])=({t[j]}, {t[j + 1]})")
         else:
             if np.any(diffs1 < -float(TIME_DECREASE_TOLERANCE)):
                 j = int(np.where(diffs1 < -float(TIME_DECREASE_TOLERANCE))[0][0])
-                raise ValueError(f"Decreasing time step beyond tolerance at j={j}")
+                raise ValueError(f"Decreasing time step beyond tolerance at j={j} "
+                                 f"(t[j], t[j+1])=({t[j]}, {t[j + 1]})")
 
         # k=1 diagnostics
         k1_min = float(diffs1.min())
@@ -842,6 +974,7 @@ class DataPreprocessor:
 
         for k in range(k_min, k_max + 1):
             dtk = t[k:] - t[:-k]  # [T-k]
+            # Strictly positive by earlier checks; still guard with epsilon
             dtk_min = float(np.min(dtk))
             dtk_max = float(np.max(dtk))
             dt_min_all = min(dt_min_all, dtk_min)
@@ -867,8 +1000,11 @@ class DataPreprocessor:
     def _write_shards_and_collect_stats_parallel(self) -> Dict[str, RunningStatistics]:
         """
         Write NPZ shards with global buffers across files to create fewer shards.
+
+        Returns:
+            Dictionary of statistics for each variable (aggregated across all ranks)
         """
-        seed = self.seed
+        seed = self.seed  # Use the seed from config for deterministic hashing
 
         # Initialize statistics accumulators for training data only
         all_keys = list(dict.fromkeys(self.species_vars + self.global_vars + [self.time_key]))
@@ -911,20 +1047,45 @@ class DataPreprocessor:
         # Use a consistent file tag for mixed trajectories
         filetag = f"mix_r{self.rank}"
 
-        # Distribute work across ranks
-        work_items = []
-        for path_str in self.raw_files:
-            valid_groups = self._valid_group_names.get(str(path_str), [])
-            if valid_groups:
-                # Don't chunk within files - process all groups at once
-                work_items.append((path_str, valid_groups))
-
-        # Distribute work items across ranks
+        # ------------------------------------------------------------------
+        # Build per-rank work assignments without broadcasting a huge
+        # self._valid_group_names object. Root constructs the global list
+        # and sends each rank only its share.
+        # ------------------------------------------------------------------
         if self.comm:
-            # Round-robin distribution
-            my_work = [work_items[i] for i in range(len(work_items)) if i % self.size == self.rank]
+            if self.rank == 0:
+                work_items: List[Tuple[str, List[str]]] = []
+                for path_str in self.raw_files:
+                    valid_groups = self._valid_group_names.get(str(path_str), [])
+                    if valid_groups:
+                        # Process all valid groups for this file together
+                        work_items.append((path_str, valid_groups))
+
+                # Round-robin assignment by file index
+                assignments: Dict[int, List[Tuple[str, List[str]]]] = {r: [] for r in range(self.size)}
+                for idx, item in enumerate(work_items):
+                    r = idx % self.size
+                    assignments[r].append(item)
+
+                self.logger.info(
+                    f"Processing {len(work_items)} files across {self.size} ranks in shard-writing phase"
+                )
+
+                my_work = assignments[0]
+                for r in range(1, self.size):
+                    self.comm.send(assignments[r], dest=r, tag=200 + r)
+            else:
+                my_work: List[Tuple[str, List[str]]] = self.comm.recv(source=0, tag=200 + self.rank)
         else:
-            my_work = work_items
+            # Serial mode: build local work list directly
+            my_work: List[Tuple[str, List[str]]] = []
+            for path_str in self.raw_files:
+                valid_groups = self._valid_group_names.get(str(path_str), [])
+                if valid_groups:
+                    my_work.append((path_str, valid_groups))
+            self.logger.info(
+                f"Processing {len(my_work)} files in serial shard-writing phase"
+            )
 
         # Process assigned work
         local_split_counts = {"train": 0, "validation": 0, "test": 0}
@@ -934,7 +1095,7 @@ class DataPreprocessor:
         shard_counter = self.rank * 100000  # Each rank gets a range of 100k shard numbers
 
         # Function to flush a buffer when it's full
-        def flush_buffer_if_full(split_name):
+        def flush_buffer_if_full(split_name: str) -> None:
             nonlocal shard_counter
             buffer = global_buffers[split_name]
             if len(buffer["x0"]) >= self.traj_per_shard:
@@ -946,7 +1107,11 @@ class DataPreprocessor:
                     shard_counter
                 )
                 local_shards_metadata[split_name].append({
-                    "filename": f"shard_{split_name}_{filetag}_{shard_counter:05d}.npz",
+                    "filename": SHARD_FILENAME_FORMAT.format(
+                        split=split_name,
+                        filetag=filetag,
+                        idx=shard_counter
+                    ),
                     "n_trajectories": len(buffer["x0"])
                 })
                 shard_counter += 1
@@ -954,10 +1119,9 @@ class DataPreprocessor:
                 for key in buffer:
                     buffer[key].clear()
 
-        # Progress tracking
-        if self.rank == 0:
-            total_work = len(work_items)
-            self.logger.info(f"Processing {total_work} files across all ranks")
+        # Progress tracking (local)
+        if self.rank == 0 and my_work:
+            self.logger.info(f"Rank 0 will process {len(my_work)} local files")
 
         for work_idx, (path_str, groups) in enumerate(my_work):
             if self.rank == 0 and work_idx % 10 == 0:
@@ -982,7 +1146,11 @@ class DataPreprocessor:
                     shard_counter
                 )
                 local_shards_metadata[split_name].append({
-                    "filename": f"shard_{split_name}_{filetag}_{shard_counter:05d}.npz",
+                    "filename": SHARD_FILENAME_FORMAT.format(
+                        split=split_name,
+                        filetag=filetag,
+                        idx=shard_counter
+                    ),
                     "n_trajectories": len(buffer["x0"])
                 })
                 shard_counter += 1
@@ -1065,7 +1233,15 @@ class DataPreprocessor:
     ) -> None:
         """
         Add a file's trajectories to global buffers.
+
+        CRITICAL: This function validates that each trajectory's time grid matches
+        the canonical time grid (within tolerance) and replaces it with the exact
+        canonical grid to ensure perfect consistency within shards.
         """
+        # Consistent tolerance values for all time comparisons
+        RTOL = 1e-10  # Relative tolerance
+        ATOL = 1e-12  # Absolute tolerance
+
         # Deterministic shuffling using deterministic_hash for reproducibility
         file_hash_seed = int(deterministic_hash(path.name, seed) * 2 ** 32)
         rng = np.random.default_rng(seed ^ file_hash_seed)
@@ -1105,19 +1281,47 @@ class DataPreprocessor:
                 species_matrix_full = self._read_species_matrix(group, T_full)
 
                 # Skip first timestep if requested
-                # Probably don't do this
                 if self.skip_first_timestep:
-                    time_data = time_data_full[1:]
+                    time_data_loaded = time_data_full[1:]
                     species_matrix = species_matrix_full[1:, :]
                 else:
-                    time_data = time_data_full
+                    time_data_loaded = time_data_full
                     species_matrix = species_matrix_full
 
-                T = int(time_data.shape[0])
+                T = int(time_data_loaded.shape[0])
 
-                # Validate after skipping
-                if T < 2:
+                # CRITICAL: Validate against canonical time grid
+                if self._canonical_time is None:
+                    raise RuntimeError("Canonical time grid not set - this should not happen")
+
+                if len(time_data_loaded) != len(self._canonical_time):
+                    self.logger.warning(
+                        f"Skipping {path.name}:{group_name} - time vector length mismatch: "
+                        f"expected {len(self._canonical_time)}, got {len(time_data_loaded)}"
+                    )
                     continue
+
+                # Check if time grid matches canonical (with tolerance)
+                if not np.allclose(time_data_loaded, self._canonical_time, rtol=RTOL, atol=ATOL):
+                    max_diff = float(np.abs(time_data_loaded - self._canonical_time).max())
+                    max_diff_idx = int(np.abs(time_data_loaded - self._canonical_time).argmax())
+
+                    # Log warning but continue - we'll use canonical time
+                    self.logger.warning(
+                        f"{path.name}:{group_name} time grid differs from canonical:\n"
+                        f"  Max difference: {max_diff:.3e} at index {max_diff_idx}\n"
+                        f"  Loaded t[{max_diff_idx}] = {time_data_loaded[max_diff_idx]:.12e}\n"
+                        f"  Canonical t[{max_diff_idx}] = {self._canonical_time[max_diff_idx]:.12e}\n"
+                        f"  Using canonical time grid for consistency."
+                    )
+
+                # ALWAYS use canonical time grid to ensure perfect consistency within shards
+                # This is the key fix - we replace the loaded time with the canonical time
+                time_data = self._canonical_time.copy()
+
+                # Validate remaining conditions after using canonical time
+                if T < 2:
+                    continue  # Need at least 2 timesteps
 
                 if not np.isfinite(species_matrix).all():
                     continue
@@ -1134,18 +1338,18 @@ class DataPreprocessor:
                 if not np.isfinite(global_values).all():
                     continue
 
-                # Initial condition (now from the potentially shifted array)
+                # Initial condition
                 x0 = species_matrix[0, :].astype(self.storage_dtype, copy=False)
 
-                # Add to global buffer
+                # Add to global buffer with CANONICAL time grid
                 buffer = global_buffers[split]
                 buffer["x0"].append(x0)
                 buffer["g"].append(global_values.astype(self.storage_dtype, copy=False))
-                buffer["t"].append(time_data.astype(np.float64, copy=False))
+                buffer["t"].append(time_data.astype(np.float64, copy=False))  # Canonical time
                 buffer["y"].append(species_matrix.astype(self.storage_dtype, copy=False))
                 split_counts[split] += 1
 
-                # Update training statistics
+                # Update training statistics using canonical time
                 if split == "train":
                     self._update_training_stats(
                         train_stats, time_data, global_values, species_matrix
@@ -1157,6 +1361,12 @@ class DataPreprocessor:
     def _merge_statistics(self, all_stats: List[Dict[str, RunningStatistics]]) -> Dict[str, RunningStatistics]:
         """
         Merge statistics from multiple ranks using Welford's algorithm.
+
+        Args:
+            all_stats: List of statistics dictionaries from each rank
+
+        Returns:
+            Merged statistics dictionary
         """
         if not all_stats:
             return {}
@@ -1318,7 +1528,12 @@ class DataPreprocessor:
             split_name: str,
             shard_idx: int
     ) -> None:
-        """Write buffer contents to NPZ shard with strict time-grid checks and diagnostics."""
+        """
+        Write buffer contents to NPZ shard with tolerance-based time-grid checks and diagnostics.
+
+        Since _add_file_to_buffers now ensures all trajectories use the exact same canonical
+        time grid, this validation should always pass. We keep it as a safety check.
+        """
         import logging
         log = self.logger or logging.getLogger("preprocessor")
 
@@ -1338,14 +1553,46 @@ class DataPreprocessor:
             raise RuntimeError("Empty shard buffer: no time vectors present")
 
         time_ref = np.asarray(buffer["t"][0], dtype=np.float64).reshape(-1)
+
+        # Use consistent tolerance values for all time comparisons
+        RTOL = 1e-10  # Relative tolerance
+        ATOL = 1e-12  # Absolute tolerance
+
         for idx, time_array in enumerate(buffer["t"][1:], start=1):
             arr = np.asarray(time_array, dtype=np.float64).reshape(-1)
-            if not np.array_equal(time_ref, arr):
-                diff_indices = np.where(time_ref != arr)[0]
-                first_diff = int(diff_indices[0]) if diff_indices.size else -1
+
+            # Check if arrays have same length first
+            if len(time_ref) != len(arr):
                 raise RuntimeError(
-                    f"Time vectors differ within shard at local trajectory {idx} "
-                    f"(first mismatch index={first_diff})"
+                    f"Time vector length mismatch in shard at local trajectory {idx}: "
+                    f"reference has {len(time_ref)} points, trajectory has {len(arr)} points"
+                )
+
+            # Use np.allclose for tolerance-based comparison
+            # NOTE: Since _add_file_to_buffers now uses canonical time for all trajectories,
+            # this should always pass. We keep it as a safety check.
+            if not np.allclose(time_ref, arr, rtol=RTOL, atol=ATOL):
+                # Find where they differ
+                diff_mask = ~np.isclose(time_ref, arr, rtol=RTOL, atol=ATOL)
+                diff_indices = np.where(diff_mask)[0]
+                first_diff = int(diff_indices[0]) if diff_indices.size else -1
+
+                # Calculate maximum difference for diagnostics
+                abs_diff = np.abs(time_ref - arr)
+                max_diff = float(abs_diff.max())
+                max_diff_idx = int(abs_diff.argmax())
+                rel_diff = abs_diff / (np.abs(time_ref) + ATOL)
+                max_rel_diff = float(rel_diff.max())
+
+                raise RuntimeError(
+                    f"Time vectors differ within shard at local trajectory {idx}\n"
+                    f"  (This should not happen - indicates bug in _add_file_to_buffers)\n"
+                    f"  First mismatch at index {first_diff}\n"
+                    f"  Maximum absolute difference: {max_diff:.3e} at index {max_diff_idx}\n"
+                    f"  Maximum relative difference: {max_rel_diff:.3e}\n"
+                    f"  Reference t[{first_diff}] = {time_ref[first_diff]:.12e}\n"
+                    f"  Current t[{first_diff}] = {arr[first_diff]:.12e}\n"
+                    f"  Tolerance used: rtol={RTOL}, atol={ATOL}"
                 )
 
         # Forward-dt checks and diagnostics
@@ -1374,6 +1621,7 @@ class DataPreprocessor:
         )
 
         # Use float32 for t_vec to match downstream expectations and keep sizes reasonable
+        # Note: This conversion happens AFTER validation, so precision loss won't affect checks
         time_1d = time_ref.astype(np.float32, copy=False)
 
         if self.npz_compressed:

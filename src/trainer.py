@@ -43,10 +43,11 @@ DEF_BETA_KL: float = 0.0
 
 # torch.compile defaults
 COMPILE_ENABLE_DEFAULT: bool = False
-COMPILE_BACKEND: str = "inductor"
-COMPILE_MODE: str = "default"
-COMPILE_DYNAMIC: bool = True
-COMPILE_FULLGRAPH: bool = False
+COMPILE_BACKEND: Optional[str] = "inductor"     # keep inductor
+COMPILE_MODE: str = "max-autotune"    # lower Python/dispatcher overhead on steady shapes
+COMPILE_DYNAMIC: bool = False            # static shapes: cheaper plans, fewer recompiles
+COMPILE_FULLGRAPH: bool = True           # fuse the whole forward when possible
+
 
 # AdaptiveStiffLoss defaults / numerics
 LOSS_LAMBDA_PHYS: float = 1.0
@@ -736,6 +737,12 @@ class Trainer:
         self.accumulate = int(tcfg.get("accumulate_grad_batches", DEF_ACCUMULATE))
         self.torch_compile = bool(tcfg.get("torch_compile", COMPILE_ENABLE_DEFAULT))
 
+        # Allow config to override compile knobs
+        self.compile_backend = tcfg.get("torch_compile_backend", COMPILE_BACKEND)
+        self.compile_mode = tcfg.get("torch_compile_mode", COMPILE_MODE)
+        self.compile_dynamic = bool(tcfg.get("compile_dynamic", COMPILE_DYNAMIC))
+        self.compile_fullgraph = bool(tcfg.get("compile_fullgraph", COMPILE_FULLGRAPH))
+
         # Optional limits (batches), distinct from dataset step bounds
         self.limit_train_batches = int(tcfg.get("max_train_steps_per_epoch", DEF_MAX_TRAIN_STEPS_PER_EPOCH) or 0)
         self.limit_val_batches = int(tcfg.get("max_val_batches", DEF_MAX_VAL_BATCHES) or 0)
@@ -789,12 +796,16 @@ class Trainer:
         try:
             compiled = torch.compile(
                 model,
-                backend=COMPILE_BACKEND,
-                mode=COMPILE_MODE,
-                dynamic=COMPILE_DYNAMIC,
-                fullgraph=COMPILE_FULLGRAPH,
+                backend=self.compile_backend,
+                mode=self.compile_mode,
+                dynamic=self.compile_dynamic,
+                fullgraph=self.compile_fullgraph,
             )
-            self.logger.info(f"torch.compile enabled ({COMPILE_BACKEND}, {COMPILE_MODE}, dynamic={COMPILE_DYNAMIC})")
+            self.logger.info(
+                f"torch.compile enabled (backend={self.compile_backend}, mode={self.compile_mode}, "
+                f"dynamic={self.compile_dynamic}, fullgraph={self.compile_fullgraph})"
+            )
+
             return compiled
         except Exception as e:
             self.logger.warning(f"torch.compile disabled ({e})")
@@ -839,18 +850,15 @@ class Trainer:
         if self.limit_val_batches > 0:
             trainer_kwargs["limit_val_batches"] = self.limit_val_batches
 
-        # ---------------------- EXTERNAL DDP FIX (IMPORTANT) -------------------
-        # If we're launched externally (mpiexec/torchrun), make Lightning's
-        # world-size match the external WORLD_SIZE so DistributedSampler is correct.
         world_size = int(os.getenv("WORLD_SIZE", "1"))
         externally_launched = world_size > 1
 
         if externally_launched:
-            # One process per external rank (devices=1), and inform PL of global size
+            # Safer default: let external launcher/rendezvous define world size.
+            # Lightning won't spawn; it will read ENV (RANK/WORLD_SIZE, etc.).
             devices = 1
-            num_nodes = world_size
+            num_nodes = 1
         else:
-            # Single-process or PL-managed multi-GPU on this host
             devices = PL_DEVICES
             num_nodes = 1
 

@@ -30,7 +30,7 @@ import torch.nn.functional as F  # noqa: F401  (may be used by Torch export)
 # Project root assumed one level above this file's parent (…/<repo>/{src,models,...})
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-WORK_DIR = ROOT / "models" / "best"
+WORK_DIR = ROOT / "models" / "2_layer"
 CONFIG_PATH = WORK_DIR / "config.json"
 
 # Export artifacts

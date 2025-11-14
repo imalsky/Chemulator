@@ -2,9 +2,8 @@
 # --- PBS ---
 #PBS -N gh200_train_job
 #PBS -q gpu_normal
-#####PBS -l select=1:ncpus=72:ngpus=1:mem=400gb:model=gh200
-#PBS -l select=8:ncpus=48:ngpus=1:mem=400gb:model=gh200
-#PBS -l walltime=10:00:00
+#PBS -l select=1:ncpus=72:ngpus=1:mpiprocs=72:ompthreads=1:mem=400gb:model=gh200
+#PBS -l walltime=5:00:00
 #PBS -W group_list=s2458
 #PBS -j oe
 # --- end PBS ---
@@ -297,25 +296,34 @@ fi
 # Phase A: PREPROCESS (MPI) — only if SKIP==0
 ########################################
 if [ "${SKIP:-0}" -eq 0 ]; then
-  echo "Phase A: Preprocessing with MPI (32 ranks)…"
+  echo "Phase A: Preprocessing with MPI"
   cat > .preprocess.py <<'PY'
 from pathlib import Path
 from utils import load_json_config, setup_logging
 from preprocessor import DataPreprocessor
+
 cfg = load_json_config(Path("config/config.jsonc"))
 setup_logging()
 DataPreprocessor(cfg).run()
 PY
 
-  export OMP_NUM_THREADS=2
-  export MKL_NUM_THREADS=2
-  export OPENBLAS_NUM_THREADS=2
-  export NUMEXPR_NUM_THREADS=2
-  mpiexec -np 32 -genvall "$PY" ./.preprocess.py || { echo "Preprocess failed"; exit 3; }
+  # 72 MPI ranks × 1 thread each, matching mpiprocs=72:ompthreads=1
+  export OMP_NUM_THREADS=1
+  export MKL_NUM_THREADS=1
+  export OPENBLAS_NUM_THREADS=1
+  export NUMEXPR_NUM_THREADS=1
+
+  # Use what PBS actually allocated rather than hardcoding 72
+  NPROCS=${PBS_NP:-$(wc -l < "$PBS_NODEFILE")}
+  echo "Preprocess: NPROCS=${NPROCS} (PBS_NP=${PBS_NP:-unset})"
+
+  mpiexec -np "$NPROCS" -genvall "$PY" ./.preprocess.py
+
   unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS
 else
   echo "Phase A: Skipped (hydrating from processed artifacts)."
 fi
+
 
 ########################################
 # Quick GPU sanity before train
@@ -459,3 +467,4 @@ PY
 
     exec "${PY:-python}" -u src/main.py
   '
+

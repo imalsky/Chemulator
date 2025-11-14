@@ -5,7 +5,7 @@
     // List of raw HDF5 files (optional; auto-detect if empty)
     "raw_data_files": [],
     // Directory for logs/checkpoints/exports
-    "work_dir": "models/recreating",
+    "work_dir": "models/v3",
     // Delete existing work_dir before start
     "overwrite": true
   },
@@ -63,11 +63,11 @@
     // Read chunk length for HDF5 (0 = full)
     "hdf5_chunk_size": 0,
     // Drop profiles with any value below this (<=0 keeps all)
-    "min_value_threshold": 0,
+    "min_value_threshold": 1e-30,
     // Compress NPZ shards (smaller, slower I/O)
     "npz_compressed": false,
     // Workers for preprocessing (I/O bound)
-    "num_workers": 16,
+    "num_workers": 8,
     // Trajectories per output shard
     "trajectories_per_shard": 65536,
     // Drop t=0 row when exporting shards
@@ -94,7 +94,7 @@
     // Sample offsets uniformly then fit anchors
     "uniform_offset_sampling_strict": false,
     // assume all the times are the same
-    "assume_shared_grid": false,
+    "assume_shared_grid": true,
     // Δt clamp floor before normalization
     "dt_epsilon": 1e-30,
 
@@ -115,13 +115,13 @@
 
   "model": {
     // Latent channel count for autoencoder
-    "latent_dim": 512,
+    "latent_dim": 64,
     // Encoder MLP hidden sizes
-    "encoder_hidden": [768, 768, 768, 768],
+    "encoder_hidden": [256, 256, 256],
     // Dynamics MLP hidden sizes
-    "dynamics_hidden": [768, 768, 768, 768],
+    "dynamics_hidden": [256, 256, 256],
     // Decoder MLP hidden sizes
-    "decoder_hidden": [768, 768, 768, 768],
+    "decoder_hidden": [256, 256, 256],
     // Nonlinearity for MLPs
     "activation": "silu",
     // Dropout rate in MLPs
@@ -131,11 +131,11 @@
     // Predict Δz and add to z (residual dynamics)
     "dynamics_residual": true,
     // Decoder predicts Δy in z-space
-    "predict_delta": false,
+    "predict_delta": true,
     // Decoder predicts Δlog10(y) in physical space
     "predict_delta_log_phys": false,
     // Use log-softmax head for simplex outputs
-    "softmax_head": true,
+    "softmax_head": false,
     // Allow softmax on subset of species
     "allow_partial_simplex": false
   },
@@ -147,8 +147,13 @@
     "gradient_clip": 0.0,
     // Gradient accumulation steps
     "accumulate_grad_batches": 1,
-    // Enable torch.compile for the Lightning module
+
     "torch_compile": true,
+    "torch_compile_backend": "inductor",
+    "torch_compile_mode": "max-autotune",
+    "compile_dynamic": false,
+    "compile_fullgraph": true,
+
     // Initial learning rate
     "lr": 1e-4,
     // Cosine schedule minimum learning rate
@@ -179,7 +184,7 @@
     // Maximum j−i offset for targets (null = T-1)
     "max_steps": 99,
     // Anchors per trajectory per epoch
-    "pairs_per_traj": 32,
+    "pairs_per_traj": 4,
 
     "adaptive_stiff_loss": {
       // Weight for physical-space term
