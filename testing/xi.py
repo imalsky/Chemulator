@@ -53,7 +53,7 @@ PROFILES_TO_PLOT: List[str] = [
 REPO_ROOT = Path("/Users/imalsky/Desktop/Chemulator")
 SRC_DIR = REPO_ROOT / "src"
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
-MODEL_DIR = REPO_ROOT / "models" / "best"
+MODEL_DIR = REPO_ROOT / "models" / "v1"
 VULCAN_DIR = Path("/Users/imalsky/Desktop/Chemistry_Project/Vulcan/0D_full_NCHO/solar")
 OUT_DIR = MODEL_DIR / "plots"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -62,7 +62,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # Time / Plot Config
 # ============================================================================
 
-T0 = 1.0e-3           # Requested anchor time (seconds). Controls ML anchor ONLY.
+T0 = 1.0e-1           # Requested anchor time (seconds). Controls ML anchor ONLY.
 DT_MIN = 1e-3         # ML Δt range (relative to anchor)
 DT_MAX = 1e8
 K_POINTS = 50.0       # number of Δt samples (float for easy edits; cast to int)
@@ -76,7 +76,7 @@ XMAX = 1e18
 # Species / Data Config
 # ============================================================================
 
-FEED_MIN = 1.0e-15
+FEED_MIN = 1.0e-25
 PLOT_SPECIES: List[str] = ['H2', 'H2O', 'CH4', 'CO', 'CO2', 'NH3', 'HCN', 'N2', 'C2H2', 'H', 'CH3', 'OH', 'O']
 PLOT_SPECIES: List[str] = ['H2O', 'CH4', 'CO', 'CO2', 'NH3', 'HCN', 'N2', 'C2H2']
 

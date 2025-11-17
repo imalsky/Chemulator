@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""
+Flow-map AE: Predicted vs True Scatter (1:1 line)
+
+- Loads exported CPU K=1 program (export_k1_cpu.pt2) from models/v2
+- Uses test shard(s) under processed_data_dir/test/shard_*.npz
+- Samples N_SAMPLES trajectories and Q_COUNT times per trajectory
+- Produces a log–log scatter of y_true vs y_pred with a 1:1 line
+- Prints average fractional error over all plotted points
+"""
+
+import os
+import sys
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+plt.style.use("science.mplstyle")
+
+# ---------------- Paths & settings ----------------
+REPO = Path(__file__).parent.parent
+MODEL_DIR = REPO / "models" / "v2"
+EP_FILENAME = "export_k1_cpu.pt2"
+
+sys.path.insert(0, str(REPO / "src"))
+from utils import load_json_config as load_json, seed_everything
+from normalizer import NormalizationHelper
+
+# Globals (no argparse)
+N_SAMPLES: int = 64       # number of test trajectories to use
+Q_COUNT: int = 100        # number of query times per trajectory
+PLOT_SPECIES: List[str] = ['H2', 'H2O', 'CH4', 'CO', 'CO2', 'NH3', 'HCN', 'N2']
+
+EPS_FRACTIONAL = 1e-25
+PLOT_FLOOR = 1e-25
+
+
+# ---------------- Helpers ----------------
+def load_first_test_shard(data_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load the first test shard.
+
+    Returns:
+        y_mat : [N, T, S]
+        g_all : [N, G]
+        t_vec : [T] or [N, T]
+    """
+    test_dir = data_dir / "test"
+    shards = sorted(test_dir.glob("shard_*.npz"))
+    if not shards:
+        raise FileNotFoundError(f"No test shards in {test_dir}")
+
+    shard_path = shards[0]
+    with np.load(shard_path) as d:
+        y_mat = d["y_mat"].astype(np.float32)         # [N, T, S]
+        g_all = d["globals"].astype(np.float32)       # [N, G]
+        t_vec = d["t_vec"].astype(np.float32)         # [T] or [N, T]
+    return y_mat, g_all, t_vec
+
+
+def get_time_vector_for_sample(t_vec: np.ndarray, idx: int) -> np.ndarray:
+    """Handle shared vs per-row time grid."""
+    if t_vec.ndim == 1:
+        return t_vec
+    elif t_vec.ndim == 2:
+        return t_vec[idx]
+    else:
+        raise ValueError(f"Invalid t_vec ndim={t_vec.ndim}")
+
+
+def select_species_indices(species_all: List[str],
+                           plot_species: List[str]) -> Tuple[List[int], List[str]]:
+    """Return indices and base names of species to keep."""
+    base_all = [n[:-10] if n.endswith("_evolution") else n for n in species_all]
+    if plot_species:
+        keep = [i for i, b in enumerate(base_all) if b in plot_species]
+    else:
+        keep = list(range(len(base_all)))
+    if not keep:
+        raise RuntimeError("No requested species found in species_variables.")
+    labels = [base_all[i] for i in keep]
+    return keep, labels
+
+
+def prepare_batch(
+    y0: np.ndarray,
+    g: np.ndarray,
+    t_phys: np.ndarray,
+    q_count: int,
+    norm: NormalizationHelper,
+    species: List[str],
+    globals_: List[str],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
+    """
+    Prepare normalized (y, dt, g) for K=1 export for a single trajectory anchored at t0.
+
+    Returns:
+        y_batch : [K, S]  (normalized)
+        dt_norm : [K, 1]  (normalized Δt)
+        g_batch : [K, G]  (normalized)
+        q_idx   : [K]     (integer indices into t_phys / y)
+    """
+    M = len(t_phys)
+    if M < 2:
+        raise ValueError("Trajectory has fewer than 2 time points; cannot form Δt queries.")
+
+    qn = max(1, min(q_count, M - 1))
+    q_idx = np.linspace(1, M - 1, qn).round().astype(int)
+    t_sel = t_phys[q_idx]                               # absolute seconds
+    dt_sec = np.maximum(t_sel - t_phys[0], 0.0).astype(np.float32)
+
+    # Normalize anchor and globals
+    y0_norm = norm.normalize(torch.from_numpy(y0[None, :]), species).float()      # [1, S]
+    if globals_:
+        g_norm = norm.normalize(torch.from_numpy(g[None, :]), globals_).float()   # [1, G]
+    else:
+        g_norm = torch.from_numpy(g[None, :]).float()                             # [1, G] or [1, 0]
+
+    # Normalize Δt (physical seconds)
+    dt_norm = norm.normalize_dt_from_phys(torch.from_numpy(dt_sec)).view(-1, 1).float()  # [K, 1]
+
+    K = dt_norm.shape[0]
+    y_batch = y0_norm.repeat(K, 1)  # [K, S]
+    g_batch = g_norm.repeat(K, 1)   # [K, G]
+    return y_batch, dt_norm, g_batch, q_idx
+
+
+@torch.inference_mode()
+def run_inference(model, y_batch: torch.Tensor,
+                  dt_batch: torch.Tensor,
+                  g_batch: torch.Tensor) -> torch.Tensor:
+    """
+    Call exported program.
+
+    Inputs:
+        y_batch : [K, S]
+        dt_batch: [K, 1]
+        g_batch : [K, G]
+
+    Exported CPU K=1 program is assumed to return [K, 1, S]. We squeeze
+    the middle dimension to get [K, S].
+    """
+    out = model(y_batch, dt_batch, g_batch)
+    if out.dim() != 3 or out.size(1) != 1:
+        raise RuntimeError(f"Unexpected export output shape: {tuple(out.shape)} (expected [K,1,S])")
+    return out[:, 0, :]  # [K, S]
+
+
+def plot_pred_vs_true_scatter(y_true_flat: np.ndarray,
+                              y_pred_flat: np.ndarray,
+                              out_path: Path) -> None:
+    """Log–log scatter of predicted vs true values with a 1:1 line."""
+    mask = np.isfinite(y_true_flat) & np.isfinite(y_pred_flat)
+    y_true = np.clip(y_true_flat[mask], PLOT_FLOOR, None)
+    y_pred = np.clip(y_pred_flat[mask], PLOT_FLOOR, None)
+
+    if y_true.size == 0:
+        raise RuntimeError("No valid points for scatter plot.")
+
+    vmin = min(y_true.min(), y_pred.min())
+    vmax = max(y_true.max(), y_pred.max())
+    lo = vmin * 0.8
+    hi = vmax * 1.2
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.loglog(y_true, y_pred, ".", alpha=0.3, markersize=3)
+    ax.loglog([lo, hi], [lo, hi], "k--", linewidth=1.5, label="1:1")
+
+    ax.set_xlabel("True abundance")
+    ax.set_ylabel("Predicted abundance")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.legend(loc="lower right")
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Scatter plot saved: {out_path}")
+
+
+# ---------------- Main ----------------
+def main() -> None:
+    os.chdir(REPO)
+    seed_everything(42)
+
+    # Load config and processed data dir
+    try:
+        cfg = load_json(MODEL_DIR / "config.json")
+    except FileNotFoundError:
+        cfg = load_json(MODEL_DIR / "trial_config.final.json")
+    data_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
+
+    # Load normalization manifest
+    manifest = load_json(data_dir / "normalization.json")
+    meta = manifest.get("meta", {})
+    species = list(meta.get("species_variables", []))
+    globals_ = list(meta.get("global_variables", []))
+    if not species:
+        raise RuntimeError("No species_variables in normalization.json")
+
+    norm = NormalizationHelper(manifest)
+    keep_idx, _labels = select_species_indices(species, PLOT_SPECIES)
+
+    # Load exported program (NO .eval(), it’s not supported for ExportedProgram)
+    ep = torch.export.load(MODEL_DIR / EP_FILENAME)
+    model = ep.module()
+
+    # Load first test shard
+    y_mat, g_all, t_vec = load_first_test_shard(data_dir)
+    n_profiles = y_mat.shape[0]
+    n_use = min(N_SAMPLES, n_profiles)
+
+    all_true = []
+    all_pred = []
+
+    for i in range(n_use):
+        y_traj = y_mat[i]             # [T, S]
+        g_vec = g_all[i]              # [G]
+        t_phys = get_time_vector_for_sample(t_vec, i)  # [T]
+
+        y0 = y_traj[0]                # anchor at t0
+
+        y_batch, dt_batch, g_batch, q_idx = prepare_batch(
+            y0=y0,
+            g=g_vec,
+            t_phys=t_phys,
+            q_count=Q_COUNT,
+            norm=norm,
+            species=species,
+            globals_=globals_,
+        )
+
+        # Predict then denormalize
+        y_pred_norm = run_inference(model, y_batch, dt_batch, g_batch)   # [K, S]
+        y_pred = norm.denormalize(y_pred_norm, species).cpu().numpy()    # [K, S]
+
+        # Ground truth at same times
+        y_true_sel = y_traj[q_idx, :len(species)]                        # [K, S]
+
+        # Restrict to selected species
+        y_true_sel = y_true_sel[:, keep_idx]                             # [K, S_sel]
+        y_pred_sel = y_pred[:, keep_idx]                                 # [K, S_sel]
+
+        all_true.append(y_true_sel.reshape(-1))
+        all_pred.append(y_pred_sel.reshape(-1))
+
+    y_true_flat = np.concatenate(all_true, axis=0)
+    y_pred_flat = np.concatenate(all_pred, axis=0)
+
+    # Average fractional error
+    frac_err = np.abs(y_pred_flat - y_true_flat) / (np.abs(y_true_flat) + EPS_FRACTIONAL)
+    mean_frac_err = float(np.mean(frac_err))
+    print(f"Average fractional error over {y_true_flat.size} points: {mean_frac_err:.3e}")
+
+    # Scatter plot with 1:1 line
+    out_png = MODEL_DIR / "plots" / f"pred_vs_true_scatter_{n_use}samples.png"
+    plot_pred_vs_true_scatter(y_true_flat, y_pred_flat, out_png)
+
+
+if __name__ == "__main__":
+    main()

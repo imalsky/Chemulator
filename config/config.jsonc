@@ -22,7 +22,7 @@
     // Allow TF32 tensor cores on Ampere/Hopper
     "tf32": true,
     // Max OpenMP threads for CPU ops
-    "omp_num_threads": 8,
+    "omp_num_threads": 4,
     // Global RNG seed
     "seed": 42
   },
@@ -67,7 +67,7 @@
     // Compress NPZ shards (smaller, slower I/O)
     "npz_compressed": false,
     // Workers for preprocessing (I/O bound)
-    "num_workers": 8,
+    "num_workers": 32,
     // Trajectories per output shard
     "trajectories_per_shard": 65536,
     // Drop t=0 row when exporting shards
@@ -78,7 +78,7 @@
 
   "dataset": {
     // Global training batch size
-    "batch_size_train": 12288,
+    "batch_size_train": 16384,
     // Avoid full shard scan for the preprocessed data; trust metadata files
     "skip_scan": true,
     // Skip time-grid monotonicity checks
@@ -102,26 +102,26 @@
     "use_first_anchor": true,
 
     // DataLoader workers
-    "num_workers": 8,
+    "num_workers": 16,
     // Keep workers alive between epochs
     "persistent_workers": true,
     // Pin memory for faster H2D copies (use only when CPU-staged)
     "pin_memory": true,
     // Prefetch batches per worker
-    "prefetch_factor": 4,
+    "prefetch_factor": 8,
     // Stage entire set to GPU at init
     "preload_to_gpu": false
   },
 
   "model": {
     // Latent channel count for autoencoder
-    "latent_dim": 64,
+    "latent_dim": 256,
     // Encoder MLP hidden sizes
-    "encoder_hidden": [256, 256, 256],
+    "encoder_hidden": [768, 768, 768, 768],
     // Dynamics MLP hidden sizes
-    "dynamics_hidden": [256, 256, 256],
+    "dynamics_hidden": [768, 768, 768, 768],
     // Decoder MLP hidden sizes
-    "decoder_hidden": [256, 256, 256],
+    "decoder_hidden": [768, 768, 768, 768],
     // Nonlinearity for MLPs
     "activation": "silu",
     // Dropout rate in MLPs
@@ -142,13 +142,13 @@
 
   "training": {
     // Total epochs to train
-    "epochs": 100,
+    "epochs": 200,
     // Clip grad-norm at this value (0 = disabled)
     "gradient_clip": 0.0,
     // Gradient accumulation steps
     "accumulate_grad_batches": 1,
 
-    "torch_compile": true,
+    "torch_compile": false,
     "torch_compile_backend": "inductor",
     "torch_compile_mode": "max-autotune",
     "compile_dynamic": false,
@@ -161,7 +161,7 @@
     // Linear warmup epochs before cosine
     "warmup_epochs": 10,
     // Weight decay for AdamW
-    "weight_decay": 1e-5,
+    "weight_decay": 1e-4,
     // Weight on KL divergence (if VAE encoder)
     "beta_kl": 0.0015,
     // Limit training steps per epoch (0 = no limit)
@@ -184,13 +184,13 @@
     // Maximum j−i offset for targets (null = T-1)
     "max_steps": 99,
     // Anchors per trajectory per epoch
-    "pairs_per_traj": 4,
+    "pairs_per_traj": 12,
 
     "adaptive_stiff_loss": {
       // Weight for physical-space term
       "lambda_phys": 1.0,
       // Weight for z-space term
-      "lambda_z": 1.0,
+      "lambda_z": 0.5,
       // Fractional loss denominator floor
       "epsilon_phys": 1e-20
     }

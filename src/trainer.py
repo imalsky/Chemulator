@@ -42,12 +42,11 @@ DEF_MIN_LR: float = 1e-6
 DEF_BETA_KL: float = 0.0
 
 # torch.compile defaults
-COMPILE_ENABLE_DEFAULT: bool = False
-COMPILE_BACKEND: Optional[str] = "inductor"     # keep inductor
-COMPILE_MODE: str = "max-autotune"    # lower Python/dispatcher overhead on steady shapes
-COMPILE_DYNAMIC: bool = False            # static shapes: cheaper plans, fewer recompiles
-COMPILE_FULLGRAPH: bool = True           # fuse the whole forward when possible
-
+COMPILE_ENABLE_DEFAULT: bool = True
+COMPILE_BACKEND: Optional[str] = "inductor"
+COMPILE_MODE: str = "default"
+COMPILE_DYNAMIC: bool = False
+COMPILE_FULLGRAPH: bool = False
 
 # AdaptiveStiffLoss defaults / numerics
 LOSS_LAMBDA_PHYS: float = 1.0
@@ -854,10 +853,9 @@ class Trainer:
         externally_launched = world_size > 1
 
         if externally_launched:
-            # Safer default: let external launcher/rendezvous define world size.
-            # Lightning won't spawn; it will read ENV (RANK/WORLD_SIZE, etc.).
+            # Each process uses 1 device; num_nodes * devices == WORLD_SIZE
             devices = 1
-            num_nodes = 1
+            num_nodes = world_size
         else:
             devices = PL_DEVICES
             num_nodes = 1
