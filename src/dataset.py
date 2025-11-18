@@ -669,6 +669,24 @@ def create_dataloader(
     num_workers = int(num_workers)
     is_train = getattr(dataset, "split", "") == "train"
 
+    if getattr(dataset, "_stage_device", None) is not None and getattr(dataset, "_stage_device").type == "cuda":
+        if num_workers > 0:
+            log = getattr(dataset, "_log", None)
+            msg = (
+                "[dl] preload_to_gpu=True detected; forcing num_workers=0, "
+                "pin_memory=False, persistent_workers=False to avoid CUDA-in-fork "
+                "errors in DataLoader workers."
+            )
+            if log is not None:
+                log.warning(msg)
+            else:
+                print(msg)
+
+        num_workers = 0
+        persistent_workers = False
+        pin_memory = False
+    # --- END NEW ---
+
     kwargs: Dict[str, Any] = dict(
         dataset=dataset,
         batch_size=int(batch_size),

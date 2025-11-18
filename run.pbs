@@ -216,6 +216,35 @@ print("optuna vendored:", optuna.__version__, "from", optuna.__file__)
 PY
 fi
 
+
+########################################
+# Make sure torch-optimizer (for LAMB) is vendored too
+########################################
+echo "Checking torch_optimizer..."
+if ! "$PY" - <<'PY'
+ok=True
+try:
+    import torch_optimizer, sys
+    print("torch_optimizer present:", torch_optimizer.__version__, "from", torch_optimizer.__file__)
+except Exception as e:
+    print("torch_optimizer import failed pre-install:", repr(e)); ok=False
+import sys; sys.exit(0 if ok else 1)
+PY
+then
+  echo "Installing torch-optimizer into $VENDOR ..."
+  "$PY" -m pip install --no-cache-dir --upgrade \
+    --target "$VENDOR" "torch-optimizer>=0.3.0,<0.5"
+  "$PY" - <<'PY'
+import torch_optimizer
+print("torch_optimizer vendored:", torch_optimizer.__version__, "from", torch_optimizer.__file__)
+PY
+fi
+
+
+
+
+
+
 ########################################
 # Print Torch/CUDA build info
 ########################################

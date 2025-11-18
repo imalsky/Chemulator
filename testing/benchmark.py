@@ -18,7 +18,7 @@ import torch
 import matplotlib.pyplot as plt
 
 # ====== GLOBALS ======
-MODEL_SUBDIR = "models/v1"     # exporter target dir
+MODEL_SUBDIR = "models/v1_long"     # exporter target dir
 BENCH_K: int = 1                # used for BK exports; CPU K1 ignores
 
 WARMUP_STEPS: int = 10

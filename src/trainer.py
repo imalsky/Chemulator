@@ -82,7 +82,7 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback, StochasticWeightAveraging
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 # ============================== LOSS ==========================================
@@ -269,54 +269,82 @@ class ModelTask(pl.LightningModule):
 
     def configure_optimizers(self):
         """
-        AdamW (+ fused when safe) with Linear warmup -> Cosine.
+        Optimizer + LR scheduler.
+
+        Supports:
+          - AdamW (default) with optional fused implementation
+          - LAMB (via torch-optimizer) when cfg["training"]["optimizer"] == "lamb"
         """
-        # Detect fused AdamW support
-        try:
-            has_fused_flag = ("fused" in inspect.signature(torch.optim.AdamW).parameters)
-        except Exception:
-            has_fused_flag = False
+        tcfg = self.cfg.get("training", {})
+        opt_name = str(tcfg.get("optimizer", "adamw")).lower().strip()
 
-        # Effective gradient-clip from Trainer (if any)
-        tr = getattr(self, "trainer", None)
-        try:
-            clip_val = float(getattr(tr, "gradient_clip_val", 0.0) or 0.0) if tr is not None else \
-                       float(self.cfg.get("training", {}).get("gradient_clip", 0.0) or 0.0)
-        except Exception:
-            clip_val = 0.0
+        # ---------------- optimizer selection ----------------
+        if opt_name == "adamw":
+            # Detect fused AdamW support
+            try:
+                has_fused_flag = ("fused" in inspect.signature(torch.optim.AdamW).parameters)
+            except Exception:
+                has_fused_flag = False
 
-        # Some builds disable fused under FP16 + grad clipping
-        is_fp16_amp = False
-        try:
-            from pytorch_lightning.plugins.precision.amp import AMPPrecisionPlugin
-            is_fp16_amp = isinstance(getattr(self.trainer, "precision_plugin", None), AMPPrecisionPlugin) and \
-                          getattr(self.trainer.precision_plugin, "precision", None) in ("16-mixed", "16-true")
-        except Exception:
-            pass
+            # Effective gradient-clip from Trainer (if any)
+            tr = getattr(self, "trainer", None)
+            try:
+                clip_val = float(getattr(tr, "gradient_clip_val", 0.0) or 0.0) if tr is not None else \
+                           float(tcfg.get("gradient_clip", 0.0) or 0.0)
+            except Exception:
+                clip_val = 0.0
 
-        use_fused = torch.cuda.is_available() and has_fused_flag and (clip_val == 0.0 or not is_fp16_amp)
+            # Some builds disable fused under FP16 + grad clipping
+            is_fp16_amp = False
+            try:
+                from pytorch_lightning.plugins.precision.amp import AMPPrecisionPlugin
+                is_fp16_amp = isinstance(getattr(self.trainer, "precision_plugin", None), AMPPrecisionPlugin) and \
+                              getattr(self.trainer.precision_plugin, "precision", None) in ("16-mixed", "16-true")
+            except Exception:
+                pass
 
-        # Optimizer
-        opt_kwargs = dict(lr=self.lr, weight_decay=self.weight_decay)
-        if use_fused:
-            opt_kwargs["fused"] = True
-        optimizer = torch.optim.AdamW(self.parameters(), **opt_kwargs)
+            use_fused = torch.cuda.is_available() and has_fused_flag and (clip_val == 0.0 or not is_fp16_amp)
 
-        # Scheduler: linear warmup -> cosine
+            opt_kwargs = dict(lr=self.lr, weight_decay=self.weight_decay)
+            if use_fused:
+                opt_kwargs["fused"] = True
+            optimizer = torch.optim.AdamW(self.parameters(), **opt_kwargs)
+
+        elif opt_name == "lamb":
+            # LAMB from torch-optimizer (third-party but "prebuilt")
+            import torch_optimizer as torchopt
+            optimizer = torchopt.Lamb(
+                self.parameters(),
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+        else:
+            raise ValueError(f"Unknown optimizer '{opt_name}'. Expected 'adamw' or 'lamb'.")
+
+        # ---------------- LR scheduler: warmup -> cosine ----------------
         scheds = []
         if self.warmup_epochs > 0:
-            scheds.append(LinearLR(optimizer, start_factor=WARMUP_START_FACTOR, total_iters=max(1, self.warmup_epochs)))
+            scheds.append(
+                LinearLR(
+                    optimizer,
+                    start_factor=WARMUP_START_FACTOR,
+                    total_iters=max(1, self.warmup_epochs),
+                )
+            )
 
         max_epochs = max(1, (getattr(self.trainer, "max_epochs", 1) or 1))
         t_max = max(1, max_epochs - self.warmup_epochs)
         cosine = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=self.min_lr)
 
         scheduler = cosine if not scheds else SequentialLR(
-            optimizer, schedulers=[scheds[0], cosine], milestones=[self.warmup_epochs]
+            optimizer,
+            schedulers=[scheds[0], cosine],
+            milestones=[self.warmup_epochs],
         )
 
         # Return tuple/list form (avoids edge-case mis-detection on some PL builds)
         return [optimizer], [{"scheduler": scheduler, "interval": "epoch", "monitor": CKPT_MONITOR}]
+
 
     # --------------------------- steps / metrics ------------------------------
 
@@ -736,6 +764,13 @@ class Trainer:
         self.accumulate = int(tcfg.get("accumulate_grad_batches", DEF_ACCUMULATE))
         self.torch_compile = bool(tcfg.get("torch_compile", COMPILE_ENABLE_DEFAULT))
 
+        # SWA config
+        self.use_swa = bool(tcfg.get("use_swa", False))
+        self.swa_lrs = tcfg.get("swa_lrs", None)
+        self.swa_epoch_start = tcfg.get("swa_epoch_start", 0.8)
+        self.swa_annealing_epochs = int(tcfg.get("swa_annealing_epochs", 10))
+        self.swa_annealing_strategy = str(tcfg.get("swa_annealing_strategy", "cos"))
+
         # Allow config to override compile knobs
         self.compile_backend = tcfg.get("torch_compile_backend", COMPILE_BACKEND)
         self.compile_mode = tcfg.get("torch_compile_mode", COMPILE_MODE)
@@ -872,6 +907,17 @@ class Trainer:
             except Exception:
                 strategy = "ddp"
 
+        callbacks = [ckpt_cb, lr_cb, epoch_cb, summary_cb]
+        if self.use_swa:
+            callbacks.append(
+                StochasticWeightAveraging(
+                    swa_lrs=self.swa_lrs if self.swa_lrs is not None else self.cfg.get("training", {}).get("lr", DEF_LR),
+                    swa_epoch_start=self.swa_epoch_start,
+                    annealing_epochs=self.swa_annealing_epochs,
+                    annealing_strategy=self.swa_annealing_strategy,
+                )
+            )
+
         pl_trainer = pl.Trainer(
             default_root_dir=str(self.work_dir),
             max_epochs=self.epochs,
@@ -883,7 +929,7 @@ class Trainer:
             gradient_clip_val=self.grad_clip if self.grad_clip > 0 else 0.0,
             accumulate_grad_batches=max(1, self.accumulate),
             logger=csv_logger,
-            callbacks=[ckpt_cb, lr_cb, epoch_cb, summary_cb],
+            callbacks=callbacks,
             enable_checkpointing=ENABLE_CHECKPOINTING,
             enable_progress_bar=ENABLE_PROGRESS_BAR,
             benchmark=bench_cfg,
