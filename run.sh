@@ -1,16 +1,17 @@
 #!/bin/bash
-#SBATCH -J Chemulator
-#SBATCH -o Chemulator.o%j
-#SBATCH -e Chemulator.e%j
-#SBATCH -p gpu
-#SBATCH --clusters=edge
-#SBATCH -N 1
-#SBATCH -n 1
-#SBATCH --gpus=1
-#SBATCH --cpus-per-task=32          # <= 32 cores per GPU (best-practice)
-#SBATCH --mem=500G                  # full-node CPU RAM (queue limit)
-#SBATCH -A exoweather
-#SBATCH -t 72:00:00
+#SBATCH -J MYGPUJOB         # Job name
+#SBATCH -o MYGPUJOB.o%j     # Name of job output file
+#SBATCH -e MYGPUJOB.e%j     # Name of stderr error file
+#SBATCH -p gpu              # Queue (partition) name for GPU nodes
+#SBATCH -N 1                # Total # of nodes per instance
+#SBATCH -n 32                # Total # of CPU cores (adjust as needed)
+#SBATCH --clusters=edge     # *** CRITICAL: Directs the job to the edge cluster nodes (gn11-gn14) ***
+#SBATCH --cpus-per-gpu=32
+#SBATCH --gpus=1            # Request 1 GPU (adjust if more needed)
+#SBATCH --mem=400G           # Memory (RAM) requested for gpu-mig
+#SBATCH -t 24:00:00         # Run time (hh:mm:ss) for gpu-mig (adjust if needed)
+#SBATCH --mail-type=all     # Send email at begin and end of job
+#SBATCH --mail-user=isaac.n.malsky@jpl.nasa.gov
 
 # Minimal, quiet SLURM launcher (conda + optional CUDA + vendored deps + preprocess + train)
 

@@ -23,7 +23,7 @@ import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-WORK_DIR = ROOT / "models" / "v1_long"
+WORK_DIR = ROOT / "models" / "quarter"
 CONFIG_PATH = WORK_DIR / "config.json"
 
 CPU_OUT = WORK_DIR / "export_k1_cpu.pt2"
@@ -60,7 +60,7 @@ def parse_dtype(dtype_str: str) -> torch.dtype:
 def find_ckpt(directory: Path) -> Path:
     d = Path(directory)
     if (d / "best.ckpt").exists():
-        return d / "best-v1.ckpt"
+        return d / "best.ckpt"
     if (d / "last.ckpt").exists():
         return d / "last.ckpt"
     ckpts = sorted(d.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
