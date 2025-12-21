@@ -17,12 +17,13 @@ from typing import List, Tuple
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.ticker import LogLocator, NullFormatter
 
 plt.style.use("science.mplstyle")
 
 # ---------------- Paths & settings ----------------
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models" / "quarter"
+MODEL_DIR = REPO / "models" / "subset_big"
 EP_FILENAME = "export_k1_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))
@@ -174,6 +175,21 @@ def plot_pred_vs_true_scatter(y_true_flat: np.ndarray,
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
     ax.legend(loc="lower right")
+
+    # Thin out log ticks to avoid overlapping labels
+    x_major = LogLocator(base=10.0, numticks=8)
+    y_major = LogLocator(base=10.0, numticks=8)
+    ax.xaxis.set_major_locator(x_major)
+    ax.yaxis.set_major_locator(y_major)
+
+    ax.xaxis.set_minor_locator(LogLocator(base=10.0, subs=(), numticks=0))
+    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=(), numticks=0))
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.yaxis.set_minor_formatter(NullFormatter())
+
+    ax.tick_params(axis="both", which="major", labelsize=12, pad=2)
+
+    ax.set_box_aspect(1)
 
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)

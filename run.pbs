@@ -1,9 +1,9 @@
 #!/bin/bash
 # --- PBS ---
 #PBS -N gh200_train_job
-#PBS -q gpu_normal
-#PBS -l select=1:ncpus=72:ngpus=1:mpiprocs=72:ompthreads=1:mem=400gb:model=gh200
-#PBS -l walltime=5:00:00
+#PBS -q gpu_long
+#PBS -l select=1:ncpus=72:ngpus=1:mpiprocs=72:ompthreads=1:mem=500gb:model=gh200
+#PBS -l walltime=72:00:00
 #PBS -W group_list=s2458
 #PBS -j oe
 # --- end PBS ---
@@ -277,7 +277,22 @@ import os
 from utils import load_json_config
 
 ROOT = Path(os.environ["ROOT"]).resolve()
-cfg  = load_json_config(ROOT / "config" / "config.jsonc")
+cfg_dir = ROOT / "config"
+
+# Prefer config.jsonc if it exists; otherwise fall back to first config_job*.jsonc
+default_cfg = cfg_dir / "config.jsonc"
+if default_cfg.exists():
+    cfg_path = default_cfg
+else:
+    job_cfgs = sorted(cfg_dir.glob("config_job*.jsonc"))
+    if not job_cfgs:
+        raise FileNotFoundError(f"No config.jsonc or config_job*.jsonc found under {cfg_dir}")
+    cfg_path = job_cfgs[0]
+
+print(f"Using config for preprocess decision: {cfg_path}")
+print(f"PREPROCESS_CONFIG={cfg_path}")
+
+cfg = load_json_config(cfg_path)
 
 pdir_cfg = cfg["paths"]["processed_data_dir"]
 proc_dir = (ROOT / pdir_cfg).resolve() if not Path(pdir_cfg).is_absolute() else Path(pdir_cfg).resolve()
@@ -297,10 +312,14 @@ PY
 )"
 
 echo "$DECISION_OUT"
-eval "$(echo "$DECISION_OUT" | egrep '^(SKIP|PROC_DIR)=' )"
+# Also pick up PREPROCESS_CONFIG from the Python snippet
+eval "$(echo "$DECISION_OUT" | egrep '^(SKIP|PROC_DIR|PREPROCESS_CONFIG)=' )"
 
 export SKIP
 export PROC_DIR
+export PREPROCESS_CONFIG
+
+
 
 # Optional override from qsub env:
 #   qsub -v FORCE_SKIP_PREPROCESS=1 ...
@@ -328,13 +347,25 @@ if [ "${SKIP:-0}" -eq 0 ]; then
   echo "Phase A: Preprocessing with MPI"
   cat > .preprocess.py <<'PY'
 from pathlib import Path
+import os
 from utils import load_json_config, setup_logging
 from preprocessor import DataPreprocessor
 
-cfg = load_json_config(Path("config/config.jsonc"))
+# Prefer PREPROCESS_CONFIG from the Phase A decision; fall back to config/config.jsonc
+cfg_path_env = os.environ.get("PREPROCESS_CONFIG")
+if cfg_path_env:
+    cfg_path = Path(cfg_path_env).expanduser().resolve()
+else:
+    cfg_path = Path("config/config.jsonc").expanduser().resolve()
+
+print(f"[preprocess] Using config: {cfg_path}")
+cfg = load_json_config(cfg_path)
 setup_logging()
 DataPreprocessor(cfg).run()
 PY
+
+
+
 
   # 72 MPI ranks × 1 thread each, matching mpiprocs=72:ompthreads=1
   export OMP_NUM_THREADS=1
@@ -451,49 +482,71 @@ if [ $PRE_OK -ne 0 ]; then
 fi
 echo "[preflight] All nodes: torch import OK."
 
+
+
+
+
+
+
 # ————————————————————————————————————————————————————————————————
-# Multi-rank launch
+# Multi-job single-GPU launch (no MPI / DDP)
 # ————————————————————————————————————————————————————————————————
-mpiexec -n "$TOTAL_RANKS" -ppn "$PPN" -f "$PBS_NODEFILE" \
-  -genvlist ROOT,MASTER_ADDR,MASTER_PORT,PPN,DEBUG,PATH,LD_LIBRARY_PATH,PYTHONPATH,CONDA_PREFIX,PY \
-  bash -lc '
+# If N_JOBS is set in the environment (e.g. qsub -v N_JOBS=3 run.pbs),
+# we run at most that many configs; otherwise we run one job per config.
+N_JOBS_ENV="${N_JOBS:-}"
+
+# Discover per-job configs: config_job*.jsonc under $ROOT/config
+shopt -s nullglob
+CFG_FILES=( "$ROOT"/config/config_job*.jsonc )
+shopt -u nullglob
+
+# If no per-job configs exist, fall back to the default config.jsonc
+if [ "${#CFG_FILES[@]}" -eq 0 ]; then
+  CFG_FILES=( "$ROOT/config/config.jsonc" )
+fi
+
+TOTAL_CFG=${#CFG_FILES[@]}
+
+# Determine how many jobs to launch
+if [ -n "$N_JOBS_ENV" ]; then
+  if [ "$N_JOBS_ENV" -lt "$TOTAL_CFG" ]; then
+    N_PAR="$N_JOBS_ENV"
+  else
+    N_PAR="$TOTAL_CFG"
+  fi
+else
+  N_PAR="$TOTAL_CFG"
+fi
+
+echo "Discovered ${TOTAL_CFG} config file(s) under $ROOT/config:"
+for cfg in "${CFG_FILES[@]}"; do
+  echo "  - $cfg"
+done
+
+echo "Launching ${N_PAR} FlowMap training job(s) on the single allocated GPU..."
+
+mkdir -p "$ROOT/logs"
+
+job=0
+while [ "$job" -lt "$N_PAR" ]; do
+  FLOWMAP_CFG="${CFG_FILES[$job]}"
+  LOG_PATH="$ROOT/logs/train_job${job}.log"
+
+  echo "  [job $job] FLOWMAP_CONFIG=${FLOWMAP_CFG}"
+  echo "  [job $job] logging to ${LOG_PATH}"
+
+  # All processes inherit the same CUDA-visible device set by PBS (ngpus=1),
+  # so they all share the same physical GPU.
+  (
     set -euo pipefail
     [ "${DEBUG:-0}" = "1" ] && set -x
     cd "$ROOT"
+    FLOWMAP_CONFIG="$FLOWMAP_CFG" "${PY:-python}" -u src/main.py
+  ) >"$LOG_PATH" 2>&1 &
 
-    # Map MPICH (Hydra) env to torch.distributed env://
-    export RANK="${PMI_RANK}"
-    export WORLD_SIZE="${PMI_SIZE}"
-    export LOCAL_RANK="${PMI_LOCAL_RANK:-0}"
+  job=$(( job + 1 ))
+done
 
-    # Pin each local process to its GPU (modulo PPN)
-    export CUDA_VISIBLE_DEVICES="$(( LOCAL_RANK % (PPN>0?PPN:1) ))"
+wait
 
-    # Harden Python import environment
-    export PYTHONNOUSERSITE=1
-    export LD_LIBRARY_PATH="${CONDA_PREFIX:+${CONDA_PREFIX}/lib:}${LD_LIBRARY_PATH:-}"
-
-    echo "[rank ${RANK}/${WORLD_SIZE}] host=$(hostname) local_rank=${LOCAL_RANK} cuda_dev=${CUDA_VISIBLE_DEVICES} master=${MASTER_ADDR}:${MASTER_PORT}"
-
-    # Per-rank quick torch check (prints wheel path + device count)
-    "${PY:-python}" - << "PY"
-import sys
-print("  python:", sys.executable)
-try:
-    import torch, torch._C
-    print("  torch:", getattr(torch, "__file__", None))
-    print("  devices:", torch.cuda.device_count(), "cuda_available:", torch.cuda.is_available())
-except Exception as e:
-    print("  FATAL: torch._C import failed:", repr(e))
-    sys.exit(43)
-PY
-
-    # Optional NCCL debug knobs
-    # export TORCH_DISTRIBUTED_DEBUG=DETAIL
-    # export NCCL_DEBUG=INFO
-    # export NCCL_SOCKET_IFNAME=^lo,docker0
-    # export NCCL_IB_DISABLE=1
-
-    exec "${PY:-python}" -u src/main.py
-  '
-
+echo "All ${N_PAR} FlowMap jobs have finished."

@@ -414,7 +414,7 @@ class FlowMapPairsDataset(Dataset):
         rows = torch.tensor([b.row for b in batch], device=dev, dtype=torch.long)  # [B]
 
         # If enabled, force i=0 for the "first" sample of each trajectory (training only)
-        force_first = self.use_first_anchor and (self.split == "train")
+        force_first = self.use_first_anchor
         first_mask: Optional[torch.Tensor] = None
         if force_first:
             first_mask = torch.tensor(
@@ -463,8 +463,8 @@ class FlowMapPairsDataset(Dataset):
             j_idx = torch.where(k_mask, j_raw, (self.T - 1))  # [B,K]
 
         else:
-            # Non-strict: deterministic for val/test; randomized for train
-            if self.split != "train":
+            # Deterministic for test
+            if self.split == "test":
                 # Deterministic, order- & world-size–invariant sampling using fast int hashing.
                 rows64 = rows.to(torch.int64)
 

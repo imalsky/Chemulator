@@ -91,16 +91,21 @@ class AdaptiveStiffLoss(nn.Module):
     """
     Loss function: MSE in z plus MAE in log10-physical space with species weighting.
     """
+
     def __init__(
-        self,
-        log_means: torch.Tensor,
-        log_stds: torch.Tensor,
-        species_log_min: torch.Tensor,
-        species_log_max: torch.Tensor,
-        *,
-        lambda_phys: float = LOSS_LAMBDA_PHYS,
-        lambda_z: float = LOSS_LAMBDA_Z,
-        epsilon_phys: float = LOSS_EPS_PHYS,  # retained for signature compatibility (unused)
+            self,
+            log_means: torch.Tensor,
+            log_stds: torch.Tensor,
+            species_log_min: torch.Tensor,
+            species_log_max: torch.Tensor,
+            *,
+            lambda_phys: float = 1.0,
+            lambda_z: float = 0.1,
+            use_weighting: bool = True,  # Toggle weighting on/off
+            weight_power: float = 0.5,  # 0.5 = sqrt, 1.0 = linear range
+            w_min: float = 0.5,  # Minimum clamp limit
+            w_max: float = 2.0,  # Maximum clamp limit
+            epsilon_phys: float = 1e-20,  # Compatibility placeholder
     ) -> None:
         super().__init__()
         # Buffers for Lightning device moves
@@ -109,59 +114,66 @@ class AdaptiveStiffLoss(nn.Module):
         self.register_buffer("log_min", species_log_min.detach().clone())
         self.register_buffer("log_max", species_log_max.detach().clone())
 
-        # Species weights ∝ sqrt(dynamic range), clipped
-        rng = torch.clamp(self.log_max - self.log_min, min=SPECIES_RANGE_EPS)
-        w = torch.sqrt(rng)
-        w = w / (w.mean() + W_SPECIES_MEAN_EPS)
-        self.register_buffer("w_species", torch.clamp(w, W_SPECIES_CLAMP_MIN, W_SPECIES_CLAMP_MAX))
+        if use_weighting:
+            # Species weights ∝ (dynamic range)^weight_power
+            # rng is the log-spread: log10(max) - log10(min)
+            rng = torch.clamp(self.log_max - self.log_min, min=SPECIES_RANGE_EPS)
+            w = torch.pow(rng, weight_power)
 
-        # Scalars
+            # Normalize so the average weight is 1.0 (preserves global loss magnitude)
+            w = w / (w.mean() + W_SPECIES_MEAN_EPS)
+
+            # Clamp to prevent extreme outliers from dominating gradients
+            w_final = torch.clamp(w, w_min, w_max)
+        else:
+            # If disabled, every species gets an identical weight of 1.0
+            w_final = torch.ones_like(log_means)
+
+        self.register_buffer("w_species", w_final)
+
+        # Loss Scaling Scalars
         self.lambda_phys = float(lambda_phys)
         self.lambda_z = float(lambda_z)
         self.eps_phys = float(epsilon_phys)
 
     @torch.no_grad()
     def _z_to_log10(self, z: torch.Tensor) -> torch.Tensor:
+        """Convert normalized z back to log10 space for physical loss calculation."""
         return z * self.log_stds + self.log_means
 
     def forward(
-        self,
-        pred_z: torch.Tensor,  # [B,K,S]
-        true_z: torch.Tensor,  # [B,K,S]
-        t_norm: torch.Tensor,  # [B,K] or [B,K,1] (unused here; kept for API)
-        mask: Optional[torch.Tensor] = None,  # [B,K] (optional)
-        return_components: bool = False,
+            self,
+            pred_z: torch.Tensor,  # [B,K,S]
+            true_z: torch.Tensor,  # [B,K,S]
+            t_norm: torch.Tensor,  # [B,K,1] (unused)
+            mask: Optional[torch.Tensor] = None,  # [B,K]
+            return_components: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
-        # Stabilizer in z-space
-        loss_z = (pred_z - true_z) ** 2  # [B,K,S]
+        # Component 1: MSE in normalized Z-space
+        loss_z = (pred_z - true_z) ** 2
 
-        # Log-physical path (ALWAYS MAE in log10-physical)
+        # Component 2: MAE in log10-physical space
         pred_log = self._z_to_log10(pred_z)
         true_log = self._z_to_log10(true_z)
-        loss_phys = (pred_log - true_log).abs()  # [B,K,S]
+        loss_phys = (pred_log - true_log).abs()
 
-        # Species weighting
-        loss_phys = loss_phys * self.w_species  # [B,K,S]
+        # Apply the species weights to the physical term
+        loss_phys = loss_phys * self.w_species
 
-        # Masked mean over valid positions (if provided)
+        # Masked mean over valid positions
         if mask is not None:
-            m = mask.unsqueeze(-1).to(loss_phys.dtype)  # [B,K,1]
+            m = mask.unsqueeze(-1).to(loss_phys.dtype)
             loss_phys = loss_phys * m
             loss_z = loss_z * m
-
-            if mask.dtype == torch.bool:
-                valid_pairs = mask.sum()
-            else:
-                valid_pairs = (mask > 0).sum()
-            if int(valid_pairs.item()) == 0:
-                raise ValueError("AdaptiveStiffLoss: mask has zero valid [B,K] positions; cannot compute loss.")
-            denom = valid_pairs.to(loss_phys.dtype) * loss_phys.shape[-1]
+            valid_pairs = torch.clamp(mask.to(loss_phys.dtype).sum(), min=1.0)
+            denom = valid_pairs * loss_phys.shape[-1]
         else:
-            denom = torch.tensor(loss_phys.numel(), dtype=loss_phys.dtype, device=loss_phys.device)
+            denom = loss_phys.numel()
 
         phys = self.lambda_phys * loss_phys.sum() / denom
         zstb = self.lambda_z * loss_z.sum() / denom
         total = phys + zstb
+
         if return_components:
             return {"total": total, "phys": phys, "z": zstb}
         return total
@@ -215,12 +227,15 @@ class ModelTask(pl.LightningModule):
         return None
 
     def _build_loss(self) -> nn.Module:
+        """Factory method to construct AdaptiveStiffLoss with hydrated config parameters."""
+        # 1. Load the normalization manifest
         manifest_path = Path(self.cfg["paths"]["processed_data_dir"]) / "normalization.json"
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
         stats = manifest["per_key_stats"]
         meta = manifest.get("meta", {})
 
+        # 2. Determine which species we are actually calculating loss for
         data_cfg = self.cfg.get("data", {})
         targets = data_cfg.get("target_species")
         if targets:
@@ -228,8 +243,9 @@ class ModelTask(pl.LightningModule):
         else:
             species_names = list(data_cfg.get("species_variables") or meta.get("species_variables", []))
             if not species_names:
-                raise RuntimeError("No species list available in cfg or manifest.meta.species_variables")
+                raise RuntimeError("No species list available in config or manifest.")
 
+        # 3. Collate the statistics into tensors
         log_means, log_stds, log_mins, log_maxs = [], [], [], []
         for n in species_names:
             s = stats[n]
@@ -238,6 +254,7 @@ class ModelTask(pl.LightningModule):
             log_mins.append(float(s.get("log_min", -30.0)))
             log_maxs.append(float(s.get("log_max", 0.0)))
 
+        # 4. Pull granular control settings from config
         loss_cfg = self.cfg.get("training", {}).get("adaptive_stiff_loss", {})
 
         return AdaptiveStiffLoss(
@@ -245,9 +262,14 @@ class ModelTask(pl.LightningModule):
             log_stds=torch.tensor(log_stds, dtype=torch.float32),
             species_log_min=torch.tensor(log_mins, dtype=torch.float32),
             species_log_max=torch.tensor(log_maxs, dtype=torch.float32),
-            lambda_phys=float(loss_cfg.get("lambda_phys", LOSS_LAMBDA_PHYS)),
-            lambda_z=float(loss_cfg.get("lambda_z", LOSS_LAMBDA_Z)),
-            epsilon_phys=float(loss_cfg.get("epsilon_phys", LOSS_EPS_PHYS)),
+            lambda_phys=float(loss_cfg.get("lambda_phys", 1.0)),
+            lambda_z=float(loss_cfg.get("lambda_z", 0.5)),
+            # New control parameters
+            use_weighting=bool(loss_cfg.get("use_weighting", True)),
+            weight_power=float(loss_cfg.get("weight_power", 0.5)),
+            w_min=float(loss_cfg.get("w_min", 0.5)),
+            w_max=float(loss_cfg.get("w_max", 2.0)),
+            epsilon_phys=float(loss_cfg.get("epsilon_phys", 1e-20)),
         )
 
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
@@ -878,7 +900,7 @@ class Trainer:
         det = bool(self.cfg.get("system", {}).get("deterministic", False))
         bench_cfg = bool(self.cfg.get("system", {}).get("cudnn_benchmark", True)) and not det
 
-        trainer_kwargs = {}
+        trainer_kwargs: dict[str, Any] = {}
         if self.limit_train_batches > 0:
             trainer_kwargs["limit_train_batches"] = self.limit_train_batches
         if self.limit_val_batches > 0:
@@ -896,7 +918,7 @@ class Trainer:
             num_nodes = 1
 
         # DDP strategy selection
-        strategy = "auto"
+        strategy: Any = "auto"
         if externally_launched or devices > 1:
             try:
                 from pytorch_lightning.strategies import DDPStrategy
@@ -908,10 +930,54 @@ class Trainer:
                 strategy = "ddp"
 
         callbacks = [ckpt_cb, lr_cb, epoch_cb, summary_cb]
+
         if self.use_swa:
+            # If swa_lrs is not set in config, derive it from the *main* LR schedule
+            # so that when SWA starts the LR is continuous (no jump back to base lr).
+            if self.swa_lrs is None:
+                max_epochs = max(1, self.epochs)
+
+                raw_start = self.swa_epoch_start
+                # Support both fractional [0,1) and absolute epoch indices.
+                if isinstance(raw_start, (float, int)) and 0.0 < float(raw_start) < 1.0:
+                    swa_start_epoch = int(float(raw_start) * max_epochs)
+                else:
+                    swa_start_epoch = int(raw_start)
+                swa_start_epoch = max(0, min(max_epochs, swa_start_epoch))
+
+                base_lr = float(getattr(task, "lr", DEF_LR))
+                warmup_epochs = int(getattr(task, "warmup_epochs", DEF_WARMUP_EPOCHS))
+                min_lr = float(getattr(task, "min_lr", DEF_MIN_LR))
+
+                if swa_start_epoch <= warmup_epochs:
+                    # Linear warmup:
+                    # lr(e) = base_lr * [ a + (1 - a) * e / warmup_epochs ]
+                    frac = swa_start_epoch / max(1, warmup_epochs)
+                    lr_swa = base_lr * (
+                        WARMUP_START_FACTOR
+                        + (1.0 - WARMUP_START_FACTOR) * frac
+                    )
+                else:
+                    # Cosine decay:
+                    # lr(e) = eta_min + 0.5 * (base_lr - eta_min) * (1 + cos(pi * t / T_max))
+                    t_max = max(1, max_epochs - warmup_epochs)
+                    t = max(0, min(t_max, swa_start_epoch - warmup_epochs))
+                    cos_term = math.cos(math.pi * t / t_max)
+                    lr_swa = min_lr + 0.5 * (base_lr - min_lr) * (1.0 + cos_term)
+
+                swa_lrs = lr_swa
+                self.logger.info(
+                    f"Enabling SWA: swa_lrs auto-set to {swa_lrs:.3e} "
+                    f"(matches main schedule at epoch {swa_start_epoch})."
+                )
+            else:
+                # Respect explicit swa_lrs from config if provided
+                swa_lrs = self.swa_lrs
+                self.logger.info(f"Enabling SWA with explicit swa_lrs={swa_lrs}.")
+
             callbacks.append(
                 StochasticWeightAveraging(
-                    swa_lrs=self.swa_lrs if self.swa_lrs is not None else self.cfg.get("training", {}).get("lr", DEF_LR),
+                    swa_lrs=swa_lrs,
                     swa_epoch_start=self.swa_epoch_start,
                     annealing_epochs=self.swa_annealing_epochs,
                     annealing_strategy=self.swa_annealing_strategy,
