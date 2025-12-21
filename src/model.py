@@ -56,6 +56,7 @@ def _fresh_activation(template: nn.Module) -> nn.Module:
         return nn.ELU(inplace=True)
     return template.__class__()
 
+
 class MLP(nn.Module):
     """Multi-layer perceptron"""
 
@@ -83,8 +84,14 @@ class MLP(nn.Module):
         # nn.Linear supports arbitrary leading dims; no reshape needed.
         return self.network(x)
 
+
 class Encoder(nn.Module):
-    """Encoder: [y_i, g] -> z (supports VAE)."""
+    """
+    Encoder: [y_i, g] -> z.
+
+    Note: vae_mode keeps the *stochastic reparameterization path* (mu/logvar -> sample),
+    but KL loss is intentionally not computed or returned anywhere.
+    """
     def __init__(
         self,
         state_dim: int,
@@ -114,7 +121,7 @@ class Encoder(nn.Module):
 
     def forward(self, y: torch.Tensor, g: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        y: [B,S], g: [B,G]  ->  z: [B,Z], kl: scalar or None
+        y: [B,S], g: [B,G]  ->  z: [B,Z], kl: always None (KL disabled)
         """
         x = torch.cat([y, g], dim=-1)
         out = self.network(x)
@@ -122,13 +129,13 @@ class Encoder(nn.Module):
         if not self.vae_mode:
             return out, None
 
-        # VAE reparameterization
+        # VAE reparameterization (KL intentionally disabled)
         mu, logvar = torch.chunk(out, 2, dim=-1)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         z = mu + eps * std
-        kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-        return z, kl
+        return z, None
+
 
 class LatentDynamics(nn.Module):
     """Latent dynamics: (z_i, dt, g) -> z_j (vectorized over K)."""
@@ -182,6 +189,7 @@ class LatentDynamics(nn.Module):
         dz = self.network(x)  # [B,K,Z]
         return (z_exp + dz) if self.residual else dz
 
+
 class Decoder(nn.Module):
     """Decoder: z -> y (broadcast over K)."""
 
@@ -208,6 +216,7 @@ class Decoder(nn.Module):
         # Accepts [B,K,Z] (or [B,Z]); nn.Linear handles leading dims.
         return self.network(z)
 
+
 class FlowMapAutoencoder(nn.Module):
     """
     Flow-map AE: (y_i, g, dt_norm) -> y_j in z-space.
@@ -219,6 +228,8 @@ class FlowMapAutoencoder(nn.Module):
       - predict_delta (z-space residual)
       - predict_delta_log_phys (delta in log10-physical space, then re-standardize)
       - softmax_head (simplex probabilities, then log10 standardized)
+
+    Note: KL loss is not computed or stored anywhere (even if vae_mode=True).
     """
 
     def __init__(
@@ -323,8 +334,6 @@ class FlowMapAutoencoder(nn.Module):
                 nn.init.zeros_(lin_out.bias)
                 lin_out.weight.mul_(0.1)
 
-        self.kl_loss: Optional[torch.Tensor] = None
-
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
         Returns predictions in z-space (log-standard normalized).
@@ -335,11 +344,11 @@ class FlowMapAutoencoder(nn.Module):
           -> y_pred_z: [B,K,S_out]
         """
         # Encode once
-        z_i, self.kl_loss = self.encoder(y_i, g)          # [B,Z], kl
+        z_i, _kl_unused = self.encoder(y_i, g)            # [B,Z]
         # Vectorized latent evolution over K
         z_j = self.dynamics(z_i, dt_norm, g)              # [B,K,Z]
         # Decode
-        y_pred = self.decoder(z_j)                         # [B,K,S_out]
+        y_pred = self.decoder(z_j)                        # [B,K,S_out]
 
         # Heads
         if self.softmax_head:
@@ -376,6 +385,7 @@ class FlowMapAutoencoder(nn.Module):
             return y_pred
 
         return y_pred
+
 
 def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = None) -> FlowMapAutoencoder:
     """

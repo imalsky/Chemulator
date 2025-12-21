@@ -15,7 +15,7 @@
     "cudnn_benchmark": true,
     // Force deterministic operations (slower)
     "deterministic": false,
-    // Model parameter dtype (FP32 recommended)
+    // Model parameter dtype (fallback only; preprocessing uses io_dtype if set)
     "dtype": "float32",
     // On-disk NPZ dtype for preprocessing output
     "io_dtype": "float32",
@@ -66,19 +66,27 @@
     "min_value_threshold": 1e-30,
     // Compress NPZ shards (smaller, slower I/O)
     "npz_compressed": false,
-    // Workers for preprocessing (I/O bound)
+    // Workers for preprocessing (I/O bound; ignored under MPI)
     "num_workers": 32,
     // Trajectories per output shard
     "trajectories_per_shard": 65536,
     // Drop t=0 row when exporting shards
     "skip_first_timestep": false,
-    // reuse the data if possible
+    // Reuse the data if possible
     "overwrite_data": false
   },
 
   "dataset": {
     // Global training batch size
     "batch_size_train": 1024,
+
+    // Optional: override dataset tensor dtype (null = use AMP dtype on CUDA; float32 forced on CPU/MPS)
+    // Allowed strings: "float32", "float16", "bf16"/"bfloat16"
+    "storage_dtype": null,
+
+    // np.load mmap mode for reading shard .npz files ("r" = memmap; null/false disables memmap)
+    "mmap_mode": "r",
+
     // Avoid full shard scan for the preprocessed data; trust metadata files
     "skip_scan": true,
     // Skip time-grid monotonicity checks
@@ -93,7 +101,7 @@
     "share_times_across_batch": false,
     // Sample offsets uniformly then fit anchors
     "uniform_offset_sampling_strict": false,
-    // assume all the times are the same
+    // Assume all trajectories share the same time grid
     "assume_shared_grid": true,
     // Δt clamp floor before normalization
     "dt_epsilon": 1e-30,
@@ -125,8 +133,8 @@
     // Nonlinearity for MLPs
     "activation": "silu",
     // Dropout rate in MLPs
-    "dropout": 0.00,
-    // Use VAE encoder with KL term
+    "dropout": 0.0,
+    // Use VAE-style stochastic encoder (if supported by your model.py)
     "vae_mode": false,
     // Predict Δz and add to z (residual dynamics)
     "dynamics_residual": true,
@@ -165,16 +173,12 @@
     "warmup_epochs": 10,
     // Weight decay for AdamW
     "weight_decay": 1e-4,
-    // Weight on KL divergence (if VAE encoder)
-    "beta_kl": 0.0015,
 
     // SWA: no separate lr/min_lr; it derives from the main schedule
-    "use_swa":             false,
-    "swa_epoch_start":     0.8,     // fraction of total epochs OR absolute int epoch
+    "use_swa": false,
+    "swa_epoch_start": 0.8, // fraction of total epochs OR absolute int epoch
     "swa_annealing_epochs": 10,
     "swa_annealing_strategy": "cos",
-
-
 
     // Limit training steps per epoch (0 = no limit)
     "max_train_steps_per_epoch": 0,
@@ -201,12 +205,11 @@
     "adaptive_stiff_loss": {
       "lambda_phys": 1.0,
       "lambda_z": 0.5,
-      "use_weighting": true,  // Set to false for equal 1.0 weights
-      "weight_power": 0.5,    // Change to 1.0 for linear weighting
-      "w_min": 0.5,           // The lowest weight a species can have
-      "w_max": 2.0,           // The highest weight a species can have
+      "use_weighting": true, // Set to false for equal 1.0 weights
+      "weight_power": 0.5,   // Change to 1.0 for linear weighting
+      "w_min": 0.5,          // The lowest weight a species can have
+      "w_max": 2.0,          // The highest weight a species can have
       "epsilon_phys": 1e-20
     }
   }
 }
-

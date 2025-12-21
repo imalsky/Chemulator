@@ -39,7 +39,6 @@ DEF_LR: float = 1e-3
 DEF_WEIGHT_DECAY: float = 1e-4
 DEF_WARMUP_EPOCHS: int = 0
 DEF_MIN_LR: float = 1e-6
-DEF_BETA_KL: float = 0.0
 
 # torch.compile defaults
 COMPILE_ENABLE_DEFAULT: bool = True
@@ -68,6 +67,7 @@ WARMUP_START_FACTOR: float = 0.1
 # ============================== IMPORTS =======================================
 
 import os
+
 PL_DEVICES: int = int(os.getenv("PL_DEVICES", "1"))
 
 import json
@@ -99,15 +99,16 @@ class AdaptiveStiffLoss(nn.Module):
             species_log_min: torch.Tensor,
             species_log_max: torch.Tensor,
             *,
-            lambda_phys: float = 1.0,
-            lambda_z: float = 0.1,
-            use_weighting: bool = True,  # Toggle weighting on/off
-            weight_power: float = 0.5,  # 0.5 = sqrt, 1.0 = linear range
-            w_min: float = 0.5,  # Minimum clamp limit
-            w_max: float = 2.0,  # Maximum clamp limit
-            epsilon_phys: float = 1e-20,  # Compatibility placeholder
+            lambda_phys: float = LOSS_LAMBDA_PHYS,
+            lambda_z: float = LOSS_LAMBDA_Z,
+            use_weighting: bool = True,   # Toggle weighting on/off
+            weight_power: float = 0.5,    # 0.5 = sqrt, 1.0 = linear range
+            w_min: float = W_SPECIES_CLAMP_MIN,
+            w_max: float = W_SPECIES_CLAMP_MAX,
+            epsilon_phys: float = LOSS_EPS_PHYS,  # retained for signature compatibility (unused)
     ) -> None:
         super().__init__()
+
         # Buffers for Lightning device moves
         self.register_buffer("log_means", log_means.detach().clone())
         self.register_buffer("log_stds", torch.clamp(log_stds.detach().clone(), min=LOG_STD_CLAMP_MIN))
@@ -118,16 +119,16 @@ class AdaptiveStiffLoss(nn.Module):
             # Species weights ∝ (dynamic range)^weight_power
             # rng is the log-spread: log10(max) - log10(min)
             rng = torch.clamp(self.log_max - self.log_min, min=SPECIES_RANGE_EPS)
-            w = torch.pow(rng, weight_power)
+            w = torch.pow(rng, float(weight_power))
 
             # Normalize so the average weight is 1.0 (preserves global loss magnitude)
             w = w / (w.mean() + W_SPECIES_MEAN_EPS)
 
             # Clamp to prevent extreme outliers from dominating gradients
-            w_final = torch.clamp(w, w_min, w_max)
+            w_final = torch.clamp(w, float(w_min), float(w_max))
         else:
             # If disabled, every species gets an identical weight of 1.0
-            w_final = torch.ones_like(log_means)
+            w_final = torch.ones_like(self.log_means)
 
         self.register_buffer("w_species", w_final)
 
@@ -165,10 +166,13 @@ class AdaptiveStiffLoss(nn.Module):
             m = mask.unsqueeze(-1).to(loss_phys.dtype)
             loss_phys = loss_phys * m
             loss_z = loss_z * m
-            valid_pairs = torch.clamp(mask.to(loss_phys.dtype).sum(), min=1.0)
-            denom = valid_pairs * loss_phys.shape[-1]
+
+            valid_pairs = torch.count_nonzero(mask if mask.dtype == torch.bool else (mask > 0))
+            if int(valid_pairs.item()) == 0:
+                raise ValueError("AdaptiveStiffLoss: mask has zero valid [B,K] positions; cannot compute loss.")
+            denom = valid_pairs.to(loss_phys.dtype) * loss_phys.shape[-1]
         else:
-            denom = loss_phys.numel()
+            denom = torch.tensor(loss_phys.numel(), dtype=loss_phys.dtype, device=loss_phys.device)
 
         phys = self.lambda_phys * loss_phys.sum() / denom
         zstb = self.lambda_z * loss_z.sum() / denom
@@ -193,7 +197,6 @@ class ModelTask(pl.LightningModule):
         self.weight_decay = float(tcfg.get("weight_decay", DEF_WEIGHT_DECAY))
         self.warmup_epochs = int(tcfg.get("warmup_epochs", DEF_WARMUP_EPOCHS))
         self.min_lr = float(tcfg.get("min_lr", DEF_MIN_LR))
-        self.beta_kl = float(tcfg.get("beta_kl", DEF_BETA_KL))
 
         # Optional GT slicing when target subset used
         self._target_idx = self._resolve_target_indices()
@@ -207,7 +210,6 @@ class ModelTask(pl.LightningModule):
                 "training": {
                     "lr": self.lr, "weight_decay": self.weight_decay,
                     "warmup_epochs": self.warmup_epochs, "min_lr": self.min_lr,
-                    "beta_kl": self.beta_kl,
                 },
                 "paths": {"processed_data_dir": cfg.get("paths", {}).get("processed_data_dir", "")},
             },
@@ -262,14 +264,13 @@ class ModelTask(pl.LightningModule):
             log_stds=torch.tensor(log_stds, dtype=torch.float32),
             species_log_min=torch.tensor(log_mins, dtype=torch.float32),
             species_log_max=torch.tensor(log_maxs, dtype=torch.float32),
-            lambda_phys=float(loss_cfg.get("lambda_phys", 1.0)),
-            lambda_z=float(loss_cfg.get("lambda_z", 0.5)),
-            # New control parameters
+            lambda_phys=float(loss_cfg.get("lambda_phys", LOSS_LAMBDA_PHYS)),
+            lambda_z=float(loss_cfg.get("lambda_z", LOSS_LAMBDA_Z)),
             use_weighting=bool(loss_cfg.get("use_weighting", True)),
             weight_power=float(loss_cfg.get("weight_power", 0.5)),
-            w_min=float(loss_cfg.get("w_min", 0.5)),
-            w_max=float(loss_cfg.get("w_max", 2.0)),
-            epsilon_phys=float(loss_cfg.get("epsilon_phys", 1e-20)),
+            w_min=float(loss_cfg.get("w_min", W_SPECIES_CLAMP_MIN)),
+            w_max=float(loss_cfg.get("w_max", W_SPECIES_CLAMP_MAX)),
+            epsilon_phys=float(loss_cfg.get("epsilon_phys", LOSS_EPS_PHYS)),
         )
 
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
@@ -370,6 +371,13 @@ class ModelTask(pl.LightningModule):
 
     # --------------------------- steps / metrics ------------------------------
 
+    def on_train_epoch_start(self) -> None:
+        dev = self.device if hasattr(self, "device") else next(self.parameters()).device
+        self._t_sum = torch.zeros((), dtype=torch.float64, device=dev)       # sum(weight * total)
+        self._t_wsum = torch.zeros((), dtype=torch.float64, device=dev)      # sum(weight)
+        self._t_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)  # sum(weight * phys)
+        self._t_z_sum = torch.zeros((), dtype=torch.float64, device=dev)     # sum(weight * z)
+
     def training_step(self, batch, batch_idx: int):
         y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
         pred = self(y_i, dt_in, g)
@@ -378,20 +386,56 @@ class ModelTask(pl.LightningModule):
             raise RuntimeError(f"Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
 
         comps = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
+
+        # Optimization objective
         loss = comps["total"]
 
-        # KL (VAE)
-        if self.beta_kl > 0.0 and getattr(self.model, "vae_mode", False):
-            kl = getattr(self.model, "kl_loss", None)
-            if kl is not None:
-                loss = loss + self.beta_kl * kl
-                self.log("train_kl", self.beta_kl * kl, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        # Sample-weighted accumulation (matches validation exactly)
+        with torch.no_grad():
+            if k_mask is not None:
+                valid_pairs = torch.count_nonzero(k_mask if k_mask.dtype == torch.bool else (k_mask > 0))
+            else:
+                B, K, _S = y_j.shape
+                valid_pairs = torch.tensor(B * K, device=y_j.device, dtype=torch.long)
 
-        # Sync at epoch granularity to avoid per-step all-reduce overhead
-        self.log("train_loss", loss,          on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log("train_phys", comps["phys"], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log("train_z",    comps["z"],    on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            if int(valid_pairs.item()) > 0:
+                S = torch.tensor(y_j.shape[-1], device=y_j.device, dtype=torch.float64)
+                weight = valid_pairs.to(torch.float64) * S
+
+                self._t_sum += (comps["total"].detach().to(torch.float64) * weight)
+                self._t_phys_sum += (comps["phys"].detach().to(torch.float64) * weight)
+                self._t_z_sum += (comps["z"].detach().to(torch.float64) * weight)
+                self._t_wsum += weight
+
         return loss
+
+    def on_train_epoch_end(self) -> None:
+        import torch.distributed as dist
+
+        # Global reduction (SUM) if DDP is active
+        if dist.is_available() and dist.is_initialized():
+            for t in (self._t_sum, self._t_phys_sum, self._t_z_sum, self._t_wsum):
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+        # If no training batches globally, skip logging
+        if float(self._t_wsum.item()) <= 0.0:
+            for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_wsum"):
+                setattr(self, name, torch.zeros_like(getattr(self, name)))
+            return
+
+        w = self._t_wsum
+        train_loss = (self._t_sum / w).to(torch.float32)
+        train_phys = (self._t_phys_sum / w).to(torch.float32)
+        train_z = (self._t_z_sum / w).to(torch.float32)
+
+        # Log as scalars; no extra sync (already all-reduced)
+        self.log("train_loss", train_loss, prog_bar=False, on_epoch=True, sync_dist=False)
+        self.log("train_phys", train_phys, prog_bar=False, on_epoch=True, sync_dist=False)
+        self.log("train_z", train_z, prog_bar=False, on_epoch=True, sync_dist=False)
+
+        # Reset for next epoch
+        for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_wsum"):
+            setattr(self, name, torch.zeros_like(getattr(self, name)))
 
     def validation_step(self, batch, batch_idx: int):
         """
