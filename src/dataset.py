@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-dataset.py — Flow-map DeepONet Dataset (Δt trunk input, dt-spec normalization)
-
 Batch variables and structures:
     y_i : [B, S]          (runtime dtype)
     dt  : [B, K, 1]       (dt-spec normalized, runtime dtype)
@@ -373,9 +371,8 @@ class FlowMapPairsDataset(Dataset):
         """
         k = int(self.K)
         low = int(self.min_steps)
-        if self.max_steps is None:
-            raise RuntimeError("max_steps must be set for offset sampling.")
-        high = int(self.max_steps) + 1  # exclusive
+        # max_steps=None means "up to T-1" (exclusive high = T)
+        high = (int(self.max_steps) + 1) if (self.max_steps is not None) else int(self.T)
 
         if self.share_offsets_across_batch:
             return torch.randint(
@@ -496,7 +493,7 @@ class FlowMapPairsDataset(Dataset):
 
                 # Offsets o (uniform in [min_steps, max_steps]) via hashed RNG
                 low = int(self.min_steps)
-                high = int(self.max_steps)
+                high = int(self.max_steps) if (self.max_steps is not None) else (int(self.T) - 1)
                 width = max(1, high - low + 1)
 
                 k = int(self.K)

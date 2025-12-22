@@ -158,7 +158,7 @@ def plot_results(t_phys: np.ndarray,
     ax.legend(handles=style_handles, loc='best', bbox_to_anchor=(1.01, 0.2), fontsize=10)
     #ax.legend(handles=style_handles, loc='best', fontsize=10)
 
-    #ax.set_box_aspect(1)
+    ax.set_box_aspect(1)
 
 
     fig.tight_layout()

@@ -31,12 +31,12 @@ from utils import load_json_config as load_json, seed_everything
 from normalizer import NormalizationHelper
 
 # Globals (no argparse)
-N_SAMPLES: int = 64       # number of test trajectories to use
-Q_COUNT: int = 100        # number of query times per trajectory
+N_SAMPLES: int = 64  # number of test trajectories to use
+Q_COUNT: int = 100  # number of query times per trajectory
 PLOT_SPECIES: List[str] = ['H2', 'H2O', 'CH4', 'CO', 'CO2', 'NH3', 'HCN', 'N2']
 
-EPS_FRACTIONAL = 1e-25
-PLOT_FLOOR = 1e-25
+EPS_FRACTIONAL = 1e-20
+PLOT_FLOOR = 1e-20
 
 
 # ---------------- Helpers ----------------
@@ -56,9 +56,9 @@ def load_first_test_shard(data_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.nd
 
     shard_path = shards[0]
     with np.load(shard_path) as d:
-        y_mat = d["y_mat"].astype(np.float32)         # [N, T, S]
-        g_all = d["globals"].astype(np.float32)       # [N, G]
-        t_vec = d["t_vec"].astype(np.float32)         # [T] or [N, T]
+        y_mat = d["y_mat"].astype(np.float32)  # [N, T, S]
+        g_all = d["globals"].astype(np.float32)  # [N, G]
+        t_vec = d["t_vec"].astype(np.float32)  # [T] or [N, T]
     return y_mat, g_all, t_vec
 
 
@@ -87,13 +87,13 @@ def select_species_indices(species_all: List[str],
 
 
 def prepare_batch(
-    y0: np.ndarray,
-    g: np.ndarray,
-    t_phys: np.ndarray,
-    q_count: int,
-    norm: NormalizationHelper,
-    species: List[str],
-    globals_: List[str],
+        y0: np.ndarray,
+        g: np.ndarray,
+        t_phys: np.ndarray,
+        q_count: int,
+        norm: NormalizationHelper,
+        species: List[str],
+        globals_: List[str],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
     """
     Prepare normalized (y, dt, g) for K=1 export for a single trajectory anchored at t0.
@@ -110,22 +110,22 @@ def prepare_batch(
 
     qn = max(1, min(q_count, M - 1))
     q_idx = np.linspace(1, M - 1, qn).round().astype(int)
-    t_sel = t_phys[q_idx]                               # absolute seconds
+    t_sel = t_phys[q_idx]  # absolute seconds
     dt_sec = np.maximum(t_sel - t_phys[0], 0.0).astype(np.float32)
 
     # Normalize anchor and globals
-    y0_norm = norm.normalize(torch.from_numpy(y0[None, :]), species).float()      # [1, S]
+    y0_norm = norm.normalize(torch.from_numpy(y0[None, :]), species).float()  # [1, S]
     if globals_:
-        g_norm = norm.normalize(torch.from_numpy(g[None, :]), globals_).float()   # [1, G]
+        g_norm = norm.normalize(torch.from_numpy(g[None, :]), globals_).float()  # [1, G]
     else:
-        g_norm = torch.from_numpy(g[None, :]).float()                             # [1, G] or [1, 0]
+        g_norm = torch.from_numpy(g[None, :]).float()  # [1, G] or [1, 0]
 
     # Normalize Δt (physical seconds)
     dt_norm = norm.normalize_dt_from_phys(torch.from_numpy(dt_sec)).view(-1, 1).float()  # [K, 1]
 
     K = dt_norm.shape[0]
     y_batch = y0_norm.repeat(K, 1)  # [K, S]
-    g_batch = g_norm.repeat(K, 1)   # [K, G]
+    g_batch = g_norm.repeat(K, 1)  # [K, G]
     return y_batch, dt_norm, g_batch, q_idx
 
 
@@ -234,11 +234,11 @@ def main() -> None:
     all_pred = []
 
     for i in range(n_use):
-        y_traj = y_mat[i]             # [T, S]
-        g_vec = g_all[i]              # [G]
+        y_traj = y_mat[i]  # [T, S]
+        g_vec = g_all[i]  # [G]
         t_phys = get_time_vector_for_sample(t_vec, i)  # [T]
 
-        y0 = y_traj[0]                # anchor at t0
+        y0 = y_traj[0]  # anchor at t0
 
         y_batch, dt_batch, g_batch, q_idx = prepare_batch(
             y0=y0,
@@ -251,15 +251,15 @@ def main() -> None:
         )
 
         # Predict then denormalize
-        y_pred_norm = run_inference(model, y_batch, dt_batch, g_batch)   # [K, S]
-        y_pred = norm.denormalize(y_pred_norm, species).cpu().numpy()    # [K, S]
+        y_pred_norm = run_inference(model, y_batch, dt_batch, g_batch)  # [K, S]
+        y_pred = norm.denormalize(y_pred_norm, species).cpu().numpy()  # [K, S]
 
         # Ground truth at same times
-        y_true_sel = y_traj[q_idx, :len(species)]                        # [K, S]
+        y_true_sel = y_traj[q_idx, :len(species)]  # [K, S]
 
         # Restrict to selected species
-        y_true_sel = y_true_sel[:, keep_idx]                             # [K, S_sel]
-        y_pred_sel = y_pred[:, keep_idx]                                 # [K, S_sel]
+        y_true_sel = y_true_sel[:, keep_idx]  # [K, S_sel]
+        y_pred_sel = y_pred[:, keep_idx]  # [K, S_sel]
 
         all_true.append(y_true_sel.reshape(-1))
         all_pred.append(y_pred_sel.reshape(-1))
@@ -270,7 +270,44 @@ def main() -> None:
     # Average fractional error
     frac_err = np.abs(y_pred_flat - y_true_flat) / (np.abs(y_true_flat) + EPS_FRACTIONAL)
     mean_frac_err = float(np.mean(frac_err))
-    print(f"Average fractional error over {y_true_flat.size} points: {mean_frac_err:.3e}")
+    max_frac_err = float(np.max(frac_err))
+
+    print(f"Average percent error over {y_true_flat.size} points: {100 * mean_frac_err:.3f}")
+
+    # --- Extended Statistics ---
+    print("\n--- Additional Summary Statistics ---")
+
+    # Linear Space Metrics
+    diff = y_pred_flat - y_true_flat
+    mae_lin = np.mean(np.abs(diff))
+    rmse_lin = np.sqrt(np.mean(diff ** 2))
+
+    # Log Space Metrics (Dex)
+    # Clamp to PLOT_FLOOR to avoid log(0) or log(neg) issues
+    y_true_clamped = np.maximum(y_true_flat, PLOT_FLOOR)
+    y_pred_clamped = np.maximum(y_pred_flat, PLOT_FLOOR)
+
+    log_true = np.log10(y_true_clamped)
+    log_pred = np.log10(y_pred_clamped)
+    log_err = log_pred - log_true
+
+    mae_log = np.mean(np.abs(log_err))
+    rmse_log = np.sqrt(np.mean(log_err ** 2))
+    bias_log = np.mean(log_err)  # Positive = over-prediction
+
+    print(f"Linear MAE:       {mae_lin:.4e}")
+    print(f"Linear RMSE:      {rmse_lin:.4e}")
+    print(f"Log10 MAE (dex):  {mae_log:.4f}")
+    print(f"Log10 RMSE (dex): {rmse_log:.4f}")
+    print(f"Log10 Bias (dex): {bias_log:.4f}")
+
+    # Fractional Error Stats
+    # Added 99.9th percentile
+    pcts = np.percentile(frac_err * 100, [50, 90, 95, 99, 99.9])
+    print(
+        f"Frac Err Percentiles (50/90/95/99/99.9%): {pcts[0]:.2f} / {pcts[1]:.2f} / {pcts[2]:.2f} / {pcts[3]:.2f} / {pcts[4]:.2f}")
+    print(f"Max Frac Error:   {100 * max_frac_err:.2f} %")
+    print("-------------------------------------")
 
     # Scatter plot with 1:1 line
     out_png = MODEL_DIR / "plots" / f"pred_vs_true_scatter_{n_use}samples.png"
