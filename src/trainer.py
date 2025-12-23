@@ -3,10 +3,11 @@
 trainer.py
 
 - CSV-only logging; checkpoints: best.ckpt / last.ckpt in work_dir
-- AMP precision from cfg (bf16/fp16/fp32); TF32/cudnn handled in hardware.optimize_hardware
+- AMP precision from cfg (bf16/fp16/fp32); TF32/cudnn handled in main/hardware setup
 - Optional torch.compile (Inductor)
 - Cosine schedule with warmup
 - Vectorized K handling; optional K-mask reduction
+- Sample-weighted epoch reduction for train/val (matches exactly)
 
 Dataset structure: (y_i, dt_norm[B,K,1], y_j[B,K,S], g[B,G], aux{...}[, k_mask[B,K]])
 """
@@ -27,13 +28,11 @@ DETECT_ANOMALY: bool = False
 INFERENCE_MODE: bool = True
 LR_LOGGING_INTERVAL: str = "epoch"
 
-OUTPUT_INTERVAL: int = 0
-
 # Training defaults (used when cfg keys absent)
 DEF_EPOCHS: int = 100
 DEF_GRAD_CLIP: float = 0.0
 DEF_ACCUMULATE: int = 1
-DEF_MAX_TRAIN_STEPS_PER_EPOCH: int = 0
+DEF_MAX_TRAIN_BATCHES: int = 0
 DEF_MAX_VAL_BATCHES: int = 0
 DEF_LR: float = 1e-3
 DEF_WEIGHT_DECAY: float = 1e-4
@@ -42,7 +41,7 @@ DEF_MIN_LR: float = 1e-6
 
 # torch.compile defaults
 COMPILE_ENABLE_DEFAULT: bool = True
-COMPILE_BACKEND: Optional[str] = "inductor"
+COMPILE_BACKEND: str | None = "inductor"
 COMPILE_MODE: str = "default"
 COMPILE_DYNAMIC: bool = False
 COMPILE_FULLGRAPH: bool = False
@@ -54,22 +53,18 @@ LOSS_EPS_PHYS: float = 1e-20
 LOG_STD_CLAMP_MIN: float = 1e-10
 W_SPECIES_CLAMP_MIN: float = 0.5
 W_SPECIES_CLAMP_MAX: float = 2.0
+SPECIES_RANGE_EPS: float = 1e-6
+W_SPECIES_MEAN_EPS: float = 1e-12
+WARMUP_START_FACTOR: float = 0.1
 
 # Resume behavior
 ENV_RESUME_VAR: str = "RESUME"
 RESUME_AUTO_SENTINEL: str = "auto"
 LAST_CKPT_NAME: str = "last.ckpt"
 
-SPECIES_RANGE_EPS: float = 1e-6
-W_SPECIES_MEAN_EPS: float = 1e-12
-WARMUP_START_FACTOR: float = 0.1
-
 # ============================== IMPORTS =======================================
 
 import os
-
-PL_DEVICES: int = int(os.getenv("PL_DEVICES", "1"))
-
 import json
 import time
 import math
@@ -82,30 +77,38 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback, StochasticWeightAveraging
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    LearningRateMonitor,
+    Callback,
+    StochasticWeightAveraging,
+)
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
 
 # ============================== LOSS ==========================================
 
 class AdaptiveStiffLoss(nn.Module):
     """
     Loss function: MSE in z plus MAE in log10-physical space with species weighting.
+
+    IMPORTANT: _z_to_log10 MUST remain differentiable. Do not decorate it with no_grad.
     """
 
     def __init__(
-            self,
-            log_means: torch.Tensor,
-            log_stds: torch.Tensor,
-            species_log_min: torch.Tensor,
-            species_log_max: torch.Tensor,
-            *,
-            lambda_phys: float = LOSS_LAMBDA_PHYS,
-            lambda_z: float = LOSS_LAMBDA_Z,
-            use_weighting: bool = True,   # Toggle weighting on/off
-            weight_power: float = 0.5,    # 0.5 = sqrt, 1.0 = linear range
-            w_min: float = W_SPECIES_CLAMP_MIN,
-            w_max: float = W_SPECIES_CLAMP_MAX,
-            epsilon_phys: float = LOSS_EPS_PHYS,  # retained for signature compatibility (unused)
+        self,
+        log_means: torch.Tensor,
+        log_stds: torch.Tensor,
+        species_log_min: torch.Tensor,
+        species_log_max: torch.Tensor,
+        *,
+        lambda_phys: float = LOSS_LAMBDA_PHYS,
+        lambda_z: float = LOSS_LAMBDA_Z,
+        use_weighting: bool = True,
+        weight_power: float = 0.5,
+        w_min: float = W_SPECIES_CLAMP_MIN,
+        w_max: float = W_SPECIES_CLAMP_MAX,
+        epsilon_phys: float = LOSS_EPS_PHYS,  # retained for signature compatibility (unused)
     ) -> None:
         super().__init__()
 
@@ -116,52 +119,44 @@ class AdaptiveStiffLoss(nn.Module):
         self.register_buffer("log_max", species_log_max.detach().clone())
 
         if use_weighting:
-            # Species weights ∝ (dynamic range)^weight_power
-            # rng is the log-spread: log10(max) - log10(min)
             rng = torch.clamp(self.log_max - self.log_min, min=SPECIES_RANGE_EPS)
             w = torch.pow(rng, float(weight_power))
-
-            # Normalize so the average weight is 1.0 (preserves global loss magnitude)
             w = w / (w.mean() + W_SPECIES_MEAN_EPS)
-
-            # Clamp to prevent extreme outliers from dominating gradients
             w_final = torch.clamp(w, float(w_min), float(w_max))
         else:
-            # If disabled, every species gets an identical weight of 1.0
             w_final = torch.ones_like(self.log_means)
 
         self.register_buffer("w_species", w_final)
 
-        # Loss Scaling Scalars
         self.lambda_phys = float(lambda_phys)
         self.lambda_z = float(lambda_z)
         self.eps_phys = float(epsilon_phys)
 
-    @torch.no_grad()
     def _z_to_log10(self, z: torch.Tensor) -> torch.Tensor:
-        """Convert normalized z back to log10 space for physical loss calculation."""
+        """Convert normalized z back to log10 space (DIFFERENTIABLE)."""
         return z * self.log_stds + self.log_means
 
+    @torch.no_grad()
+    def z_to_log10_nograd(self, z: torch.Tensor) -> torch.Tensor:
+        """Metrics-only helper (explicitly no-grad)."""
+        return self._z_to_log10(z)
+
     def forward(
-            self,
-            pred_z: torch.Tensor,  # [B,K,S]
-            true_z: torch.Tensor,  # [B,K,S]
-            t_norm: torch.Tensor,  # [B,K,1] (unused)
-            mask: Optional[torch.Tensor] = None,  # [B,K]
-            return_components: bool = False,
+        self,
+        pred_z: torch.Tensor,                 # [B,K,S]
+        true_z: torch.Tensor,                 # [B,K,S]
+        t_norm: torch.Tensor,                 # [B,K,1] (unused)
+        mask: Optional[torch.Tensor] = None,  # [B,K]
+        return_components: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
-        # Component 1: MSE in normalized Z-space
+        # MSE in normalized Z-space
         loss_z = (pred_z - true_z) ** 2
 
-        # Component 2: MAE in log10-physical space
+        # MAE in log10-physical space (MUST backprop to pred_z)
         pred_log = self._z_to_log10(pred_z)
         true_log = self._z_to_log10(true_z)
-        loss_phys = (pred_log - true_log).abs()
+        loss_phys = (pred_log - true_log).abs() * self.w_species
 
-        # Apply the species weights to the physical term
-        loss_phys = loss_phys * self.w_species
-
-        # Masked mean over valid positions
         if mask is not None:
             m = mask.unsqueeze(-1).to(loss_phys.dtype)
             loss_phys = loss_phys * m
@@ -182,10 +177,11 @@ class AdaptiveStiffLoss(nn.Module):
             return {"total": total, "phys": phys, "z": zstb}
         return total
 
+
 # ============================== LIGHTNING TASK ================================
 
 class ModelTask(pl.LightningModule):
-    """LightningModule wrapping the model and adaptive stiff loss."""
+    """LightningModule wrapping the model + sample-weighted epoch metrics."""
     def __init__(self, model: nn.Module, cfg: Dict[str, Any], work_dir: Path) -> None:
         super().__init__()
         self.model = model
@@ -201,43 +197,46 @@ class ModelTask(pl.LightningModule):
         # Optional GT slicing when target subset used
         self._target_idx = self._resolve_target_indices()
 
-        # Build loss from normalization manifest (no atomic term)
+        # Build loss from normalization manifest
         self.criterion = self._build_loss()
 
-        # Save compact hparams for repro
         self.save_hyperparameters({
             "cfg_min": {
                 "training": {
-                    "lr": self.lr, "weight_decay": self.weight_decay,
-                    "warmup_epochs": self.warmup_epochs, "min_lr": self.min_lr,
+                    "lr": self.lr,
+                    "weight_decay": self.weight_decay,
+                    "warmup_epochs": self.warmup_epochs,
+                    "min_lr": self.min_lr,
                 },
                 "paths": {"processed_data_dir": cfg.get("paths", {}).get("processed_data_dir", "")},
             },
             "work_dir": str(work_dir),
         })
 
-    # -------------------------------- helpers ---------------------------------
-
     def _resolve_target_indices(self) -> Optional[torch.Tensor]:
         data_cfg = self.cfg.get("data", {})
         species = list(data_cfg.get("species_variables") or [])
         targets = list(data_cfg.get("target_species") or species)
-        if targets != species:
-            name_to_idx = {n: i for i, n in enumerate(species)}
-            idx = [name_to_idx[n] for n in targets]
-            return torch.tensor(idx, dtype=torch.long)
-        return None
+
+        if not species or targets == species:
+            return None
+
+        name_to_idx = {n: i for i, n in enumerate(species)}
+        missing = [n for n in targets if n not in name_to_idx]
+        if missing:
+            raise ValueError(f"target_species contains unknown names: {missing}")
+
+        idx = [name_to_idx[n] for n in targets]
+        return torch.tensor(idx, dtype=torch.long)
 
     def _build_loss(self) -> nn.Module:
-        """Factory method to construct AdaptiveStiffLoss with hydrated config parameters."""
-        # 1. Load the normalization manifest
         manifest_path = Path(self.cfg["paths"]["processed_data_dir"]) / "normalization.json"
-        with open(manifest_path, "r") as f:
+        with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
+
         stats = manifest["per_key_stats"]
         meta = manifest.get("meta", {})
 
-        # 2. Determine which species we are actually calculating loss for
         data_cfg = self.cfg.get("data", {})
         targets = data_cfg.get("target_species")
         if targets:
@@ -247,7 +246,6 @@ class ModelTask(pl.LightningModule):
             if not species_names:
                 raise RuntimeError("No species list available in config or manifest.")
 
-        # 3. Collate the statistics into tensors
         log_means, log_stds, log_mins, log_maxs = [], [], [], []
         for n in species_names:
             s = stats[n]
@@ -256,7 +254,6 @@ class ModelTask(pl.LightningModule):
             log_mins.append(float(s.get("log_min", -30.0)))
             log_maxs.append(float(s.get("log_max", 0.0)))
 
-        # 4. Pull granular control settings from config
         loss_cfg = self.cfg.get("training", {}).get("adaptive_stiff_loss", {})
 
         return AdaptiveStiffLoss(
@@ -283,6 +280,7 @@ class ModelTask(pl.LightningModule):
         else:
             y_i, dt_norm, y_j, g, _aux = batch
             k_mask = None
+
         if self._target_idx is not None:
             idx = self._target_idx.to(y_j.device)
             y_j = y_j.index_select(dim=-1, index=idx)
@@ -291,42 +289,21 @@ class ModelTask(pl.LightningModule):
     # --------------------------- optim / sched --------------------------------
 
     def configure_optimizers(self):
-        """
-        Optimizer + LR scheduler.
-
-        Supports:
-          - AdamW (default) with optional fused implementation
-          - LAMB (via torch-optimizer) when cfg["training"]["optimizer"] == "lamb"
-        """
         tcfg = self.cfg.get("training", {})
         opt_name = str(tcfg.get("optimizer", "adamw")).lower().strip()
 
-        # ---------------- optimizer selection ----------------
         if opt_name == "adamw":
-            # Detect fused AdamW support
             try:
                 has_fused_flag = ("fused" in inspect.signature(torch.optim.AdamW).parameters)
             except Exception:
                 has_fused_flag = False
 
-            # Effective gradient-clip from Trainer (if any)
-            tr = getattr(self, "trainer", None)
             try:
-                clip_val = float(getattr(tr, "gradient_clip_val", 0.0) or 0.0) if tr is not None else \
-                           float(tcfg.get("gradient_clip", 0.0) or 0.0)
+                clip_val = float(getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0)
             except Exception:
                 clip_val = 0.0
 
-            # Some builds disable fused under FP16 + grad clipping
-            is_fp16_amp = False
-            try:
-                from pytorch_lightning.plugins.precision.amp import AMPPrecisionPlugin
-                is_fp16_amp = isinstance(getattr(self.trainer, "precision_plugin", None), AMPPrecisionPlugin) and \
-                              getattr(self.trainer.precision_plugin, "precision", None) in ("16-mixed", "16-true")
-            except Exception:
-                pass
-
-            use_fused = torch.cuda.is_available() and has_fused_flag and (clip_val == 0.0 or not is_fp16_amp)
+            use_fused = bool(torch.cuda.is_available() and has_fused_flag and clip_val == 0.0)
 
             opt_kwargs = dict(lr=self.lr, weight_decay=self.weight_decay)
             if use_fused:
@@ -334,17 +311,13 @@ class ModelTask(pl.LightningModule):
             optimizer = torch.optim.AdamW(self.parameters(), **opt_kwargs)
 
         elif opt_name == "lamb":
-            # LAMB from torch-optimizer (third-party but "prebuilt")
             import torch_optimizer as torchopt
-            optimizer = torchopt.Lamb(
-                self.parameters(),
-                lr=self.lr,
-                weight_decay=self.weight_decay,
-            )
+            optimizer = torchopt.Lamb(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
         else:
             raise ValueError(f"Unknown optimizer '{opt_name}'. Expected 'adamw' or 'lamb'.")
 
-        # ---------------- LR scheduler: warmup -> cosine ----------------
+        # warmup -> cosine
         scheds = []
         if self.warmup_epochs > 0:
             scheds.append(
@@ -355,7 +328,7 @@ class ModelTask(pl.LightningModule):
                 )
             )
 
-        max_epochs = max(1, (getattr(self.trainer, "max_epochs", 1) or 1))
+        max_epochs = max(1, int(getattr(self.trainer, "max_epochs", 1) or 1))
         t_max = max(1, max_epochs - self.warmup_epochs)
         cosine = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=self.min_lr)
 
@@ -365,18 +338,16 @@ class ModelTask(pl.LightningModule):
             milestones=[self.warmup_epochs],
         )
 
-        # Return tuple/list form (avoids edge-case mis-detection on some PL builds)
         return [optimizer], [{"scheduler": scheduler, "interval": "epoch", "monitor": CKPT_MONITOR}]
 
-
-    # --------------------------- steps / metrics ------------------------------
+    # --------------------------- steps / epoch metrics ------------------------
 
     def on_train_epoch_start(self) -> None:
         dev = self.device if hasattr(self, "device") else next(self.parameters()).device
-        self._t_sum = torch.zeros((), dtype=torch.float64, device=dev)       # sum(weight * total)
-        self._t_wsum = torch.zeros((), dtype=torch.float64, device=dev)      # sum(weight)
-        self._t_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)  # sum(weight * phys)
-        self._t_z_sum = torch.zeros((), dtype=torch.float64, device=dev)     # sum(weight * z)
+        self._t_sum = torch.zeros((), dtype=torch.float64, device=dev)
+        self._t_wsum = torch.zeros((), dtype=torch.float64, device=dev)
+        self._t_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)
+        self._t_z_sum = torch.zeros((), dtype=torch.float64, device=dev)
 
     def training_step(self, batch, batch_idx: int):
         y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
@@ -386,11 +357,9 @@ class ModelTask(pl.LightningModule):
             raise RuntimeError(f"Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
 
         comps = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
-
-        # Optimization objective
         loss = comps["total"]
 
-        # Sample-weighted accumulation (matches validation exactly)
+        # sample-weighted accumulation (matches validation exactly)
         with torch.no_grad():
             if k_mask is not None:
                 valid_pairs = torch.count_nonzero(k_mask if k_mask.dtype == torch.bool else (k_mask > 0))
@@ -412,12 +381,10 @@ class ModelTask(pl.LightningModule):
     def on_train_epoch_end(self) -> None:
         import torch.distributed as dist
 
-        # Global reduction (SUM) if DDP is active
         if dist.is_available() and dist.is_initialized():
             for t in (self._t_sum, self._t_phys_sum, self._t_z_sum, self._t_wsum):
                 dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
-        # If no training batches globally, skip logging
         if float(self._t_wsum.item()) <= 0.0:
             for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_wsum"):
                 setattr(self, name, torch.zeros_like(getattr(self, name)))
@@ -428,38 +395,33 @@ class ModelTask(pl.LightningModule):
         train_phys = (self._t_phys_sum / w).to(torch.float32)
         train_z = (self._t_z_sum / w).to(torch.float32)
 
-        # Log as scalars; no extra sync (already all-reduced)
+        # already all-reduced (no sync_dist)
         self.log("train_loss", train_loss, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_phys", train_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_z", train_z, prog_bar=False, on_epoch=True, sync_dist=False)
 
-        # Reset for next epoch
         for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
 
-    def validation_step(self, batch, batch_idx: int):
-        """
-        Validation with explicit sample-weighted accumulation.
+    def on_validation_epoch_start(self) -> None:
+        dev = self.device if hasattr(self, "device") else next(self.parameters()).device
+        self._v_sum = torch.zeros((), dtype=torch.float64, device=dev)
+        self._v_wsum = torch.zeros((), dtype=torch.float64, device=dev)
+        self._v_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)
+        self._v_z_sum = torch.zeros((), dtype=torch.float64, device=dev)
 
-        Weight = S * (#valid [B,K]) using k_mask if provided; otherwise B*K*S.
-        Raises on non-finite components or zero valid pairs in the batch.
-        Accumulates locally; global reduction occurs at epoch end.
-        """
-        # Unpack and forward
+    def validation_step(self, batch, batch_idx: int):
         y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
         pred = self(y_i, dt_in, g)
 
-        # Shape sanity
         if pred.shape != y_j.shape:
             raise RuntimeError(f"[val] Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
 
-        # Per-batch loss components
         comps = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
         total = comps["total"].detach()
         phys = comps["phys"].detach()
         zstb = comps["z"].detach()
 
-        # Guard against non-finite values
         if not torch.isfinite(total):
             raise ValueError(f"[val] Non-finite total loss at batch {batch_idx}")
         if not torch.isfinite(phys):
@@ -467,7 +429,6 @@ class ModelTask(pl.LightningModule):
         if not torch.isfinite(zstb):
             raise ValueError(f"[val] Non-finite z loss at batch {batch_idx}")
 
-        # Weight = S * (#valid [B,K])  (no time-edge weights)
         if k_mask is not None:
             valid_pairs = torch.count_nonzero(k_mask if k_mask.dtype == torch.bool else (k_mask > 0))
         else:
@@ -481,28 +442,16 @@ class ModelTask(pl.LightningModule):
         S = torch.tensor(y_j.shape[-1], device=y_j.device, dtype=torch.float64)
         weight = valid_pairs.to(torch.float64) * S
 
-        # Local accumulators
         self._v_sum += (total.to(torch.float64) * weight)
         self._v_phys_sum += (phys.to(torch.float64) * weight)
         self._v_z_sum += (zstb.to(torch.float64) * weight)
         self._v_wsum += weight
 
-        return total  # scalar for Lightning bookkeeping
-
-    def on_validation_epoch_start(self) -> None:
-        dev = self.device if hasattr(self, "device") else next(self.parameters()).device
-        self._v_sum = torch.zeros((), dtype=torch.float64, device=dev)       # sum(weight * total)
-        self._v_wsum = torch.zeros((), dtype=torch.float64, device=dev)      # sum(weight)
-        self._v_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)  # sum(weight * phys)
-        self._v_z_sum = torch.zeros((), dtype=torch.float64, device=dev)     # sum(weight * z)
+        return total
 
     def on_validation_epoch_end(self) -> None:
-        """
-        Finalize and log sample-weighted validation metrics once per epoch.
-        """
         tr = getattr(self, "trainer", None)
         if tr is not None and getattr(tr, "sanity_checking", False):
-            # Reset and bail during Lightning’s sanity pass
             for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_wsum"):
                 if hasattr(self, name):
                     setattr(self, name, torch.zeros_like(getattr(self, name)))
@@ -510,7 +459,6 @@ class ModelTask(pl.LightningModule):
 
         import torch.distributed as dist
 
-        # Ensure accumulators exist even if validation never started
         if not hasattr(self, "_v_wsum"):
             dev = self.device if hasattr(self, "device") else next(self.parameters()).device
             self._v_sum = torch.zeros((), dtype=torch.float64, device=dev)
@@ -518,275 +466,128 @@ class ModelTask(pl.LightningModule):
             self._v_z_sum = torch.zeros((), dtype=torch.float64, device=dev)
             self._v_wsum = torch.zeros((), dtype=torch.float64, device=dev)
 
-        # Global reduction (SUM) if DDP is active
         if dist.is_available() and dist.is_initialized():
             for t in (self._v_sum, self._v_phys_sum, self._v_z_sum, self._v_wsum):
                 dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
-        # If no validation batches globally, skip logging
         if float(self._v_wsum.item()) <= 0.0:
             for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_wsum"):
                 setattr(self, name, torch.zeros_like(getattr(self, name)))
             return
 
-        # Compute weighted means
         w = self._v_wsum
         val_loss = (self._v_sum / w).to(torch.float32)
         val_phys = (self._v_phys_sum / w).to(torch.float32)
         val_z = (self._v_z_sum / w).to(torch.float32)
 
-        # Log as scalars; no extra sync (already all-reduced)
         self.log("val_loss", val_loss, prog_bar=True, on_epoch=True, sync_dist=False)
         self.log("val_phys", val_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("val_z", val_z, prog_bar=False, on_epoch=True, sync_dist=False)
 
-        # Reset for next epoch
         for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
+
 
 # ============================== CALLBACKS =====================================
 
 class SetEpochCallback(Callback):
-    """Ensure dataset-driven sampling is advanced per epoch."""
-    def __init__(self, datasets: list) -> None:
+    """
+    Minimal and safe:
+      - Only touches the TRAIN dataset
+      - Only once per epoch (train_epoch_start)
+    """
+    def __init__(self, train_dataset: Any) -> None:
         super().__init__()
-        self.datasets = [d for d in datasets if d is not None]
+        self.train_dataset = train_dataset
 
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        for ds in self.datasets:
-            try:
-                if hasattr(ds, "set_epoch"):
-                    ds.set_epoch(trainer.current_epoch)
-            except Exception:
-                pass
-
-    def on_validation_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        for ds in self.datasets:
-            try:
-                if hasattr(ds, "set_epoch"):
-                    ds.set_epoch(trainer.current_epoch)
-            except Exception:
-                pass
-
-
-class EpochSummaryCallback(Callback):
-    """
-    Epoch summary + heartbeat that works under external DDP.
-    - Emits on env rank 0 (independent of PL's internal state).
-    - Starts a background heartbeat earlier than the first batch (unless disabled).
-    - Writes to stdout and to <work_dir>/train.log.
-    Columns: train_loss | val_loss | lr | time
-    """
-    def __init__(self, heartbeat_s: float | None = None) -> None:
-        super().__init__()
-        self._printed_header = False
-        self._t0: Optional[float] = None
-        self._next_emit_at: Optional[float] = None
-        self._hb_stop = None
-        self._hb_thread = None
-        self._trainer_ref = None  # weakref to PL trainer
-        # Disable periodic heartbeat when None/NaN/<=0
-        self._heartbeat_s = None if heartbeat_s is None else float(heartbeat_s)
-        self._logfile: Optional[Path] = None
-
-    # -------- rank gating via env (works even before PL initializes) ---------
-    @staticmethod
-    def _is_rank_zero_env() -> bool:
-        env = os.environ
-        for key in ("RANK", "WORLD_RANK", "OMPI_COMM_WORLD_RANK", "PMI_RANK"):
-            if key in env:
-                try:
-                    return int(env[key]) == 0
-                except Exception:
-                    return False
-        return True  # single-process
-
-    # -------------------------------- formatting -----------------------------
-    def _fmt_secs(self, seconds: float) -> str:
-        if seconds is None or not math.isfinite(seconds) or seconds < 0:
-            return "--:--"
-        m = int(seconds // 60); s = int(seconds % 60)
-        return f"{m:02d}:{s:02d}"
-
-    def _header(self) -> str:
-        return "EPOCH | " + " | ".join([f"{'train':>11}", f"{'val':>11}", f"{'lr':>10}", f"{'time':>8}"])
-
-    def _sep(self) -> str:
-        return "----- | " + " | ".join(["-"*11, "-"*11, "-"*10, "-"*8])
-
-    def _get_metric(self, trainer: Optional[pl.Trainer], keys: list[str]) -> float:
-        if trainer is None:
-            return float("nan")
-        merged = {}
-        for src in (getattr(trainer, "callback_metrics", None), getattr(trainer, "logged_metrics", None)):
-            if src:
-                try:
-                    merged.update(src)
-                except Exception:
-                    pass
-        for k in keys:
-            if k in merged:
-                v = merged[k]
-                try:
-                    return float(v.detach().cpu().item()) if torch.is_tensor(v) else float(v)
-                except Exception:
-                    continue
-        return float("nan")
-
-    def _emit(self, trainer: Optional[pl.Trainer]) -> None:
-        # Gate on PL's global-zero if available and via environment
-        if trainer is not None and hasattr(trainer, "is_global_zero") and not trainer.is_global_zero:
+        ds = self.train_dataset
+        if ds is None:
             return
-        if not self._is_rank_zero_env():
-            return
-        # Skip Lightning's sanity validation step
-        if trainer is not None and getattr(trainer, "sanity_checking", False):
-            return
-
-        if not self._printed_header:
-            msg_h = self._header()
-            print(msg_h, flush=True)
-            print(self._sep(), flush=True)
-            self._append_file(msg_h + "\n" + self._sep())
-            self._printed_header = True
-
-        epoch = getattr(trainer, "current_epoch", 0) if trainer is not None else 0
-
-        if trainer is not None and getattr(trainer, "global_step", 0) == 0:
-            return
-
-        train_v = self._get_metric(trainer, ["train_loss", "train_loss_epoch", "train"])
-        val_raw = self._get_metric(trainer, ["val_loss", "val"])
-
-        # 2) If nothing landed yet for this epoch, skip this tick
-        have_train = math.isfinite(train_v)
-        have_val = math.isfinite(val_raw)
-        if not have_train and not have_val:
-            return
-
-        val_str = f"{val_raw:>11.3e}" if have_val else f"{'—':>11}"
-
         try:
-            lr = float(trainer.optimizers[0].param_groups[0]["lr"]) if trainer else float("nan")
-        except Exception:
-            lr = float("nan")
-
-        elapsed = (time.perf_counter() - self._t0) if self._t0 is not None else float("nan")
-        line = f"E{epoch:04d} | {train_v:>11.3e} | {val_str} | {lr:>10.3e} | {self._fmt_secs(elapsed):>8}"
-        print(line, flush=True)
-        self._append_file(line)
-
-    def _append_file(self, text: str) -> None:
-        try:
-            if self._logfile is not None:
-                with self._logfile.open("a") as f:
-                    f.write(text + ("\n" if not text.endswith("\n") else ""))
-        except Exception:
-            pass  # never crash on logging
-
-    def _start_heartbeat(self, trainer: Optional[pl.Trainer]) -> None:
-        import threading, weakref
-        # Always (re)point the weakref to the latest trainer, even if the thread already exists.
-        self._trainer_ref = weakref.ref(trainer) if trainer is not None else (lambda: None)
-
-        # If the thread is already running, don't start another one.
-        if self._hb_thread is not None:
-            return
-
-        # When disabled (None/NaN/<=0), do not start the thread and do not schedule emits.
-        if (self._heartbeat_s is None) or (not math.isfinite(self._heartbeat_s)) or (self._heartbeat_s <= 0.0):
-            if self._t0 is None:
-                self._t0 = time.perf_counter()
-            self._next_emit_at = None
-            return
-
-        self._hb_stop = threading.Event()
-        if self._t0 is None:
-            self._t0 = time.perf_counter()
-        self._next_emit_at = self._t0 + float(self._heartbeat_s)
-
-        def _loop():
-            while not self._hb_stop.wait(5.0):
-                tr = None
-                try:
-                    tr = self._trainer_ref() if callable(self._trainer_ref) else None
-                except Exception:
-                    tr = None
-                if self._next_emit_at is not None and time.perf_counter() >= self._next_emit_at:
-                    self._emit(tr if isinstance(tr, pl.Trainer) else None)
-                    self._next_emit_at = time.perf_counter() + float(self._heartbeat_s)
-
-        self._hb_thread = threading.Thread(target=_loop, daemon=True)
-        self._hb_thread.start()
-
-    def _stop_heartbeat(self) -> None:
-        try:
-            if self._hb_stop is not None:
-                self._hb_stop.set()
-            if self._hb_thread is not None:
-                self._hb_thread.join(timeout=0.2)
+            if hasattr(ds, "set_epoch"):
+                ds.set_epoch(trainer.current_epoch)
         except Exception:
             pass
-        finally:  # noqa: E305
-            self._hb_stop = None
-            self._hb_thread = None
-            self._trainer_ref = None
 
-    def start_early(self) -> None:
-        """Allow starting the heartbeat before PL constructs/initializes."""
-        self._start_heartbeat(trainer=None)
 
-    # ---------------------------- PL hook wiring ------------------------------
-    def on_before_fit(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        # Determine log file once we have module/trainer
-        try:
-            root = Path(getattr(pl_module, "work_dir", None) or getattr(trainer, "default_root_dir", "."))
-            self._logfile = (root if isinstance(root, Path) else Path(root)) / "train.log"
-        except Exception:
-            self._logfile = None
-        self._start_heartbeat(trainer)
+class EpochTableCallback(Callback):
+    """
+    Rank-0 epoch summary print.
 
-    # Back-compat for older PL
-    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        if self._logfile is None:
-            try:
-                root = Path(getattr(pl_module, "work_dir", None) or getattr(trainer, "default_root_dir", "."))
-                self._logfile = (root if isinstance(root, Path) else Path(root)) / "train.log"
-            except Exception:
-                self._logfile = None
-        self._start_heartbeat(trainer)
-
-    def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        self._emit(trainer)
-        self._stop_heartbeat()
+    EPOCH | train       | val         | lr         | time
+    ----- | ----------- | ----------- | ---------- | --------
+    E0001 | 2.345e-01   | 1.234e-01   | 1.000e-03  | 12:34
+    """
+    def __init__(self) -> None:
+        super().__init__()
+        self._t0: float | None = None
+        self._printed_header: bool = False
 
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        self._t0 = time.perf_counter()
-        if (self._heartbeat_s is None) or (not math.isfinite(self._heartbeat_s)) or (self._heartbeat_s <= 0.0):
-            self._next_emit_at = None
-        else:
-            self._next_emit_at = self._t0 + float(self._heartbeat_s)
+        if trainer.is_global_zero and not trainer.sanity_checking:
+            self._t0 = time.time()
 
-    def on_train_batch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule, batch, batch_idx: int) -> None:
-        if self._next_emit_at is not None and time.perf_counter() >= self._next_emit_at:
-            self._emit(trainer)
-            self._next_emit_at = time.perf_counter() + float(self._heartbeat_s)
+    @staticmethod
+    def _get_metric(metrics: dict, key: str) -> Optional[float]:
+        for k in (key, f"{key}_epoch"):
+            v = metrics.get(k)
+            if v is None:
+                continue
+            try:
+                return float(v.detach().cpu().item() if hasattr(v, "detach") else float(v))
+            except Exception:
+                continue
+        return None
 
-    def on_validation_batch_start(
-        self,
-        trainer: pl.Trainer,
-        pl_module: pl.LightningModule,
-        batch,
-        batch_idx: int,
-        dataloader_idx: int = 0,
-    ) -> None:
-        if self._next_emit_at is not None and time.perf_counter() >= self._next_emit_at:
-            self._emit(trainer)
-            self._next_emit_at = time.perf_counter() + float(self._heartbeat_s)
+    @staticmethod
+    def _get_lr(trainer: pl.Trainer) -> Optional[float]:
+        try:
+            if trainer.optimizers and trainer.optimizers[0].param_groups:
+                return float(trainer.optimizers[0].param_groups[0].get("lr", None))
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _fmt_sci(x: Optional[float], width: int = 11) -> str:
+        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+            return f"{'—':>{width}}"
+        return f"{x:>{width}.3e}"
+
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        if seconds < 0:
+            seconds = 0.0
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m:02d}:{s:02d}"
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        # emit once more after val metrics land
-        self._emit(trainer)
+        if not trainer.is_global_zero or trainer.sanity_checking:
+            return
+
+        elapsed = (time.time() - self._t0) if self._t0 is not None else 0.0
+
+        metrics = dict(trainer.callback_metrics)
+        tr = self._get_metric(metrics, "train_loss")
+        va = self._get_metric(metrics, "val_loss")
+        lr = self._get_lr(trainer)
+
+        if not self._printed_header:
+            print("EPOCH | train       | val         | lr         | time", flush=True)
+            print("----- | ----------- | ----------- | ---------- | --------", flush=True)
+            self._printed_header = True
+
+        epoch_str = f"E{trainer.current_epoch + 1:04d}"
+        line = (
+            f"{epoch_str} | "
+            f"{self._fmt_sci(tr)} | "
+            f"{self._fmt_sci(va)} | "
+            f"{self._fmt_sci(lr)} | "
+            f"{self._fmt_time(elapsed)}"
+        )
+        print(line, flush=True)
 
 
 # ============================== WRAPPER =======================================
@@ -802,6 +603,8 @@ class Trainer:
         work_dir: Path,
         device: torch.device,
         logger: Optional[logging.Logger] = None,
+        *,
+        pl_precision_override: Any = None,  # optional override from main
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -809,6 +612,7 @@ class Trainer:
         self.cfg = cfg
         self.work_dir = Path(work_dir)
         self.device = device
+        self.pl_precision_override = pl_precision_override
 
         self.logger = logger or logging.getLogger("trainer")
         if not self.logger.handlers:
@@ -818,17 +622,23 @@ class Trainer:
             self.logger.setLevel(logging.INFO)
 
         # Silence non-zero ranks to avoid duplicate INFO lines
-        if int(os.getenv("RANK", "0")) != 0:
+        if int(os.getenv("RANK", "0") or "0") != 0:
             self.logger.propagate = False
-            self.logger.setLevel(logging.WARNING)  # or logging.ERROR to be stricter
+            self.logger.setLevel(logging.WARNING)
 
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
         tcfg = cfg.get("training", {})
+        syscfg = cfg.get("system", {})
+
         self.epochs = int(tcfg.get("epochs", DEF_EPOCHS))
         self.grad_clip = float(tcfg.get("gradient_clip", DEF_GRAD_CLIP))
         self.accumulate = int(tcfg.get("accumulate_grad_batches", DEF_ACCUMULATE))
         self.torch_compile = bool(tcfg.get("torch_compile", COMPILE_ENABLE_DEFAULT))
+
+        # Determinism / cudnn benchmark (keep aligned with main)
+        self.deterministic = bool(syscfg.get("deterministic", False))
+        self.cudnn_benchmark = bool(syscfg.get("cudnn_benchmark", True)) and not self.deterministic
 
         # SWA config
         self.use_swa = bool(tcfg.get("use_swa", False))
@@ -837,21 +647,22 @@ class Trainer:
         self.swa_annealing_epochs = int(tcfg.get("swa_annealing_epochs", 10))
         self.swa_annealing_strategy = str(tcfg.get("swa_annealing_strategy", "cos"))
 
-        # Allow config to override compile knobs
+        # Compile knobs
         self.compile_backend = tcfg.get("torch_compile_backend", COMPILE_BACKEND)
         self.compile_mode = tcfg.get("torch_compile_mode", COMPILE_MODE)
         self.compile_dynamic = bool(tcfg.get("compile_dynamic", COMPILE_DYNAMIC))
         self.compile_fullgraph = bool(tcfg.get("compile_fullgraph", COMPILE_FULLGRAPH))
 
-        # Optional limits (batches), distinct from dataset step bounds
-        self.limit_train_batches = int(tcfg.get("max_train_steps_per_epoch", DEF_MAX_TRAIN_STEPS_PER_EPOCH) or 0)
+        # Optional limits (PL "limit_*_batches")
+        self.limit_train_batches = int(tcfg.get("max_train_batches", DEF_MAX_TRAIN_BATCHES) or 0)
         self.limit_val_batches = int(tcfg.get("max_val_batches", DEF_MAX_VAL_BATCHES) or 0)
 
-    def _precision_from_cfg(self) -> str:
-        # Accept both aliases and explicit Lightning strings
+    def _precision_from_cfg(self) -> Any:
+        if self.pl_precision_override is not None:
+            return self.pl_precision_override
+
         mp = str(self.cfg.get("mixed_precision", {}).get("mode", "32-true")).lower().strip()
         aliases = {
-            # BF16
             "bf16": "bf16-mixed",
             "bfloat16": "bf16-mixed",
             "bf16-mixed": "bf16-mixed",
@@ -880,14 +691,17 @@ class Trainer:
         if isinstance(p_cfg, str) and p_cfg.strip():
             p = Path(p_cfg)
             return str(p) if p.is_file() else None
+
         env_resume = os.environ.get(ENV_RESUME_VAR, "").strip()
         if env_resume and env_resume.lower() != RESUME_AUTO_SENTINEL:
             p = Path(env_resume)
             return str(p) if p.is_file() else None
+
         if env_resume.lower() == RESUME_AUTO_SENTINEL or bool(tcfg.get("auto_resume", True)):
             p = self.work_dir / LAST_CKPT_NAME
             if p.is_file():
                 return str(p)
+
         return None
 
     def _maybe_compile(self, model: nn.Module) -> nn.Module:
@@ -905,14 +719,13 @@ class Trainer:
                 f"torch.compile enabled (backend={self.compile_backend}, mode={self.compile_mode}, "
                 f"dynamic={self.compile_dynamic}, fullgraph={self.compile_fullgraph})"
             )
-
             return compiled
         except Exception as e:
             self.logger.warning(f"torch.compile disabled ({e})")
             return model
 
     def train(self) -> float:
-        # Optional model compile (Lightning handles AMP/precision)
+        # Optional model compile (Lightning handles precision)
         self.model = self._maybe_compile(self.model)
         task = ModelTask(self.model, self.cfg, self.work_dir)
 
@@ -928,21 +741,27 @@ class Trainer:
             verbose=False,
         )
         lr_cb = LearningRateMonitor(logging_interval=LR_LOGGING_INTERVAL)
-        epoch_cb = SetEpochCallback([
-            getattr(self.train_loader, "dataset", None),
-            getattr(self.val_loader, "dataset", None) if self.val_loader is not None else None,
-        ])
 
-        # Single, final summary callback. Start its heartbeat before PL initializes.
-        summary_cb = EpochSummaryCallback(heartbeat_s=OUTPUT_INTERVAL)
-        summary_cb.start_early()
+        # Only set epoch on TRAIN dataset (once per epoch)
+        train_ds = getattr(self.train_loader, "dataset", None)
+        epoch_set_cb = SetEpochCallback(train_ds)
+
+        epoch_print_cb = EpochTableCallback()
+
+        callbacks = [ckpt_cb, lr_cb, epoch_set_cb, epoch_print_cb]
+
+        if self.use_swa:
+            swa_kwargs = dict(
+                swa_epoch_start=self.swa_epoch_start,
+                annealing_epochs=self.swa_annealing_epochs,
+                annealing_strategy=self.swa_annealing_strategy,
+            )
+            if self.swa_lrs is not None:
+                swa_kwargs["swa_lrs"] = self.swa_lrs
+            callbacks.append(StochasticWeightAveraging(**swa_kwargs))
 
         accelerator = self._accelerator_from_device()
         precision = self._precision_from_cfg()
-
-        # Keep Lightning's cudnn.benchmark aligned with hardware.optimize_hardware
-        det = bool(self.cfg.get("system", {}).get("deterministic", False))
-        bench_cfg = bool(self.cfg.get("system", {}).get("cudnn_benchmark", True)) and not det
 
         trainer_kwargs: dict[str, Any] = {}
         if self.limit_train_batches > 0:
@@ -950,90 +769,25 @@ class Trainer:
         if self.limit_val_batches > 0:
             trainer_kwargs["limit_val_batches"] = self.limit_val_batches
 
-        world_size = int(os.getenv("WORLD_SIZE", "1"))
+        # DDP: only support externally-launched (torchrun/mpirun/srun).
+        world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
         externally_launched = world_size > 1
 
-        if externally_launched:
-            # Each process uses 1 device; num_nodes * devices == WORLD_SIZE
+        # Avoid Lightning spawn; this codebase builds datasets in main (often GPU-preloaded).
+        if not externally_launched:
+            requested = int(os.getenv("PL_DEVICES", "1") or "1")
+            if requested != 1:
+                self.logger.warning("PL_DEVICES>1 requested but spawn is unsafe here; forcing devices=1. Use torchrun/mpirun/srun.")
             devices = 1
-            num_nodes = world_size
         else:
-            devices = PL_DEVICES
-            num_nodes = 1
+            devices = 1  # per-rank process
+        strategy: Any = "ddp" if externally_launched else "auto"
 
-        # DDP strategy selection
-        strategy: Any = "auto"
-        if externally_launched or devices > 1:
-            try:
-                from pytorch_lightning.strategies import DDPStrategy
-                try:
-                    strategy = DDPStrategy(process_group_backend="nccl")
-                except TypeError:
-                    strategy = DDPStrategy()
-            except Exception:
-                strategy = "ddp"
-
-        callbacks = [ckpt_cb, lr_cb, epoch_cb, summary_cb]
-
-        if self.use_swa:
-            # If swa_lrs is not set in config, derive it from the *main* LR schedule
-            # so that when SWA starts the LR is continuous (no jump back to base lr).
-            if self.swa_lrs is None:
-                max_epochs = max(1, self.epochs)
-
-                raw_start = self.swa_epoch_start
-                # Support both fractional [0,1) and absolute epoch indices.
-                if isinstance(raw_start, (float, int)) and 0.0 < float(raw_start) < 1.0:
-                    swa_start_epoch = int(float(raw_start) * max_epochs)
-                else:
-                    swa_start_epoch = int(raw_start)
-                swa_start_epoch = max(0, min(max_epochs, swa_start_epoch))
-
-                base_lr = float(getattr(task, "lr", DEF_LR))
-                warmup_epochs = int(getattr(task, "warmup_epochs", DEF_WARMUP_EPOCHS))
-                min_lr = float(getattr(task, "min_lr", DEF_MIN_LR))
-
-                if swa_start_epoch <= warmup_epochs:
-                    # Linear warmup:
-                    # lr(e) = base_lr * [ a + (1 - a) * e / warmup_epochs ]
-                    frac = swa_start_epoch / max(1, warmup_epochs)
-                    lr_swa = base_lr * (
-                        WARMUP_START_FACTOR
-                        + (1.0 - WARMUP_START_FACTOR) * frac
-                    )
-                else:
-                    # Cosine decay:
-                    # lr(e) = eta_min + 0.5 * (base_lr - eta_min) * (1 + cos(pi * t / T_max))
-                    t_max = max(1, max_epochs - warmup_epochs)
-                    t = max(0, min(t_max, swa_start_epoch - warmup_epochs))
-                    cos_term = math.cos(math.pi * t / t_max)
-                    lr_swa = min_lr + 0.5 * (base_lr - min_lr) * (1.0 + cos_term)
-
-                swa_lrs = lr_swa
-                self.logger.info(
-                    f"Enabling SWA: swa_lrs auto-set to {swa_lrs:.3e} "
-                    f"(matches main schedule at epoch {swa_start_epoch})."
-                )
-            else:
-                # Respect explicit swa_lrs from config if provided
-                swa_lrs = self.swa_lrs
-                self.logger.info(f"Enabling SWA with explicit swa_lrs={swa_lrs}.")
-
-            callbacks.append(
-                StochasticWeightAveraging(
-                    swa_lrs=swa_lrs,
-                    swa_epoch_start=self.swa_epoch_start,
-                    annealing_epochs=self.swa_annealing_epochs,
-                    annealing_strategy=self.swa_annealing_strategy,
-                )
-            )
-
-        pl_trainer = pl.Trainer(
+        base_kwargs = dict(
             default_root_dir=str(self.work_dir),
             max_epochs=self.epochs,
             accelerator=accelerator,
             devices=devices,
-            num_nodes=num_nodes,
             strategy=strategy,
             precision=precision,
             gradient_clip_val=self.grad_clip if self.grad_clip > 0 else 0.0,
@@ -1042,13 +796,19 @@ class Trainer:
             callbacks=callbacks,
             enable_checkpointing=ENABLE_CHECKPOINTING,
             enable_progress_bar=ENABLE_PROGRESS_BAR,
-            benchmark=bench_cfg,
-            log_every_n_steps=LOG_EVERY_N_STEPS,
             enable_model_summary=ENABLE_MODEL_SUMMARY,
             detect_anomaly=DETECT_ANOMALY,
             inference_mode=INFERENCE_MODE,
+            benchmark=self.cudnn_benchmark,
+            log_every_n_steps=LOG_EVERY_N_STEPS,
             **trainer_kwargs,
         )
+
+        # keep deterministic flag if supported by installed PL
+        try:
+            pl_trainer = pl.Trainer(deterministic=self.deterministic, **base_kwargs)
+        except TypeError:
+            pl_trainer = pl.Trainer(**base_kwargs)
 
         ckpt_path = self._resolve_resume_ckpt()
         self.logger.info(f"resume: {ckpt_path if ckpt_path else 'fresh'}")

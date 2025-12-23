@@ -2,7 +2,7 @@
 """
 main.py
 - JSON/JSONC config loading
-- Hardware + reproducibility setup
+- Hardware + reproducibility setup (inlined; hardware.py not required)
 - Preprocess if needed, then hydrate cfg.data.* from artifacts
 - Build datasets/dataloaders (single set of knobs; no *_val variants)
 - Build model
@@ -12,16 +12,19 @@ main.py
 from __future__ import annotations
 
 import os
+import sys
 
-# Resolve duplicate OpenMP on macOS
-# I should get rid of this, but my mac envs are messy
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# Resolve duplicate OpenMP on macOS (avoid setting this on Linux)
+if sys.platform == "darwin":
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import json
+import time
+import shutil
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-import time
+
 import torch
 
 from utils import (
@@ -31,18 +34,178 @@ from utils import (
     dump_json,
     resolve_precision_and_dtype,
 )
-from hardware import setup_device, optimize_hardware
 from dataset import FlowMapPairsDataset, create_dataloader
 from model import create_model
 from trainer import Trainer
-import shutil
 from preprocessor import DataPreprocessor
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config.jsonc"
 GLOBAL_SEED = 42
 GLOBAL_WORK_DIR = REPO_ROOT / "models" / "autoencoder-flowmap"
 VALIDATION_SEED_OFFSET = 1337
+
+
+# --------------------------------------------------------------------------------------
+# DDP / MPI env normalization (optional but helpful on clusters)
+# --------------------------------------------------------------------------------------
+
+def normalize_distributed_env() -> None:
+    """
+    Lightning/DDP expects torchrun-style env vars (RANK/WORLD_SIZE/LOCAL_RANK).
+    Map common MPI/PMI/MVAPICH/SLURM env vars to torchrun equivalents *only when missing*.
+    """
+    if os.getenv("RANK") is None:
+        for k in ("SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK", "MV2_COMM_WORLD_RANK"):
+            v = os.getenv(k)
+            if v is not None:
+                os.environ["RANK"] = v
+                break
+
+    if os.getenv("WORLD_SIZE") is None:
+        for k in ("SLURM_NTASKS", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE"):
+            v = os.getenv(k)
+            if v is not None:
+                os.environ["WORLD_SIZE"] = v
+                break
+
+    if os.getenv("LOCAL_RANK") is None:
+        for k in (
+            "SLURM_LOCALID",
+            "OMPI_COMM_WORLD_LOCAL_RANK",
+            "MPI_LOCALRANKID",
+            "MV2_COMM_WORLD_LOCAL_RANK",
+            "CUDA_LOCAL_RANK",
+        ):
+            v = os.getenv(k)
+            if v is not None:
+                os.environ["LOCAL_RANK"] = v
+                break
+
+
+# --------------------------------------------------------------------------------------
+# Inlined "hardware.py"
+# --------------------------------------------------------------------------------------
+
+def setup_device(logger: logging.Logger) -> torch.device:
+    """
+    Device selection:
+      - CUDA: uses LOCAL_RANK (or defaults to 0) and calls torch.cuda.set_device.
+      - MPS: uses Apple MPS if available.
+      - CPU: fallback.
+    """
+    if torch.cuda.is_available():
+        local_rank = int(os.getenv("LOCAL_RANK", "0") or "0")
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        try:
+            dev_name = torch.cuda.get_device_name(local_rank)
+        except Exception:
+            dev_name = "unknown"
+        logger.info(f"Set CUDA device to local_rank={local_rank} ({dev_name})")
+        return device
+
+    if torch.backends.mps.is_available():
+        logger.info("Using Apple MPS")
+        return torch.device("mps")
+
+    logger.info("Using CPU")
+    return torch.device("cpu")
+
+
+def optimize_hardware(system_cfg: Dict[str, Any], device: torch.device, logger: logging.Logger) -> None:
+    """
+    Mirrors the intent of hardware.optimize_hardware:
+      - TF32 / matmul precision
+      - cudnn benchmark vs deterministic
+      - deterministic algorithms (optional)
+      - optional CPU thread settings
+    """
+    # Matmul precision (safe no-op if unsupported)
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+    # TF32 flags (CUDA only) — support both legacy key "tf32" and newer "allow_tf32"
+    tf32 = system_cfg.get("tf32", system_cfg.get("allow_tf32", True))
+    tf32 = bool(tf32)
+
+    if device.type == "cuda":
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = tf32
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.allow_tf32 = tf32
+        except Exception:
+            pass
+
+    # CPU thread control (optional): set both env + torch threads
+    omp = system_cfg.get("omp_num_threads")
+    if omp is not None:
+        try:
+            omp_int = int(omp)
+            if omp_int > 0:
+                os.environ["OMP_NUM_THREADS"] = str(omp_int)
+                torch.set_num_threads(omp_int)
+                logger.info(f"Set OMP_NUM_THREADS={omp_int}")
+                logger.info(f"Set torch num_threads={omp_int}")
+        except Exception as e:
+            logger.warning(f"Failed to set OMP_NUM_THREADS / torch num_threads: {e}")
+
+    deterministic = bool(system_cfg.get("deterministic", False))
+    cudnn_benchmark = bool(system_cfg.get("cudnn_benchmark", True)) and not deterministic
+
+    if deterministic:
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception as e:
+            logger.warning(f"torch.use_deterministic_algorithms(True) failed: {e}")
+        try:
+            torch.backends.cudnn.deterministic = True
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.benchmark = False
+        except Exception:
+            pass
+        logger.info("Deterministic mode enabled (cudnn.benchmark forced False).")
+    else:
+        try:
+            torch.use_deterministic_algorithms(False)
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.deterministic = False
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.benchmark = cudnn_benchmark
+        except Exception:
+            pass
+        logger.info(f"cudnn.benchmark={cudnn_benchmark}")
+
+    # Final effective settings summary (matches old behavior)
+    try:
+        eff_bench = bool(torch.backends.cudnn.benchmark)
+    except Exception:
+        eff_bench = cudnn_benchmark
+    try:
+        eff_det = bool(torch.backends.cudnn.deterministic)
+    except Exception:
+        eff_det = False
+
+    logger.info(
+        f"Hardware settings: TF32={tf32}, cudnn.benchmark={eff_bench}, "
+        f"deterministic={deterministic}, cudnn.deterministic={eff_det}"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Config hydration from processed artifacts
+# --------------------------------------------------------------------------------------
 
 def hydrate_config_from_processed(
     cfg: Dict[str, Any],
@@ -116,16 +279,21 @@ def hydrate_config_from_processed(
 
     return processed_dir
 
-def ensure_preprocessed_data(cfg, logger):
+
+def ensure_preprocessed_data(cfg: Dict[str, Any], logger: logging.Logger) -> Path:
     """
     Reuse processed data if complete; otherwise run the preprocessor.
+
+    Safety: if preprocessing is required and WORLD_SIZE>1, exit.
     """
     processed_dir = Path(cfg.get("paths", {}).get("processed_data_dir", "data/processed")).resolve()
     overwrite_data = bool(cfg.get("preprocessing", {}).get("overwrite_data", False))
 
-    req_files = [processed_dir / "normalization.json",
-                 processed_dir / "preprocessing_summary.json",
-                 processed_dir / "shard_index.json"]
+    req_files = [
+        processed_dir / "normalization.json",
+        processed_dir / "preprocessing_summary.json",
+        processed_dir / "shard_index.json",
+    ]
     have_required = all(p.exists() for p in req_files)
     have_splits = all(
         (processed_dir / split).exists() and any((processed_dir / split).glob("*.npz"))
@@ -133,22 +301,12 @@ def ensure_preprocessed_data(cfg, logger):
     )
     preprocessing_needed = overwrite_data or not (have_required and have_splits)
 
-    # Detect multi-rank / multi-GPU (robust)
-    ws_vals = [os.getenv(k) for k in ("WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE")]
-    multi = any(v and v.isdigit() and int(v) > 1 for v in ws_vals)
-
-    cvd = (os.getenv("CUDA_VISIBLE_DEVICES") or "").strip()
-    if cvd:
-        if len([t for t in cvd.split(",") if t.strip() != ""]) > 1:
-            multi = True
-
-    try:
-        multi = multi or (torch.cuda.is_available() and torch.cuda.device_count() > 1)
-    except Exception:
-        pass
+    # Multi means multi-rank, not "node has multiple GPUs"
+    world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
+    multi = world_size > 1
 
     if preprocessing_needed and multi:
-        logger.warning("Preprocessing is required but multiple GPUs/ranks are requested")
+        logger.warning("Preprocessing is required but WORLD_SIZE>1 (multi-rank) is active")
         raise SystemExit(2)
 
     # Fast path: reuse existing artifacts (hydrate cfg.data non-destructively if snapshot exists)
@@ -169,7 +327,7 @@ def ensure_preprocessed_data(cfg, logger):
             logger.info("[pre] Reusing existing preprocessed data at %s", processed_dir)
         return processed_dir
 
-    # Single-GPU/CPU preprocessing
+    # Single-rank preprocessing
     if overwrite_data and processed_dir.exists():
         logger.warning("Deleting existing processed dir: %s", processed_dir)
         shutil.rmtree(processed_dir, ignore_errors=True)
@@ -177,6 +335,7 @@ def ensure_preprocessed_data(cfg, logger):
     dp = DataPreprocessor(cfg, logger=logger.getChild("pre"))
     dp.run()
     return processed_dir
+
 
 # --------------------------------------------------------------------------------------
 # Datasets + DataLoaders (single set of knobs)
@@ -244,6 +403,7 @@ def build_datasets_and_loaders(
     )
     return train_dataset, val_dataset, train_loader, val_loader
 
+
 def validate_dataloaders(
     train_loader: torch.utils.data.DataLoader,
     val_loader: Optional[torch.utils.data.DataLoader],
@@ -257,11 +417,15 @@ def validate_dataloaders(
     except Exception:
         n_train_items = n_val_items = n_train_batches = n_val_batches = 0
 
-    logger.info(f"Dataset stats: train={n_train_items} items/{n_train_batches} batches; val={n_val_items} items/{n_val_batches} batches")
+    logger.info(
+        f"Dataset stats: train={n_train_items} items/{n_train_batches} batches; "
+        f"val={n_val_items} items/{n_val_batches} batches"
+    )
     if n_train_batches == 0:
         raise RuntimeError("Empty training loader")
     if val_loader and n_val_batches == 0:
         raise RuntimeError("Empty validation loader")
+
 
 # --------------------------------------------------------------------------------------
 # Model
@@ -274,6 +438,7 @@ def build_model(cfg: Dict[str, Any], logger: logging.Logger) -> torch.nn.Module:
     logger.info(f"Model parameters: {n_params/1e6:.2f}M")
     return model
 
+
 # --------------------------------------------------------------------------------------
 # Training entrypoint
 # --------------------------------------------------------------------------------------
@@ -281,7 +446,6 @@ def build_model(cfg: Dict[str, Any], logger: logging.Logger) -> torch.nn.Module:
 def main() -> None:
     """Main training entrypoint (rank-0 writes; N GPU safe)."""
     # ------------------------------- Load config -------------------------------
-    # Optional env override; otherwise use DEFAULT_CONFIG_PATH
     cfg_path_str = os.getenv("FLOWMAP_CONFIG", str(DEFAULT_CONFIG_PATH))
     cfg_path = Path(cfg_path_str).expanduser().resolve()
     cfg = load_json_config(cfg_path)
@@ -289,17 +453,25 @@ def main() -> None:
     if "paths" not in cfg or "processed_data_dir" not in cfg["paths"]:
         raise KeyError("cfg.paths.processed_data_dir is required")
 
-    cfg.setdefault("system", {"seed": GLOBAL_SEED})
+    cfg.setdefault("system", {})
+    cfg["system"].setdefault("seed", GLOBAL_SEED)
+
     cfg.setdefault("dataset", {})
-    cfg.setdefault("mixed_precision", {"mode": "bf16"})
+
+    cfg.setdefault("mixed_precision", {})
+    cfg["mixed_precision"].setdefault("mode", "bf16")
+
+    # Normalize env vars so Lightning can DDP under MPI/torchrun/srun
+    normalize_distributed_env()
 
     # ----------------------- Rank/env + work_dir prepare -----------------------
     work_dir = Path(cfg.get("paths", {}).get("work_dir", GLOBAL_WORK_DIR)).expanduser().resolve()
     overwrite = bool(cfg.get("paths", {}).get("overwrite", False))
 
-    # Robust rank detection across MPI stacks
+    # Robust rank detection across MPI stacks + SLURM
     rank_env = (
         os.getenv("RANK")
+        or os.getenv("SLURM_PROCID")
         or os.getenv("PMI_RANK")
         or os.getenv("OMPI_COMM_WORLD_RANK")
         or os.getenv("MV2_COMM_WORLD_RANK")
@@ -311,18 +483,16 @@ def main() -> None:
         global_rank = 0
 
     if global_rank == 0:
-        # Only rank-0 mutates the work directory
         if work_dir.exists() and overwrite:
             print(f"[main] Deleting existing work dir: {work_dir}", flush=True)
             shutil.rmtree(work_dir, ignore_errors=True)
         work_dir.mkdir(parents=True, exist_ok=True)
-        # Sentinel so other ranks can safely proceed
         try:
             (work_dir / ".ready").write_text("ok", encoding="utf-8")
         except Exception:
             pass
     else:
-        # Wait up to ~60s for rank-0 to prepare the directory
+        # Wait up to ~60s for rank-0 to prep the dir
         for _ in range(600):
             if work_dir.exists() and (work_dir / ".ready").exists():
                 break
@@ -330,7 +500,6 @@ def main() -> None:
         work_dir.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------- Logging setup ------------------------------
-    # Rank-0 logs to file; workers log to console only (no file writes)
     if global_rank == 0:
         setup_logging(log_file=work_dir / "train.log", level=logging.INFO)
     else:
@@ -340,19 +509,7 @@ def main() -> None:
 
     # -------------------------- Repro + device setup ---------------------------
     seed_everything(int(cfg["system"]["seed"]))
-    device = setup_device()
-    if device.type == "cuda":
-        # Prefer LOCAL_RANK (OpenMPI sets OMPI_COMM_WORLD_LOCAL_RANK), else CUDA_LOCAL_RANK, else 0
-        local_rank = int(os.getenv("LOCAL_RANK",
-                           os.getenv("OMPI_COMM_WORLD_LOCAL_RANK",
-                           os.getenv("CUDA_LOCAL_RANK", "0"))))
-        torch.cuda.set_device(local_rank)
-        try:
-            dev_name = torch.cuda.get_device_name(local_rank)
-        except Exception:
-            dev_name = "unknown"
-        logger.info(f"Set CUDA device to local_rank={local_rank} ({dev_name})")
-
+    device = setup_device(logger)
     optimize_hardware(cfg.get("system", {}), device, logger)
 
     # -------------------- Precision + runtime dtype resolve --------------------
@@ -367,7 +524,6 @@ def main() -> None:
         except Exception:
             pass
     else:
-        # Exit immediately (no wait) if preprocessing would be required in a multi-GPU/multi-rank launch
         processed_dir = Path(cfg.get("paths", {}).get("processed_data_dir", "data/processed")).resolve()
         req_files = [
             processed_dir / "normalization.json",
@@ -382,24 +538,14 @@ def main() -> None:
         overwrite_data = bool(cfg.get("preprocessing", {}).get("overwrite_data", False))
         preprocessing_needed = overwrite_data or not (have_required and have_splits)
 
-        # Compact multi-rank / multi-GPU detection
-        ws_vals = [os.getenv(k) for k in ("WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE")]
-        multi = any(v and v.isdigit() and int(v) > 1 for v in ws_vals)
-
-        cvd = (os.getenv("CUDA_VISIBLE_DEVICES") or "").strip()
-        if cvd:
-            if len([t for t in cvd.split(",") if t.strip() != ""]) > 1:
-                multi = True
-        try:
-            multi = multi or (torch.cuda.is_available() and torch.cuda.device_count() > 1)
-        except Exception:
-            pass
+        world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
+        multi = world_size > 1
 
         if preprocessing_needed and multi:
-            logger.warning( "Preprocessing is required but multiple GPUs/ranks are requested")
+            logger.warning("Preprocessing is required but WORLD_SIZE>1 (multi-rank) is active")
             raise SystemExit(2)
 
-        # Otherwise, safe to wait for rank-0 to finish (single-GPU preprocessing)
+        # Otherwise safe to wait for rank-0 to finish
         for _ in range(36000):
             if (work_dir / ".data.ready").exists():
                 break
@@ -408,7 +554,6 @@ def main() -> None:
 
     assert processed_dir.exists(), "Processed data dir must exist after preprocessing/hydration"
 
-    # Get all the config info
     hydrate_config_from_processed(cfg, logger, processed_dir)
 
     if global_rank == 0:
@@ -422,7 +567,6 @@ def main() -> None:
     )
     validate_dataloaders(train_loader=train_loader, val_loader=val_loader, logger=logger)
 
-    # Build the model
     model = build_model(cfg, logger)
 
     trainer = Trainer(
@@ -433,12 +577,14 @@ def main() -> None:
         work_dir=work_dir,
         device=device,
         logger=logger.getChild("trainer"),
+        pl_precision_override=pl_precision,  # keep Trainer + main consistent
     )
     best_val_loss = trainer.train()
     if global_rank == 0:
         logger.info(f"Training complete. Best val loss: {best_val_loss:.6e}")
     else:
         logger.info("Training complete (rank>0).")
+
 
 if __name__ == "__main__":
     main()

@@ -160,7 +160,6 @@ def plot_results(t_phys: np.ndarray,
 
     ax.set_box_aspect(1)
 
-
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
