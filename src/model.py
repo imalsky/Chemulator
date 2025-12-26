@@ -97,16 +97,14 @@ class Encoder(nn.Module):
         latent_dim: int,
         activation: nn.Module,
         dropout_p: float = 0.0,
-        vae_mode: bool = False,
     ):
         super().__init__()
         self.state_dim = state_dim
         self.global_dim = global_dim
         self.latent_dim = latent_dim
-        self.vae_mode = bool(vae_mode)
 
         inp = state_dim + global_dim
-        out = latent_dim * 2 if self.vae_mode else latent_dim
+        out = latent_dim
 
         self.network = MLP(
             input_dim=inp,
@@ -118,20 +116,11 @@ class Encoder(nn.Module):
 
     def forward(self, y: torch.Tensor, g: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        y: [B,S], g: [B,G]  ->  z: [B,Z], kl: always None (KL disabled)
+        y: [B,S], g: [B,G]  ->  z: [B,Z], kl: always None
         """
         x = torch.cat([y, g], dim=-1)
         out = self.network(x)
-
-        if not self.vae_mode:
-            return out, None
-
-        # VAE reparameterization (KL intentionally disabled)
-        mu, logvar = torch.chunk(out, 2, dim=-1)
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z = mu + eps * std
-        return z, None
+        return out, None
 
 
 class LatentDynamics(nn.Module):
@@ -225,8 +214,6 @@ class FlowMapAutoencoder(nn.Module):
       - predict_delta (z-space residual)
       - predict_delta_log_phys (delta in log10-physical space, then re-standardize)
       - softmax_head (simplex probabilities, then log10 standardized)
-
-    Note: KL loss is not computed or stored anywhere (even if vae_mode=True).
     """
 
     def __init__(
@@ -241,7 +228,6 @@ class FlowMapAutoencoder(nn.Module):
         decoder_hidden: Sequence[int],
         activation_name: str = "gelu",
         dropout: float = 0.0,
-        vae_mode: bool = False,
         dynamics_residual: bool = True,
         predict_delta: bool = True,
         predict_delta_log_phys: bool = False,
@@ -260,7 +246,6 @@ class FlowMapAutoencoder(nn.Module):
         self.Z = int(latent_dim)
 
         # Config
-        self.vae_mode = bool(vae_mode)
         self.predict_delta = bool(predict_delta)
         self.predict_delta_log_phys = bool(predict_delta_log_phys)
         self.softmax_head = bool(softmax_head)
@@ -306,7 +291,6 @@ class FlowMapAutoencoder(nn.Module):
             latent_dim=self.Z,
             activation=act,
             dropout_p=float(dropout),
-            vae_mode=self.vae_mode,
         )
         self.dynamics = LatentDynamics(
             latent_dim=self.Z,
@@ -419,7 +403,6 @@ def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = No
     encoder_hidden = list(mcfg.get("encoder_hidden", [256, 128]))
     dynamics_hidden = list(mcfg.get("dynamics_hidden", [256, 256]))
     decoder_hidden = list(mcfg.get("decoder_hidden", [128, 256]))
-    vae_mode = bool(mcfg.get("vae_mode", False))
     dynamics_residual = bool(mcfg.get("dynamics_residual", True))
 
     activation = str(mcfg.get("activation", "gelu"))
@@ -465,7 +448,6 @@ def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = No
         decoder_hidden=decoder_hidden,
         activation_name=activation,
         dropout=dropout,
-        vae_mode=vae_mode,
         dynamics_residual=dynamics_residual,
         predict_delta=predict_delta,
         predict_delta_log_phys=predict_delta_log_phys,
