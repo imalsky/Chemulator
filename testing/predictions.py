@@ -20,14 +20,14 @@ plt.style.use('science.mplstyle')
 
 # ---------------- Paths & settings ----------------
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models/subset_big"
+MODEL_DIR = REPO / "models" / "big_big_big"
 EP_FILENAME = "export_k1_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))
 from utils import load_json_config as load_json, seed_everything
 from normalizer import NormalizationHelper
 
-SAMPLE_IDX = 3
+SAMPLE_IDX = 4
 Q_COUNT = 100
 XMIN, XMAX = 1e-3, 1e8
 
@@ -123,17 +123,17 @@ def plot_results(t_phys: np.ndarray,
     t_pr_plot = t_pred[m_pr]
     y_pr_plot = np.clip(y_pred[m_pr], tiny, None)
 
-    fig, ax = plt.subplots(figsize=(9, 3.5))
+    fig, ax = plt.subplots(figsize=(7, 7))
     colors = plt.cm.tab20(np.linspace(0, 0.95, len(keep)))
 
     for i, (lab, col) in enumerate(zip(labels, colors)):
-        ax.loglog(t_gt_plot, y_gt_plot[:, i], '-', lw=1.8, alpha=0.3, color=col)
+        ax.loglog(t_gt_plot, y_gt_plot[:, i], '-', lw=3, alpha=0.3, color=col)
 
 
         if t_gt_plot.size:
             ax.loglog([t_gt_plot[0]], [y_gt_plot[0, i]], 'o', mfc='none', color=col, ms=5)
         if t_pr_plot.size:
-            ax.loglog(t_pr_plot, y_pr_plot[:, i], '--', lw=1.5, alpha=0.9, color=col)
+            ax.loglog(t_pr_plot, y_pr_plot[:, i], '--', lw=3, alpha=1.0, color=col)
 
     ax.set_xlim(XMIN, XMAX)
     ax.set_xlabel("Time (s)")
@@ -143,19 +143,20 @@ def plot_results(t_phys: np.ndarray,
     order = np.argsort(np.max(y_gt_plot, axis=0))[::-1]
     species_handles = [Line2D([0], [0], color=colors[i], lw=2.0) for i in order]
     species_labels = [labels[i] for i in order]
-    leg1 = ax.legend(handles=species_handles, labels=species_labels,
-                     loc='center left', bbox_to_anchor=(1.01, 0.6),
-                     title='Species', fontsize=10)
     #leg1 = ax.legend(handles=species_handles, labels=species_labels,
-    #                 loc='best',
+    #                 loc='center left', bbox_to_anchor=(1.01, 0.6),
     #                 title='Species', fontsize=10)
+
+    leg1 = ax.legend(handles=species_handles, labels=species_labels,
+                     loc='best',
+                     title='Species')
     ax.add_artist(leg1)
 
     style_handles = [
         Line2D([0], [0], color='black', lw=2.0, ls='-', label='Ground Truth'),
         Line2D([0], [0], color='black', lw=1.6, ls='--', label='Prediction'),
     ]
-    ax.legend(handles=style_handles, loc='best', bbox_to_anchor=(1.01, 0.2), fontsize=10)
+    ax.legend(handles=style_handles, loc='lower right')
     #ax.legend(handles=style_handles, loc='best', fontsize=10)
 
     ax.set_box_aspect(1)
@@ -194,6 +195,17 @@ def main():
 
     # Load sample
     y, g, t_phys = load_data(data_dir, SAMPLE_IDX)  # y:[T,S], g:[G], t:[T]
+
+    print(f"--- Globals for Sample {SAMPLE_IDX} ---")
+    for name, val in zip(globals_, g):
+        unit = ""
+        if name in ["P", "Pressure"]:
+            unit = " barye"
+        elif name in ["T", "Temperature"]:
+            unit = " K"
+        print(f"{name}: {val}{unit}")
+    print("-----------------------------------")
+
     y0 = y[0]                                        # anchor at t0
 
     # Prepare batch (normalized)

@@ -10,6 +10,11 @@ trainer.py
 - Sample-weighted epoch reduction for train/val (matches exactly)
 
 Dataset structure: (y_i, dt_norm[B,K,1], y_j[B,K,S], g[B,G], aux{...}[, k_mask[B,K]])
+
+NOTE on "fractional error":
+- This file logs/prints an *approximate* fractional error derived from the epoch-mean |Δlog10| metric:
+    frac_err_proxy = 10**(mean_abs_log10_error) - 1
+- It does NOT subsample 100k examples; it uses the already-aggregated epoch metric (val_phys/train_phys).
 """
 
 from __future__ import annotations
@@ -108,7 +113,7 @@ class AdaptiveStiffLoss(nn.Module):
         weight_power: float = 0.5,
         w_min: float = W_SPECIES_CLAMP_MIN,
         w_max: float = W_SPECIES_CLAMP_MAX,
-        epsilon_phys: float = LOSS_EPS_PHYS,  # retained for signature compatibility (unused)
+        epsilon_phys: float = LOSS_EPS_PHYS,  # retained for signature compatibility (unused in loss)
     ) -> None:
         super().__init__()
 
@@ -395,10 +400,19 @@ class ModelTask(pl.LightningModule):
         train_phys = (self._t_phys_sum / w).to(torch.float32)
         train_z = (self._t_z_sum / w).to(torch.float32)
 
+        # Approx fractional error proxy from mean |Δlog10|:
+        #   frac ≈ 10**(train_phys) - 1
+        eps = float(getattr(self.criterion, "eps_phys", LOSS_EPS_PHYS))
+        base10 = torch.tensor(10.0, device=train_phys.device, dtype=train_phys.dtype)
+        train_frac = torch.pow(base10, train_phys) - 1.0
+        if eps > 0.0:
+            train_frac = torch.clamp(train_frac, min=eps)
+
         # already all-reduced (no sync_dist)
         self.log("train_loss", train_loss, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_phys", train_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_z", train_z, prog_bar=False, on_epoch=True, sync_dist=False)
+        self.log("train_frac", train_frac, prog_bar=False, on_epoch=True, sync_dist=False)
 
         for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
@@ -480,9 +494,18 @@ class ModelTask(pl.LightningModule):
         val_phys = (self._v_phys_sum / w).to(torch.float32)
         val_z = (self._v_z_sum / w).to(torch.float32)
 
+        # Approx fractional error proxy from mean |Δlog10|:
+        #   frac ≈ 10**(val_phys) - 1
+        eps = float(getattr(self.criterion, "eps_phys", LOSS_EPS_PHYS))
+        base10 = torch.tensor(10.0, device=val_phys.device, dtype=val_phys.dtype)
+        val_frac = torch.pow(base10, val_phys) - 1.0
+        if eps > 0.0:
+            val_frac = torch.clamp(val_frac, min=eps)
+
         self.log("val_loss", val_loss, prog_bar=True, on_epoch=True, sync_dist=False)
         self.log("val_phys", val_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("val_z", val_z, prog_bar=False, on_epoch=True, sync_dist=False)
+        self.log("val_frac", val_frac, prog_bar=False, on_epoch=True, sync_dist=False)
 
         for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
@@ -515,16 +538,18 @@ class EpochTableCallback(Callback):
     """
     Rank-0 epoch summary print.
 
-    EPOCH | train       | val         | lr         | time
-    ----- | ----------- | ----------- | ---------- | --------
-    E0001 | 2.345e-01   | 1.234e-01   | 1.000e-03  | 12:34
+    EPOCH | train       | val         | val_frac    | lr         | time
+    ----- | ----------- | ----------- | ----------- | ---------- | --------
+    E0001 | 2.345e-01   | 1.234e-01   | 5.678e-02   | 1.000e-03  | 12:34
     """
     def __init__(self) -> None:
         super().__init__()
         self._t0: float | None = None
         self._printed_header: bool = False
+        self._last_printed_epoch: int = -1
 
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # Start timing at the beginning of the training epoch.
         if trainer.is_global_zero and not trainer.sanity_checking:
             self._t0 = time.time()
 
@@ -563,8 +588,12 @@ class EpochTableCallback(Callback):
         s = int(seconds % 60)
         return f"{m:02d}:{s:02d}"
 
-    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+    def _maybe_print(self, trainer: pl.Trainer) -> None:
         if not trainer.is_global_zero or trainer.sanity_checking:
+            return
+
+        # Guard against double prints if multiple hooks call into this.
+        if trainer.current_epoch == self._last_printed_epoch:
             return
 
         elapsed = (time.time() - self._t0) if self._t0 is not None else 0.0
@@ -572,11 +601,12 @@ class EpochTableCallback(Callback):
         metrics = dict(trainer.callback_metrics)
         tr = self._get_metric(metrics, "train_loss")
         va = self._get_metric(metrics, "val_loss")
+        vf = self._get_metric(metrics, "val_frac")
         lr = self._get_lr(trainer)
 
         if not self._printed_header:
-            print("EPOCH | train       | val         | lr         | time", flush=True)
-            print("----- | ----------- | ----------- | ---------- | --------", flush=True)
+            print("EPOCH | train       | val         | val_frac    | lr         | time", flush=True)
+            print("----- | ----------- | ----------- | ----------- | ---------- | --------", flush=True)
             self._printed_header = True
 
         epoch_str = f"E{trainer.current_epoch + 1:04d}"
@@ -584,10 +614,23 @@ class EpochTableCallback(Callback):
             f"{epoch_str} | "
             f"{self._fmt_sci(tr)} | "
             f"{self._fmt_sci(va)} | "
+            f"{self._fmt_sci(vf)} | "
             f"{self._fmt_sci(lr)} | "
             f"{self._fmt_time(elapsed)}"
         )
         print(line, flush=True)
+
+        self._last_printed_epoch = trainer.current_epoch
+
+    def on_fit_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # This runs after Lightning has finalized epoch metrics.
+        self._maybe_print(trainer)
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # Fallback for older Lightning versions / edge cases where on_fit_epoch_end
+        # isn’t triggered as expected. Guard prevents double printing.
+        self._maybe_print(trainer)
+
 
 
 # ============================== WRAPPER =======================================

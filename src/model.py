@@ -88,9 +88,6 @@ class MLP(nn.Module):
 class Encoder(nn.Module):
     """
     Encoder: [y_i, g] -> z.
-
-    Note: vae_mode keeps the *stochastic reparameterization path* (mu/logvar -> sample),
-    but KL loss is intentionally not computed or returned anywhere.
     """
     def __init__(
         self,
