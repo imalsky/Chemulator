@@ -99,8 +99,6 @@
     "times_per_anchor": 4,
     // Use same offsets for entire batch
     "share_times_across_batch": false,
-    // Sample offsets uniformly then fit anchors
-    "uniform_offset_sampling_strict": false,
     // Assume all trajectories share the same time grid
     "assume_shared_grid": true,
     // Δt clamp floor before normalization

@@ -546,7 +546,7 @@ def main() -> None:
             raise SystemExit(2)
 
         # Otherwise safe to wait for rank-0 to finish
-        for _ in range(36000):
+        for _ in range(3600):
             if (work_dir / ".data.ready").exists():
                 break
             time.sleep(0.1)

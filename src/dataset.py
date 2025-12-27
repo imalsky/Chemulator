@@ -46,8 +46,8 @@ def _canonical_split(split: str) -> str:
 
 @dataclass
 class _Index:
-    row: int       # global trajectory index in [0, N)
-    is_first: bool # first of the pairs_per_traj samples for that row
+    row: int  # global trajectory index in [0, N)
+    is_first: bool  # first of the pairs_per_traj samples for that row
 
 
 class FlowMapPairsDataset(Dataset):
@@ -66,18 +66,18 @@ class FlowMapPairsDataset(Dataset):
     """
 
     def __init__(
-        self,
-        processed_root: Path | str,
-        split: str,
-        config: Dict[str, Any],
-        pairs_per_traj: int,
-        min_steps: int,
-        max_steps: Optional[int],
-        preload_to_gpu: bool,
-        device: Optional[torch.device],
-        dtype: torch.dtype,
-        seed: int = 42,
-        logger: Optional[Any] = None,
+            self,
+            processed_root: Path | str,
+            split: str,
+            config: Dict[str, Any],
+            pairs_per_traj: int,
+            min_steps: int,
+            max_steps: Optional[int],
+            preload_to_gpu: bool,
+            device: Optional[torch.device],
+            dtype: torch.dtype,
+            seed: int = 42,
+            logger: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.root = _as_path(processed_root)
@@ -103,9 +103,6 @@ class FlowMapPairsDataset(Dataset):
 
         # Enforce i=0 for the first of the pairs_per_traj samples (training only)
         self.use_first_anchor = bool(dcfg.get("use_first_anchor", False))
-
-        # Strict K-offset mode
-        self.uniform_offset_sampling_strict = bool(dcfg.get("uniform_offset_sampling_strict", False))
 
         # Time-grid / IO options
         self.skip_scan = bool(dcfg.get("skip_scan", False))
@@ -272,7 +269,7 @@ class FlowMapPairsDataset(Dataset):
 
             # Species: normalize then cast to runtime dtype
             y_t = torch.from_numpy(np.asarray(y_np, dtype=np.float32))  # [n_i, T, S]
-            y_t = self.norm.normalize(y_t, self.species_vars)           # log/std etc.
+            y_t = self.norm.normalize(y_t, self.species_vars)  # log/std etc.
             y_t = _to_device_dtype(y_t, self._stage_device, self._runtime_dtype)
             self.y[start:end] = y_t
 
@@ -320,7 +317,7 @@ class FlowMapPairsDataset(Dataset):
             dt_phys = torch.where(lower_or_diag, dt_min_phys, dt_phys)
             dt_phys = dt_phys.clamp_min(float(self.dt_epsilon))
 
-            dt_norm = self.norm.normalize_dt_from_phys(dt_phys)   # [T,T] float32
+            dt_norm = self.norm.normalize_dt_from_phys(dt_phys)  # [T,T] float32
             self.dt_table = dt_norm.to(dtype=self._time_dtype).contiguous()
 
         # Derived length
@@ -350,7 +347,7 @@ class FlowMapPairsDataset(Dataset):
 
     def _sample_anchor_indices(self, B: int) -> torch.Tensor:
         """
-        Sample anchor indices per row for the non-strict training modes.
+        Sample anchor indices per row.
         """
         upper = max(0, self.T - 1 - self.min_steps)
         if upper <= 0:
@@ -363,39 +360,67 @@ class FlowMapPairsDataset(Dataset):
             dtype=torch.long,
         )
 
-    def _sample_offsets(self, B: int) -> torch.Tensor:
+    def _sample_offsets_conditioned(self, i_used: torch.Tensor) -> torch.Tensor:
         """
-        Sample offsets o = j - i.
+        Sample offsets o = j - i conditioned on the chosen anchor i so that j is always valid.
 
-        Draws from the global RNG; DataLoader workers get distinct seeds.
+        Returns:
+            offs : [B, K] long, with low <= offs <= min(max_steps, T-1-i_used)
         """
+        if i_used.ndim != 1:
+            raise ValueError(f"i_used must be 1D [B], got shape {tuple(i_used.shape)}")
+
+        B = int(i_used.shape[0])
         k = int(self.K)
+        dev = self._stage_device
+
         low = int(self.min_steps)
-        # max_steps=None means "up to T-1" (exclusive high = T)
-        high = (int(self.max_steps) + 1) if (self.max_steps is not None) else int(self.T)
+        max_off_global = int(self.max_steps) if (self.max_steps is not None) else (int(self.T) - 1)
+        max_off_global = min(max_off_global, int(self.T) - 1)
+
+        if max_off_global < low:
+            raise ValueError(
+                f"Invalid offset range: max_steps={self.max_steps} < min_steps={self.min_steps}"
+            )
+
+        # Per-row maximum offset so that j = i + o <= T-1
+        max_off_row = torch.minimum(
+            torch.full((B,), max_off_global, device=dev, dtype=torch.long),
+            (self.T - 1 - i_used),
+        )  # [B]
+
+        # Defensive: should never happen if anchors are sampled with upper = T-1-min_steps
+        if torch.any(max_off_row < low):
+            max_off_row = torch.maximum(max_off_row, torch.full_like(max_off_row, low))
 
         if self.share_offsets_across_batch:
-            return torch.randint(
-                low=low,
-                high=high,
+            # Preserve the meaning of "share offsets": same integer offsets for every row.
+            # Use the batch-min max_off so all rows can use the shared offsets without masking.
+            max_off_batch = int(max_off_row.min().item())
+            width = max(1, max_off_batch - low + 1)
+
+            offs_shared_cpu = torch.randint(
+                low=0,
+                high=width,
                 size=(k,),
                 device=torch.device("cpu"),
                 dtype=torch.long,
-            ).to(self._stage_device, non_blocking=True)
+            ) + low  # [K]
+            offs = offs_shared_cpu.to(dev, non_blocking=True).view(1, k).expand(B, -1)  # [B,K]
+            return offs
 
-        # Per-row offsets
-        return torch.randint(
-            low=low,
-            high=high,
-            size=(B, k),
-            device=torch.device("cpu"),
-            dtype=torch.long,
-        ).to(self._stage_device, non_blocking=True)
+        # Per-row offsets with per-row ranges (vectorized via rand/floor on CPU)
+        width_row = (max_off_row - low + 1).clamp_min(1)  # [B]
+        width_cpu_f = width_row.to(torch.float32).cpu()  # [B] on CPU for fast rand/floor
+
+        u = torch.rand((B, k), device="cpu")  # [B,K]
+        offs_cpu = (torch.floor(u * width_cpu_f.view(B, 1)).to(torch.long) + low)  # [B,K]
+        return offs_cpu.to(dev, non_blocking=True)
 
     # =============================== Collation ==================================
 
     def collate_batch(
-        self, batch: Sequence[_Index]
+            self, batch: Sequence[_Index]
     ) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], torch.Tensor
     ]:
@@ -413,7 +438,7 @@ class FlowMapPairsDataset(Dataset):
         # If enabled, force i=0 for the "first" sample of each trajectory (training only)
         force_first = self.use_first_anchor
         first_mask: Optional[torch.Tensor] = None
-        if force_first:
+        if force_first and self.split != "test":
             first_mask = torch.tensor(
                 [b.is_first for b in batch],
                 device=dev,
@@ -422,115 +447,28 @@ class FlowMapPairsDataset(Dataset):
 
         # ------------------------------------------------------------------
         # Choose anchors i and offsets o = j - i
+        #
+        # Simplified behavior:
+        #   - Always sample anchor i first.
+        #   - Then sample offsets conditioned on i so that j = i + o is always valid.
+        #   - No masking/clamping required; k_mask is kept for API compatibility.
         # ------------------------------------------------------------------
-        if self.uniform_offset_sampling_strict:
-            # Pick i so all K offsets fit (then honor force_first)
-            offs = self._sample_offsets(B)  # [B,K] or [K]
+        i_used = self._sample_anchor_indices(B)  # [B]
 
-            if offs.ndim == 1:
-                # Shared offsets across batch
-                o_max = offs.max()
-                i_max = (self.T - 1 - o_max).clamp_min(0)
-                i_used_cpu = torch.randint(
-                    low=0,
-                    high=int(i_max.item()) + 1,
-                    size=(B,),
-                    device=torch.device("cpu"),
-                    dtype=torch.long,
-                )
-                i_used = i_used_cpu.to(dev, non_blocking=True)
-                if first_mask is not None and first_mask.any():
-                    i_used = i_used.clone()
-                    i_used[first_mask] = 0
-                j_raw = i_used.unsqueeze(1) + offs.unsqueeze(0).expand(B, -1)  # [B,K]
-            else:
-                # Per-row offsets
-                o_max = offs.max(dim=1).values  # [B]
-                i_max = (self.T - 1 - o_max).clamp_min(0)  # [B]
-                i_used_cpu = torch.floor(
-                    torch.rand((B,), device="cpu") * (i_max.to(torch.float32, copy=True).cpu() + 1.0)
-                ).to(torch.long)
-                i_used = i_used_cpu.to(dev, non_blocking=True)
-                if first_mask is not None and first_mask.any():
-                    i_used = i_used.clone()
-                    i_used[first_mask] = 0
-                j_raw = i_used.unsqueeze(1) + offs  # [B,K]
+        if first_mask is not None and first_mask.any():
+            # Keep prior behavior: forced-first anchors apply only on non-test splits.
+            i_used = torch.where(first_mask, torch.zeros_like(i_used), i_used)
 
-            k_mask = (j_raw < self.T)  # [B,K]
-            j_idx = torch.where(k_mask, j_raw, (self.T - 1))  # [B,K]
+        offs = self._sample_offsets_conditioned(i_used)  # [B,K]
+        j_idx = i_used.unsqueeze(1) + offs  # [B,K], guaranteed < T
 
-        else:
-            # Deterministic for test
-            if self.split == "test":
-                # Deterministic, order- & world-size–invariant sampling using fast int hashing.
-                rows64 = rows.to(torch.int64)
-
-                MASK63 = (1 << 63) - 1
-
-                def _i64(x: int) -> torch.Tensor:
-                    return torch.tensor(int(x) & MASK63, dtype=torch.int64, device=dev)
-
-                # Constants
-                C_EPOCH_MIX = 0x9E3779B97F4A7C15
-                C_ROW_MIX_1 = 6364136223846793005
-                C_ROW_MIX_2 = 1442695040888963407
-                C_XOR       = 0x94D049BB133111EB
-                C_OFF_STRIDE = 2862933555777941757
-
-                C_XOR_T = _i64(C_XOR)
-                C_OFF_STRIDE_T = _i64(C_OFF_STRIDE)
-
-                seed_epoch = _i64(int(self._base_seed) + C_EPOCH_MIX * int(self._epoch + 1))
-
-                # Anchors i (uniform in [0, T-1-min_steps])
-                i_upper = max(0, int(self.T) - 1 - int(self.min_steps))
-                if i_upper == 0:
-                    i_used = torch.zeros(B, dtype=torch.long, device=dev)
-                else:
-                    x = rows64 * C_ROW_MIX_1 + seed_epoch
-                    mod = torch.tensor(i_upper + 1, dtype=torch.int64, device=dev)
-                    i_used = torch.remainder(x, mod).to(torch.long)
-
-                # Offsets o (uniform in [min_steps, max_steps]) via hashed RNG
-                low = int(self.min_steps)
-                high = int(self.max_steps) if (self.max_steps is not None) else (int(self.T) - 1)
-                width = max(1, high - low + 1)
-
-                k = int(self.K)
-                width_t = torch.tensor(width, dtype=torch.int64, device=dev)
-
-                if k == 1:
-                    row_seed = (rows64 * C_ROW_MIX_2 + seed_epoch) ^ C_XOR_T   # [B]
-                    off_rng = row_seed * C_OFF_STRIDE_T                        # [B]
-                    offs = (low + torch.remainder(off_rng, width_t)).to(torch.long)
-                    offs = offs.view(B, 1)                                     # [B,1]
-                else:
-                    row_seed = (rows64 * C_ROW_MIX_2 + seed_epoch) ^ C_XOR_T
-                    k_ar = torch.arange(k, dtype=torch.int64, device=dev)          # [K]
-                    off_rng = row_seed.unsqueeze(1) + k_ar.view(1, -1) * C_OFF_STRIDE_T  # [B,K]
-                    offs = (low + torch.remainder(off_rng, width_t)).to(torch.long)      # [B,K]
-
-                j_raw = i_used.unsqueeze(1) + offs  # [B,K]
-                k_mask = (j_raw < self.T)           # [B,K]
-                j_idx = torch.where(k_mask, j_raw, (self.T - 1))  # [B,K]
-
-            else:
-                # Training: randomized anchors, optional forced first anchors
-                i_idx = self._sample_anchor_indices(B)  # [B]
-                if first_mask is not None and first_mask.any():
-                    i_idx = torch.where(first_mask, torch.zeros_like(i_idx), i_idx)
-                offs = self._sample_offsets(B)  # [B,K] or [K]
-                if offs.ndim == 1:
-                    offs = offs.unsqueeze(0).expand(B, -1)
-                j_raw = i_idx.unsqueeze(1) + offs  # [B,K]
-                k_mask = (j_raw < self.T)          # [B,K]
-                j_idx = torch.where(k_mask, j_raw, (self.T - 1))  # [B,K]
-                i_used = i_idx  # [B]
+        # keep mask for API compatibility (now always True)
+        k_mask = torch.ones((B, int(self.K)), device=dev, dtype=torch.bool)
 
         # ------------------------------------------------------------------
         # Gather species/globals/time for this batch from in-memory tensors
         # ------------------------------------------------------------------
-        y_btS = self.y.index_select(0, rows)          # [B,T,S]
+        y_btS = self.y.index_select(0, rows)  # [B,T,S]
         g = self.g.index_select(0, rows) if self.G > 0 else self.g.new_zeros((B, 0))
 
         # y_i, y_j
@@ -598,12 +536,12 @@ class FlowMapPairsDataset(Dataset):
             self._did_log_init_summary = True
 
     def _log_first_batch_checks_once(
-        self,
-        y_i: torch.Tensor,
-        dt: torch.Tensor,
-        y_j: torch.Tensor,
-        g: torch.Tensor,
-        k_mask: torch.Tensor,
+            self,
+            y_i: torch.Tensor,
+            dt: torch.Tensor,
+            y_j: torch.Tensor,
+            g: torch.Tensor,
+            k_mask: torch.Tensor,
     ) -> None:
         if self._log is None or self._did_log_first_batch_checks:
             return
@@ -646,13 +584,13 @@ def collate_flowmap(batch: Sequence[_Index], dataset: FlowMapPairsDataset):
 
 
 def create_dataloader(
-    dataset: "FlowMapPairsDataset",
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-    persistent_workers: bool,
-    pin_memory: bool,
-    prefetch_factor: int,
+        dataset: "FlowMapPairsDataset",
+        batch_size: int,
+        shuffle: bool,
+        num_workers: int,
+        persistent_workers: bool,
+        pin_memory: bool,
+        prefetch_factor: int,
 ) -> DataLoader:
     """
     Wrap torch.utils.data.DataLoader with the right collate_fn and drop_last.
@@ -682,7 +620,6 @@ def create_dataloader(
         num_workers = 0
         persistent_workers = False
         pin_memory = False
-    # --- END NEW ---
 
     kwargs: Dict[str, Any] = dict(
         dataset=dataset,
