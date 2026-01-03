@@ -79,14 +79,8 @@
   "dataset": {
     // Global training batch size
     "batch_size_train": 1024,
-
-    // Optional: override dataset tensor dtype (null = use AMP dtype on CUDA; float32 forced on CPU/MPS)
-    // Allowed strings: "float32", "float16", "bf16"/"bfloat16"
-    "storage_dtype": null,
-
     // np.load mmap mode for reading shard .npz files ("r" = memmap; null/false disables memmap)
     "mmap_mode": "r",
-
     // Avoid full shard scan for the preprocessed data; trust metadata files
     "skip_scan": true,
     // Skip time-grid monotonicity checks
@@ -131,9 +125,7 @@
     // Nonlinearity for MLPs
     "activation": "silu",
     // Dropout rate in MLPs
-    "dropout": 0.0,
-    // Use VAE-style stochastic encoder (if supported by your model.py)
-    "vae_mode": false,
+    "dropout": 0.0, ,
     // Predict Δz and add to z (residual dynamics)
     "dynamics_residual": true,
     // Decoder predicts Δy in z-space
@@ -179,7 +171,7 @@
     "swa_annealing_strategy": "cos",
 
     // Limit training steps per epoch (0 = no limit)
-    "max_train_steps_per_epoch": 0,
+    "max_train_batches": 0,
     // Limit validation batches per epoch (0 = no limit)
     "max_val_batches": 0,
     // Checkpoint path to resume from (optional)

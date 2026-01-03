@@ -14,7 +14,7 @@ Dataset structure: (y_i, dt_norm[B,K,1], y_j[B,K,S], g[B,G], aux{...}[, k_mask[B
 NOTE on "fractional error":
 - This file logs/prints an *approximate* fractional error derived from the epoch-mean |Δlog10| metric:
     frac_err_proxy = 10**(mean_abs_log10_error) - 1
-- It does NOT subsample 100k examples; it uses the already-aggregated epoch metric (val_phys/train_phys).
+- It uses the already-aggregated epoch metric (val_phys/train_phys), not a separate subsample.
 """
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ class AdaptiveStiffLoss(nn.Module):
         weight_power: float = 0.5,
         w_min: float = W_SPECIES_CLAMP_MIN,
         w_max: float = W_SPECIES_CLAMP_MAX,
-        epsilon_phys: float = LOSS_EPS_PHYS,  # retained for signature compatibility (unused in loss)
+        epsilon_phys: float = LOSS_EPS_PHYS,  # retained for signature compatibility
     ) -> None:
         super().__init__()
 
@@ -400,15 +400,9 @@ class ModelTask(pl.LightningModule):
         train_phys = (self._t_phys_sum / w).to(torch.float32)
         train_z = (self._t_z_sum / w).to(torch.float32)
 
-        # Approx fractional error proxy from mean |Δlog10|:
-        #   frac ≈ 10**(train_phys) - 1
-        eps = float(getattr(self.criterion, "eps_phys", LOSS_EPS_PHYS))
         base10 = torch.tensor(10.0, device=train_phys.device, dtype=train_phys.dtype)
         train_frac = torch.pow(base10, train_phys) - 1.0
-        if eps > 0.0:
-            train_frac = torch.clamp(train_frac, min=eps)
 
-        # already all-reduced (no sync_dist)
         self.log("train_loss", train_loss, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_phys", train_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_z", train_z, prog_bar=False, on_epoch=True, sync_dist=False)
@@ -494,13 +488,8 @@ class ModelTask(pl.LightningModule):
         val_phys = (self._v_phys_sum / w).to(torch.float32)
         val_z = (self._v_z_sum / w).to(torch.float32)
 
-        # Approx fractional error proxy from mean |Δlog10|:
-        #   frac ≈ 10**(val_phys) - 1
-        eps = float(getattr(self.criterion, "eps_phys", LOSS_EPS_PHYS))
         base10 = torch.tensor(10.0, device=val_phys.device, dtype=val_phys.dtype)
         val_frac = torch.pow(base10, val_phys) - 1.0
-        if eps > 0.0:
-            val_frac = torch.clamp(val_frac, min=eps)
 
         self.log("val_loss", val_loss, prog_bar=True, on_epoch=True, sync_dist=False)
         self.log("val_phys", val_phys, prog_bar=False, on_epoch=True, sync_dist=False)
@@ -511,37 +500,8 @@ class ModelTask(pl.LightningModule):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
 
 
-# ============================== CALLBACKS =====================================
-
-class SetEpochCallback(Callback):
-    """
-    Minimal and safe:
-      - Only touches the TRAIN dataset
-      - Only once per epoch (train_epoch_start)
-    """
-    def __init__(self, train_dataset: Any) -> None:
-        super().__init__()
-        self.train_dataset = train_dataset
-
-    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        ds = self.train_dataset
-        if ds is None:
-            return
-        try:
-            if hasattr(ds, "set_epoch"):
-                ds.set_epoch(trainer.current_epoch)
-        except Exception:
-            pass
-
-
 class EpochTableCallback(Callback):
-    """
-    Rank-0 epoch summary print.
-
-    EPOCH | train       | val         | val_frac    | lr         | time
-    ----- | ----------- | ----------- | ----------- | ---------- | --------
-    E0001 | 2.345e-01   | 1.234e-01   | 5.678e-02   | 1.000e-03  | 12:34
-    """
+    """Rank-0 epoch summary print."""
     def __init__(self) -> None:
         super().__init__()
         self._t0: float | None = None
@@ -549,7 +509,6 @@ class EpochTableCallback(Callback):
         self._last_printed_epoch: int = -1
 
     def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        # Start timing at the beginning of the training epoch.
         if trainer.is_global_zero and not trainer.sanity_checking:
             self._t0 = time.time()
 
@@ -591,8 +550,6 @@ class EpochTableCallback(Callback):
     def _maybe_print(self, trainer: pl.Trainer) -> None:
         if not trainer.is_global_zero or trainer.sanity_checking:
             return
-
-        # Guard against double prints if multiple hooks call into this.
         if trainer.current_epoch == self._last_printed_epoch:
             return
 
@@ -619,18 +576,13 @@ class EpochTableCallback(Callback):
             f"{self._fmt_time(elapsed)}"
         )
         print(line, flush=True)
-
         self._last_printed_epoch = trainer.current_epoch
 
     def on_fit_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        # This runs after Lightning has finalized epoch metrics.
         self._maybe_print(trainer)
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        # Fallback for older Lightning versions / edge cases where on_fit_epoch_end
-        # isn’t triggered as expected. Guard prevents double printing.
         self._maybe_print(trainer)
-
 
 
 # ============================== WRAPPER =======================================
@@ -647,7 +599,7 @@ class Trainer:
         device: torch.device,
         logger: Optional[logging.Logger] = None,
         *,
-        pl_precision_override: Any = None,  # optional override from main
+        pl_precision_override: Any = None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -735,13 +687,13 @@ class Trainer:
             p = Path(p_cfg)
             return str(p) if p.is_file() else None
 
-        env_resume = os.environ.get(ENV_RESUME_VAR, "").strip()
-        if env_resume and env_resume.lower() != RESUME_AUTO_SENTINEL:
+        env_resume = os.environ.get("RESUME", "").strip()
+        if env_resume and env_resume.lower() != "auto":
             p = Path(env_resume)
             return str(p) if p.is_file() else None
 
-        if env_resume.lower() == RESUME_AUTO_SENTINEL or bool(tcfg.get("auto_resume", True)):
-            p = self.work_dir / LAST_CKPT_NAME
+        if env_resume.lower() == "auto" or bool(tcfg.get("auto_resume", True)):
+            p = self.work_dir / "last.ckpt"
             if p.is_file():
                 return str(p)
 
@@ -768,7 +720,6 @@ class Trainer:
             return model
 
     def train(self) -> float:
-        # Optional model compile (Lightning handles precision)
         self.model = self._maybe_compile(self.model)
         task = ModelTask(self.model, self.cfg, self.work_dir)
 
@@ -776,22 +727,17 @@ class Trainer:
 
         ckpt_cb = ModelCheckpoint(
             dirpath=str(self.work_dir),
-            filename=CKPT_FILENAME_BEST,
-            monitor=CKPT_MONITOR,
-            mode=CKPT_MODE,
+            filename="best",
+            monitor="val_loss",
+            mode="min",
             save_top_k=1,
             save_last=True,
             verbose=False,
         )
-        lr_cb = LearningRateMonitor(logging_interval=LR_LOGGING_INTERVAL)
-
-        # Only set epoch on TRAIN dataset (once per epoch)
-        train_ds = getattr(self.train_loader, "dataset", None)
-        epoch_set_cb = SetEpochCallback(train_ds)
-
+        lr_cb = LearningRateMonitor(logging_interval="epoch")
         epoch_print_cb = EpochTableCallback()
 
-        callbacks = [ckpt_cb, lr_cb, epoch_set_cb, epoch_print_cb]
+        callbacks = [ckpt_cb, lr_cb, epoch_print_cb]
 
         if self.use_swa:
             swa_kwargs = dict(
@@ -806,52 +752,63 @@ class Trainer:
         accelerator = self._accelerator_from_device()
         precision = self._precision_from_cfg()
 
-        trainer_kwargs: dict[str, Any] = {}
+        trainer_kwargs: Dict[str, Any] = {}
         if self.limit_train_batches > 0:
             trainer_kwargs["limit_train_batches"] = self.limit_train_batches
         if self.limit_val_batches > 0:
             trainer_kwargs["limit_val_batches"] = self.limit_val_batches
 
-        # DDP: only support externally-launched (torchrun/mpirun/srun).
         world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
         externally_launched = world_size > 1
 
-        # Avoid Lightning spawn; this codebase builds datasets in main (often GPU-preloaded).
+        devices_env = os.getenv("PL_DEVICES", "").strip()
         if not externally_launched:
-            requested = int(os.getenv("PL_DEVICES", "1") or "1")
-            if requested != 1:
-                self.logger.warning("PL_DEVICES>1 requested but spawn is unsafe here; forcing devices=1. Use torchrun/mpirun/srun.")
             devices = 1
+            strategy = "auto"
+            if devices_env:
+                try:
+                    req = int(devices_env)
+                    if req != 1:
+                        self.logger.warning(
+                            "PL_DEVICES=%s requested, but non-DDP multi-device is not supported here; forcing devices=1. "
+                            "Use torchrun/mpirun/srun for multi-GPU.",
+                            devices_env,
+                        )
+                except Exception:
+                    pass
         else:
-            devices = 1  # per-rank process
-        strategy: Any = "ddp" if externally_launched else "auto"
+            devices = "auto"
+            strategy = "ddp"
 
-        base_kwargs = dict(
-            default_root_dir=str(self.work_dir),
-            max_epochs=self.epochs,
+        trainer_kwargs.update(
             accelerator=accelerator,
             devices=devices,
             strategy=strategy,
             precision=precision,
-            gradient_clip_val=self.grad_clip if self.grad_clip > 0 else 0.0,
+        )
+
+        base_kwargs: Dict[str, Any] = dict(
+            max_epochs=self.epochs,
             accumulate_grad_batches=max(1, self.accumulate),
+            gradient_clip_val=float(self.grad_clip),
             logger=csv_logger,
             callbacks=callbacks,
-            enable_checkpointing=ENABLE_CHECKPOINTING,
-            enable_progress_bar=ENABLE_PROGRESS_BAR,
-            enable_model_summary=ENABLE_MODEL_SUMMARY,
-            detect_anomaly=DETECT_ANOMALY,
-            inference_mode=INFERENCE_MODE,
+            enable_checkpointing=True,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+            detect_anomaly=False,
+            inference_mode=True,
             benchmark=self.cudnn_benchmark,
-            log_every_n_steps=LOG_EVERY_N_STEPS,
+            log_every_n_steps=200,
             **trainer_kwargs,
         )
 
-        # keep deterministic flag if supported by installed PL
-        try:
-            pl_trainer = pl.Trainer(deterministic=self.deterministic, **base_kwargs)
-        except TypeError:
-            pl_trainer = pl.Trainer(**base_kwargs)
+        trainer_params = set(inspect.signature(pl.Trainer).parameters.keys())
+        filtered = {k: v for k, v in base_kwargs.items() if k in trainer_params}
+        if "deterministic" in trainer_params:
+            filtered["deterministic"] = self.deterministic
+
+        pl_trainer = pl.Trainer(**filtered)
 
         ckpt_path = self._resolve_resume_ckpt()
         self.logger.info(f"resume: {ckpt_path if ckpt_path else 'fresh'}")
