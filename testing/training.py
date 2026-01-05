@@ -10,7 +10,7 @@ plt.style.use('science.mplstyle')
 plt.rcParams.update({'mathtext.default':  'regular'})
 
 # Paths
-MODEL_DIR = Path(__file__).parent.parent / "models" / "full_big"
+MODEL_DIR = Path(__file__).parent.parent / "models" / "big_big_big"
 CSVS = MODEL_DIR / "csv"
 PLOT_DIR = MODEL_DIR / "plots"
 
@@ -24,7 +24,7 @@ df = df.dropna(subset=['train_loss']).reset_index(drop=True)
 df['epoch'] = df.index
 
 # 3. Plot
-fig, ax = plt.subplots(figsize=(5, 5))
+fig, ax = plt.subplots(figsize=(8, 8))
 ax.plot(df['epoch'], df['train_loss'], label='Train')
 
 ax.set(xlabel='Epoch', ylabel='Loss', yscale='log', box_aspect=1)

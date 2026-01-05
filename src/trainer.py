@@ -11,10 +11,10 @@ trainer.py
 
 Dataset structure: (y_i, dt_norm[B,K,1], y_j[B,K,S], g[B,G], aux{...}[, k_mask[B,K]])
 
-NOTE on "fractional error":
-- This file logs/prints an *approximate* fractional error derived from the epoch-mean |Δlog10| metric:
-    frac_err_proxy = 10**(mean_abs_log10_error) - 1
-- It uses the already-aggregated epoch metric (val_phys/train_phys), not a separate subsample.
+NOTE on "multiplicative error proxy":
+- This file logs/prints an *approximate multiplicative error proxy* derived from the epoch-mean |Δlog10| metric:
+    mult_err_proxy = 10**(mean_abs_log10_error) - 1
+- This is **not** a true fractional error; it is a proxy mapping log10-MAE to a typical multiplicative factor minus 1.
 """
 
 from __future__ import annotations
@@ -81,13 +81,11 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import (
     ModelCheckpoint,
-    LearningRateMonitor,
-    Callback,
     StochasticWeightAveraging,
 )
+
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 
@@ -185,6 +183,116 @@ class AdaptiveStiffLoss(nn.Module):
 
 # ============================== LIGHTNING TASK ================================
 
+
+# ============================== EPOCH CSV ====================================
+
+class EpochCSVWriter:
+    """
+    Single, epoch-level CSV writer that appends across restarts and avoids Lightning's versioned log dirs.
+
+    Behavior:
+      - Writes to work_dir/metrics.csv
+      - On resume: keeps existing file and overwrites the current epoch row if needed
+      - On fresh run in an existing work_dir: backs up the old file and starts a new one
+      - Writes atomically to avoid partial/corrupt rows
+
+    Columns are intentionally minimal and epoch-level only.
+    """
+
+    COLUMNS = (
+        "epoch",
+        "step",
+        "wall_time",
+        "epoch_time_sec",
+        "lr",
+        "train_loss",
+        "train_phys",
+        "train_z",
+        "train_mult_err_proxy",
+        "val_loss",
+        "val_phys",
+        "val_z",
+        "val_mult_err_proxy",
+    )
+
+    def __init__(self, csv_path: Path, *, resume: bool) -> None:
+        self.csv_path = Path(csv_path)
+        self.resume = bool(resume)
+
+    @staticmethod
+    def wall_time_str() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def _backup_existing(self) -> None:
+        if not self.csv_path.exists():
+            return
+        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        bak = self.csv_path.with_name(f"{self.csv_path.stem}.bak.{ts}{self.csv_path.suffix}")
+        try:
+            self.csv_path.replace(bak)
+        except Exception:
+            try:
+                self.csv_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _read_rows(self) -> list[dict[str, str]]:
+        if not self.csv_path.exists():
+            return []
+        try:
+            with open(self.csv_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames is None:
+                    return []
+                return [dict(r) for r in reader]
+        except Exception:
+            return []
+
+    def _write_rows_atomic(self, rows: list[dict[str, str]]) -> None:
+        tmp = self.csv_path.with_suffix(self.csv_path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(self.COLUMNS))
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k, "") for k in self.COLUMNS})
+        tmp.replace(self.csv_path)
+
+    def ensure_initialized(self) -> None:
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if (not self.resume) and self.csv_path.exists():
+            self._backup_existing()
+
+        if not self.csv_path.exists():
+            self._write_rows_atomic([])
+            return
+
+        # Validate header; if mismatched/corrupt, back it up and start clean.
+        try:
+            with open(self.csv_path, "r", encoding="utf-8", newline="") as f:
+                header = next(csv.reader(f), None)
+            if header is None or tuple(header) != tuple(self.COLUMNS):
+                self._backup_existing()
+                self._write_rows_atomic([])
+        except Exception:
+            self._backup_existing()
+            self._write_rows_atomic([])
+
+    def write_epoch_row(self, epoch_1idx: int, row: dict[str, str]) -> None:
+        rows = self._read_rows()
+        kept: list[dict[str, str]] = []
+        for r in rows:
+            try:
+                e = int(float(r.get("epoch", "0") or 0))
+            except Exception:
+                continue
+            if e < epoch_1idx:
+                kept.append(r)
+
+        kept.append({k: row.get(k, "") for k in self.COLUMNS})
+        self._write_rows_atomic(kept)
+
+
 class ModelTask(pl.LightningModule):
     """LightningModule wrapping the model + sample-weighted epoch metrics."""
     def __init__(self, model: nn.Module, cfg: Dict[str, Any], work_dir: Path) -> None:
@@ -193,6 +301,14 @@ class ModelTask(pl.LightningModule):
         self.cfg = cfg
         self.work_dir = Path(work_dir)
 
+
+        self._resume = bool(resume)
+        self._csv: Optional[EpochCSVWriter] = None
+        self._epoch_t0: float | None = None
+        self._printed_header: bool = False
+        self._last_reported_epoch: int = -1
+        self._last_train_metrics: dict[str, float] = {}
+        self._last_val_metrics: dict[str, float] = {}
         tcfg = cfg.get("training", {})
         self.lr = float(tcfg.get("lr", DEF_LR))
         self.weight_decay = float(tcfg.get("weight_decay", DEF_WEIGHT_DECAY))
@@ -347,7 +463,15 @@ class ModelTask(pl.LightningModule):
 
     # --------------------------- steps / epoch metrics ------------------------
 
+    def on_fit_start(self) -> None:
+        tr = getattr(self, "trainer", None)
+        if tr is None or (not tr.is_global_zero) or getattr(tr, "sanity_checking", False):
+            return
+        self._csv = EpochCSVWriter(self.work_dir / "metrics.csv", resume=self._resume)
+        self._csv.ensure_initialized()
+
     def on_train_epoch_start(self) -> None:
+        self._epoch_t0 = time.time()
         dev = self.device if hasattr(self, "device") else next(self.parameters()).device
         self._t_sum = torch.zeros((), dtype=torch.float64, device=dev)
         self._t_wsum = torch.zeros((), dtype=torch.float64, device=dev)
@@ -401,12 +525,19 @@ class ModelTask(pl.LightningModule):
         train_z = (self._t_z_sum / w).to(torch.float32)
 
         base10 = torch.tensor(10.0, device=train_phys.device, dtype=train_phys.dtype)
-        train_frac = torch.pow(base10, train_phys) - 1.0
+        train_mult_err_proxy = torch.pow(base10, train_phys) - 1.0
 
+
+        self._last_train_metrics = {
+            "train_loss": float(train_loss.detach().cpu().item()),
+            "train_phys": float(train_phys.detach().cpu().item()),
+            "train_z": float(train_z.detach().cpu().item()),
+            "train_mult_err_proxy": float(train_mult_err_proxy.detach().cpu().item()),
+        }
         self.log("train_loss", train_loss, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_phys", train_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_z", train_z, prog_bar=False, on_epoch=True, sync_dist=False)
-        self.log("train_frac", train_frac, prog_bar=False, on_epoch=True, sync_dist=False)
+        self.log("train_mult_err_proxy", train_mult_err_proxy, prog_bar=False, on_epoch=True, sync_dist=False)
 
         for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
@@ -489,100 +620,107 @@ class ModelTask(pl.LightningModule):
         val_z = (self._v_z_sum / w).to(torch.float32)
 
         base10 = torch.tensor(10.0, device=val_phys.device, dtype=val_phys.dtype)
-        val_frac = torch.pow(base10, val_phys) - 1.0
+        val_mult_err_proxy = torch.pow(base10, val_phys) - 1.0
+
+
+        self._last_val_metrics = {
+            "val_loss": float(val_loss.detach().cpu().item()),
+            "val_phys": float(val_phys.detach().cpu().item()),
+            "val_z": float(val_z.detach().cpu().item()),
+            "val_mult_err_proxy": float(val_mult_err_proxy.detach().cpu().item()),
+        }
 
         self.log("val_loss", val_loss, prog_bar=True, on_epoch=True, sync_dist=False)
         self.log("val_phys", val_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("val_z", val_z, prog_bar=False, on_epoch=True, sync_dist=False)
-        self.log("val_frac", val_frac, prog_bar=False, on_epoch=True, sync_dist=False)
+        self.log("val_mult_err_proxy", val_mult_err_proxy, prog_bar=False, on_epoch=True, sync_dist=False)
+
+        self._report_epoch()
 
         for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
 
 
-class EpochTableCallback(Callback):
-    """Rank-0 epoch summary print."""
-    def __init__(self) -> None:
-        super().__init__()
-        self._t0: float | None = None
-        self._printed_header: bool = False
-        self._last_printed_epoch: int = -1
 
-    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        if trainer.is_global_zero and not trainer.sanity_checking:
-            self._t0 = time.time()
+    def _report_epoch(self) -> None:
+        tr = getattr(self, "trainer", None)
+        if tr is None or (not tr.is_global_zero) or getattr(tr, "sanity_checking", False):
+            return
+        if self._csv is None:
+            self._csv = EpochCSVWriter(self.work_dir / "metrics.csv", resume=self._resume)
+            self._csv.ensure_initialized()
 
-    @staticmethod
-    def _get_metric(metrics: dict, key: str) -> Optional[float]:
-        for k in (key, f"{key}_epoch"):
-            v = metrics.get(k)
-            if v is None:
-                continue
-            try:
-                return float(v.detach().cpu().item() if hasattr(v, "detach") else float(v))
-            except Exception:
-                continue
-        return None
+        epoch_1idx = int(self.current_epoch) + 1
+        step = int(getattr(tr, "global_step", 0) or 0)
 
-    @staticmethod
-    def _get_lr(trainer: pl.Trainer) -> Optional[float]:
+        epoch_time = float("nan") if self._epoch_t0 is None else (time.time() - float(self._epoch_t0))
+
+        lr: Optional[float] = None
         try:
-            if trainer.optimizers and trainer.optimizers[0].param_groups:
-                return float(trainer.optimizers[0].param_groups[0].get("lr", None))
+            if tr.optimizers and tr.optimizers[0].param_groups:
+                lr = float(tr.optimizers[0].param_groups[0].get("lr", None))
         except Exception:
-            pass
-        return None
+            lr = None
 
-    @staticmethod
-    def _fmt_sci(x: Optional[float], width: int = 11) -> str:
-        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-            return f"{'—':>{width}}"
-        return f"{x:>{width}.3e}"
+        def fmt(x: Optional[float]) -> str:
+            if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+                return ""
+            return f"{x:.6e}"
 
-    @staticmethod
-    def _fmt_time(seconds: float) -> str:
-        if seconds < 0:
-            seconds = 0.0
-        m = int(seconds // 60)
-        s = int(seconds % 60)
-        return f"{m:02d}:{s:02d}"
+        row: dict[str, str] = {
+            "epoch": str(epoch_1idx),
+            "step": str(step),
+            "wall_time": self._csv.wall_time_str(),
+            "epoch_time_sec": ("" if (not math.isfinite(epoch_time)) else f"{epoch_time:.6f}"),
+            "lr": ("" if lr is None else f"{lr:.6e}"),
+            "train_loss": fmt(self._last_train_metrics.get("train_loss")),
+            "train_phys": fmt(self._last_train_metrics.get("train_phys")),
+            "train_z": fmt(self._last_train_metrics.get("train_z")),
+            "train_mult_err_proxy": fmt(self._last_train_metrics.get("train_mult_err_proxy")),
+            "val_loss": fmt(self._last_val_metrics.get("val_loss")),
+            "val_phys": fmt(self._last_val_metrics.get("val_phys")),
+            "val_z": fmt(self._last_val_metrics.get("val_z")),
+            "val_mult_err_proxy": fmt(self._last_val_metrics.get("val_mult_err_proxy")),
+        }
+        self._csv.write_epoch_row(epoch_1idx, row)
 
-    def _maybe_print(self, trainer: pl.Trainer) -> None:
-        if not trainer.is_global_zero or trainer.sanity_checking:
+        if epoch_1idx == self._last_reported_epoch:
             return
-        if trainer.current_epoch == self._last_printed_epoch:
-            return
 
-        elapsed = (time.time() - self._t0) if self._t0 is not None else 0.0
+        def fmt_sci(x: Optional[float], width: int = 11) -> str:
+            if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+                return f"{'—':>{width}}"
+            return f"{x:>{width}.3e}"
 
-        metrics = dict(trainer.callback_metrics)
-        tr = self._get_metric(metrics, "train_loss")
-        va = self._get_metric(metrics, "val_loss")
-        vf = self._get_metric(metrics, "val_frac")
-        lr = self._get_lr(trainer)
+        def fmt_time(seconds: float) -> str:
+            if not math.isfinite(seconds) or seconds < 0:
+                seconds = 0.0
+            m, s = divmod(int(seconds), 60)
+            h, m = divmod(m, 60)
+            if h > 0:
+                return f"{h:d}:{m:02d}:{s:02d}"
+            return f"{m:d}:{s:02d}"
 
         if not self._printed_header:
-            print("EPOCH | train       | val         | val_frac    | lr         | time", flush=True)
-            print("----- | ----------- | ----------- | ----------- | ---------- | --------", flush=True)
+            print("EPOCH | train       | val         | mult_err_proxy | lr         | time", flush=True)
+            print("----- | ----------- | ----------- | -------------- | ---------- | --------", flush=True)
             self._printed_header = True
 
-        epoch_str = f"E{trainer.current_epoch + 1:04d}"
+        tr_loss = self._last_train_metrics.get("train_loss")
+        va_loss = self._last_val_metrics.get("val_loss")
+        va_proxy = self._last_val_metrics.get("val_mult_err_proxy")
+
+        epoch_str = f"E{epoch_1idx:04d}"
         line = (
             f"{epoch_str} | "
-            f"{self._fmt_sci(tr)} | "
-            f"{self._fmt_sci(va)} | "
-            f"{self._fmt_sci(vf)} | "
-            f"{self._fmt_sci(lr)} | "
-            f"{self._fmt_time(elapsed)}"
+            f"{fmt_sci(tr_loss)} | "
+            f"{fmt_sci(va_loss)} | "
+            f"{fmt_sci(va_proxy, width=14)} | "
+            f"{fmt_sci(lr)} | "
+            f"{fmt_time(epoch_time)}"
         )
         print(line, flush=True)
-        self._last_printed_epoch = trainer.current_epoch
-
-    def on_fit_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        self._maybe_print(trainer)
-
-    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        self._maybe_print(trainer)
+        self._last_reported_epoch = epoch_1idx
 
 
 # ============================== WRAPPER =======================================
@@ -719,106 +857,111 @@ class Trainer:
             self.logger.warning(f"torch.compile disabled ({e})")
             return model
 
-    def train(self) -> float:
-        self.model = self._maybe_compile(self.model)
-        task = ModelTask(self.model, self.cfg, self.work_dir)
+def train(self) -> float:
+    # Resolve resume checkpoint before constructing the task (task needs resume flag for CSV behavior)
+    ckpt_path = self._resolve_resume_ckpt()
+    self.logger.info(f"resume: {ckpt_path if ckpt_path else 'fresh'}")
 
-        csv_logger = CSVLogger(save_dir=str(self.work_dir), name="csv")
+    self.model = self._maybe_compile(self.model)
+    task = ModelTask(self.model, self.cfg, self.work_dir, resume=bool(ckpt_path))
 
-        ckpt_cb = ModelCheckpoint(
-            dirpath=str(self.work_dir),
-            filename="best",
-            monitor="val_loss",
-            mode="min",
-            save_top_k=1,
-            save_last=True,
-            verbose=False,
+    ckpt_cb = ModelCheckpoint(
+        dirpath=str(self.work_dir),
+        filename=CKPT_FILENAME_BEST,
+        monitor=CKPT_MONITOR,
+        mode=CKPT_MODE,
+        save_top_k=1,
+        save_last=True,
+        verbose=False,
+    )
+    callbacks = [ckpt_cb]
+
+    if self.use_swa:
+        swa_kwargs = dict(
+            swa_epoch_start=self.swa_epoch_start,
+            annealing_epochs=self.swa_annealing_epochs,
+            annealing_strategy=self.swa_annealing_strategy,
         )
-        lr_cb = LearningRateMonitor(logging_interval="epoch")
-        epoch_print_cb = EpochTableCallback()
+        if self.swa_lrs is not None:
+            swa_kwargs["swa_lrs"] = self.swa_lrs
+        callbacks.append(StochasticWeightAveraging(**swa_kwargs))
 
-        callbacks = [ckpt_cb, lr_cb, epoch_print_cb]
+    accelerator = self._accelerator_from_device()
+    precision = self._precision_from_cfg()
 
-        if self.use_swa:
-            swa_kwargs = dict(
-                swa_epoch_start=self.swa_epoch_start,
-                annealing_epochs=self.swa_annealing_epochs,
-                annealing_strategy=self.swa_annealing_strategy,
-            )
-            if self.swa_lrs is not None:
-                swa_kwargs["swa_lrs"] = self.swa_lrs
-            callbacks.append(StochasticWeightAveraging(**swa_kwargs))
+    trainer_kwargs: Dict[str, Any] = {}
+    if self.limit_train_batches > 0:
+        trainer_kwargs["limit_train_batches"] = self.limit_train_batches
+    if self.limit_val_batches > 0:
+        trainer_kwargs["limit_val_batches"] = self.limit_val_batches
 
-        accelerator = self._accelerator_from_device()
-        precision = self._precision_from_cfg()
+    # Correct behavior for externally launched DDP (torchrun/srun):
+    # each process should use exactly one device.
+    world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
+    externally_launched = world_size > 1
 
-        trainer_kwargs: Dict[str, Any] = {}
-        if self.limit_train_batches > 0:
-            trainer_kwargs["limit_train_batches"] = self.limit_train_batches
-        if self.limit_val_batches > 0:
-            trainer_kwargs["limit_val_batches"] = self.limit_val_batches
+    devices_env = os.getenv("PL_DEVICES", "").strip()
+    if not externally_launched:
+        devices = 1
+        strategy = "auto"
+        if devices_env:
+            try:
+                req = int(devices_env)
+                if req != 1:
+                    self.logger.warning(
+                        "PL_DEVICES=%s requested, but non-DDP multi-device is not supported here; forcing devices=1. "
+                        "Use torchrun/mpirun/srun for multi-GPU.",
+                        devices_env,
+                    )
+            except Exception:
+                pass
+    else:
+        devices = 1
+        strategy = "ddp"
+        # Multi-node hint (optional)
+        try:
+            num_nodes = int(os.getenv("SLURM_NNODES", os.getenv("NUM_NODES", "1")))
+        except Exception:
+            num_nodes = 1
+        if num_nodes > 1:
+            trainer_kwargs["num_nodes"] = num_nodes
 
-        world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
-        externally_launched = world_size > 1
+    trainer_kwargs.update(
+        accelerator=accelerator,
+        devices=devices,
+        strategy=strategy,
+        precision=precision,
+    )
 
-        devices_env = os.getenv("PL_DEVICES", "").strip()
-        if not externally_launched:
-            devices = 1
-            strategy = "auto"
-            if devices_env:
-                try:
-                    req = int(devices_env)
-                    if req != 1:
-                        self.logger.warning(
-                            "PL_DEVICES=%s requested, but non-DDP multi-device is not supported here; forcing devices=1. "
-                            "Use torchrun/mpirun/srun for multi-GPU.",
-                            devices_env,
-                        )
-                except Exception:
-                    pass
-        else:
-            devices = "auto"
-            strategy = "ddp"
+    base_kwargs: Dict[str, Any] = dict(
+        max_epochs=self.epochs,
+        accumulate_grad_batches=max(1, self.accumulate),
+        gradient_clip_val=float(self.grad_clip),
+        logger=False,  # we own CSV logging
+        callbacks=callbacks,
+        enable_checkpointing=ENABLE_CHECKPOINTING,
+        enable_progress_bar=ENABLE_PROGRESS_BAR,
+        enable_model_summary=ENABLE_MODEL_SUMMARY,
+        detect_anomaly=DETECT_ANOMALY,
+        inference_mode=INFERENCE_MODE,
+        benchmark=self.cudnn_benchmark,
+        log_every_n_steps=LOG_EVERY_N_STEPS,
+        **trainer_kwargs,
+    )
 
-        trainer_kwargs.update(
-            accelerator=accelerator,
-            devices=devices,
-            strategy=strategy,
-            precision=precision,
-        )
+    trainer_params = set(inspect.signature(pl.Trainer).parameters.keys())
+    filtered = {k: v for k, v in base_kwargs.items() if k in trainer_params}
+    if "deterministic" in trainer_params:
+        filtered["deterministic"] = self.deterministic
 
-        base_kwargs: Dict[str, Any] = dict(
-            max_epochs=self.epochs,
-            accumulate_grad_batches=max(1, self.accumulate),
-            gradient_clip_val=float(self.grad_clip),
-            logger=csv_logger,
-            callbacks=callbacks,
-            enable_checkpointing=True,
-            enable_progress_bar=False,
-            enable_model_summary=False,
-            detect_anomaly=False,
-            inference_mode=True,
-            benchmark=self.cudnn_benchmark,
-            log_every_n_steps=200,
-            **trainer_kwargs,
-        )
+    pl_trainer = pl.Trainer(**filtered)
 
-        trainer_params = set(inspect.signature(pl.Trainer).parameters.keys())
-        filtered = {k: v for k, v in base_kwargs.items() if k in trainer_params}
-        if "deterministic" in trainer_params:
-            filtered["deterministic"] = self.deterministic
+    pl_trainer.fit(
+        task,
+        train_dataloaders=self.train_loader,
+        val_dataloaders=self.val_loader,
+        ckpt_path=ckpt_path,
+    )
 
-        pl_trainer = pl.Trainer(**filtered)
-
-        ckpt_path = self._resolve_resume_ckpt()
-        self.logger.info(f"resume: {ckpt_path if ckpt_path else 'fresh'}")
-
-        pl_trainer.fit(
-            task,
-            train_dataloaders=self.train_loader,
-            val_dataloaders=self.val_loader,
-            ckpt_path=ckpt_path,
-        )
-
-        best = ckpt_cb.best_model_score
-        return float(best.item()) if best is not None else float("nan")
+    best = ckpt_cb.best_model_score
+    return float(best.item()) if best is not None else float("nan")
