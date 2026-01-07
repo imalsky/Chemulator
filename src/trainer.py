@@ -31,7 +31,6 @@ ENABLE_PROGRESS_BAR: bool = False
 ENABLE_MODEL_SUMMARY: bool = False
 DETECT_ANOMALY: bool = False
 INFERENCE_MODE: bool = True
-LR_LOGGING_INTERVAL: str = "epoch"
 
 # Training defaults (used when cfg keys absent)
 DEF_EPOCHS: int = 100
@@ -62,11 +61,6 @@ SPECIES_RANGE_EPS: float = 1e-6
 W_SPECIES_MEAN_EPS: float = 1e-12
 WARMUP_START_FACTOR: float = 0.1
 
-# Resume behavior
-ENV_RESUME_VAR: str = "RESUME"
-RESUME_AUTO_SENTINEL: str = "auto"
-LAST_CKPT_NAME: str = "last.ckpt"
-
 # ============================== IMPORTS =======================================
 
 import os
@@ -75,6 +69,8 @@ import time
 import math
 import logging
 import inspect
+import csv
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -179,9 +175,6 @@ class AdaptiveStiffLoss(nn.Module):
         if return_components:
             return {"total": total, "phys": phys, "z": zstb}
         return total
-
-
-# ============================== LIGHTNING TASK ================================
 
 
 # ============================== EPOCH CSV ====================================
@@ -293,14 +286,15 @@ class EpochCSVWriter:
         self._write_rows_atomic(kept)
 
 
+# ============================== LIGHTNING TASK ================================
+
 class ModelTask(pl.LightningModule):
     """LightningModule wrapping the model + sample-weighted epoch metrics."""
-    def __init__(self, model: nn.Module, cfg: Dict[str, Any], work_dir: Path) -> None:
+    def __init__(self, model: nn.Module, cfg: Dict[str, Any], work_dir: Path, *, resume: bool = False) -> None:
         super().__init__()
         self.model = model
         self.cfg = cfg
         self.work_dir = Path(work_dir)
-
 
         self._resume = bool(resume)
         self._csv: Optional[EpochCSVWriter] = None
@@ -309,6 +303,7 @@ class ModelTask(pl.LightningModule):
         self._last_reported_epoch: int = -1
         self._last_train_metrics: dict[str, float] = {}
         self._last_val_metrics: dict[str, float] = {}
+
         tcfg = cfg.get("training", {})
         self.lr = float(tcfg.get("lr", DEF_LR))
         self.weight_decay = float(tcfg.get("weight_decay", DEF_WEIGHT_DECAY))
@@ -527,7 +522,6 @@ class ModelTask(pl.LightningModule):
         base10 = torch.tensor(10.0, device=train_phys.device, dtype=train_phys.dtype)
         train_mult_err_proxy = torch.pow(base10, train_phys) - 1.0
 
-
         self._last_train_metrics = {
             "train_loss": float(train_loss.detach().cpu().item()),
             "train_phys": float(train_phys.detach().cpu().item()),
@@ -622,7 +616,6 @@ class ModelTask(pl.LightningModule):
         base10 = torch.tensor(10.0, device=val_phys.device, dtype=val_phys.dtype)
         val_mult_err_proxy = torch.pow(base10, val_phys) - 1.0
 
-
         self._last_val_metrics = {
             "val_loss": float(val_loss.detach().cpu().item()),
             "val_phys": float(val_phys.detach().cpu().item()),
@@ -639,8 +632,6 @@ class ModelTask(pl.LightningModule):
 
         for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
-
-
 
     def _report_epoch(self) -> None:
         tr = getattr(self, "trainer", None)
@@ -661,6 +652,10 @@ class ModelTask(pl.LightningModule):
                 lr = float(tr.optimizers[0].param_groups[0].get("lr", None))
         except Exception:
             lr = None
+
+        # Also expose LR as a Lightning metric (available in callback_metrics even with logger=False)
+        if lr is not None:
+            self.log("lr", float(lr), prog_bar=False, on_step=False, on_epoch=True, sync_dist=False)
 
         def fmt(x: Optional[float]) -> str:
             if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
@@ -857,111 +852,111 @@ class Trainer:
             self.logger.warning(f"torch.compile disabled ({e})")
             return model
 
-def train(self) -> float:
-    # Resolve resume checkpoint before constructing the task (task needs resume flag for CSV behavior)
-    ckpt_path = self._resolve_resume_ckpt()
-    self.logger.info(f"resume: {ckpt_path if ckpt_path else 'fresh'}")
+    def train(self) -> float:
+        # Resolve resume checkpoint before constructing the task (task needs resume flag for CSV behavior)
+        ckpt_path = self._resolve_resume_ckpt()
+        self.logger.info(f"resume: {ckpt_path if ckpt_path else 'fresh'}")
 
-    self.model = self._maybe_compile(self.model)
-    task = ModelTask(self.model, self.cfg, self.work_dir, resume=bool(ckpt_path))
+        self.model = self._maybe_compile(self.model)
+        task = ModelTask(self.model, self.cfg, self.work_dir, resume=bool(ckpt_path))
 
-    ckpt_cb = ModelCheckpoint(
-        dirpath=str(self.work_dir),
-        filename=CKPT_FILENAME_BEST,
-        monitor=CKPT_MONITOR,
-        mode=CKPT_MODE,
-        save_top_k=1,
-        save_last=True,
-        verbose=False,
-    )
-    callbacks = [ckpt_cb]
-
-    if self.use_swa:
-        swa_kwargs = dict(
-            swa_epoch_start=self.swa_epoch_start,
-            annealing_epochs=self.swa_annealing_epochs,
-            annealing_strategy=self.swa_annealing_strategy,
+        ckpt_cb = ModelCheckpoint(
+            dirpath=str(self.work_dir),
+            filename=CKPT_FILENAME_BEST,
+            monitor=CKPT_MONITOR,
+            mode=CKPT_MODE,
+            save_top_k=1,
+            save_last=True,
+            verbose=False,
         )
-        if self.swa_lrs is not None:
-            swa_kwargs["swa_lrs"] = self.swa_lrs
-        callbacks.append(StochasticWeightAveraging(**swa_kwargs))
+        callbacks = [ckpt_cb]
 
-    accelerator = self._accelerator_from_device()
-    precision = self._precision_from_cfg()
+        if self.use_swa:
+            swa_kwargs = dict(
+                swa_epoch_start=self.swa_epoch_start,
+                annealing_epochs=self.swa_annealing_epochs,
+                annealing_strategy=self.swa_annealing_strategy,
+            )
+            if self.swa_lrs is not None:
+                swa_kwargs["swa_lrs"] = self.swa_lrs
+            callbacks.append(StochasticWeightAveraging(**swa_kwargs))
 
-    trainer_kwargs: Dict[str, Any] = {}
-    if self.limit_train_batches > 0:
-        trainer_kwargs["limit_train_batches"] = self.limit_train_batches
-    if self.limit_val_batches > 0:
-        trainer_kwargs["limit_val_batches"] = self.limit_val_batches
+        accelerator = self._accelerator_from_device()
+        precision = self._precision_from_cfg()
 
-    # Correct behavior for externally launched DDP (torchrun/srun):
-    # each process should use exactly one device.
-    world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
-    externally_launched = world_size > 1
+        trainer_kwargs: Dict[str, Any] = {}
+        if self.limit_train_batches > 0:
+            trainer_kwargs["limit_train_batches"] = self.limit_train_batches
+        if self.limit_val_batches > 0:
+            trainer_kwargs["limit_val_batches"] = self.limit_val_batches
 
-    devices_env = os.getenv("PL_DEVICES", "").strip()
-    if not externally_launched:
-        devices = 1
-        strategy = "auto"
-        if devices_env:
+        # Correct behavior for externally launched DDP (torchrun/srun):
+        # each process should use exactly one device.
+        world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
+        externally_launched = world_size > 1
+
+        devices_env = os.getenv("PL_DEVICES", "").strip()
+        if not externally_launched:
+            devices = 1
+            strategy = "auto"
+            if devices_env:
+                try:
+                    req = int(devices_env)
+                    if req != 1:
+                        self.logger.warning(
+                            "PL_DEVICES=%s requested, but non-DDP multi-device is not supported here; forcing devices=1. "
+                            "Use torchrun/mpirun/srun for multi-GPU.",
+                            devices_env,
+                        )
+                except Exception:
+                    pass
+        else:
+            devices = 1
+            strategy = "ddp"
+            # Multi-node hint (optional)
             try:
-                req = int(devices_env)
-                if req != 1:
-                    self.logger.warning(
-                        "PL_DEVICES=%s requested, but non-DDP multi-device is not supported here; forcing devices=1. "
-                        "Use torchrun/mpirun/srun for multi-GPU.",
-                        devices_env,
-                    )
+                num_nodes = int(os.getenv("SLURM_NNODES", os.getenv("NUM_NODES", "1")))
             except Exception:
-                pass
-    else:
-        devices = 1
-        strategy = "ddp"
-        # Multi-node hint (optional)
-        try:
-            num_nodes = int(os.getenv("SLURM_NNODES", os.getenv("NUM_NODES", "1")))
-        except Exception:
-            num_nodes = 1
-        if num_nodes > 1:
-            trainer_kwargs["num_nodes"] = num_nodes
+                num_nodes = 1
+            if num_nodes > 1:
+                trainer_kwargs["num_nodes"] = num_nodes
 
-    trainer_kwargs.update(
-        accelerator=accelerator,
-        devices=devices,
-        strategy=strategy,
-        precision=precision,
-    )
+        trainer_kwargs.update(
+            accelerator=accelerator,
+            devices=devices,
+            strategy=strategy,
+            precision=precision,
+        )
 
-    base_kwargs: Dict[str, Any] = dict(
-        max_epochs=self.epochs,
-        accumulate_grad_batches=max(1, self.accumulate),
-        gradient_clip_val=float(self.grad_clip),
-        logger=False,  # we own CSV logging
-        callbacks=callbacks,
-        enable_checkpointing=ENABLE_CHECKPOINTING,
-        enable_progress_bar=ENABLE_PROGRESS_BAR,
-        enable_model_summary=ENABLE_MODEL_SUMMARY,
-        detect_anomaly=DETECT_ANOMALY,
-        inference_mode=INFERENCE_MODE,
-        benchmark=self.cudnn_benchmark,
-        log_every_n_steps=LOG_EVERY_N_STEPS,
-        **trainer_kwargs,
-    )
+        base_kwargs: Dict[str, Any] = dict(
+            max_epochs=self.epochs,
+            accumulate_grad_batches=max(1, self.accumulate),
+            gradient_clip_val=float(self.grad_clip),
+            logger=False,  # we own CSV logging
+            callbacks=callbacks,
+            enable_checkpointing=ENABLE_CHECKPOINTING,
+            enable_progress_bar=ENABLE_PROGRESS_BAR,
+            enable_model_summary=ENABLE_MODEL_SUMMARY,
+            detect_anomaly=DETECT_ANOMALY,
+            inference_mode=INFERENCE_MODE,
+            benchmark=self.cudnn_benchmark,
+            log_every_n_steps=LOG_EVERY_N_STEPS,
+            **trainer_kwargs,
+        )
 
-    trainer_params = set(inspect.signature(pl.Trainer).parameters.keys())
-    filtered = {k: v for k, v in base_kwargs.items() if k in trainer_params}
-    if "deterministic" in trainer_params:
-        filtered["deterministic"] = self.deterministic
+        trainer_params = set(inspect.signature(pl.Trainer).parameters.keys())
+        filtered = {k: v for k, v in base_kwargs.items() if k in trainer_params}
+        if "deterministic" in trainer_params:
+            filtered["deterministic"] = self.deterministic
 
-    pl_trainer = pl.Trainer(**filtered)
+        pl_trainer = pl.Trainer(**filtered)
 
-    pl_trainer.fit(
-        task,
-        train_dataloaders=self.train_loader,
-        val_dataloaders=self.val_loader,
-        ckpt_path=ckpt_path,
-    )
+        pl_trainer.fit(
+            task,
+            train_dataloaders=self.train_loader,
+            val_dataloaders=self.val_loader,
+            ckpt_path=ckpt_path,
+        )
 
-    best = ckpt_cb.best_model_score
-    return float(best.item()) if best is not None else float("nan")
+        best = ckpt_cb.best_model_score
+        return float(best.item()) if best is not None else float("nan")

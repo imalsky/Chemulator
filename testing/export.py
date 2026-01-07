@@ -23,7 +23,7 @@ import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-WORK_DIR = ROOT / "models" / "big_big_big"
+WORK_DIR = ROOT / "models" / "big_subset_1_5"
 CONFIG_PATH = WORK_DIR / "config.json"
 
 CPU_OUT = WORK_DIR / "export_k1_cpu.pt2"

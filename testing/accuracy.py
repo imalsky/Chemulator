@@ -2,11 +2,11 @@
 """
 Flow-map AE: Predicted vs True Scatter (1:1 line)
 
-- Loads exported CPU K=1 program (export_k1_cpu.pt2) from models/v2
+- Loads exported CPU K=1 program (export_k1_cpu.pt2)
 - Uses test shard(s) under processed_data_dir/test/shard_*.npz
 - Samples N_SAMPLES trajectories and Q_COUNT times per trajectory
 - Produces a log–log scatter of y_true vs y_pred with a 1:1 line
-- Prints average fractional error over all plotted points
+- Prints summary error metrics over all plotted points
 """
 
 import os
@@ -23,7 +23,7 @@ plt.style.use("science.mplstyle")
 
 # ---------------- Paths & settings ----------------
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models" / "big_big_big"
+MODEL_DIR = REPO / "models" / "big_subset_1_5"
 EP_FILENAME = "export_k1_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))
@@ -31,9 +31,9 @@ from utils import load_json_config as load_json, seed_everything
 from normalizer import NormalizationHelper
 
 # Globals (no argparse)
-N_SAMPLES: int = 64  # number of test trajectories to use
-Q_COUNT: int = 100  # number of query times per trajectory
-PLOT_SPECIES: List[str] = ['H2', 'H2O', 'CH4', 'CO', 'CO2', 'NH3', 'HCN', 'N2']
+N_SAMPLES: int = 64
+Q_COUNT: int = 100
+PLOT_SPECIES: List[str] = ["H2", "H2O", "CH4", "CO", "CO2", "NH3", "HCN", "N2"]
 
 EPS_FRACTIONAL = 1e-20
 PLOT_FLOOR = 1e-20
@@ -45,8 +45,8 @@ def load_first_test_shard(data_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.nd
     Load the first test shard.
 
     Returns:
-        y_mat : [N, T, S]
-        g_all : [N, G]
+        y_mat : [N, T, S_all]
+        g_all : [N, G_all]
         t_vec : [T] or [N, T]
     """
     test_dir = data_dir / "test"
@@ -56,44 +56,48 @@ def load_first_test_shard(data_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.nd
 
     shard_path = shards[0]
     with np.load(shard_path) as d:
-        y_mat = d["y_mat"].astype(np.float32)  # [N, T, S]
-        g_all = d["globals"].astype(np.float32)  # [N, G]
-        t_vec = d["t_vec"].astype(np.float32)  # [T] or [N, T]
+        y_mat = d["y_mat"].astype(np.float32)      # [N, T, S_all]
+        g_all = d["globals"].astype(np.float32)    # [N, G_all]
+        t_vec = d["t_vec"].astype(np.float32)      # [T] or [N, T]
     return y_mat, g_all, t_vec
 
 
 def get_time_vector_for_sample(t_vec: np.ndarray, idx: int) -> np.ndarray:
-    """Handle shared vs per-row time grid."""
     if t_vec.ndim == 1:
         return t_vec
-    elif t_vec.ndim == 2:
+    if t_vec.ndim == 2:
         return t_vec[idx]
-    else:
-        raise ValueError(f"Invalid t_vec ndim={t_vec.ndim}")
+    raise ValueError(f"Invalid t_vec ndim={t_vec.ndim}")
 
 
-def select_species_indices(species_all: List[str],
-                           plot_species: List[str]) -> Tuple[List[int], List[str]]:
-    """Return indices and base names of species to keep."""
+def select_species_indices(species_all: List[str], plot_species: List[str]) -> Tuple[List[int], List[str]]:
     base_all = [n[:-10] if n.endswith("_evolution") else n for n in species_all]
     if plot_species:
         keep = [i for i, b in enumerate(base_all) if b in plot_species]
     else:
         keep = list(range(len(base_all)))
     if not keep:
-        raise RuntimeError("No requested species found in species_variables.")
+        raise RuntimeError("No requested species found in selected species list.")
     labels = [base_all[i] for i in keep]
     return keep, labels
 
 
+def _indices(all_names: List[str], chosen: List[str]) -> List[int]:
+    m = {n: i for i, n in enumerate(all_names)}
+    try:
+        return [m[n] for n in chosen]
+    except KeyError as e:
+        raise ValueError(f"Name not found in normalization meta list: {e.args[0]}") from None
+
+
 def prepare_batch(
-        y0: np.ndarray,
-        g: np.ndarray,
-        t_phys: np.ndarray,
-        q_count: int,
-        norm: NormalizationHelper,
-        species: List[str],
-        globals_: List[str],
+    y0: np.ndarray,
+    g: np.ndarray,
+    t_phys: np.ndarray,
+    q_count: int,
+    norm: NormalizationHelper,
+    species: List[str],
+    globals_: List[str],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
     """
     Prepare normalized (y, dt, g) for K=1 export for a single trajectory anchored at t0.
@@ -102,15 +106,13 @@ def prepare_batch(
         y_batch : [K, S]  (normalized)
         dt_norm : [K, 1]  (normalized Δt)
         g_batch : [K, G]  (normalized)
-        q_idx   : [K]     (integer indices into t_phys / y)
+        q_idx   : [K]     (indices into t_phys / y)
     """
     M = len(t_phys)
-    if M < 2:
-        raise ValueError("Trajectory has fewer than 2 time points; cannot form Δt queries.")
-
     qn = max(1, min(q_count, M - 1))
     q_idx = np.linspace(1, M - 1, qn).round().astype(int)
-    t_sel = t_phys[q_idx]  # absolute seconds
+
+    t_sel = t_phys[q_idx]
     dt_sec = np.maximum(t_sel - t_phys[0], 0.0).astype(np.float32)
 
     # Normalize anchor and globals
@@ -118,48 +120,36 @@ def prepare_batch(
     if globals_:
         g_norm = norm.normalize(torch.from_numpy(g[None, :]), globals_).float()  # [1, G]
     else:
-        g_norm = torch.from_numpy(g[None, :]).float()  # [1, G] or [1, 0]
+        g_norm = torch.from_numpy(g[None, :]).float()  # [1, 0] or [1, G]
 
-    # Normalize Δt (physical seconds)
+    # Normalize Δt (seconds)
     dt_norm = norm.normalize_dt_from_phys(torch.from_numpy(dt_sec)).view(-1, 1).float()  # [K, 1]
 
     K = dt_norm.shape[0]
     y_batch = y0_norm.repeat(K, 1)  # [K, S]
-    g_batch = g_norm.repeat(K, 1)  # [K, G]
+    g_batch = g_norm.repeat(K, 1)   # [K, G]
     return y_batch, dt_norm, g_batch, q_idx
 
 
 @torch.inference_mode()
-def run_inference(model, y_batch: torch.Tensor,
-                  dt_batch: torch.Tensor,
-                  g_batch: torch.Tensor) -> torch.Tensor:
+def run_inference(model, y_batch: torch.Tensor, dt_batch: torch.Tensor, g_batch: torch.Tensor) -> torch.Tensor:
     """
-    Call exported program.
-
     Inputs:
-        y_batch : [K, S]
-        dt_batch: [K, 1]
-        g_batch : [K, G]
+        y_batch : [B, S]
+        dt_batch: [B, 1]
+        g_batch : [B, G]
 
-    Exported CPU K=1 program is assumed to return [K, 1, S]. We squeeze
-    the middle dimension to get [K, S].
+    Output (exported CPU K=1):
+        [B, 1, S] -> return [B, S]
     """
     out = model(y_batch, dt_batch, g_batch)
-    if out.dim() != 3 or out.size(1) != 1:
-        raise RuntimeError(f"Unexpected export output shape: {tuple(out.shape)} (expected [K,1,S])")
-    return out[:, 0, :]  # [K, S]
+    return out[:, 0, :]
 
 
-def plot_pred_vs_true_scatter(y_true_flat: np.ndarray,
-                              y_pred_flat: np.ndarray,
-                              out_path: Path) -> None:
-    """Log–log scatter of predicted vs true values with a 1:1 line."""
+def plot_pred_vs_true_scatter(y_true_flat: np.ndarray, y_pred_flat: np.ndarray, out_path: Path) -> None:
     mask = np.isfinite(y_true_flat) & np.isfinite(y_pred_flat)
     y_true = np.clip(y_true_flat[mask], PLOT_FLOOR, None)
     y_pred = np.clip(y_pred_flat[mask], PLOT_FLOOR, None)
-
-    if y_true.size == 0:
-        raise RuntimeError("No valid points for scatter plot.")
 
     vmin = min(y_true.min(), y_pred.min())
     vmax = max(y_true.max(), y_pred.max())
@@ -176,19 +166,13 @@ def plot_pred_vs_true_scatter(y_true_flat: np.ndarray,
     ax.set_ylim(lo, hi)
     ax.legend(loc="lower right")
 
-    # Thin out log ticks to avoid overlapping labels
-    x_major = LogLocator(base=10.0, numticks=8)
-    y_major = LogLocator(base=10.0, numticks=8)
-    ax.xaxis.set_major_locator(x_major)
-    ax.yaxis.set_major_locator(y_major)
-
+    ax.xaxis.set_major_locator(LogLocator(base=10.0, numticks=8))
+    ax.yaxis.set_major_locator(LogLocator(base=10.0, numticks=8))
     ax.xaxis.set_minor_locator(LogLocator(base=10.0, subs=(), numticks=0))
     ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=(), numticks=0))
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.yaxis.set_minor_formatter(NullFormatter())
-
     ax.tick_params(axis="both", which="major", labelsize=12, pad=2)
-
     ax.set_box_aspect(1)
 
     fig.tight_layout()
@@ -203,42 +187,49 @@ def main() -> None:
     os.chdir(REPO)
     seed_everything(42)
 
-    # Load config and processed data dir
-    try:
-        cfg = load_json(MODEL_DIR / "config.json")
-    except FileNotFoundError:
-        cfg = load_json(MODEL_DIR / "trial_config.final.json")
+    # Load config
+    cfg = load_json(MODEL_DIR / "config.json")
+    data_cfg = dict(cfg.get("data", {}))
+    species_cfg = list(data_cfg.get("species_variables") or [])
+    globals_cfg = list(data_cfg.get("global_variables") or [])
+
     data_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
 
-    # Load normalization manifest
+    # Load normalization manifest (authoritative processed column order)
     manifest = load_json(data_dir / "normalization.json")
-    meta = manifest.get("meta", {})
-    species = list(meta.get("species_variables", []))
-    globals_ = list(meta.get("global_variables", []))
-    if not species:
-        raise RuntimeError("No species_variables in normalization.json")
+    meta = manifest.get("meta", {}) or {}
+    species_all = list(meta.get("species_variables", []) or [])
+    globals_all = list(meta.get("global_variables", []) or [])
+
+    # If config leaves lists empty, it means "use all processed"
+    if not species_cfg:
+        species_cfg = species_all
+    if globals_all and not globals_cfg:
+        globals_cfg = globals_all
+
+    idx_species = _indices(species_all, species_cfg)
+    idx_globals = _indices(globals_all, globals_cfg) if globals_cfg else []
 
     norm = NormalizationHelper(manifest)
-    keep_idx, _labels = select_species_indices(species, PLOT_SPECIES)
+    keep_idx, _labels = select_species_indices(species_cfg, PLOT_SPECIES)
 
-    # Load exported program (NO .eval(), it’s not supported for ExportedProgram)
+    # Load exported program
     ep = torch.export.load(MODEL_DIR / EP_FILENAME)
     model = ep.module()
 
     # Load first test shard
     y_mat, g_all, t_vec = load_first_test_shard(data_dir)
-    n_profiles = y_mat.shape[0]
-    n_use = min(N_SAMPLES, n_profiles)
+    n_use = min(N_SAMPLES, y_mat.shape[0])
 
     all_true = []
     all_pred = []
 
     for i in range(n_use):
-        y_traj = y_mat[i]  # [T, S]
-        g_vec = g_all[i]  # [G]
-        t_phys = get_time_vector_for_sample(t_vec, i)  # [T]
+        y_traj = y_mat[i][:, idx_species]  # [T, S_model]
+        g_vec = g_all[i][idx_globals] if idx_globals else np.empty((0,), dtype=np.float32)
+        t_phys = get_time_vector_for_sample(t_vec, i)
 
-        y0 = y_traj[0]  # anchor at t0
+        y0 = y_traj[0]
 
         y_batch, dt_batch, g_batch, q_idx = prepare_batch(
             y0=y0,
@@ -246,20 +237,17 @@ def main() -> None:
             t_phys=t_phys,
             q_count=Q_COUNT,
             norm=norm,
-            species=species,
-            globals_=globals_,
+            species=species_cfg,
+            globals_=globals_cfg,
         )
 
-        # Predict then denormalize
-        y_pred_norm = run_inference(model, y_batch, dt_batch, g_batch)  # [K, S]
-        y_pred = norm.denormalize(y_pred_norm, species).cpu().numpy()  # [K, S]
+        y_pred_norm = run_inference(model, y_batch, dt_batch, g_batch)  # [K, S_model]
+        y_pred = norm.denormalize(y_pred_norm, species_cfg).cpu().numpy()  # [K, S_model]
 
-        # Ground truth at same times
-        y_true_sel = y_traj[q_idx, :len(species)]  # [K, S]
+        y_true_sel = y_traj[q_idx, :]  # [K, S_model]
 
-        # Restrict to selected species
-        y_true_sel = y_true_sel[:, keep_idx]  # [K, S_sel]
-        y_pred_sel = y_pred[:, keep_idx]  # [K, S_sel]
+        y_true_sel = y_true_sel[:, keep_idx]
+        y_pred_sel = y_pred[:, keep_idx]
 
         all_true.append(y_true_sel.reshape(-1))
         all_pred.append(y_pred_sel.reshape(-1))
@@ -267,33 +255,24 @@ def main() -> None:
     y_true_flat = np.concatenate(all_true, axis=0)
     y_pred_flat = np.concatenate(all_pred, axis=0)
 
-    # Average fractional error
     frac_err = np.abs(y_pred_flat - y_true_flat) / (np.abs(y_true_flat) + EPS_FRACTIONAL)
     mean_frac_err = float(np.mean(frac_err))
     max_frac_err = float(np.max(frac_err))
 
     print(f"Average percent error over {y_true_flat.size} points: {100 * mean_frac_err:.3f}")
 
-    # --- Extended Statistics ---
-    print("\n--- Additional Summary Statistics ---")
-
-    # Linear Space Metrics
+    # --- Summary Statistics ---
     diff = y_pred_flat - y_true_flat
-    mae_lin = np.mean(np.abs(diff))
-    rmse_lin = np.sqrt(np.mean(diff ** 2))
+    mae_lin = float(np.mean(np.abs(diff)))
+    rmse_lin = float(np.sqrt(np.mean(diff ** 2)))
 
-    # Log Space Metrics (Dex)
-    # Clamp to PLOT_FLOOR to avoid log(0) or log(neg) issues
     y_true_clamped = np.maximum(y_true_flat, PLOT_FLOOR)
     y_pred_clamped = np.maximum(y_pred_flat, PLOT_FLOOR)
+    log_err = np.log10(y_pred_clamped) - np.log10(y_true_clamped)
 
-    log_true = np.log10(y_true_clamped)
-    log_pred = np.log10(y_pred_clamped)
-    log_err = log_pred - log_true
-
-    mae_log = np.mean(np.abs(log_err))
-    rmse_log = np.sqrt(np.mean(log_err ** 2))
-    bias_log = np.mean(log_err)  # Positive = over-prediction
+    mae_log = float(np.mean(np.abs(log_err)))
+    rmse_log = float(np.sqrt(np.mean(log_err ** 2)))
+    bias_log = float(np.mean(log_err))
 
     print(f"Linear MAE:       {mae_lin:.4e}")
     print(f"Linear RMSE:      {rmse_lin:.4e}")
@@ -301,15 +280,10 @@ def main() -> None:
     print(f"Log10 RMSE (dex): {rmse_log:.4f}")
     print(f"Log10 Bias (dex): {bias_log:.4f}")
 
-    # Fractional Error Stats
-    # Added 99.9th percentile
     pcts = np.percentile(frac_err * 100, [50, 90, 95, 99, 99.9])
-    print(
-        f"Frac Err Percentiles (50/90/95/99/99.9%): {pcts[0]:.2f} / {pcts[1]:.2f} / {pcts[2]:.2f} / {pcts[3]:.2f} / {pcts[4]:.2f}")
+    print(f"Frac Err % (50/90/95/99/99.9): {pcts[0]:.2f} / {pcts[1]:.2f} / {pcts[2]:.2f} / {pcts[3]:.2f} / {pcts[4]:.2f}")
     print(f"Max Frac Error:   {100 * max_frac_err:.2f} %")
-    print("-------------------------------------")
 
-    # Scatter plot with 1:1 line
     out_png = MODEL_DIR / "plots" / f"pred_vs_true_scatter_{n_use}samples.png"
     plot_pred_vs_true_scatter(y_true_flat, y_pred_flat, out_png)
 
