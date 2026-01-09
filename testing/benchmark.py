@@ -20,7 +20,7 @@ import torch
 import matplotlib.pyplot as plt
 
 # ====== GLOBALS ======
-MODEL_SUBDIR = "models_finished_safe/full_big"   # exporter target dir
+MODEL_SUBDIR = "models/big_mlp"   # exporter target dir
 BENCH_K: int = 1                   # for BK exports; ignored by K1 exports
 
 WARMUP_STEPS: int = 10

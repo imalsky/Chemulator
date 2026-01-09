@@ -6,13 +6,17 @@ Flow-map AE: Predicted vs True Scatter (1:1 line)
 - Uses test shard(s) under processed_data_dir/test/shard_*.npz
 - Samples N_SAMPLES trajectories and Q_COUNT times per trajectory
 - Produces a log–log scatter of y_true vs y_pred with a 1:1 line
-- Prints summary error metrics over all plotted points
+- Prints summary error metrics in two buckets:
+  (1) Points where y_true > ABUND_BUCKET_THRESHOLD
+  (2) All finite points together
+
+Also prints how the point counts are constructed (trajectories, anchors, query times, species).
 """
 
 import os
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -23,7 +27,7 @@ plt.style.use("science.mplstyle")
 
 # ---------------- Paths & settings ----------------
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models" / "big_subset_1_5"
+MODEL_DIR = REPO / "models" / "0"
 EP_FILENAME = "export_k1_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))
@@ -31,12 +35,14 @@ from utils import load_json_config as load_json, seed_everything
 from normalizer import NormalizationHelper
 
 # Globals (no argparse)
-N_SAMPLES: int = 64
+N_SAMPLES: int = 84
 Q_COUNT: int = 100
-PLOT_SPECIES: List[str] = ["H2", "H2O", "CH4", "CO", "CO2", "NH3", "HCN", "N2"]
+PLOT_SPECIES: List[str] = []
 
 EPS_FRACTIONAL = 1e-20
-PLOT_FLOOR = 1e-20
+PLOT_FLOOR = 5e-20
+
+ABUND_BUCKET_THRESHOLD = 1e-10  # bucket boundary (defined on y_true)
 
 
 # ---------------- Helpers ----------------
@@ -182,6 +188,89 @@ def plot_pred_vs_true_scatter(y_true_flat: np.ndarray, y_pred_flat: np.ndarray, 
     print(f"Scatter plot saved: {out_path}")
 
 
+def _stats_1d(x: np.ndarray) -> Tuple[int, float, int, int]:
+    """Returns: (n, median, min, max) for integer-ish arrays (safe for empty)."""
+    if x.size == 0:
+        return 0, float("nan"), 0, 0
+    return int(x.size), float(np.median(x)), int(np.min(x)), int(np.max(x))
+
+
+def print_count_breakdown(context: Dict[str, object], points_after_filters: int, title: str) -> None:
+    n_traj = int(context["n_traj"])
+    n_species = int(context["n_species"])
+    total_q = int(context["total_q"])
+    raw_points = int(context["raw_points"])
+    finite_points = int(context["finite_points"])
+    q_req = int(context["q_requested"])
+    t_stats = context["t_stats"]
+    k_stats = context["k_stats"]
+    ku_stats = context["ku_stats"]
+    dup_total = int(context["dup_total"])
+    dup_traj = int(context["dup_traj"])
+
+    print(f"\n--- {title} ---")
+    print(f"Trajectories used:            {n_traj}")
+    print(f"Anchors:                     {n_traj} (1 anchor per trajectory at t0)")
+    print(f"Requested Q_COUNT:           {q_req}")
+    print(f"Trajectory lengths T (med/min/max): {t_stats[1]:.1f} / {t_stats[2]} / {t_stats[3]}")
+    print(f"Query times K (med/min/max):        {k_stats[1]:.1f} / {k_stats[2]} / {k_stats[3]}")
+    print(f"Unique query times Ku (med/min/max):{ku_stats[1]:.1f} / {ku_stats[2]} / {ku_stats[3]}")
+    if dup_traj > 0:
+        print(
+            f"Note: duplicate q_idx present in {dup_traj}/{n_traj} trajectories "
+            f"(total duplicate indices counted as separate points: {dup_total})."
+        )
+
+    print(f"Species plotted:             {n_species}")
+    print(f"Total query times (sum K):   {total_q}")
+    print(f"Raw points:                  {raw_points} = (sum K) {total_q} * (species) {n_species}")
+    print(f"Finite points:               {finite_points} (after dropping non-finite y_true/y_pred)")
+    print(f"Points (this bucket):        {points_after_filters}")
+
+
+def print_error_stats(y_true_flat: np.ndarray, y_pred_flat: np.ndarray, title: str) -> None:
+    mask = np.isfinite(y_true_flat) & np.isfinite(y_pred_flat)
+    y_true = y_true_flat[mask]
+    y_pred = y_pred_flat[mask]
+
+    n = int(y_true.size)
+    if n == 0:
+        print("\nError stats: none (no finite points in this bucket).")
+        return
+
+    frac_err = np.abs(y_pred - y_true) / (np.abs(y_true) + EPS_FRACTIONAL)
+    mean_frac_err = float(np.mean(frac_err))
+    max_frac_err = float(np.max(frac_err))
+
+    diff = y_pred - y_true
+    mae_lin = float(np.mean(np.abs(diff)))
+    rmse_lin = float(np.sqrt(np.mean(diff ** 2)))
+
+    y_true_clamped = np.maximum(y_true, PLOT_FLOOR)
+    y_pred_clamped = np.maximum(y_pred, PLOT_FLOOR)
+    log_err = np.log10(y_pred_clamped) - np.log10(y_true_clamped)
+
+    mae_log = float(np.mean(np.abs(log_err)))
+    rmse_log = float(np.sqrt(np.mean(log_err ** 2)))
+    bias_log = float(np.mean(log_err))
+
+    pcts = np.percentile(frac_err * 100, [50, 90, 95, 99, 99.9])
+
+    print("\nError stats:")
+    print(f"Points:           {n}")
+    print(f"Average % error:  {100 * mean_frac_err:.3f}")
+    print(f"Linear MAE:       {mae_lin:.4e}")
+    print(f"Linear RMSE:      {rmse_lin:.4e}")
+    print(f"Log10 MAE (dex):  {mae_log:.4f}")
+    print(f"Log10 RMSE (dex): {rmse_log:.4f}")
+    print(f"Log10 Bias (dex): {bias_log:.4f}")
+    print(
+        "Frac Err % (50/90/95/99/99.9): "
+        f"{pcts[0]:.2f} / {pcts[1]:.2f} / {pcts[2]:.2f} / {pcts[3]:.2f} / {pcts[4]:.2f}"
+    )
+    print(f"Max Frac Error:   {100 * max_frac_err:.2f} %")
+
+
 # ---------------- Main ----------------
 def main() -> None:
     os.chdir(REPO)
@@ -212,6 +301,7 @@ def main() -> None:
 
     norm = NormalizationHelper(manifest)
     keep_idx, _labels = select_species_indices(species_cfg, PLOT_SPECIES)
+    n_species_plotted = len(keep_idx)
 
     # Load exported program
     ep = torch.export.load(MODEL_DIR / EP_FILENAME)
@@ -224,10 +314,19 @@ def main() -> None:
     all_true = []
     all_pred = []
 
+    # For count breakdown
+    traj_T = []
+    traj_K = []
+    traj_Ku = []
+    dup_total = 0
+    dup_traj = 0
+
     for i in range(n_use):
         y_traj = y_mat[i][:, idx_species]  # [T, S_model]
         g_vec = g_all[i][idx_globals] if idx_globals else np.empty((0,), dtype=np.float32)
         t_phys = get_time_vector_for_sample(t_vec, i)
+
+        traj_T.append(int(len(t_phys)))
 
         y0 = y_traj[0]
 
@@ -240,6 +339,14 @@ def main() -> None:
             species=species_cfg,
             globals_=globals_cfg,
         )
+
+        K = int(q_idx.size)
+        Ku = int(np.unique(q_idx).size)
+        traj_K.append(K)
+        traj_Ku.append(Ku)
+        if Ku < K:
+            dup_traj += 1
+            dup_total += (K - Ku)
 
         y_pred_norm = run_inference(model, y_batch, dt_batch, g_batch)  # [K, S_model]
         y_pred = norm.denormalize(y_pred_norm, species_cfg).cpu().numpy()  # [K, S_model]
@@ -255,36 +362,58 @@ def main() -> None:
     y_true_flat = np.concatenate(all_true, axis=0)
     y_pred_flat = np.concatenate(all_pred, axis=0)
 
-    frac_err = np.abs(y_pred_flat - y_true_flat) / (np.abs(y_true_flat) + EPS_FRACTIONAL)
-    mean_frac_err = float(np.mean(frac_err))
-    max_frac_err = float(np.max(frac_err))
+    # Global count components
+    traj_T_arr = np.asarray(traj_T, dtype=int)
+    traj_K_arr = np.asarray(traj_K, dtype=int)
+    traj_Ku_arr = np.asarray(traj_Ku, dtype=int)
 
-    print(f"Average percent error over {y_true_flat.size} points: {100 * mean_frac_err:.3f}")
+    total_q = int(np.sum(traj_K_arr))
+    raw_points = int(total_q * n_species_plotted)
+    # This should match unless something changes in how we flatten/append.
+    if raw_points != int(y_true_flat.size):
+        print(
+            "WARNING: raw_points != y_true_flat.size "
+            f"({raw_points} vs {y_true_flat.size}). Using y_true_flat.size for reporting."
+        )
+        raw_points = int(y_true_flat.size)
 
-    # --- Summary Statistics ---
-    diff = y_pred_flat - y_true_flat
-    mae_lin = float(np.mean(np.abs(diff)))
-    rmse_lin = float(np.sqrt(np.mean(diff ** 2)))
+    finite_mask = np.isfinite(y_true_flat) & np.isfinite(y_pred_flat)
+    finite_points = int(np.sum(finite_mask))
 
-    y_true_clamped = np.maximum(y_true_flat, PLOT_FLOOR)
-    y_pred_clamped = np.maximum(y_pred_flat, PLOT_FLOOR)
-    log_err = np.log10(y_pred_clamped) - np.log10(y_true_clamped)
+    context: Dict[str, object] = {
+        "n_traj": int(n_use),
+        "n_species": int(n_species_plotted),
+        "q_requested": int(Q_COUNT),
+        "total_q": int(total_q),
+        "raw_points": int(raw_points),
+        "finite_points": int(finite_points),
+        "t_stats": _stats_1d(traj_T_arr),
+        "k_stats": _stats_1d(traj_K_arr),
+        "ku_stats": _stats_1d(traj_Ku_arr),
+        "dup_total": int(dup_total),
+        "dup_traj": int(dup_traj),
+    }
 
-    mae_log = float(np.mean(np.abs(log_err)))
-    rmse_log = float(np.sqrt(np.mean(log_err ** 2)))
-    bias_log = float(np.mean(log_err))
+    # Bucket 1: y_true > threshold (and finite)
+    bucket_mask = finite_mask & (y_true_flat > ABUND_BUCKET_THRESHOLD)
+    bucket_points = int(np.sum(bucket_mask))
 
-    print(f"Linear MAE:       {mae_lin:.4e}")
-    print(f"Linear RMSE:      {rmse_lin:.4e}")
-    print(f"Log10 MAE (dex):  {mae_log:.4f}")
-    print(f"Log10 RMSE (dex): {rmse_log:.4f}")
-    print(f"Log10 Bias (dex): {bias_log:.4f}")
+    print_count_breakdown(
+        context=context,
+        points_after_filters=bucket_points,
+        title=f"Bucket: y_true > {ABUND_BUCKET_THRESHOLD:.1e}",
+    )
+    print_error_stats(y_true_flat[bucket_mask], y_pred_flat[bucket_mask], title="(stats)")
 
-    pcts = np.percentile(frac_err * 100, [50, 90, 95, 99, 99.9])
-    print(f"Frac Err % (50/90/95/99/99.9): {pcts[0]:.2f} / {pcts[1]:.2f} / {pcts[2]:.2f} / {pcts[3]:.2f} / {pcts[4]:.2f}")
-    print(f"Max Frac Error:   {100 * max_frac_err:.2f} %")
+    # Bucket 2: all finite points
+    print_count_breakdown(
+        context=context,
+        points_after_filters=finite_points,
+        title="Bucket: all finite points",
+    )
+    print_error_stats(y_true_flat[finite_mask], y_pred_flat[finite_mask], title="(stats)")
 
-    out_png = MODEL_DIR / "plots" / f"pred_vs_true_scatter_{n_use}samples.png"
+    out_png = MODEL_DIR / "plots" / f"accuracy.png"
     plot_pred_vs_true_scatter(y_true_flat, y_pred_flat, out_png)
 
 

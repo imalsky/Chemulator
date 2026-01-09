@@ -24,7 +24,7 @@ plt.style.use("science.mplstyle")
 
 # ---------------- Paths & settings ----------------
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models" / "big_subset_1_5"
+MODEL_DIR = REPO / "models" / "big_mlp"
 EP_FILENAME = "export_k1_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))
@@ -36,7 +36,7 @@ Q_COUNT = 100
 XMIN, XMAX = 1e-3, 1e8
 
 # Choose species by base names; empty list = plot all
-PLOT_SPECIES: List[str] = ["H2", "H2O", "CH4", "CO", "CO2", "NH3", "HCN", "N2"]
+PLOT_SPECIES: List[str] = []
 
 
 # ---------------- Utils ----------------
@@ -107,7 +107,11 @@ def plot_results(
     plot_species: List[str],
     out_path: Path,
 ) -> None:
-    """Log–log plot: solid=truth, dashed=prediction; only selected species."""
+    """Log–log plot: solid=truth, dashed=prediction; only selected species.
+
+    Color map: viridis
+    Ordering: by max ground-truth abundance (descending)
+    """
     base_all = [n[:-10] if n.endswith("_evolution") else n for n in species_out]
     keep = [i for i, b in enumerate(base_all) if (not plot_species) or (b in plot_species)]
     labels = [base_all[i] for i in keep]
@@ -125,24 +129,40 @@ def plot_results(
     y_pr = np.clip(y_pred[m_pr], tiny, None)
 
     fig, ax = plt.subplots(figsize=(7, 7))
-    colors = plt.cm.tab20(np.linspace(0, 0.95, len(keep)))
 
-    for i, (lab, col) in enumerate(zip(labels, colors)):
-        ax.loglog(t_gt, y_gt[:, i], "-", lw=3, alpha=0.3, color=col)
+    # Order species by max ground-truth abundance (descending)
+    if y_gt.size:
+        max_gt = np.max(y_gt, axis=0)  # [N_keep]
+        order = np.argsort(max_gt)[::-1]
+    else:
+        order = np.arange(len(labels))
+
+    # Viridis colors assigned by abundance rank: max -> brightest
+    n = len(order)
+    if n > 0:
+        color_vals = np.linspace(0.15, 0.95, n)  # avoid extremes; nice contrast
+        colors = plt.cm.plasma(color_vals[::-1])  # max abundance gets ~0.95 (bright)
+    else:
+        colors = np.empty((0, 4))
+
+    for rank, idx in enumerate(order):
+        lab = labels[idx]
+        col = colors[rank]
+
+        ax.loglog(t_gt, y_gt[:, idx], "-", lw=3, alpha=0.3, color=col)
         if t_gt.size:
-            ax.loglog([t_gt[0]], [y_gt[0, i]], "o", mfc="none", color=col, ms=5)
-        ax.loglog(t_pr, y_pr[:, i], "--", lw=3, alpha=1.0, color=col)
+            ax.loglog([t_gt[0]], [y_gt[0, idx]], "o", mfc="none", color=col, ms=5)
+        ax.loglog(t_pr, y_pr[:, idx], "--", lw=3, alpha=1.0, color=col)
 
     ax.set_xlim(XMIN, XMAX)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Relative Abundance")
     ax.set_box_aspect(1)
 
-    # Species legend (sorted by max ground-truth abundance)
-    order = np.argsort(np.max(y_gt, axis=0))[::-1] if y_gt.size else np.arange(len(labels))
-    species_handles = [Line2D([0], [0], color=colors[i], lw=2.0) for i in order]
+    # Species legend (already ordered by max ground-truth abundance)
+    species_handles = [Line2D([0], [0], color=colors[r], lw=2.0) for r in range(n)]
     species_labels = [labels[i] for i in order]
-    leg1 = ax.legend(handles=species_handles, labels=species_labels, loc="best", title="Species")
+    leg1 = ax.legend(handles=species_handles, labels=species_labels, loc="best", title="Species", ncol=3)
     ax.add_artist(leg1)
 
     style_handles = [
@@ -150,6 +170,7 @@ def plot_results(
         Line2D([0], [0], color="black", lw=1.6, ls="--", label="Prediction"),
     ]
     ax.legend(handles=style_handles, loc="lower right")
+    ax.set_ylim(1e-28, 3)
 
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
