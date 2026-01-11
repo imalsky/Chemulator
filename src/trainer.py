@@ -13,7 +13,7 @@ Dataset structure: (y_i, dt_norm[B,K,1], y_j[B,K,S], g[B,G], aux{...}[, k_mask[B
 
 NOTE on "multiplicative error proxy":
 - This file logs/prints an *approximate multiplicative error proxy* derived from the epoch-mean |Δlog10| metric:
-    mult_err_proxy = 10**(mean_abs_log10_error) - 1
+    mult_err_proxy = expm1(ln(10) * mean_abs_log10_error)   # == 10**x - 1, but numerically stable
 - This is **not** a true fractional error; it is a proxy mapping log10-MAE to a typical multiplicative factor minus 1.
 """
 
@@ -148,32 +148,47 @@ class AdaptiveStiffLoss(nn.Module):
         mask: Optional[torch.Tensor] = None,  # [B,K]
         return_components: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
-        # MSE in normalized Z-space
-        loss_z = (pred_z - true_z) ** 2
+        # Promote reductions/metrics to float32 for stability under AMP.
+        # Keep the operation differentiable (casts still allow gradients).
+        diff_z_f = (pred_z - true_z).to(torch.float32)
+        loss_z_f = diff_z_f * diff_z_f  # [B,K,S] float32
 
         # MAE in log10-physical space (MUST backprop to pred_z)
         pred_log = self._z_to_log10(pred_z)
         true_log = self._z_to_log10(true_z)
-        loss_phys = (pred_log - true_log).abs() * self.w_species
+        abs_log_f = (pred_log - true_log).abs().to(torch.float32)  # [B,K,S] float32
+
+        w_species_f = self.w_species.to(dtype=abs_log_f.dtype)
+        loss_phys_f = abs_log_f * w_species_f  # weighted |Δlog10|, float32
 
         if mask is not None:
-            m = mask.unsqueeze(-1).to(loss_phys.dtype)
-            loss_phys = loss_phys * m
-            loss_z = loss_z * m
+            m = mask.unsqueeze(-1).to(loss_phys_f.dtype)
+            loss_phys_f = loss_phys_f * m
+            loss_z_f = loss_z_f * m
+            abs_log_f = abs_log_f * m
 
             valid_pairs = torch.count_nonzero(mask if mask.dtype == torch.bool else (mask > 0))
             if int(valid_pairs.item()) == 0:
                 raise ValueError("AdaptiveStiffLoss: mask has zero valid [B,K] positions; cannot compute loss.")
-            denom = valid_pairs.to(loss_phys.dtype) * loss_phys.shape[-1]
+            denom_f = valid_pairs.to(loss_phys_f.dtype) * loss_phys_f.shape[-1]
         else:
-            denom = torch.tensor(loss_phys.numel(), dtype=loss_phys.dtype, device=loss_phys.device)
+            denom_f = torch.tensor(loss_phys_f.numel(), dtype=loss_phys_f.dtype, device=loss_phys_f.device)
 
-        phys = self.lambda_phys * loss_phys.sum() / denom
-        zstb = self.lambda_z * loss_z.sum() / denom
+        mean_abs_log10 = abs_log_f.sum() / denom_f
+        weighted_mean_abs_log10 = loss_phys_f.sum() / denom_f
+
+        phys = self.lambda_phys * weighted_mean_abs_log10
+        zstb = self.lambda_z * (loss_z_f.sum() / denom_f)
         total = phys + zstb
 
         if return_components:
-            return {"total": total, "phys": phys, "z": zstb}
+            return {
+                "total": total,
+                "phys": phys,
+                "z": zstb,
+                "mean_abs_log10": mean_abs_log10,
+                "weighted_mean_abs_log10": weighted_mean_abs_log10,
+            }
         return total
 
 
@@ -303,6 +318,8 @@ class ModelTask(pl.LightningModule):
         self._last_reported_epoch: int = -1
         self._last_train_metrics: dict[str, float] = {}
         self._last_val_metrics: dict[str, float] = {}
+        self._last_train_epoch_idx: int | None = None
+        self._last_val_epoch_idx: int | None = None
 
         tcfg = cfg.get("training", {})
         self.lr = float(tcfg.get("lr", DEF_LR))
@@ -472,6 +489,7 @@ class ModelTask(pl.LightningModule):
         self._t_wsum = torch.zeros((), dtype=torch.float64, device=dev)
         self._t_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)
         self._t_z_sum = torch.zeros((), dtype=torch.float64, device=dev)
+        self._t_abslog_sum = torch.zeros((), dtype=torch.float64, device=dev)
 
     def training_step(self, batch, batch_idx: int):
         y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
@@ -482,6 +500,16 @@ class ModelTask(pl.LightningModule):
 
         comps = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
         loss = comps["total"]
+
+        # Fail fast on NaN/inf to avoid meaningless epoch aggregates.
+        if not torch.isfinite(loss):
+            raise ValueError(f"[train] Non-finite total loss at batch {batch_idx}")
+        if not torch.isfinite(comps["phys"]):
+            raise ValueError(f"[train] Non-finite phys loss at batch {batch_idx}")
+        if not torch.isfinite(comps["z"]):
+            raise ValueError(f"[train] Non-finite z loss at batch {batch_idx}")
+        if "mean_abs_log10" in comps and (not torch.isfinite(comps["mean_abs_log10"])):
+            raise ValueError(f"[train] Non-finite mean_abs_log10 at batch {batch_idx}")
 
         # sample-weighted accumulation (matches validation exactly)
         with torch.no_grad():
@@ -498,6 +526,8 @@ class ModelTask(pl.LightningModule):
                 self._t_sum += (comps["total"].detach().to(torch.float64) * weight)
                 self._t_phys_sum += (comps["phys"].detach().to(torch.float64) * weight)
                 self._t_z_sum += (comps["z"].detach().to(torch.float64) * weight)
+                if "mean_abs_log10" in comps:
+                    self._t_abslog_sum += (comps["mean_abs_log10"].detach().to(torch.float64) * weight)
                 self._t_wsum += weight
 
         return loss
@@ -505,12 +535,13 @@ class ModelTask(pl.LightningModule):
     def on_train_epoch_end(self) -> None:
         import torch.distributed as dist
 
+        # Reduce epoch accumulators across ranks (we handle sync manually).
         if dist.is_available() and dist.is_initialized():
-            for t in (self._t_sum, self._t_phys_sum, self._t_z_sum, self._t_wsum):
+            for t in (self._t_sum, self._t_phys_sum, self._t_z_sum, self._t_abslog_sum, self._t_wsum):
                 dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
         if float(self._t_wsum.item()) <= 0.0:
-            for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_wsum"):
+            for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_abslog_sum", "_t_wsum"):
                 setattr(self, name, torch.zeros_like(getattr(self, name)))
             return
 
@@ -519,8 +550,9 @@ class ModelTask(pl.LightningModule):
         train_phys = (self._t_phys_sum / w).to(torch.float32)
         train_z = (self._t_z_sum / w).to(torch.float32)
 
-        base10 = torch.tensor(10.0, device=train_phys.device, dtype=train_phys.dtype)
-        train_mult_err_proxy = torch.pow(base10, train_phys) - 1.0
+        mean_abslog = (self._t_abslog_sum / w).to(torch.float64)
+        mean_abslog = torch.clamp(mean_abslog, min=0.0)
+        train_mult_err_proxy = torch.expm1(mean_abslog * math.log(10.0)).to(torch.float32)
 
         self._last_train_metrics = {
             "train_loss": float(train_loss.detach().cpu().item()),
@@ -528,12 +560,35 @@ class ModelTask(pl.LightningModule):
             "train_z": float(train_z.detach().cpu().item()),
             "train_mult_err_proxy": float(train_mult_err_proxy.detach().cpu().item()),
         }
+        self._last_train_epoch_idx = int(self.current_epoch)
         self.log("train_loss", train_loss, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_phys", train_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_z", train_z, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_mult_err_proxy", train_mult_err_proxy, prog_bar=False, on_epoch=True, sync_dist=False)
 
-        for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_wsum"):
+        # If validation will NOT run this epoch, report now so we still emit one row/line per epoch.
+        # (If validation runs, we report at the end of validation so val metrics are included.)
+        tr = getattr(self, "trainer", None)
+        if tr is not None and (not getattr(tr, "sanity_checking", False)):
+            # Determine whether a validation loop is scheduled for this epoch.
+            has_val_dl = True
+            vdl = getattr(tr, "val_dataloaders", None)
+            try:
+                has_val_dl = (vdl is not None) and (len(vdl) > 0)
+            except Exception:
+                has_val_dl = vdl is not None
+
+            check_every = 1
+            try:
+                check_every = int(getattr(tr, "check_val_every_n_epoch", 1) or 1)
+            except Exception:
+                check_every = 1
+            will_val = (check_every <= 1) or (((int(self.current_epoch) + 1) % check_every) == 0)
+
+            if (not has_val_dl) or (not will_val):
+                self._report_epoch()
+
+        for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_abslog_sum", "_t_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
 
     def on_validation_epoch_start(self) -> None:
@@ -542,6 +597,7 @@ class ModelTask(pl.LightningModule):
         self._v_wsum = torch.zeros((), dtype=torch.float64, device=dev)
         self._v_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)
         self._v_z_sum = torch.zeros((), dtype=torch.float64, device=dev)
+        self._v_abslog_sum = torch.zeros((), dtype=torch.float64, device=dev)
 
     def validation_step(self, batch, batch_idx: int):
         y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
@@ -554,6 +610,9 @@ class ModelTask(pl.LightningModule):
         total = comps["total"].detach()
         phys = comps["phys"].detach()
         zstb = comps["z"].detach()
+        abslog = comps.get("mean_abs_log10", None)
+        if abslog is not None:
+            abslog = abslog.detach()
 
         if not torch.isfinite(total):
             raise ValueError(f"[val] Non-finite total loss at batch {batch_idx}")
@@ -561,6 +620,8 @@ class ModelTask(pl.LightningModule):
             raise ValueError(f"[val] Non-finite phys loss at batch {batch_idx}")
         if not torch.isfinite(zstb):
             raise ValueError(f"[val] Non-finite z loss at batch {batch_idx}")
+        if abslog is not None and (not torch.isfinite(abslog)):
+            raise ValueError(f"[val] Non-finite mean_abs_log10 at batch {batch_idx}")
 
         if k_mask is not None:
             valid_pairs = torch.count_nonzero(k_mask if k_mask.dtype == torch.bool else (k_mask > 0))
@@ -578,6 +639,8 @@ class ModelTask(pl.LightningModule):
         self._v_sum += (total.to(torch.float64) * weight)
         self._v_phys_sum += (phys.to(torch.float64) * weight)
         self._v_z_sum += (zstb.to(torch.float64) * weight)
+        if abslog is not None:
+            self._v_abslog_sum += (abslog.to(torch.float64) * weight)
         self._v_wsum += weight
 
         return total
@@ -585,7 +648,7 @@ class ModelTask(pl.LightningModule):
     def on_validation_epoch_end(self) -> None:
         tr = getattr(self, "trainer", None)
         if tr is not None and getattr(tr, "sanity_checking", False):
-            for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_wsum"):
+            for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_abslog_sum", "_v_wsum"):
                 if hasattr(self, name):
                     setattr(self, name, torch.zeros_like(getattr(self, name)))
             return
@@ -597,14 +660,16 @@ class ModelTask(pl.LightningModule):
             self._v_sum = torch.zeros((), dtype=torch.float64, device=dev)
             self._v_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)
             self._v_z_sum = torch.zeros((), dtype=torch.float64, device=dev)
+            self._v_abslog_sum = torch.zeros((), dtype=torch.float64, device=dev)
             self._v_wsum = torch.zeros((), dtype=torch.float64, device=dev)
 
+        # Reduce epoch accumulators across ranks (we handle sync manually).
         if dist.is_available() and dist.is_initialized():
-            for t in (self._v_sum, self._v_phys_sum, self._v_z_sum, self._v_wsum):
+            for t in (self._v_sum, self._v_phys_sum, self._v_z_sum, self._v_abslog_sum, self._v_wsum):
                 dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
         if float(self._v_wsum.item()) <= 0.0:
-            for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_wsum"):
+            for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_abslog_sum", "_v_wsum"):
                 setattr(self, name, torch.zeros_like(getattr(self, name)))
             return
 
@@ -613,8 +678,9 @@ class ModelTask(pl.LightningModule):
         val_phys = (self._v_phys_sum / w).to(torch.float32)
         val_z = (self._v_z_sum / w).to(torch.float32)
 
-        base10 = torch.tensor(10.0, device=val_phys.device, dtype=val_phys.dtype)
-        val_mult_err_proxy = torch.pow(base10, val_phys) - 1.0
+        mean_abslog = (self._v_abslog_sum / w).to(torch.float64)
+        mean_abslog = torch.clamp(mean_abslog, min=0.0)
+        val_mult_err_proxy = torch.expm1(mean_abslog * math.log(10.0)).to(torch.float32)
 
         self._last_val_metrics = {
             "val_loss": float(val_loss.detach().cpu().item()),
@@ -622,6 +688,7 @@ class ModelTask(pl.LightningModule):
             "val_z": float(val_z.detach().cpu().item()),
             "val_mult_err_proxy": float(val_mult_err_proxy.detach().cpu().item()),
         }
+        self._last_val_epoch_idx = int(self.current_epoch)
 
         self.log("val_loss", val_loss, prog_bar=True, on_epoch=True, sync_dist=False)
         self.log("val_phys", val_phys, prog_bar=False, on_epoch=True, sync_dist=False)
@@ -630,7 +697,7 @@ class ModelTask(pl.LightningModule):
 
         self._report_epoch()
 
-        for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_wsum"):
+        for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_abslog_sum", "_v_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
 
     def _report_epoch(self) -> None:
@@ -657,6 +724,10 @@ class ModelTask(pl.LightningModule):
         if lr is not None:
             self.log("lr", float(lr), prog_bar=False, on_step=False, on_epoch=True, sync_dist=False)
 
+        cur_epoch_idx = int(self.current_epoch)
+        train_m = self._last_train_metrics if self._last_train_epoch_idx == cur_epoch_idx else {}
+        val_m = self._last_val_metrics if self._last_val_epoch_idx == cur_epoch_idx else {}
+
         def fmt(x: Optional[float]) -> str:
             if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
                 return ""
@@ -668,14 +739,14 @@ class ModelTask(pl.LightningModule):
             "wall_time": self._csv.wall_time_str(),
             "epoch_time_sec": ("" if (not math.isfinite(epoch_time)) else f"{epoch_time:.6f}"),
             "lr": ("" if lr is None else f"{lr:.6e}"),
-            "train_loss": fmt(self._last_train_metrics.get("train_loss")),
-            "train_phys": fmt(self._last_train_metrics.get("train_phys")),
-            "train_z": fmt(self._last_train_metrics.get("train_z")),
-            "train_mult_err_proxy": fmt(self._last_train_metrics.get("train_mult_err_proxy")),
-            "val_loss": fmt(self._last_val_metrics.get("val_loss")),
-            "val_phys": fmt(self._last_val_metrics.get("val_phys")),
-            "val_z": fmt(self._last_val_metrics.get("val_z")),
-            "val_mult_err_proxy": fmt(self._last_val_metrics.get("val_mult_err_proxy")),
+            "train_loss": fmt(train_m.get("train_loss")),
+            "train_phys": fmt(train_m.get("train_phys")),
+            "train_z": fmt(train_m.get("train_z")),
+            "train_mult_err_proxy": fmt(train_m.get("train_mult_err_proxy")),
+            "val_loss": fmt(val_m.get("val_loss")),
+            "val_phys": fmt(val_m.get("val_phys")),
+            "val_z": fmt(val_m.get("val_z")),
+            "val_mult_err_proxy": fmt(val_m.get("val_mult_err_proxy")),
         }
         self._csv.write_epoch_row(epoch_1idx, row)
 
@@ -701,9 +772,9 @@ class ModelTask(pl.LightningModule):
             print("----- | ----------- | ----------- | -------------- | ---------- | --------", flush=True)
             self._printed_header = True
 
-        tr_loss = self._last_train_metrics.get("train_loss")
-        va_loss = self._last_val_metrics.get("val_loss")
-        va_proxy = self._last_val_metrics.get("val_mult_err_proxy")
+        tr_loss = train_m.get("train_loss")
+        va_loss = val_m.get("val_loss")
+        va_proxy = val_m.get("val_mult_err_proxy")
 
         epoch_str = f"E{epoch_1idx:04d}"
         line = (
