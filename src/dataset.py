@@ -6,8 +6,6 @@ Batch variables and structures:
     dt  : [B, K, 1]       (dt-spec normalized, runtime dtype)
     y_j : [B, K, S]       (runtime dtype)
     g   : [B, G]          (runtime dtype)
-    aux : {'i':[B], 'j':[B,K]}
-    k_mask : [B, K]       (True where j is valid)
 """
 
 from __future__ import annotations
@@ -551,12 +549,12 @@ class FlowMapPairsDataset(Dataset):
 
     def collate_batch(
         self, batch: Sequence[_Index]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Vectorized sampling for a batch of row indices.
 
         Returns:
-            (y_i, dt, y_j, g, aux, k_mask)
+            (y_i, dt, y_j, g)
         """
         B = len(batch)
         dev = self._stage_device
@@ -575,8 +573,6 @@ class FlowMapPairsDataset(Dataset):
         offs = self._sample_offsets_conditioned(i_used)  # [B,K]
         j_idx = i_used.unsqueeze(1) + offs  # [B,K], guaranteed < T
 
-        # Keep mask for API compatibility (always True because j is always valid)
-        k_mask = torch.ones((B, int(self.K)), device=dev, dtype=torch.bool)
 
         # Gather species/globals/time
         y_btS = self.y.index_select(0, rows)  # [B,T,S]
@@ -607,10 +603,9 @@ class FlowMapPairsDataset(Dataset):
             dt_norm = self.norm.normalize_dt_from_phys(dt_phys)  # [B,K] float32
 
         dt = dt_norm.to(dtype=self._runtime_dtype).unsqueeze(-1)  # [B,K,1]
-        aux = {"i": i_used, "j": j_idx}
 
-        self._log_first_batch_checks_once(y_i, dt, y_j, g, k_mask)
-        return y_i, dt, y_j, g, aux, k_mask
+        self._log_first_batch_checks_once(y_i, dt, y_j, g)
+        return y_i, dt, y_j, g
 
     # ============================= Logging helpers ==============================
 
@@ -655,7 +650,6 @@ class FlowMapPairsDataset(Dataset):
         dt: torch.Tensor,
         y_j: torch.Tensor,
         g: torch.Tensor,
-        k_mask: torch.Tensor,
     ) -> None:
         if self._log is None or self._did_log_first_batch_checks:
             return
@@ -667,20 +661,17 @@ class FlowMapPairsDataset(Dataset):
 
             dt_min = float(dt.min().item())
             dt_max = float(dt.max().item())
-            k_valid_frac = float(k_mask.float().mean().item())
 
             self._log.info(
                 "FlowMapPairsDataset first batch checks: "
                 "y_i finite=%s, y_j finite=%s, dt finite=%s, g finite=%s, "
-                "dt_range=[%g, %g], k_mask_valid_frac=%.3f, "
-                "batch_size=%d, K=%d, S=%d, G=%d",
+                "dt_range=[%g, %g], batch_size=%d, K=%d, S=%d, G=%d",
                 yi_finite,
                 yj_finite,
                 dt_finite,
                 g_finite,
                 dt_min,
                 dt_max,
-                k_valid_frac,
                 int(y_i.shape[0]),
                 int(y_j.shape[1]) if y_j.ndim >= 2 else 0,
                 int(y_i.shape[1]) if y_i.ndim == 2 else 0,

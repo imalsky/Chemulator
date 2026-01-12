@@ -51,6 +51,7 @@ def _fresh_activation(act: nn.Module) -> nn.Module:
 
 # ----------------------------- Core blocks ------------------------------------
 
+
 class MLP(nn.Module):
     """Simple MLP with optional dropout."""
     def __init__(
@@ -74,6 +75,75 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.network(x)
+
+
+class ResidualMLP(nn.Module):
+    """
+    Residual MLP with skip connections across each hidden layer.
+
+    This is used for the MLP-only model to provide a "dynamics-style" residual
+    (analogous in spirit to LatentDynamics(residual=True) in the autoencoder),
+    while still allowing an explicit y + dy head via predict_delta.
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: Sequence[int],
+        output_dim: int,
+        activation: nn.Module,
+        dropout_p: float = 0.0,
+        residual: bool = True,
+    ):
+        super().__init__()
+        self.residual = bool(residual)
+
+        h = [int(x) for x in hidden_dims]
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+
+        self.linears = nn.ModuleList()
+        self.proj = nn.ModuleList()
+        self.acts = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+
+        dims = [self.input_dim] + h
+        for i in range(len(h)):
+            in_d = dims[i]
+            out_d = dims[i + 1]
+
+            self.linears.append(nn.Linear(in_d, out_d))
+            self.acts.append(_fresh_activation(activation))
+
+            if dropout_p and dropout_p > 0:
+                self.dropouts.append(nn.Dropout(p=float(dropout_p)))
+            else:
+                self.dropouts.append(nn.Identity())
+
+            if self.residual:
+                if in_d == out_d:
+                    self.proj.append(nn.Identity())
+                else:
+                    # Projection for skip path when dimensions differ.
+                    self.proj.append(nn.Linear(in_d, out_d, bias=False))
+            else:
+                self.proj.append(nn.Identity())
+
+        last_dim = dims[-1]
+        self.out = nn.Linear(last_dim, self.output_dim)
+
+    def last_linear(self) -> nn.Linear:
+        return self.out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x
+        for lin, act, do, proj in zip(self.linears, self.acts, self.dropouts, self.proj):
+            y = lin(h)
+            y = act(y)
+            y = do(y)
+            if self.residual:
+                y = y + proj(h)
+            h = y
+        return self.out(h)
 
 
 class Encoder(nn.Module):
@@ -373,6 +443,7 @@ class FlowMapMLP(nn.Module):
         hidden_dims: Sequence[int],
         activation_name: str = "gelu",
         dropout: float = 0.0,
+        dynamics_residual: bool = True,
         predict_delta: bool = True,
         predict_delta_log_phys: bool = False,
         target_idx: Optional[torch.Tensor] = None,
@@ -389,6 +460,7 @@ class FlowMapMLP(nn.Module):
         self.G = int(global_dim)
 
         # Config
+        self.dynamics_residual = bool(dynamics_residual)
         self.predict_delta = bool(predict_delta)
         self.predict_delta_log_phys = bool(predict_delta_log_phys)
         self.softmax_head = bool(softmax_head)
@@ -426,19 +498,36 @@ class FlowMapMLP(nn.Module):
         # Main MLP
         act = get_activation(activation_name)
         inp = self.S_in + 1 + self.G
-        self.network = MLP(
-            input_dim=inp,
-            hidden_dims=list(hidden_dims),
-            output_dim=self.S_out,
-            activation=act,
-            dropout_p=float(dropout),
-        )
+
+        # "Dynamics-style" residual connections inside the MLP (default ON).
+        # This is distinct from the explicit y + dy head (predict_delta).
+        if self.dynamics_residual:
+            self.network = ResidualMLP(
+                input_dim=inp,
+                hidden_dims=list(hidden_dims),
+                output_dim=self.S_out,
+                activation=act,
+                dropout_p=float(dropout),
+                residual=True,
+            )
+        else:
+            self.network = MLP(
+                input_dim=inp,
+                hidden_dims=list(hidden_dims),
+                output_dim=self.S_out,
+                activation=act,
+                dropout_p=float(dropout),
+            )
 
         # Gentle init on residual-style heads for stability at start
         if self.predict_delta or self.predict_delta_log_phys:
             try:
                 with torch.no_grad():
-                    lin_out: nn.Linear = self.network.network[-1]  # type: ignore[assignment]
+                    lin_out: nn.Linear
+                    if isinstance(self.network, ResidualMLP):
+                        lin_out = self.network.last_linear()
+                    else:
+                        lin_out = self.network.network[-1]  # type: ignore[assignment]
                     nn.init.zeros_(lin_out.bias)
                     lin_out.weight.mul_(0.1)
             except Exception:
@@ -598,6 +687,7 @@ def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = No
             hidden_dims=mlp_hidden,
             activation_name=activation,
             dropout=dropout,
+            dynamics_residual=dynamics_residual,
             predict_delta=predict_delta,
             predict_delta_log_phys=predict_delta_log_phys,
             target_idx=torch.tensor(target_idx, dtype=torch.long),

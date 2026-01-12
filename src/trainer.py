@@ -6,10 +6,10 @@ trainer.py
 - AMP precision from cfg (bf16/fp16/fp32); TF32/cudnn handled in main/hardware setup
 - Optional torch.compile (Inductor)
 - Cosine schedule with warmup
-- Vectorized K handling; optional K-mask reduction
+- Vectorized K handling (fixed K per batch)
 - Sample-weighted epoch reduction for train/val (matches exactly)
 
-Dataset structure: (y_i, dt_norm[B,K,1], y_j[B,K,S], g[B,G], aux{...}[, k_mask[B,K]])
+Dataset structure: (y_i, dt_norm[B,K,1], y_j[B,K,S], g[B,G])
 
 NOTE on "multiplicative error proxy":
 - This file logs/prints an *approximate multiplicative error proxy* derived from the epoch-mean |Δlog10| metric:
@@ -144,8 +144,6 @@ class AdaptiveStiffLoss(nn.Module):
         self,
         pred_z: torch.Tensor,                 # [B,K,S]
         true_z: torch.Tensor,                 # [B,K,S]
-        t_norm: torch.Tensor,                 # [B,K,1] (unused)
-        mask: Optional[torch.Tensor] = None,  # [B,K]
         return_components: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         # Promote reductions/metrics to float32 for stability under AMP.
@@ -160,19 +158,7 @@ class AdaptiveStiffLoss(nn.Module):
 
         w_species_f = self.w_species.to(dtype=abs_log_f.dtype)
         loss_phys_f = abs_log_f * w_species_f  # weighted |Δlog10|, float32
-
-        if mask is not None:
-            m = mask.unsqueeze(-1).to(loss_phys_f.dtype)
-            loss_phys_f = loss_phys_f * m
-            loss_z_f = loss_z_f * m
-            abs_log_f = abs_log_f * m
-
-            valid_pairs = torch.count_nonzero(mask if mask.dtype == torch.bool else (mask > 0))
-            if int(valid_pairs.item()) == 0:
-                raise ValueError("AdaptiveStiffLoss: mask has zero valid [B,K] positions; cannot compute loss.")
-            denom_f = valid_pairs.to(loss_phys_f.dtype) * loss_phys_f.shape[-1]
-        else:
-            denom_f = torch.tensor(loss_phys_f.numel(), dtype=loss_phys_f.dtype, device=loss_phys_f.device)
+        denom_f = torch.tensor(loss_phys_f.numel(), dtype=loss_phys_f.dtype, device=loss_phys_f.device)
 
         mean_abs_log10 = abs_log_f.sum() / denom_f
         weighted_mean_abs_log10 = loss_phys_f.sum() / denom_f
@@ -407,17 +393,17 @@ class ModelTask(pl.LightningModule):
         return self.model(y_i, dt_norm, g)
 
     def _unpack(self, batch):
-        # (y_i, dt_norm, y_j, g, aux[, k_mask])
-        if len(batch) == 6:
-            y_i, dt_norm, y_j, g, _aux, k_mask = batch
-        else:
-            y_i, dt_norm, y_j, g, _aux = batch
-            k_mask = None
+        # (y_i, dt_norm, y_j, g)
+        if len(batch) != 4:
+            raise ValueError(
+                f"Expected batch to be a 4-tuple (y_i, dt_norm, y_j, g); got len={len(batch)}"
+            )
+        y_i, dt_norm, y_j, g = batch
 
         if self._target_idx is not None:
             idx = self._target_idx.to(y_j.device)
             y_j = y_j.index_select(dim=-1, index=idx)
-        return y_i, dt_norm, y_j, g, k_mask
+        return y_i, dt_norm, y_j, g
 
     # --------------------------- optim / sched --------------------------------
 
@@ -492,13 +478,13 @@ class ModelTask(pl.LightningModule):
         self._t_abslog_sum = torch.zeros((), dtype=torch.float64, device=dev)
 
     def training_step(self, batch, batch_idx: int):
-        y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
+        y_i, dt_in, y_j, g = self._unpack(batch)
         pred = self(y_i, dt_in, g)
 
         if pred.shape != y_j.shape:
             raise RuntimeError(f"Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
 
-        comps = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
+        comps = self.criterion(pred, y_j, return_components=True)
         loss = comps["total"]
 
         # Fail fast on NaN/inf to avoid meaningless epoch aggregates.
@@ -513,11 +499,8 @@ class ModelTask(pl.LightningModule):
 
         # sample-weighted accumulation (matches validation exactly)
         with torch.no_grad():
-            if k_mask is not None:
-                valid_pairs = torch.count_nonzero(k_mask if k_mask.dtype == torch.bool else (k_mask > 0))
-            else:
-                B, K, _S = y_j.shape
-                valid_pairs = torch.tensor(B * K, device=y_j.device, dtype=torch.long)
+            B, K, _S = y_j.shape
+            valid_pairs = torch.tensor(B * K, device=y_j.device, dtype=torch.long)
 
             if int(valid_pairs.item()) > 0:
                 S = torch.tensor(y_j.shape[-1], device=y_j.device, dtype=torch.float64)
@@ -566,27 +549,10 @@ class ModelTask(pl.LightningModule):
         self.log("train_z", train_z, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_mult_err_proxy", train_mult_err_proxy, prog_bar=False, on_epoch=True, sync_dist=False)
 
-        # If validation will NOT run this epoch, report now so we still emit one row/line per epoch.
-        # (If validation runs, we report at the end of validation so val metrics are included.)
-        tr = getattr(self, "trainer", None)
-        if tr is not None and (not getattr(tr, "sanity_checking", False)):
-            # Determine whether a validation loop is scheduled for this epoch.
-            has_val_dl = True
-            vdl = getattr(tr, "val_dataloaders", None)
-            try:
-                has_val_dl = (vdl is not None) and (len(vdl) > 0)
-            except Exception:
-                has_val_dl = vdl is not None
-
-            check_every = 1
-            try:
-                check_every = int(getattr(tr, "check_val_every_n_epoch", 1) or 1)
-            except Exception:
-                check_every = 1
-            will_val = (check_every <= 1) or (((int(self.current_epoch) + 1) % check_every) == 0)
-
-            if (not has_val_dl) or (not will_val):
-                self._report_epoch()
+        # Always report here.
+        # Lightning finalizes the epoch (including any validation) before this hook returns,
+        # so both train and val metrics for the current epoch (if any) are available.
+        self._report_epoch()
 
         for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_abslog_sum", "_t_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
@@ -600,13 +566,13 @@ class ModelTask(pl.LightningModule):
         self._v_abslog_sum = torch.zeros((), dtype=torch.float64, device=dev)
 
     def validation_step(self, batch, batch_idx: int):
-        y_i, dt_in, y_j, g, k_mask = self._unpack(batch)
+        y_i, dt_in, y_j, g = self._unpack(batch)
         pred = self(y_i, dt_in, g)
 
         if pred.shape != y_j.shape:
             raise RuntimeError(f"[val] Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
 
-        comps = self.criterion(pred, y_j, dt_in, k_mask, return_components=True)
+        comps = self.criterion(pred, y_j, return_components=True)
         total = comps["total"].detach()
         phys = comps["phys"].detach()
         zstb = comps["z"].detach()
@@ -623,11 +589,8 @@ class ModelTask(pl.LightningModule):
         if abslog is not None and (not torch.isfinite(abslog)):
             raise ValueError(f"[val] Non-finite mean_abs_log10 at batch {batch_idx}")
 
-        if k_mask is not None:
-            valid_pairs = torch.count_nonzero(k_mask if k_mask.dtype == torch.bool else (k_mask > 0))
-        else:
-            B, K, _S = y_j.shape
-            valid_pairs = torch.tensor(B * K, device=y_j.device, dtype=torch.long)
+        B, K, _S = y_j.shape
+        valid_pairs = torch.tensor(B * K, device=y_j.device, dtype=torch.long)
 
         if int(valid_pairs.item()) == 0:
             B, K, S = y_j.shape
@@ -694,8 +657,6 @@ class ModelTask(pl.LightningModule):
         self.log("val_phys", val_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("val_z", val_z, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("val_mult_err_proxy", val_mult_err_proxy, prog_bar=False, on_epoch=True, sync_dist=False)
-
-        self._report_epoch()
 
         for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_abslog_sum", "_v_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
