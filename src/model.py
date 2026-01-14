@@ -18,6 +18,7 @@ Notes:
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
@@ -223,9 +224,29 @@ class LatentDynamics(nn.Module):
 
         z_exp = z.unsqueeze(1).expand(B, K, -1)
         g_exp = g.unsqueeze(1).expand(B, K, -1)
-        x = torch.cat([z_exp, dt.unsqueeze(-1), g_exp], dim=-1)  # [B,K,Z+1+G]
 
-        dz = self.network(x)  # [B,K,Z]
+        # ---- dt precision fix: disable autocast for dt-conditioned dynamics ----
+        device_type = z.device.type
+        autocast_off = (
+            torch.autocast(device_type=device_type, enabled=False)
+            if device_type in ("cuda", "cpu")
+            else nullcontext()
+        )
+
+        with autocast_off:
+            x = torch.cat(
+                [
+                    z_exp.to(torch.float32),
+                    dt.to(torch.float32).unsqueeze(-1),
+                    g_exp.to(torch.float32),
+                ],
+                dim=-1,
+            )  # [B,K,Z+1+G] (FP32)
+            dz = self.network(x)  # [B,K,Z] (FP32)
+
+        # Cast back to original dtype for downstream speed/compat
+        dz = dz.to(dtype=z_exp.dtype)
+
         return (z_exp + dz) if self.residual else dz
 
 
@@ -559,9 +580,28 @@ class FlowMapMLP(nn.Module):
 
         y_exp = y_i.unsqueeze(1).expand(B, K, -1)
         g_exp = g.unsqueeze(1).expand(B, K, -1)
-        x = torch.cat([y_exp, dt.unsqueeze(-1), g_exp], dim=-1)  # [B,K,S_in+1+G]
 
-        y_pred = self.network(x)  # [B,K,S_out]
+        # ---- dt precision fix: disable autocast for dt-conditioned MLP ----
+        device_type = y_i.device.type
+        autocast_off = (
+            torch.autocast(device_type=device_type, enabled=False)
+            if device_type in ("cuda", "cpu")
+            else nullcontext()
+        )
+
+        with autocast_off:
+            x = torch.cat(
+                [
+                    y_exp.to(torch.float32),
+                    dt.to(torch.float32).unsqueeze(-1),
+                    g_exp.to(torch.float32),
+                ],
+                dim=-1,
+            )  # [B,K,S_in+1+G] (FP32)
+            y_pred = self.network(x)  # [B,K,S_out] (FP32)
+
+        # Keep a FP32 base copy for residual heads
+        y_i_f = y_i.to(torch.float32)
 
         # Heads (must match FlowMapAutoencoder exactly)
         if self.softmax_head:
@@ -579,9 +619,9 @@ class FlowMapMLP(nn.Module):
             if self.S_out != self.S_in:
                 if not isinstance(self.target_idx, torch.Tensor):
                     raise RuntimeError("target_idx required when S_out != S_in")
-                base_z = y_i.index_select(1, self.target_idx)
+                base_z = y_i_f.index_select(1, self.target_idx)
             else:
-                base_z = y_i
+                base_z = y_i_f
             lm = self.log_mean.to(base_z.dtype)
             ls = self.log_std.to(base_z.dtype)
             base_log = base_z * ls + lm                 # [B,S_out]
@@ -593,9 +633,9 @@ class FlowMapMLP(nn.Module):
             if self.S_out != self.S_in:
                 if not isinstance(self.target_idx, torch.Tensor):
                     raise RuntimeError("target_idx required when S_out != S_in")
-                base = y_i.index_select(1, self.target_idx)
+                base = y_i_f.index_select(1, self.target_idx)
             else:
-                base = y_i
+                base = y_i_f
             y_pred = y_pred + base.unsqueeze(1)
             return y_pred
 

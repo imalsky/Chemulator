@@ -602,7 +602,9 @@ class FlowMapPairsDataset(Dataset):
             dt_phys = (t_j - t_i.unsqueeze(1)).clamp_min(float(self.dt_epsilon))  # [B,K]
             dt_norm = self.norm.normalize_dt_from_phys(dt_phys)  # [B,K] float32
 
-        dt = dt_norm.to(dtype=self._runtime_dtype).unsqueeze(-1)  # [B,K,1]
+        # Precision for time
+        #dt = dt_norm.to(dtype=self._runtime_dtype).unsqueeze(-1)  # [B,K,1]
+        dt = dt_norm.to(dtype=torch.float32).unsqueeze(-1)
 
         self._log_first_batch_checks_once(y_i, dt, y_j, g)
         return y_i, dt, y_j, g

@@ -34,8 +34,8 @@ plt.rcParams.update({"mathtext.default": "regular"})  # regular font for exponen
 
 # ---------------- Paths ----------------
 REPO = Path(__file__).resolve().parent.parent
-MODEL_DIR = REPO / "models" / "big_big_big"
-# MODEL_DIR = REPO / "models" / "big_mlp"
+#MODEL_DIR = REPO / "models" / "big_big_big"
+MODEL_DIR = REPO / "models" / "big_mlp"
 
 PLOT_DIR = MODEL_DIR / "plots"
 OUTFILE = PLOT_DIR / "training.png"
@@ -120,7 +120,7 @@ def main() -> int:
         if c in df_plot.columns:
             df_plot.loc[df_plot[c] <= 0, c] = float("nan")
 
-    print(df_plot.head(10).to_string(index=False))
+    print(df_plot.head(100).to_string(index=False))
 
     # ---------------- Plot ----------------
     fig, ax = plt.subplots(figsize=(8, 8))

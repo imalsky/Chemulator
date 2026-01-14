@@ -23,7 +23,8 @@ import time
 import shutil
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List, Sequence
+
 
 import torch
 
