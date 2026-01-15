@@ -29,7 +29,7 @@
 
   "mixed_precision": {
     // AMP precision: "bf16", "fp16", or "fp32"/"none"
-    "mode": "fp32"
+    "mode": "bf16"
   },
 
   "data": {
@@ -80,7 +80,7 @@
     // Global training batch size
     "batch_size_train": 2048,
     // Optional: override dataset tensor dtype (null = use AMP dtype)
-    "storage_dtype": null,
+    "storage_dtype": "float32",
     // np.load mmap mode ("r" = memmap; null disables)
     "mmap_mode": "r",
     // Trust metadata; skip shard scan
@@ -307,7 +307,7 @@
       // Loss weighting across rollout steps: "uniform", "linear", "exponential"
       "loss_weighting": "linear",
       // Discount factor for exponential weighting (weight[k] = discount^k)
-      "loss_discount": 0.0,
+      "loss_discount": 0.95,
       // Truncated BPTT: detach gradient every N steps (0 = disabled)
       "detach_every": 0,
       

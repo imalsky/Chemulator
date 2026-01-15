@@ -145,6 +145,9 @@ class ResidualMLP(nn.Module):
     """
     Residual MLP with skip connections across each hidden layer.
 
+    **Pre-norm** variant:
+      h -> LN(h) -> Linear -> Act -> Dropout -> + skip(proj(h)).
+
     Used for MLP-only model to provide "dynamics-style" residual connections.
     """
 
@@ -165,6 +168,7 @@ class ResidualMLP(nn.Module):
         h = [int(x) for x in hidden_dims]
         dims = [self.input_dim] + h
 
+        self.norms = nn.ModuleList()
         self.linears = nn.ModuleList()
         self.proj = nn.ModuleList()
         self.acts = nn.ModuleList()
@@ -172,6 +176,10 @@ class ResidualMLP(nn.Module):
 
         for i in range(len(h)):
             in_d, out_d = dims[i], dims[i + 1]
+
+            # Pre-norm on the *input* to the block.
+            self.norms.append(nn.LayerNorm(in_d))
+
             self.linears.append(nn.Linear(in_d, out_d))
             self.acts.append(_fresh_activation(activation))
             self.dropouts.append(nn.Dropout(p=float(dropout_p)) if dropout_p > 0 else nn.Identity())
@@ -188,8 +196,9 @@ class ResidualMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x
-        for lin, act, do, proj in zip(self.linears, self.acts, self.dropouts, self.proj):
-            y = do(act(lin(h)))
+        for norm, lin, act, do, proj in zip(self.norms, self.linears, self.acts, self.dropouts, self.proj):
+            h_norm = norm(h)
+            y = do(act(lin(h_norm)))
             if self.residual:
                 y = y + proj(h)
             h = y
@@ -263,28 +272,19 @@ class LatentDynamics(nn.Module):
         g: [B,G]
         -> z_j: [B,K,Z]
         """
-        dt = _normalize_dt_shape(dt_norm)
+        dt = _normalize_dt_shape(dt_norm)  # [B,K]
         B, K = z.shape[0], dt.shape[1]
 
         z_exp = z.unsqueeze(1).expand(B, K, -1)
         g_exp = g.unsqueeze(1).expand(B, K, -1)
 
-        # dt precision: compute dt-conditioned dynamics in FP32
-        device_type = z.device.type
-        autocast_off = (
-            torch.autocast(device_type=device_type, enabled=False)
-            if device_type in ("cuda", "cpu")
-            else nullcontext()
-        )
+        # Keep AMP enabled for the MLP (fast tensor-core GEMMs).
+        # Only ensure dt matches compute dtype so it doesn't upcast the whole concat to FP32.
+        dtc = dt.to(dtype=z_exp.dtype).unsqueeze(-1)  # [B,K,1]
 
-        with autocast_off:
-            x = torch.cat(
-                [z_exp.to(torch.float32), dt.to(torch.float32).unsqueeze(-1), g_exp.to(torch.float32)],
-                dim=-1,
-            )
-            dz = self.network(x)
+        x = torch.cat([z_exp, dtc, g_exp], dim=-1)  # [B,K,Z+1+G]
+        dz = self.network(x)  # [B,K,Z]
 
-        dz = _cast_like(dz, z_exp)
         return (z_exp + dz) if self.residual else dz
 
 
@@ -549,26 +549,17 @@ class FlowMapMLP(nn.Module, PredictionHeadMixin):
           g: [B,G]
           -> y_pred_z: [B,K,S]
         """
-        dt = _normalize_dt_shape(dt_norm)
+        dt = _normalize_dt_shape(dt_norm)  # [B,K]
         B, K = y_i.shape[0], dt.shape[1]
 
         y_exp = y_i.unsqueeze(1).expand(B, K, -1)
         g_exp = g.unsqueeze(1).expand(B, K, -1)
 
-        # dt precision: compute dt-conditioned MLP in FP32
-        device_type = y_i.device.type
-        autocast_off = (
-            torch.autocast(device_type=device_type, enabled=False)
-            if device_type in ("cuda", "cpu")
-            else nullcontext()
-        )
+        # Keep AMP enabled for the MLP; prevent dt from promoting concat to FP32.
+        dtc = dt.to(dtype=y_exp.dtype).unsqueeze(-1)  # [B,K,1]
 
-        with autocast_off:
-            x = torch.cat(
-                [y_exp.to(torch.float32), dt.to(torch.float32).unsqueeze(-1), g_exp.to(torch.float32)],
-                dim=-1,
-            )
-            y_pred = self.network(x)
+        x = torch.cat([y_exp, dtc, g_exp], dim=-1)  # [B,K,S+1+G]
+        y_pred = self.network(x)  # [B,K,S]
 
         return self._apply_prediction_head(y_pred, y_i)
 
