@@ -2,32 +2,45 @@
 """
 model.py
 
-Flow-map autoencoder model:
-  (y_i, dt_norm, g) -> y_j  in z-space (log-standard normalized)
+Flow-map models for stiff chemistry in z-space (log-standard normalized):
+
+  (y_i, dt_norm, g) -> y_j  in z-space
 
 Supports:
   - Residual in z-space (predict_delta)
   - Residual in physical log10 space (predict_delta_log_phys)
-  - Optional simplex head (softmax_head) to output log10 probabilities, then z-normalize
+  - Simplex projection in physical space when predict_delta_log_phys is enabled
 
-Notes:
-  - y is always z-space (log-standard normalized) throughout training.
-  - "physical" means log10(y_phys) space (before standardization).
+Architecture options:
+  - FlowMapAutoencoder: Encoder -> LatentDynamics -> Decoder
+  - FlowMapMLP: Direct MLP with configurable layers
+
+IMPORTANT RESTRICTION (by design):
+  - Subset target species is NOT supported.
+  - The model always predicts the full state: S_out == S_in.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 
+# =============================================================================
+# Constants
+# =============================================================================
 
-# ----------------------------- Small helpers ----------------------------------
+LN10 = math.log(10.0)
+MIN_LOG_STD = 1e-10
+RESIDUAL_INIT_SCALE = 0.1
 
-ACTIVATION_ALIASES = {
+ACTIVATION_REGISTRY = {
     "relu": nn.ReLU,
     "gelu": nn.GELU,
     "silu": nn.SiLU,
@@ -38,23 +51,73 @@ ACTIVATION_ALIASES = {
 }
 
 
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
 def get_activation(name: str) -> nn.Module:
-    n = str(name).lower().strip()
-    if n not in ACTIVATION_ALIASES:
-        raise ValueError(f"Unknown activation '{name}'. Choices={sorted(ACTIVATION_ALIASES)}")
-    return ACTIVATION_ALIASES[n]()
+    """Get activation module by name."""
+    key = str(name).lower().strip()
+    if key not in ACTIVATION_REGISTRY:
+        raise ValueError(f"Unknown activation '{name}'. Choices={sorted(ACTIVATION_REGISTRY)}")
+    return ACTIVATION_REGISTRY[key]()
 
 
 def _fresh_activation(act: nn.Module) -> nn.Module:
-    # Create a new instance of the same activation type (avoid sharing state if any)
+    """Create a new instance of the same activation type."""
     return act.__class__()
 
 
-# ----------------------------- Core blocks ------------------------------------
+def _cast_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Cast tensor to match reference dtype."""
+    if x.dtype == ref.dtype:
+        return x
+    return x.to(dtype=ref.dtype)
+
+
+def _project_log10_simplex(log10_vals: torch.Tensor, ln10: torch.Tensor) -> torch.Tensor:
+    """
+    Project log10-values onto the simplex in physical space (sum_i y_i = 1).
+
+    Given log10(y_raw), returns log10(y_raw / sum_i y_raw). This guarantees that
+    the corresponding linear-space values sum to 1, while staying in log10 space.
+    """
+    ln10_t = ln10.to(dtype=log10_vals.dtype, device=log10_vals.device)
+    ln_raw = log10_vals * ln10_t
+    ln_norm = ln_raw - torch.logsumexp(ln_raw, dim=-1, keepdim=True)
+    return ln_norm / ln10_t
+
+
+def _init_residual_output(linear: nn.Linear) -> None:
+    """Initialize output layer for residual prediction (small weights, zero bias)."""
+    with torch.no_grad():
+        nn.init.zeros_(linear.bias)
+        linear.weight.mul_(RESIDUAL_INIT_SCALE)
+
+
+def _normalize_dt_shape(dt_norm: torch.Tensor) -> torch.Tensor:
+    """Normalize dt_norm to [B, K] shape."""
+    if dt_norm.ndim == 3:
+        if dt_norm.shape[-1] != 1:
+            raise ValueError(f"dt_norm expected last dim=1 when 3D; got {tuple(dt_norm.shape)}")
+        return dt_norm.squeeze(-1)
+    elif dt_norm.ndim == 2:
+        return dt_norm
+    elif dt_norm.ndim == 1:
+        return dt_norm.unsqueeze(1)
+    else:
+        raise ValueError(f"dt_norm must be 1D/2D/3D; got shape {tuple(dt_norm.shape)}")
+
+
+# =============================================================================
+# Core Network Blocks
+# =============================================================================
 
 
 class MLP(nn.Module):
     """Simple MLP with optional dropout."""
+
     def __init__(
         self,
         input_dim: int,
@@ -69,7 +132,7 @@ class MLP(nn.Module):
         for i in range(len(dims) - 2):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
             layers.append(_fresh_activation(activation))
-            if dropout_p and dropout_p > 0:
+            if dropout_p > 0:
                 layers.append(nn.Dropout(p=float(dropout_p)))
         layers.append(nn.Linear(dims[-2], dims[-1]))
         self.network = nn.Sequential(*layers)
@@ -82,10 +145,9 @@ class ResidualMLP(nn.Module):
     """
     Residual MLP with skip connections across each hidden layer.
 
-    This is used for the MLP-only model to provide a "dynamics-style" residual
-    (analogous in spirit to LatentDynamics(residual=True) in the autoencoder),
-    while still allowing an explicit y + dy head via predict_delta.
+    Used for MLP-only model to provide "dynamics-style" residual connections.
     """
+
     def __init__(
         self,
         input_dim: int,
@@ -97,40 +159,29 @@ class ResidualMLP(nn.Module):
     ):
         super().__init__()
         self.residual = bool(residual)
-
-        h = [int(x) for x in hidden_dims]
         self.input_dim = int(input_dim)
         self.output_dim = int(output_dim)
+
+        h = [int(x) for x in hidden_dims]
+        dims = [self.input_dim] + h
 
         self.linears = nn.ModuleList()
         self.proj = nn.ModuleList()
         self.acts = nn.ModuleList()
         self.dropouts = nn.ModuleList()
 
-        dims = [self.input_dim] + h
         for i in range(len(h)):
-            in_d = dims[i]
-            out_d = dims[i + 1]
-
+            in_d, out_d = dims[i], dims[i + 1]
             self.linears.append(nn.Linear(in_d, out_d))
             self.acts.append(_fresh_activation(activation))
-
-            if dropout_p and dropout_p > 0:
-                self.dropouts.append(nn.Dropout(p=float(dropout_p)))
-            else:
-                self.dropouts.append(nn.Identity())
+            self.dropouts.append(nn.Dropout(p=float(dropout_p)) if dropout_p > 0 else nn.Identity())
 
             if self.residual:
-                if in_d == out_d:
-                    self.proj.append(nn.Identity())
-                else:
-                    # Projection for skip path when dimensions differ.
-                    self.proj.append(nn.Linear(in_d, out_d, bias=False))
+                self.proj.append(nn.Identity() if in_d == out_d else nn.Linear(in_d, out_d, bias=False))
             else:
                 self.proj.append(nn.Identity())
 
-        last_dim = dims[-1]
-        self.out = nn.Linear(last_dim, self.output_dim)
+        self.out = nn.Linear(dims[-1], self.output_dim)
 
     def last_linear(self) -> nn.Linear:
         return self.out
@@ -138,17 +189,21 @@ class ResidualMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x
         for lin, act, do, proj in zip(self.linears, self.acts, self.dropouts, self.proj):
-            y = lin(h)
-            y = act(y)
-            y = do(y)
+            y = do(act(lin(h)))
             if self.residual:
                 y = y + proj(h)
             h = y
         return self.out(h)
 
 
+# =============================================================================
+# Autoencoder Components
+# =============================================================================
+
+
 class Encoder(nn.Module):
     """Encoder: (y, g) -> z."""
+
     def __init__(
         self,
         state_dim: int,
@@ -159,19 +214,18 @@ class Encoder(nn.Module):
         dropout_p: float = 0.0,
     ):
         super().__init__()
-        self.state_dim = state_dim
-        self.global_dim = global_dim
-        self.latent_dim = latent_dim
+        self.state_dim = int(state_dim)
+        self.global_dim = int(global_dim)
+        self.latent_dim = int(latent_dim)
         self.network = MLP(
-            input_dim=state_dim + global_dim,
+            input_dim=self.state_dim + self.global_dim,
             hidden_dims=hidden_dims,
-            output_dim=latent_dim,
+            output_dim=self.latent_dim,
             activation=activation,
             dropout_p=dropout_p,
         )
 
     def forward(self, y: torch.Tensor, g: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # For future expansion: return (z, kl) to support VAE-like encoder; for now kl=0.
         x = torch.cat([y, g], dim=-1) if g.numel() > 0 else y
         z = self.network(x)
         kl = torch.zeros((), device=z.device, dtype=z.dtype)
@@ -180,6 +234,7 @@ class Encoder(nn.Module):
 
 class LatentDynamics(nn.Module):
     """Latent dynamics: (z, dt_norm, g) -> z_j (vectorized over K)."""
+
     def __init__(
         self,
         latent_dim: int,
@@ -190,13 +245,13 @@ class LatentDynamics(nn.Module):
         residual: bool = True,
     ):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.global_dim = global_dim
+        self.latent_dim = int(latent_dim)
+        self.global_dim = int(global_dim)
         self.residual = bool(residual)
         self.network = MLP(
-            input_dim=latent_dim + 1 + global_dim,
-            hidden_dims=hidden_dims,
-            output_dim=latent_dim,
+            input_dim=self.latent_dim + 1 + self.global_dim,
+            hidden_dims=list(hidden_dims),
+            output_dim=self.latent_dim,
             activation=activation,
             dropout_p=dropout_p,
         )
@@ -208,24 +263,13 @@ class LatentDynamics(nn.Module):
         g: [B,G]
         -> z_j: [B,K,Z]
         """
-        if dt_norm.ndim == 3:
-            if dt_norm.shape[-1] != 1:
-                raise ValueError(f"dt_norm expected last dim=1 when 3D; got {tuple(dt_norm.shape)}")
-            dt = dt_norm.squeeze(-1)  # [B,K]
-        elif dt_norm.ndim == 2:
-            dt = dt_norm
-        elif dt_norm.ndim == 1:
-            dt = dt_norm.unsqueeze(1)  # [B,1]
-        else:
-            raise ValueError(f"dt_norm must be 1D/2D/3D; got shape {tuple(dt_norm.shape)}")
-
-        B = z.shape[0]
-        K = dt.shape[1]
+        dt = _normalize_dt_shape(dt_norm)
+        B, K = z.shape[0], dt.shape[1]
 
         z_exp = z.unsqueeze(1).expand(B, K, -1)
         g_exp = g.unsqueeze(1).expand(B, K, -1)
 
-        # ---- dt precision fix: disable autocast for dt-conditioned dynamics ----
+        # dt precision: compute dt-conditioned dynamics in FP32
         device_type = z.device.type
         autocast_off = (
             torch.autocast(device_type=device_type, enabled=False)
@@ -235,18 +279,12 @@ class LatentDynamics(nn.Module):
 
         with autocast_off:
             x = torch.cat(
-                [
-                    z_exp.to(torch.float32),
-                    dt.to(torch.float32).unsqueeze(-1),
-                    g_exp.to(torch.float32),
-                ],
+                [z_exp.to(torch.float32), dt.to(torch.float32).unsqueeze(-1), g_exp.to(torch.float32)],
                 dim=-1,
-            )  # [B,K,Z+1+G] (FP32)
-            dz = self.network(x)  # [B,K,Z] (FP32)
+            )
+            dz = self.network(x)
 
-        # Cast back to original dtype for downstream speed/compat
-        dz = dz.to(dtype=z_exp.dtype)
-
+        dz = _cast_like(dz, z_exp)
         return (z_exp + dz) if self.residual else dz
 
 
@@ -262,39 +300,112 @@ class Decoder(nn.Module):
         dropout_p: float = 0.0,
     ):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.state_dim = state_dim
+        self.latent_dim = int(latent_dim)
+        self.state_dim = int(state_dim)
         self.network = MLP(
-            input_dim=latent_dim,
+            input_dim=self.latent_dim,
             hidden_dims=hidden_dims,
-            output_dim=state_dim,
+            output_dim=self.state_dim,
             activation=activation,
             dropout_p=dropout_p,
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # Accepts [B,K,Z] (or [B,Z]); nn.Linear handles leading dims.
         return self.network(z)
 
 
-class FlowMapAutoencoder(nn.Module):
+# =============================================================================
+# Prediction Heads Mixin
+# =============================================================================
+
+
+class PredictionHeadMixin:
+    """Mixin providing prediction head logic for both model types."""
+
+    predict_delta: bool
+    predict_delta_log_phys: bool
+    log_mean: Optional[torch.Tensor]
+    log_std: Optional[torch.Tensor]
+    ln10: Optional[torch.Tensor]
+    S: int
+
+    def _apply_prediction_head(
+        self,
+        y_pred: torch.Tensor,
+        y_i: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply prediction head transformation.
+
+        Args:
+            y_pred: [B, K, S] raw network output
+            y_i: [B, S] input state
+
+        Returns:
+            y_pred_z: [B, K, S] predictions in z-space
+        """
+        if self.predict_delta_log_phys:
+            y_i_f = y_i.to(torch.float32)
+            lm = self.log_mean.to(torch.float32)
+            ls = self.log_std.to(torch.float32)
+
+            base_log10 = y_i_f * ls + lm
+            delta_out = y_pred.to(torch.float32)
+            delta_log10 = delta_out * ls if self.predict_delta else delta_out
+
+            y_pred_log10 = base_log10.unsqueeze(1) + delta_log10
+            y_pred_log10 = _project_log10_simplex(y_pred_log10, self.ln10)
+
+            y_pred_z = (y_pred_log10 - lm) / ls
+            return _cast_like(y_pred_z, y_i)
+
+        if self.predict_delta:
+            y_pred = y_pred + y_i.to(torch.float32).unsqueeze(1)
+            return _cast_like(y_pred, y_i)
+
+        return _cast_like(y_pred, y_i)
+
+    def _init_log_stats(
+        self,
+        target_log_mean: Optional[Sequence[float]],
+        target_log_std: Optional[Sequence[float]],
+    ) -> None:
+        """Initialize log statistics buffers for predict_delta_log_phys mode."""
+        if self.predict_delta_log_phys:
+            if target_log_mean is None or target_log_std is None:
+                raise ValueError("target_log_mean/std required for predict_delta_log_phys")
+            log_mean = torch.as_tensor(target_log_mean, dtype=torch.float32)
+            log_std = torch.clamp(torch.as_tensor(target_log_std, dtype=torch.float32), min=MIN_LOG_STD)
+            if log_mean.numel() != self.S or log_std.numel() != self.S:
+                raise ValueError(
+                    f"target_log_mean/std must have length {self.S} (full state); "
+                    f"got mean={log_mean.numel()} std={log_std.numel()}"
+                )
+            self.register_buffer("log_mean", log_mean, persistent=True)
+            self.register_buffer("log_std", log_std, persistent=True)
+            self.register_buffer("ln10", torch.tensor(LN10, dtype=torch.float32), persistent=True)
+        else:
+            self.log_mean = None
+            self.log_std = None
+            self.ln10 = None
+
+
+# =============================================================================
+# Full Models
+# =============================================================================
+
+
+class FlowMapAutoencoder(nn.Module, PredictionHeadMixin):
     """
     Flow-map AE: (y_i, g, dt_norm) -> y_j in z-space.
 
-    Architecture:
-      Encoder -> LatentDynamics -> Decoder
-
-    Heads:
-      - predict_delta (z-space residual)
-      - predict_delta_log_phys (delta in log10-physical space, then re-standardize)
-      - softmax_head (simplex probabilities, then log10 standardized)
+    Architecture: Encoder -> LatentDynamics -> Decoder
     """
 
     def __init__(
         self,
         *,
-        state_dim_in: int,
-        state_dim_out: int,
+        state_dim: int,
         global_dim: int,
         latent_dim: int,
         encoder_hidden: Sequence[int],
@@ -305,61 +416,24 @@ class FlowMapAutoencoder(nn.Module):
         dynamics_residual: bool = True,
         predict_delta: bool = True,
         predict_delta_log_phys: bool = False,
-        target_idx: Optional[torch.Tensor] = None,
         target_log_mean: Optional[Sequence[float]] = None,
         target_log_std: Optional[Sequence[float]] = None,
-        softmax_head: bool = False,
-        allow_partial_simplex: bool = False,
     ):
         super().__init__()
 
-        # Dimensions
-        self.S_in = int(state_dim_in)
-        self.S_out = int(state_dim_out)
+        self.S = int(state_dim)
         self.G = int(global_dim)
         self.Z = int(latent_dim)
 
-        # Config
         self.predict_delta = bool(predict_delta)
         self.predict_delta_log_phys = bool(predict_delta_log_phys)
-        self.softmax_head = bool(softmax_head)
-        self.allow_partial_simplex = bool(allow_partial_simplex)
 
-        if self.softmax_head and (self.predict_delta or self.predict_delta_log_phys):
-            raise RuntimeError("softmax_head=True is incompatible with residual modes")
-        if self.softmax_head and (self.S_out != self.S_in) and not self.allow_partial_simplex:
-            raise RuntimeError("softmax_head=True with S_out!=S_in requires allow_partial_simplex=True")
+        self._init_log_stats(target_log_mean, target_log_std)
 
-        # Target indices
-        if target_idx is None:
-            self.target_idx = None
-        else:
-            if not isinstance(target_idx, torch.Tensor):
-                target_idx = torch.tensor(target_idx, dtype=torch.long)
-            self.register_buffer("target_idx", target_idx, persistent=True)
-
-        # Stats for log-phys/simplex heads
-        if self.predict_delta_log_phys or self.softmax_head:
-            if target_log_mean is None or target_log_std is None:
-                raise ValueError("target_log_mean/std required for log-phys or softmax head")
-            log_mean = torch.as_tensor(target_log_mean, dtype=torch.float32)
-            log_std = torch.clamp(torch.as_tensor(target_log_std, dtype=torch.float32), min=1e-10)
-            self.register_buffer("log_mean", log_mean, persistent=True)
-            self.register_buffer("log_std", log_std, persistent=True)
-            self.register_buffer("ln10", torch.tensor(math.log(10.0), dtype=torch.float32), persistent=True)
-            self._logsoftmax = nn.LogSoftmax(dim=-1) if self.softmax_head else None
-        else:
-            self.log_mean = None
-            self.log_std = None
-            self.ln10 = None
-            self._logsoftmax = None
-
-        # Activation
         act = get_activation(activation_name)
 
-        # Submodules
         self.encoder = Encoder(
-            state_dim=self.S_in,
+            state_dim=self.S,
             global_dim=self.G,
             hidden_dims=list(encoder_hidden),
             latent_dim=self.Z,
@@ -372,94 +446,46 @@ class FlowMapAutoencoder(nn.Module):
             hidden_dims=list(dynamics_hidden),
             activation=act,
             dropout_p=float(dropout),
-            residual=dynamics_residual,
+            residual=bool(dynamics_residual),
         )
         self.decoder = Decoder(
             latent_dim=self.Z,
             hidden_dims=list(decoder_hidden),
-            state_dim=self.S_out,
+            state_dim=self.S,
             activation=act,
             dropout_p=float(dropout),
         )
 
-        # Gentle decoder init for residual heads
         if self.predict_delta or self.predict_delta_log_phys:
-            with torch.no_grad():
-                lin_out: nn.Linear = self.decoder.network.network[-1]
-                nn.init.zeros_(lin_out.bias)
-                lin_out.weight.mul_(0.1)
+            _init_residual_output(self.decoder.network.network[-1])
 
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
         Returns predictions in z-space (log-standard normalized).
+
         Shapes:
-          y_i: [B,S_in]
-          dt_norm: [B,K] or [B,K,1]
+          y_i: [B,S]
+          dt_norm: [B,K] or [B,K,1] or [B]
           g: [B,G]
-          -> y_pred_z: [B,K,S_out]
+          -> y_pred_z: [B,K,S]
         """
-        # Encode once
-        z_i, _kl_unused = self.encoder(y_i, g)            # [B,Z]
-        # Vectorized latent evolution over K
-        z_j = self.dynamics(z_i, dt_norm, g)              # [B,K,Z]
-        # Decode
-        y_pred = self.decoder(z_j)                        # [B,K,S_out]
-
-        # Heads
-        if self.softmax_head:
-            # Stable: log-softmax -> log10 -> standardize to z-space
-            log_p = self._logsoftmax(y_pred)  # [B,K,S_out]
-            dtype = log_p.dtype
-            ln10 = self.ln10.to(dtype=dtype)
-            log10_p = log_p / ln10
-            y_pred = (log10_p - self.log_mean.to(dtype)) / self.log_std.to(dtype)
-            return y_pred
-
-        if self.predict_delta_log_phys:
-            if self.S_out != self.S_in:
-                if not isinstance(self.target_idx, torch.Tensor):
-                    raise RuntimeError("target_idx required when S_out != S_in")
-                base_z = y_i.index_select(1, self.target_idx)
-            else:
-                base_z = y_i
-            lm = self.log_mean.to(base_z.dtype)
-            ls = self.log_std.to(base_z.dtype)
-            base_log = base_z * ls + lm                 # [B,S_out]
-            y_pred_log = base_log.unsqueeze(1) + y_pred # [B,K,S_out]
-            y_pred = (y_pred_log - lm.to(y_pred.dtype)) / ls.to(y_pred.dtype)
-            return y_pred
-
-        if self.predict_delta:
-            if self.S_out != self.S_in:
-                if not isinstance(self.target_idx, torch.Tensor):
-                    raise RuntimeError("target_idx required when S_out != S_in")
-                base = y_i.index_select(1, self.target_idx)
-            else:
-                base = y_i
-            y_pred = y_pred + base.unsqueeze(1)
-            return y_pred
-
-        return y_pred
+        z_i, _ = self.encoder(y_i, g)
+        z_j = self.dynamics(z_i, dt_norm, g)
+        y_pred = self.decoder(z_j)
+        return self._apply_prediction_head(y_pred, y_i)
 
 
-class FlowMapMLP(nn.Module):
+class FlowMapMLP(nn.Module, PredictionHeadMixin):
     """
     MLP-only flow-map: (y_i, g, dt_norm) -> y_j in z-space.
 
-    Architecture:
-      Single MLP over concatenated [y_i, dt_norm, g], vectorized over K.
-
-    Heads:
-      - predict_delta (z-space residual)
-      - predict_delta_log_phys (delta in log10-physical space, then re-standardize)
-      - softmax_head (simplex probabilities, then log10 standardized)
+    Architecture: Single MLP (optionally residual) over concatenated [y_i, dt_norm, g].
     """
 
     def __init__(
         self,
         *,
-        state_dim_in: int,
-        state_dim_out: int,
+        state_dim: int,
         global_dim: int,
         hidden_dims: Sequence[int],
         activation_name: str = "gelu",
@@ -467,66 +493,28 @@ class FlowMapMLP(nn.Module):
         dynamics_residual: bool = True,
         predict_delta: bool = True,
         predict_delta_log_phys: bool = False,
-        target_idx: Optional[torch.Tensor] = None,
         target_log_mean: Optional[Sequence[float]] = None,
         target_log_std: Optional[Sequence[float]] = None,
-        softmax_head: bool = False,
-        allow_partial_simplex: bool = False,
     ):
         super().__init__()
 
-        # Dimensions
-        self.S_in = int(state_dim_in)
-        self.S_out = int(state_dim_out)
+        self.S = int(state_dim)
         self.G = int(global_dim)
 
-        # Config
         self.dynamics_residual = bool(dynamics_residual)
         self.predict_delta = bool(predict_delta)
         self.predict_delta_log_phys = bool(predict_delta_log_phys)
-        self.softmax_head = bool(softmax_head)
-        self.allow_partial_simplex = bool(allow_partial_simplex)
 
-        if self.softmax_head and (self.predict_delta or self.predict_delta_log_phys):
-            raise RuntimeError("softmax_head=True is incompatible with residual modes")
-        if self.softmax_head and (self.S_out != self.S_in) and not self.allow_partial_simplex:
-            raise RuntimeError("softmax_head=True with S_out!=S_in requires allow_partial_simplex=True")
+        self._init_log_stats(target_log_mean, target_log_std)
 
-        # Target indices
-        if target_idx is None:
-            self.target_idx = None
-        else:
-            if not isinstance(target_idx, torch.Tensor):
-                target_idx = torch.tensor(target_idx, dtype=torch.long)
-            self.register_buffer("target_idx", target_idx, persistent=True)
-
-        # Stats for log-phys/simplex heads (match FlowMapAutoencoder behavior)
-        if self.predict_delta_log_phys or self.softmax_head:
-            if target_log_mean is None or target_log_std is None:
-                raise ValueError("target_log_mean/std required for log-phys or softmax head")
-            log_mean = torch.as_tensor(target_log_mean, dtype=torch.float32)
-            log_std = torch.clamp(torch.as_tensor(target_log_std, dtype=torch.float32), min=1e-10)
-            self.register_buffer("log_mean", log_mean, persistent=True)
-            self.register_buffer("log_std", log_std, persistent=True)
-            self.register_buffer("ln10", torch.tensor(math.log(10.0), dtype=torch.float32), persistent=True)
-            self._logsoftmax = nn.LogSoftmax(dim=-1) if self.softmax_head else None
-        else:
-            self.log_mean = None
-            self.log_std = None
-            self.ln10 = None
-            self._logsoftmax = None
-
-        # Main MLP
         act = get_activation(activation_name)
-        inp = self.S_in + 1 + self.G
+        inp = self.S + 1 + self.G
 
-        # "Dynamics-style" residual connections inside the MLP (default ON).
-        # This is distinct from the explicit y + dy head (predict_delta).
         if self.dynamics_residual:
             self.network = ResidualMLP(
                 input_dim=inp,
                 hidden_dims=list(hidden_dims),
-                output_dim=self.S_out,
+                output_dim=self.S,
                 activation=act,
                 dropout_p=float(dropout),
                 residual=True,
@@ -535,53 +523,39 @@ class FlowMapMLP(nn.Module):
             self.network = MLP(
                 input_dim=inp,
                 hidden_dims=list(hidden_dims),
-                output_dim=self.S_out,
+                output_dim=self.S,
                 activation=act,
                 dropout_p=float(dropout),
             )
 
-        # Gentle init on residual-style heads for stability at start
         if self.predict_delta or self.predict_delta_log_phys:
             try:
-                with torch.no_grad():
-                    lin_out: nn.Linear
-                    if isinstance(self.network, ResidualMLP):
-                        lin_out = self.network.last_linear()
-                    else:
-                        lin_out = self.network.network[-1]  # type: ignore[assignment]
-                    nn.init.zeros_(lin_out.bias)
-                    lin_out.weight.mul_(0.1)
+                lin_out = (
+                    self.network.last_linear()
+                    if isinstance(self.network, ResidualMLP)
+                    else self.network.network[-1]
+                )
+                _init_residual_output(lin_out)
             except Exception:
                 pass
 
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
         Returns predictions in z-space (log-standard normalized).
+
         Shapes:
-          y_i: [B,S_in]
+          y_i: [B,S]
           dt_norm: [B,K] or [B,K,1] or [B]
           g: [B,G]
-          -> y_pred_z: [B,K,S_out]
+          -> y_pred_z: [B,K,S]
         """
-        if dt_norm.ndim == 3:
-            # [B,K,1] -> [B,K]
-            if dt_norm.shape[-1] != 1:
-                raise ValueError(f"dt_norm expected last dim=1 when 3D; got {tuple(dt_norm.shape)}")
-            dt = dt_norm.squeeze(-1)
-        elif dt_norm.ndim == 2:
-            dt = dt_norm
-        elif dt_norm.ndim == 1:
-            dt = dt_norm.unsqueeze(1)
-        else:
-            raise ValueError(f"dt_norm must be 1D/2D/3D; got shape {tuple(dt_norm.shape)}")
-
-        B = y_i.shape[0]
-        K = dt.shape[1]
+        dt = _normalize_dt_shape(dt_norm)
+        B, K = y_i.shape[0], dt.shape[1]
 
         y_exp = y_i.unsqueeze(1).expand(B, K, -1)
         g_exp = g.unsqueeze(1).expand(B, K, -1)
 
-        # ---- dt precision fix: disable autocast for dt-conditioned MLP ----
+        # dt precision: compute dt-conditioned MLP in FP32
         device_type = y_i.device.type
         autocast_off = (
             torch.autocast(device_type=device_type, enabled=False)
@@ -591,65 +565,76 @@ class FlowMapMLP(nn.Module):
 
         with autocast_off:
             x = torch.cat(
-                [
-                    y_exp.to(torch.float32),
-                    dt.to(torch.float32).unsqueeze(-1),
-                    g_exp.to(torch.float32),
-                ],
+                [y_exp.to(torch.float32), dt.to(torch.float32).unsqueeze(-1), g_exp.to(torch.float32)],
                 dim=-1,
-            )  # [B,K,S_in+1+G] (FP32)
-            y_pred = self.network(x)  # [B,K,S_out] (FP32)
+            )
+            y_pred = self.network(x)
 
-        # Keep a FP32 base copy for residual heads
-        y_i_f = y_i.to(torch.float32)
-
-        # Heads (must match FlowMapAutoencoder exactly)
-        if self.softmax_head:
-            if self._logsoftmax is None:
-                raise RuntimeError("softmax_head=True requires _logsoftmax to be initialized")
-            # Stable: log-softmax -> log10 -> standardize to z-space
-            log_p = self._logsoftmax(y_pred)  # [B,K,S_out]
-            dtype = log_p.dtype
-            ln10 = self.ln10.to(dtype=dtype)
-            log10_p = log_p / ln10
-            y_pred = (log10_p - self.log_mean.to(dtype)) / self.log_std.to(dtype)
-            return y_pred
-
-        if self.predict_delta_log_phys:
-            if self.S_out != self.S_in:
-                if not isinstance(self.target_idx, torch.Tensor):
-                    raise RuntimeError("target_idx required when S_out != S_in")
-                base_z = y_i_f.index_select(1, self.target_idx)
-            else:
-                base_z = y_i_f
-            lm = self.log_mean.to(base_z.dtype)
-            ls = self.log_std.to(base_z.dtype)
-            base_log = base_z * ls + lm                 # [B,S_out]
-            y_pred_log = base_log.unsqueeze(1) + y_pred # [B,K,S_out]
-            y_pred = (y_pred_log - lm.to(y_pred.dtype)) / ls.to(y_pred.dtype)
-            return y_pred
-
-        if self.predict_delta:
-            if self.S_out != self.S_in:
-                if not isinstance(self.target_idx, torch.Tensor):
-                    raise RuntimeError("target_idx required when S_out != S_in")
-                base = y_i_f.index_select(1, self.target_idx)
-            else:
-                base = y_i_f
-            y_pred = y_pred + base.unsqueeze(1)
-            return y_pred
-
-        return y_pred
+        return self._apply_prediction_head(y_pred, y_i)
 
 
-def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = None) -> nn.Module:
+# =============================================================================
+# Model Factory
+# =============================================================================
+
+
+def _load_log_stats(
+    norm_path: Path, species_vars: Sequence[str], logger: logging.Logger
+) -> Tuple[list, list]:
+    """Load log statistics from normalization manifest."""
+    with open(norm_path, "r") as f:
+        manifest = json.load(f)
+    stats = manifest["per_key_stats"]
+    log_mean, log_std = [], []
+    for name in species_vars:
+        if name not in stats:
+            raise KeyError(f"Species '{name}' not in normalization stats")
+        s = stats[name]
+        log_mean.append(float(s.get("log_mean", 0.0)))
+        log_std.append(float(s.get("log_std", 1.0)))
+    logger.info(f"Loaded normalization stats for {len(species_vars)} species")
+    return log_mean, log_std
+
+
+def _parse_hidden_dims(mcfg: Dict[str, Any]) -> Sequence[int]:
+    """
+    Parse hidden layer dimensions from config.
+
+    Supports two formats:
+      1. Explicit list: model.mlp_hidden = [512, 512, 512]
+      2. Shorthand: model.mlp_num_layers = 4, model.mlp_hidden_dim = 512
+    """
+    # Check for explicit list first
+    if "mlp_hidden" in mcfg:
+        return list(mcfg["mlp_hidden"])
+
+    # Check for shorthand format
+    num_layers = mcfg.get("mlp_num_layers")
+    hidden_dim = mcfg.get("mlp_hidden_dim")
+
+    if num_layers is not None and hidden_dim is not None:
+        return [int(hidden_dim)] * int(num_layers)
+
+    # Fall back to concatenating encoder/dynamics/decoder hidden
+    return (
+        list(mcfg.get("encoder_hidden", [256, 128]))
+        + list(mcfg.get("dynamics_hidden", [256, 256]))
+        + list(mcfg.get("decoder_hidden", [128, 256]))
+    )
+
+
+def create_model(config: Dict[str, Any], logger: Optional[logging.Logger] = None) -> nn.Module:
     """
     Build model from config.
-    """
-    import json
-    from pathlib import Path
-    import logging
 
+    Enforces:
+      - Full-state prediction only: target_species must be absent or identical to species_variables.
+
+    MLP configuration options (when mlp_only=True):
+      - model.mlp_hidden: Explicit list of hidden layer widths [512, 512, 512]
+      - model.mlp_num_layers + model.mlp_hidden_dim: Shorthand for uniform layers
+      - Falls back to encoder_hidden + dynamics_hidden + decoder_hidden if neither specified
+    """
     log = logger if logger is not None else logging.getLogger(__name__)
 
     data_cfg = config.get("data", {})
@@ -658,17 +643,14 @@ def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = No
     if not species_vars:
         raise KeyError("data.species_variables must be set and non-empty")
 
-    target_vars = list(data_cfg.get("target_species") or species_vars)
+    target_vars_cfg = list(data_cfg.get("target_species") or [])
+    if target_vars_cfg and target_vars_cfg != species_vars:
+        raise ValueError(
+            "Subset target_species is not supported. "
+            "Either remove data.target_species or set it equal to data.species_variables."
+        )
 
-    # map targets to indices
-    name_to_idx = {n: i for i, n in enumerate(species_vars)}
-    try:
-        target_idx = [name_to_idx[n] for n in target_vars]
-    except KeyError as e:
-        raise KeyError(f"target_species contains unknown name: {e.args[0]!r}")
-
-    S_in = len(species_vars)
-    S_out = len(target_vars)
+    S = len(species_vars)
     G = len(global_vars)
 
     mcfg = config.get("model", {})
@@ -684,45 +666,25 @@ def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = No
 
     predict_delta = bool(mcfg.get("predict_delta", True))
     predict_delta_log_phys = bool(mcfg.get("predict_delta_log_phys", False))
-    softmax_head = bool(mcfg.get("softmax_head", False))
-    allow_partial_simplex = bool(mcfg.get("allow_partial_simplex", False))
 
-    if softmax_head:
-        if predict_delta or predict_delta_log_phys:
-            raise ValueError("softmax_head=True requires predict_delta=False and predict_delta_log_phys=False")
-        if S_out != S_in:
-            # When predicting only a subset with a simplex head, force allow_partial_simplex
-            if not allow_partial_simplex:
-                raise ValueError("softmax_head=True with subset species requires allow_partial_simplex=True")
-
-    need_stats = predict_delta_log_phys or softmax_head
+    # Load normalization stats if needed
     target_log_mean = None
     target_log_std = None
-    if need_stats:
+    if predict_delta_log_phys:
         norm_path = Path(config["paths"]["processed_data_dir"]) / "normalization.json"
-        with open(norm_path, "r") as f:
-            manifest = json.load(f)
-        stats = manifest["per_key_stats"]
-        target_log_mean, target_log_std = [], []
-        for name in target_vars:
-            if name not in stats:
-                raise KeyError(f"Target species '{name}' not in normalization stats")
-            s = stats[name]
-            target_log_mean.append(float(s.get("log_mean", 0.0)))
-            target_log_std.append(float(s.get("log_std", 1.0)))
-        log.info(f"Loaded normalization stats for {len(target_vars)} species")
+        target_log_mean, target_log_std = _load_log_stats(norm_path, species_vars, log)
 
     use_mlp_only = bool(mcfg.get("mlp_only", False))
 
     if use_mlp_only:
-        # MLP hidden sizes are specified by the existing encoder/dynamics/decoder lists.
-        mlp_hidden = list(encoder_hidden) + list(dynamics_hidden) + list(decoder_hidden)
-        if len(mlp_hidden) == 0:
-            raise ValueError("model.mlp_only=True requires non-empty encoder_hidden/dynamics_hidden/decoder_hidden")
+        mlp_hidden = _parse_hidden_dims(mcfg)
+        if not mlp_hidden:
+            raise ValueError("model.mlp_only=True requires non-empty hidden dimensions")
+
+        log.info(f"Creating FlowMapMLP with hidden_dims={mlp_hidden}")
 
         return FlowMapMLP(
-            state_dim_in=S_in,
-            state_dim_out=S_out,
+            state_dim=S,
             global_dim=G,
             hidden_dims=mlp_hidden,
             activation_name=activation,
@@ -730,16 +692,17 @@ def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = No
             dynamics_residual=dynamics_residual,
             predict_delta=predict_delta,
             predict_delta_log_phys=predict_delta_log_phys,
-            target_idx=torch.tensor(target_idx, dtype=torch.long),
             target_log_mean=target_log_mean,
             target_log_std=target_log_std,
-            softmax_head=softmax_head,
-            allow_partial_simplex=allow_partial_simplex,
         )
 
+    log.info(
+        f"Creating FlowMapAutoencoder with latent_dim={latent_dim}, "
+        f"encoder={encoder_hidden}, dynamics={dynamics_hidden}, decoder={decoder_hidden}"
+    )
+
     return FlowMapAutoencoder(
-        state_dim_in=S_in,
-        state_dim_out=S_out,
+        state_dim=S,
         global_dim=G,
         latent_dim=latent_dim,
         encoder_hidden=encoder_hidden,
@@ -750,9 +713,6 @@ def create_model(config: Dict[str, Any], logger: Optional["logging.Logger"] = No
         dynamics_residual=dynamics_residual,
         predict_delta=predict_delta,
         predict_delta_log_phys=predict_delta_log_phys,
-        target_idx=torch.tensor(target_idx, dtype=torch.long),
         target_log_mean=target_log_mean,
         target_log_std=target_log_std,
-        softmax_head=softmax_head,
-        allow_partial_simplex=allow_partial_simplex,
     )

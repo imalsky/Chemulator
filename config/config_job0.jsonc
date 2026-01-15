@@ -5,17 +5,15 @@
     // List of raw HDF5 files (optional; auto-detect if empty)
     "raw_data_files": [],
     // Directory for logs/checkpoints/exports
-    "work_dir": "models/3",
+    "work_dir": "models/flowmap",
     // Delete existing work_dir before start
     "overwrite": false
   },
 
   "system": {
-    // Enable cuDNN autotuning (faster, non-deterministic convs)
+    // Enable cuDNN autotuning (faster convs)
     "cudnn_benchmark": true,
-    // Force deterministic operations (slower)
-    "deterministic": false,
-    // Model parameter dtype (fallback only; preprocessing uses io_dtype if set)
+    // Model parameter dtype (fallback; preprocessing uses io_dtype)
     "dtype": "float32",
     // On-disk NPZ dtype for preprocessing output
     "io_dtype": "float32",
@@ -24,11 +22,13 @@
     // Max OpenMP threads for CPU ops
     "omp_num_threads": 4,
     // Global RNG seed
-    "seed": 42
+    "seed": 42,
+    // Deterministic mode (slower but reproducible)
+    "deterministic": false
   },
 
   "mixed_precision": {
-    // AMP precision: "bf16", "fp16", or "none"
+    // AMP precision: "bf16", "fp16", or "fp32"/"none"
     "mode": "bf16"
   },
 
@@ -39,7 +39,7 @@
     "time_variable": "t_time",
     // Species list; hydrated from artifacts if empty
     "species_variables": [],
-    // Subset of species to predict; empty = all
+    // Subset of species to predict; empty = all (must equal species_variables)
     "target_species": []
   },
 
@@ -66,7 +66,7 @@
     "min_value_threshold": 1e-30,
     // Compress NPZ shards (smaller, slower I/O)
     "npz_compressed": false,
-    // Workers for preprocessing (I/O bound; ignored under MPI)
+    // Workers for preprocessing (I/O bound)
     "num_workers": 32,
     // Trajectories per output shard
     "trajectories_per_shard": 65536,
@@ -79,28 +79,20 @@
   "dataset": {
     // Global training batch size
     "batch_size_train": 1024,
-
-    // Optional: override dataset tensor dtype (null = use AMP dtype on CUDA; float32 forced on CPU/MPS)
-    // Allowed strings: "float32", "float16", "bf16"/"bfloat16"
+    // Optional: override dataset tensor dtype (null = use AMP dtype)
     "storage_dtype": null,
-
-    // np.load mmap mode for reading shard .npz files ("r" = memmap; null/false disables memmap)
+    // np.load mmap mode ("r" = memmap; null disables)
     "mmap_mode": "r",
-
-    // Avoid full shard scan for the preprocessed data; trust metadata files
+    // Trust metadata; skip shard scan
     "skip_scan": true,
     // Skip time-grid monotonicity checks
     "skip_validate_grids": true,
-    // Precompute normalized Δt table for shared grids
-    "precompute_dt_table": true,
-    // Return K targets per anchor (K=times_per_anchor)
+    // Return K targets per anchor
     "multi_time_per_anchor": true,
-    // K: number of target steps per anchor when multi_time_per_anchor
+    // K: number of target steps per anchor
     "times_per_anchor": 4,
     // Use same offsets for entire batch
     "share_times_across_batch": false,
-    // Sample offsets uniformly then fit anchors
-    "uniform_offset_sampling_strict": false,
     // Assume all trajectories share the same time grid
     "assume_shared_grid": true,
     // Δt clamp floor before normalization
@@ -111,7 +103,7 @@
     "num_workers": 4,
     // Keep workers alive between epochs
     "persistent_workers": true,
-    // Pin memory for faster H2D copies (use only when CPU-staged)
+    // Pin memory for faster H2D copies
     "pin_memory": true,
     // Prefetch batches per worker
     "prefetch_factor": 2,
@@ -120,74 +112,131 @@
   },
 
   "model": {
+    // =========================================================================
+    // Architecture Selection
+    // =========================================================================
+    
+    // Use MLP-only architecture (no encoder/decoder, direct state prediction)
     "mlp_only": false,
+
+    // =========================================================================
+    // Autoencoder Architecture (when mlp_only=false)
+    // =========================================================================
+    
     // Latent channel count for autoencoder
-    "latent_dim": 1024,
+    "latent_dim": 512,
     // Encoder MLP hidden sizes
-    "encoder_hidden": [1024, 1024, 1024, 1024],
+    "encoder_hidden": [512, 512],
     // Dynamics MLP hidden sizes
-    "dynamics_hidden": [1024, 1024, 1024, 1024],
+    "dynamics_hidden": [512, 512],
     // Decoder MLP hidden sizes
-    "decoder_hidden": [1024, 1024, 1024, 1024],
-    // Nonlinearity for MLPs
+    "decoder_hidden": [512, 512],
+
+    // =========================================================================
+    // MLP-Only Architecture (when mlp_only=true)
+    // Three ways to configure hidden layers (in order of precedence):
+    //
+    // 1. Explicit list (highest priority):
+    //    "mlp_hidden": [512, 512, 512, 512]
+    //
+    // 2. Shorthand (num_layers × hidden_dim):
+    //    "mlp_num_layers": 6,
+    //    "mlp_hidden_dim": 512
+    //
+    // 3. Fallback: concatenates encoder_hidden + dynamics_hidden + decoder_hidden
+    // =========================================================================
+    
+    // Option 1: Explicit hidden layer dimensions (overrides all other options)
+    "mlp_hidden": [512, 512, 512, 512, 512, 512],
+    
+    // Option 2: Uniform layers shorthand
+    // "mlp_num_layers": 6,
+    // "mlp_hidden_dim": 512,
+
+    // =========================================================================
+    // Shared Settings
+    // =========================================================================
+    
+    // Nonlinearity for MLPs: "relu", "gelu", "silu"/"swish", "tanh", "elu", "leaky_relu"
     "activation": "silu",
     // Dropout rate in MLPs
     "dropout": 0.0,
-    // Use VAE-style stochastic encoder (if supported by your model.py)
-    "vae_mode": false,
-    // Predict Δz and add to z (residual dynamics)
+    // Use residual connections in dynamics/MLP
     "dynamics_residual": true,
-    // Decoder predicts Δy in z-space
+    // Decoder/MLP predicts Δy in z-space (added to input)
     "predict_delta": true,
-    // Decoder predicts Δlog10(y) in physical space
-    "predict_delta_log_phys": false,
-    // Use log-softmax head for simplex outputs
-    "softmax_head": false,
-    // Allow softmax on subset of species
-    "allow_partial_simplex": false
+    // Decoder/MLP predicts Δlog10(y) in physical space (enables simplex projection)
+    "predict_delta_log_phys": false
   },
 
   "training": {
+    // =========================================================================
+    // Basic Training
+    // =========================================================================
+    
     // Total epochs to train
     "epochs": 100,
     // Clip grad-norm at this value (0 = disabled)
-    "gradient_clip": 0.0,
+    "gradient_clip": 1.0,
     // Gradient accumulation steps
     "accumulate_grad_batches": 1,
 
-    // Optimizer choice: "adamw" (default) or "lamb"
+    // =========================================================================
+    // Optimizer
+    // =========================================================================
+    
+    // Optimizer choice: "adamw" or "lamb"
     "optimizer": "adamw",
-
-    "torch_compile": false,
-    "torch_compile_backend": "inductor",
-    "torch_compile_mode": "max-autotune",
-    "compile_dynamic": false,
-    "compile_fullgraph": true,
-
     // Initial learning rate
     "lr": 1e-4,
-    // Cosine schedule minimum learning rate
-    "min_lr": 5e-7,
-    // Linear warmup epochs before cosine
-    "warmup_epochs": 10,
     // Weight decay for AdamW
     "weight_decay": 1e-4,
 
-    // SWA: no separate lr/min_lr; it derives from the main schedule
+    // =========================================================================
+    // Learning Rate Schedule
+    // =========================================================================
+    
+    // Linear warmup epochs before cosine
+    "warmup_epochs": 10,
+    // Cosine schedule minimum learning rate
+    "min_lr": 5e-7,
+
+    // =========================================================================
+    // torch.compile (Optional)
+    // =========================================================================
+    
+    "torch_compile": false,
+    "torch_compile_backend": "inductor",
+    "torch_compile_mode": "default",
+    "compile_dynamic": false,
+    "compile_fullgraph": false,
+
+    // =========================================================================
+    // Stochastic Weight Averaging (Optional)
+    // =========================================================================
+    
     "use_swa": false,
-    "swa_epoch_start": 0.8, // fraction of total epochs OR absolute int epoch
+    "swa_epoch_start": 0.8,
     "swa_annealing_epochs": 10,
     "swa_annealing_strategy": "cos",
 
-    // Limit training steps per epoch (0 = no limit)
-    "max_train_steps_per_epoch": 0,
+    // =========================================================================
+    // Debugging / Limits
+    // =========================================================================
+    
+    // Limit training batches per epoch (0 = no limit)
+    "max_train_batches": 0,
     // Limit validation batches per epoch (0 = no limit)
     "max_val_batches": 0,
     // Checkpoint path to resume from (optional)
     "resume": null,
-    // Allow auto-resume from config/env/CLI
+    // Allow auto-resume from last.ckpt
     "auto_resume": true,
 
+    // =========================================================================
+    // Data Sampling
+    // =========================================================================
+    
     // Subsample fraction of trajectories during preprocessing
     "use_fraction": 1.0,
     // Validation fraction for preprocessing split
@@ -197,18 +246,76 @@
     // Minimum j−i offset for targets
     "min_steps": 1,
     // Maximum j−i offset for targets (null = T-1)
-    "max_steps": 99,
+    "max_steps": null,
     // Anchors per trajectory per epoch
     "pairs_per_traj": 4,
 
+    // =========================================================================
+    // Loss Function
+    // =========================================================================
+    
     "adaptive_stiff_loss": {
+      // Weight for log10-space physical loss
       "lambda_phys": 1.0,
+      // Weight for z-space MSE loss
       "lambda_z": 0.5,
-      "use_weighting": false, // Set to false for equal 1.0 weights
-      "weight_power": 0.5,   // Change to 1.0 for linear weighting
-      "w_min": 0.5,          // The lowest weight a species can have
-      "w_max": 2.0,          // The highest weight a species can have
+      // Use per-species weighting based on dynamic range
+      "use_weighting": false,
+      // Power for range-based weighting (0.5 = sqrt)
+      "weight_power": 0.5,
+      // Min/max clamps for species weights
+      "w_min": 0.5,
+      "w_max": 2.0,
+      // Epsilon for numerical stability
       "epsilon_phys": 1e-20
+    },
+
+    // =========================================================================
+    // Rollout Training (for stable long-horizon autoregressive prediction)
+    // Based on Kelp (2020): noise injection, clipping, curriculum learning
+    // =========================================================================
+    
+    "rollout": {
+      // Enable rollout training (requires dataset.times_per_anchor >= steps)
+      "enabled": false,
+      // Number of autoregressive steps per training sample
+      "steps": 4,
+      
+      // Curriculum learning: gradually increase rollout steps
+      "curriculum": {
+        "enabled": true,
+        "start_steps": 1,
+        "end_steps": 8,
+        "ramp_epochs": 20
+      },
+      
+      // Noise injection in log10 space (KEY for robustness)
+      // Forces model to recover from prediction errors during training
+      "noise": {
+        "enabled": true,
+        // Standard deviation of Gaussian noise in log10 space
+        "log10_std": 0.01
+      },
+      
+      // Clipping in log10 space to prevent nonphysical values
+      "clip": {
+        "enabled": true,
+        "log10_min": -30.0,
+        "log10_max": 10.0
+      },
+      
+      // Loss weighting across rollout steps: "uniform", "linear", "exponential"
+      "loss_weighting": "uniform",
+      // Discount factor for exponential weighting (weight[k] = discount^k)
+      "loss_discount": 0.9,
+      // Truncated BPTT: detach gradient every N steps (0 = disabled)
+      "detach_every": 0,
+      
+      // Validation rollout: track long-horizon performance during validation
+      "validation": {
+        "enabled": false,
+        "steps": 8
+      }
     }
   }
 }

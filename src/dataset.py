@@ -3,9 +3,18 @@
 
 Batch variables and structures:
     y_i : [B, S]          (runtime dtype)
-    dt  : [B, K, 1]       (dt-spec normalized, runtime dtype)
+    dt  : [B, K, 1]       (dt-spec normalized, always float32 for precision)
     y_j : [B, K, S]       (runtime dtype)
     g   : [B, G]          (runtime dtype)
+
+Rollout mode (training.rollout.enabled=True):
+    - Targets are sorted sequentially: j_0 < j_1 < ... < j_{K-1}
+    - dt is INCREMENTAL: dt[0] = t[j_0] - t[i], dt[k] = t[j_k] - t[j_{k-1}] for k>0
+    - This matches the rollout trainer's autoregressive loop semantics
+
+Standard mode (training.rollout.enabled=False, default):
+    - Targets are randomly sampled (may not be ordered)
+    - dt is CUMULATIVE from anchor: dt[k] = t[j_k] - t[i] for all k
 """
 
 from __future__ import annotations
@@ -21,6 +30,17 @@ from torch.utils.data import DataLoader, Dataset
 
 from normalizer import NormalizationHelper
 from utils import load_json_config as load_json
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+DDP_SEED_OFFSET = 1_000_003
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
 
 
 def _as_path(p: Any) -> Path:
@@ -38,7 +58,7 @@ def _canonical_split(split: str) -> str:
     if name in ("train", "training"):
         return "train"
     if name in ("val", "valid", "validation"):
-        return "validation"  # keep in sync with preprocessor output
+        return "validation"
     if name in ("test", "testing"):
         return "test"
     raise ValueError(f"Unknown split: {split!r}")
@@ -61,8 +81,13 @@ def _check_duplicates(items: Sequence[str], label: str) -> None:
 
 @dataclass(frozen=True)
 class _Index:
-    row: int        # global trajectory index in [0, N)
-    is_first: bool  # True for the first of the pairs_per_traj samples for that row
+    row: int
+    is_first: bool
+
+
+# =============================================================================
+# Dataset
+# =============================================================================
 
 
 class FlowMapPairsDataset(Dataset):
@@ -70,10 +95,8 @@ class FlowMapPairsDataset(Dataset):
     High-performance in-memory dataset with K future targets per anchor.
 
     Key behavior:
-      - This dataset does not precompute (i, j) pairs.
       - Each batch samples anchors/offsets on the fly inside collate_batch().
-      - With DataLoader workers, randomness lives inside the worker process; therefore
-        reproducibility depends on DataLoader's worker seeding, not on dataset.set_epoch().
+      - With DataLoader workers, randomness lives inside the worker process.
     """
 
     def __init__(
@@ -102,18 +125,22 @@ class FlowMapPairsDataset(Dataset):
         self._log = logger if logger is not None else logging.getLogger(__name__)
         log = self._log
 
-        # One-time logging flags
         self._did_log_init_summary: bool = False
         self._did_log_first_batch_checks: bool = False
 
         # Dataset config knobs
         dcfg = dict(self.cfg.get("dataset", {}))
-        self.precompute_dt_table = bool(dcfg.get("precompute_dt_table", True))
         self.multi_time = bool(dcfg.get("multi_time_per_anchor", True))
         self.K = int(dcfg.get("times_per_anchor", 1)) if self.multi_time else 1
         self.share_offsets_across_batch = bool(dcfg.get("share_times_across_batch", False))
 
-        # Enforce i=0 for the first of the pairs_per_traj samples (TRAIN + VAL).
+        # Rollout mode
+        rollout_cfg = self.cfg.get("training", {}).get("rollout", {})
+        self.rollout_mode = bool(rollout_cfg.get("enabled", False))
+        if self.rollout_mode:
+            log.info("Rollout mode ENABLED: targets will be sequential, dt will be incremental")
+
+        # Anchor sampling options
         if "use_first_anchor" in dcfg:
             self.use_first_anchor = bool(dcfg.get("use_first_anchor", True))
         else:
@@ -125,23 +152,22 @@ class FlowMapPairsDataset(Dataset):
         self.assume_shared_grid = bool(dcfg.get("assume_shared_grid", False))
         self._mmap_mode = (str(dcfg.get("mmap_mode", "r")) if dcfg.get("mmap_mode", "r") else None)
 
-        # Stage device and dtypes (if preload_to_gpu=True, DataLoader workers must be disabled)
+        # Stage device and dtypes
         self._stage_device = device if (preload_to_gpu and device is not None) else torch.device("cpu")
         self.device = self._stage_device
         self._runtime_dtype = dtype
         self._time_dtype = torch.float32
 
-        # Δt clamp floor
         self.dt_epsilon = float(dcfg.get("dt_epsilon", self.cfg.get("normalization", {}).get("epsilon", 1e-30)))
 
-        # Normalization helper (requires manifest)
+        # Normalization helper
         manifest_path = self.root / "normalization.json"
         if not manifest_path.exists():
             raise FileNotFoundError(f"Missing normalization manifest: {manifest_path}")
         manifest = load_json(manifest_path)
         self.norm = NormalizationHelper(manifest, device=self._stage_device)
 
-        # Processed meta (authoritative column order for shards)
+        # Processed meta
         meta = manifest.get("meta", {}) or {}
         processed_species_all: List[str] = list(meta.get("species_variables", []) or [])
         if not processed_species_all:
@@ -165,9 +191,7 @@ class FlowMapPairsDataset(Dataset):
         cfg_targets: List[str] = list(cfg_targets_raw) if cfg_targets_raw else []
         cfg_globals: List[str] = list(cfg_globals_raw) if cfg_globals_raw else []
 
-        # Resolve species selection:
-        # - Empty list means "unspecified": use all processed species.
-        # - Non-empty list must be a subset of processed species.
+        # Resolve species selection
         if cfg_species:
             _check_duplicates(cfg_species, "cfg.data.species_variables")
             missing = [s for s in cfg_species if s not in processed_species_index]
@@ -196,9 +220,7 @@ class FlowMapPairsDataset(Dataset):
                 len(selected_species),
             )
 
-        # Resolve target selection:
-        # - If specified, must be subset of processed species and identical to species_variables.
-        # - If empty, defaults to species_variables.
+        # Resolve target selection
         if cfg_targets:
             _check_duplicates(cfg_targets, "cfg.data.target_species")
             missing = [s for s in cfg_targets if s not in processed_species_index]
@@ -220,9 +242,7 @@ class FlowMapPairsDataset(Dataset):
                 len(selected_targets),
             )
 
-        # Resolve globals selection:
-        # - If processed has globals, empty config means use all processed globals.
-        # - If specified, must be subset of processed globals (and will be selected in that order).
+        # Resolve globals selection
         if processed_globals_all:
             if cfg_globals:
                 _check_duplicates(cfg_globals, "cfg.data.global_variables")
@@ -253,7 +273,6 @@ class FlowMapPairsDataset(Dataset):
                     _preview(selected_globals),
                 )
         else:
-            # No processed globals; require config to be empty.
             if cfg_globals:
                 raise ValueError(
                     "Processed artifacts contain no global_variables, but cfg.data.global_variables is non-empty: "
@@ -261,7 +280,7 @@ class FlowMapPairsDataset(Dataset):
                 )
             selected_globals = []
 
-        # Persist resolved lists on the dataset instance.
+        # Persist resolved lists
         self.species_vars = list(selected_species)
         self.target_species = list(selected_targets)
         self.global_vars = list(selected_globals)
@@ -272,13 +291,13 @@ class FlowMapPairsDataset(Dataset):
         self._species_idx = [processed_species_index[s] for s in self.species_vars]
         self._globals_idx = [processed_globals_index[g] for g in self.global_vars] if self.global_vars else []
 
-        # Normalization methods must exist for all used keys.
+        # Validate normalization methods
         norm_methods = manifest.get("normalization_methods", {})
         for key in (self.species_vars + self.global_vars + [self.time_key]):
             if key not in norm_methods:
                 raise RuntimeError(f"Normalization method missing for variable {key!r} in normalization.json")
 
-        # Enumerate shard files for this split
+        # Enumerate shard files
         split_dir = self.root / self.split
         if not split_dir.exists():
             raise FileNotFoundError(f"Missing split directory: {split_dir}")
@@ -287,9 +306,7 @@ class FlowMapPairsDataset(Dataset):
             raise FileNotFoundError(f"No shards found in {split_dir}")
         self.shard_paths: List[Path] = shard_paths
 
-        # ------------------------------------------------------------------
         # First pass: shapes, counts, and shared-grid detection
-        # ------------------------------------------------------------------
         shard_sizes: List[int] = []
         S_expected: Optional[int] = None
         G_expected_raw: Optional[int] = None
@@ -337,23 +354,20 @@ class FlowMapPairsDataset(Dataset):
         if S_expected is None or T_expected is None or G_expected_raw is None:
             raise RuntimeError("Failed to infer dataset shapes from shards.")
 
-        # Validate processed shard dimensions against manifest meta.
+        # Validate processed shard dimensions
         if int(S_expected) != len(self._processed_species_all):
             raise RuntimeError(
                 "Processed shard species dimension does not match normalization.json meta.species_variables. "
-                f"Shards report S={int(S_expected)} but meta.species_variables has {len(self._processed_species_all)} entries. "
-                "This usually indicates mixed artifacts or an out-of-sync processed directory."
+                f"Shards report S={int(S_expected)} but meta.species_variables has {len(self._processed_species_all)} entries."
             )
         if self._processed_globals_all and int(G_expected_raw) != len(self._processed_globals_all):
             raise RuntimeError(
                 "Processed shard globals dimension does not match normalization.json meta.global_variables. "
-                f"Shards report G={int(G_expected_raw)} but meta.global_variables has {len(self._processed_globals_all)} entries. "
-                "This usually indicates mixed artifacts or an out-of-sync processed directory."
+                f"Shards report G={int(G_expected_raw)} but meta.global_variables has {len(self._processed_globals_all)} entries."
             )
         if (not self._processed_globals_all) and int(G_expected_raw) != 0:
             raise RuntimeError(
-                "Processed shards contain globals (G>0) but normalization.json meta.global_variables is empty. "
-                "This usually indicates inconsistent artifacts."
+                "Processed shards contain globals (G>0) but normalization.json meta.global_variables is empty."
             )
 
         self.N = int(sum(shard_sizes))
@@ -363,17 +377,11 @@ class FlowMapPairsDataset(Dataset):
         self.G_raw = int(G_expected_raw)
         self.G = int(len(self.global_vars))
 
-        # Shared time grid flag
         self._shared_time_grid = bool(shared_time_grid) if not self.assume_shared_grid else True
 
-        # ------------------------------------------------------------------
         # Second pass: preload + normalization
-        # ------------------------------------------------------------------
-        self.g_table: Optional[torch.Tensor] = None
-        self.dt_table: Optional[torch.Tensor] = None
         self.t_shared: Optional[torch.Tensor] = None
         self.time_grid_per_row: Optional[torch.Tensor] = None
-        self.y_table: Optional[torch.Tensor] = None
 
         # Preallocate on stage device
         self.g = torch.empty((self.N, self.G), device=self._stage_device, dtype=self._runtime_dtype)
@@ -386,7 +394,7 @@ class FlowMapPairsDataset(Dataset):
                 raise RuntimeError("Shared time grid enabled but failed to load a reference time vector.")
             self.t_shared = _to_device_dtype(t_ref, self._stage_device, self._time_dtype).reshape(-1)
 
-        # Load shards into preallocated tensors
+        # Load shards
         shard_offsets: List[int] = [0]
         for n_i in shard_sizes:
             shard_offsets.append(shard_offsets[-1] + int(n_i))
@@ -410,12 +418,9 @@ class FlowMapPairsDataset(Dataset):
                 g_t = torch.from_numpy(g_np_sel).to(device=self._stage_device, dtype=torch.float32, non_blocking=True)
                 g_t = self.norm.normalize(g_t, self.global_vars)
                 self.g[start:end].copy_(g_t.to(dtype=self._runtime_dtype), non_blocking=True)
-            else:
-                # No globals used.
-                pass
 
-            # Species: select requested columns (cfg order), normalize, then cast
-            y_np_sel = np.asarray(y_np[..., self._species_idx], dtype=np.float32)  # [n_i, T, S_selected]
+            # Species
+            y_np_sel = np.asarray(y_np[..., self._species_idx], dtype=np.float32)
             y_t = torch.from_numpy(y_np_sel).to(device=self._stage_device, dtype=torch.float32, non_blocking=True)
             y_t = self.norm.normalize(y_t, self.species_vars)
             self.y[start:end].copy_(y_t.to(dtype=self._runtime_dtype), non_blocking=True)
@@ -430,30 +435,6 @@ class FlowMapPairsDataset(Dataset):
                 t_t = torch.from_numpy(t_row).to(device=self._stage_device, dtype=self._time_dtype, non_blocking=True)
                 assert self.time_grid_per_row is not None
                 self.time_grid_per_row[start:end].copy_(t_t, non_blocking=True)
-
-        # Precompute dt table if requested and feasible
-        if self.precompute_dt_table:
-            if self._shared_time_grid:
-                # dt_table is indexed by time indices: dt_table[i, j] corresponds to dt(t_i -> t_j)
-                assert self.t_shared is not None
-                t = self.t_shared.to(dtype=self._time_dtype)
-                dt_phys = t.view(1, self.T) - t.view(self.T, 1)  # [T, T], dt_phys[i, j] = t[j] - t[i]
-
-                # For safety, force non-positive dt values to the dt_min floor.
-                dt_min_phys = torch.tensor(float(self.norm.dt_min_phys), device=self._stage_device, dtype=self._time_dtype)
-                lower_or_diag = torch.tril(torch.ones((self.T, self.T), device=self._stage_device, dtype=torch.bool))
-                dt_phys = torch.where(lower_or_diag, dt_min_phys, dt_phys)
-
-                dt_phys = dt_phys.clamp_min(float(self.dt_epsilon))
-                dt_norm = self.norm.normalize_dt_from_phys(dt_phys)  # float32
-                self.dt_table = dt_norm.to(device=self._stage_device, dtype=self._time_dtype).contiguous()
-            else:
-                # Per-row dt_table would be O(N*T^2) memory and is not feasible for typical runs.
-                log.info(
-                    "dt_table precompute requested but disabled because per-row time grids are in use (shared_time_grid=False). "
-                    "Δt will be computed on the fly."
-                )
-                self.dt_table = None
 
         self.length = int(self.N * self.pairs_per_traj)
         self._log_init_summary_once(num_shards=len(shard_paths), shard_sizes=shard_sizes)
@@ -472,20 +453,18 @@ class FlowMapPairsDataset(Dataset):
         """
         Sample anchor indices per row.
 
-        Sampling is performed on CPU so it works in DataLoader workers even if
-        staging tensors live on GPU (workers are disabled in that case).
+        In rollout mode, anchors are constrained to ensure K distinct offsets exist.
         """
-        upper = max(0, self.T - 1 - self.min_steps)
+        if self.rollout_mode:
+            required_room = self.min_steps + (self.K - 1)
+            upper = max(0, self.T - 1 - required_room)
+        else:
+            upper = max(0, self.T - 1 - self.min_steps)
+
         if upper <= 0:
             out = torch.zeros(B, dtype=torch.long, device="cpu")
         else:
-            out = torch.randint(
-                low=0,
-                high=upper + 1,  # randint high is exclusive
-                size=(B,),
-                device="cpu",
-                dtype=torch.long,
-            )
+            out = torch.randint(low=0, high=upper + 1, size=(B,), device="cpu", dtype=torch.long)
 
         dev = self._stage_device
         if dev.type == "cpu":
@@ -493,12 +472,7 @@ class FlowMapPairsDataset(Dataset):
         return out.to(dev, non_blocking=True)
 
     def _sample_offsets_conditioned(self, i_used: torch.Tensor) -> torch.Tensor:
-        """
-        Sample offsets o = j - i conditioned on the chosen anchor i so that j is always valid.
-
-        Returns:
-            offs : [B, K] long, with low <= offs <= min(max_steps, T-1-i_used)
-        """
+        """Sample offsets o = j - i conditioned on the chosen anchor i."""
         if i_used.ndim != 1:
             raise ValueError(f"i_used must be 1D [B], got shape {tuple(i_used.shape)}")
 
@@ -513,37 +487,70 @@ class FlowMapPairsDataset(Dataset):
         if max_off_global < low:
             raise ValueError(f"Invalid offset range: max_steps={self.max_steps} < min_steps={self.min_steps}")
 
-        # Per-row maximum offset so that j = i + o <= T-1
         max_off_row = torch.minimum(
             torch.full((B,), max_off_global, device=dev, dtype=torch.long),
             (self.T - 1 - i_used),
-        )  # [B]
+        )
 
         if torch.any(max_off_row < low):
             raise RuntimeError("Invalid sampling state: max_off_row < min_steps")
 
         if self.share_offsets_across_batch:
-            # Same offsets for every row; choose offsets using batch-min to keep all rows valid.
             max_off_batch = int(max_off_row.min().item())
             width = max(1, max_off_batch - low + 1)
 
-            offs_shared_cpu = torch.randint(
-                low=0,
-                high=width,
-                size=(k,),
-                device=torch.device("cpu"),
-                dtype=torch.long,
-            ) + low  # [K]
-            offs = offs_shared_cpu.to(dev, non_blocking=True).view(1, k).expand(B, -1)  # [B,K]
+            offs_shared_cpu = torch.randint(low=0, high=width, size=(k,), device=torch.device("cpu"), dtype=torch.long) + low
+            offs = offs_shared_cpu.to(dev, non_blocking=True).view(1, k).expand(B, -1)
             return offs
 
-        # Per-row offsets with per-row ranges; rand/floor on CPU for speed.
-        width_row = (max_off_row - low + 1).clamp_min(1)  # [B]
-        width_cpu_f = width_row.to(torch.float32).cpu()  # [B]
+        width_row = (max_off_row - low + 1).clamp_min(1)
+        width_cpu_f = width_row.to(torch.float32).cpu()
 
-        u = torch.rand((B, k), device="cpu")  # [B,K]
-        offs_cpu = (torch.floor(u * width_cpu_f.view(B, 1)).to(torch.long) + low)  # [B,K]
+        u = torch.rand((B, k), device="cpu")
+        offs_cpu = (torch.floor(u * width_cpu_f.view(B, 1)).to(torch.long) + low)
         return offs_cpu.to(dev, non_blocking=True)
+
+    def _sample_sequential_offsets(self, i_used: torch.Tensor) -> torch.Tensor:
+        """
+        Sample K DISTINCT SORTED offsets for rollout training.
+
+        In rollout mode, targets must be sequential (j_0 < j_1 < ... < j_{K-1}).
+        """
+        if i_used.ndim != 1:
+            raise ValueError(f"i_used must be 1D [B], got shape {tuple(i_used.shape)}")
+
+        B = int(i_used.shape[0])
+        K = int(self.K)
+        dev = self._stage_device
+
+        low = self.min_steps
+        max_off_global = self.max_steps if self.max_steps is not None else (self.T - 1)
+        max_off_global = min(max_off_global, self.T - 1)
+
+        max_off_row = torch.minimum(
+            torch.full((B,), max_off_global, device=dev, dtype=torch.long),
+            (self.T - 1 - i_used),
+        )
+
+        width_row = max_off_row - low + 1
+        insufficient = width_row < K
+        if insufficient.any():
+            bad_indices = insufficient.nonzero(as_tuple=True)[0].tolist()
+            bad_widths = width_row[insufficient].tolist()
+            raise RuntimeError(
+                f"Rollout mode requires K={K} distinct offsets, but rows {bad_indices[:5]} "
+                f"only have room for {bad_widths[:5]} offsets."
+            )
+
+        offs_list = []
+        for b in range(B):
+            max_off_b = int(max_off_row[b].item())
+            width = max_off_b - low + 1
+            perm = torch.randperm(width, device="cpu")[:K]
+            offs_b = (perm + low).sort().values
+            offs_list.append(offs_b)
+
+        return torch.stack(offs_list, dim=0).to(dev, non_blocking=True)
 
     # =============================== Collation ==================================
 
@@ -559,55 +566,115 @@ class FlowMapPairsDataset(Dataset):
         B = len(batch)
         dev = self._stage_device
 
-        rows = torch.tensor([b.row for b in batch], device=dev, dtype=torch.long)  # [B]
+        rows = torch.tensor([b.row for b in batch], device=dev, dtype=torch.long)
 
         first_mask: Optional[torch.Tensor] = None
         if self.use_first_anchor and self.split != "test":
             first_mask = torch.tensor([b.is_first for b in batch], device=dev, dtype=torch.bool)
 
-        # Choose anchors i and offsets o=j-i (conditioned so j is always valid)
-        i_used = self._sample_anchor_indices(B)  # [B]
+        # Choose anchors i and offsets o=j-i
+        i_used = self._sample_anchor_indices(B)
         if first_mask is not None and bool(first_mask.any().item()):
             i_used = torch.where(first_mask, torch.zeros_like(i_used), i_used)
 
-        offs = self._sample_offsets_conditioned(i_used)  # [B,K]
-        j_idx = i_used.unsqueeze(1) + offs  # [B,K], guaranteed < T
-
+        # Sample offsets
+        if self.rollout_mode:
+            offs = self._sample_sequential_offsets(i_used)
+        else:
+            offs = self._sample_offsets_conditioned(i_used)
+        j_idx = i_used.unsqueeze(1) + offs
 
         # Gather species/globals/time
-        y_btS = self.y.index_select(0, rows)  # [B,T,S]
+        y_btS = self.y.index_select(0, rows)
         g = self.g.index_select(0, rows) if self.G > 0 else self.y.new_zeros((B, 0))
 
-        y_i = y_btS.gather(dim=1, index=i_used.view(B, 1, 1).expand(-1, 1, self.S)).squeeze(1)  # [B,S]
-        y_j = y_btS.gather(dim=1, index=j_idx.view(B, self.K, 1).expand(-1, -1, self.S))  # [B,K,S]
+        y_i = y_btS.gather(dim=1, index=i_used.view(B, 1, 1).expand(-1, 1, self.S)).squeeze(1)
+        y_j = y_btS.gather(dim=1, index=j_idx.view(B, self.K, 1).expand(-1, -1, self.S))
 
-        # Δt normalized -> [B,K,1]
-        if self.dt_table is not None:
-            # dt_table is [T,T]; index_select rows by i, then gather cols by j
-            dt_norm = self.dt_table.index_select(0, i_used).gather(dim=1, index=j_idx)  # [B,K]
+        # Compute dt - different behavior for rollout mode vs standard mode
+        if self.rollout_mode:
+            dt_norm = self._compute_incremental_dt(rows, i_used, j_idx)
         else:
-            if self._shared_time_grid:
-                t = self.t_shared
-                if t is None:
-                    raise RuntimeError("Shared time grid enabled but t_shared is None.")
-                t_i = t.index_select(0, i_used)  # [B]
-                t_j = t.index_select(0, j_idx.reshape(-1)).view(B, self.K)  # [B,K]
-            else:
-                if self.time_grid_per_row is None:
-                    raise RuntimeError("Per-row time grids required but time_grid_per_row is None.")
-                t_rows = self.time_grid_per_row.index_select(0, rows)  # [B,T]
-                t_i = t_rows.gather(dim=1, index=i_used.view(B, 1)).squeeze(1)  # [B]
-                t_j = t_rows.gather(dim=1, index=j_idx)  # [B,K]
+            dt_norm = self._compute_cumulative_dt(rows, i_used, j_idx)
 
-            dt_phys = (t_j - t_i.unsqueeze(1)).clamp_min(float(self.dt_epsilon))  # [B,K]
-            dt_norm = self.norm.normalize_dt_from_phys(dt_phys)  # [B,K] float32
-
-        # Precision for time
-        #dt = dt_norm.to(dtype=self._runtime_dtype).unsqueeze(-1)  # [B,K,1]
         dt = dt_norm.to(dtype=torch.float32).unsqueeze(-1)
 
         self._log_first_batch_checks_once(y_i, dt, y_j, g)
         return y_i, dt, y_j, g
+
+    def _compute_cumulative_dt(
+        self, rows: torch.Tensor, i_used: torch.Tensor, j_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute cumulative dt from anchor for standard (non-rollout) mode.
+
+        dt[k] = t[j_k] - t[i] for all k
+        """
+        B = int(rows.shape[0])
+
+        if self._shared_time_grid:
+            t = self.t_shared
+            if t is None:
+                raise RuntimeError("Shared time grid enabled but t_shared is None.")
+            t_i = t.index_select(0, i_used)
+            t_j = t.index_select(0, j_idx.reshape(-1)).view(B, self.K)
+        else:
+            if self.time_grid_per_row is None:
+                raise RuntimeError("Per-row time grids required but time_grid_per_row is None.")
+            t_rows = self.time_grid_per_row.index_select(0, rows)
+            t_i = t_rows.gather(dim=1, index=i_used.view(B, 1)).squeeze(1)
+            t_j = t_rows.gather(dim=1, index=j_idx)
+
+        dt_phys = (t_j - t_i.unsqueeze(1)).clamp_min(float(self.dt_epsilon))
+        dt_norm = self.norm.normalize_dt_from_phys(dt_phys)
+
+        return dt_norm
+
+    def _compute_incremental_dt(
+        self, rows: torch.Tensor, i_used: torch.Tensor, j_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute incremental dt for rollout training.
+
+        dt[0] = t[j_0] - t[i]
+        dt[k] = t[j_k] - t[j_{k-1}] for k > 0
+        """
+        B = int(rows.shape[0])
+        K = int(j_idx.shape[1])
+
+        if self._shared_time_grid:
+            t = self.t_shared
+            if t is None:
+                raise RuntimeError("Shared time grid enabled but t_shared is None.")
+            t_i = t.index_select(0, i_used)
+            t_j = t.index_select(0, j_idx.reshape(-1)).view(B, K)
+        else:
+            if self.time_grid_per_row is None:
+                raise RuntimeError("Per-row time grids required but time_grid_per_row is None.")
+            t_rows = self.time_grid_per_row.index_select(0, rows)
+            t_i = t_rows.gather(dim=1, index=i_used.view(B, 1)).squeeze(1)
+            t_j = t_rows.gather(dim=1, index=j_idx)
+
+        # Compute incremental dt_phys
+        dt_phys = torch.zeros((B, K), device=t_j.device, dtype=t_j.dtype)
+        dt_phys[:, 0] = t_j[:, 0] - t_i
+        if K > 1:
+            dt_phys[:, 1:] = t_j[:, 1:] - t_j[:, :-1]
+
+        # Validate dt > 0 before clamping
+        non_positive = dt_phys <= 0
+        if non_positive.any():
+            bad_count = int(non_positive.sum().item())
+            min_dt = float(dt_phys.min().item())
+            raise RuntimeError(
+                f"Rollout incremental dt has {bad_count} non-positive values (min={min_dt:.3e}). "
+                f"This indicates repeated time indices."
+            )
+
+        dt_phys = dt_phys.clamp_min(float(self.dt_epsilon))
+        dt_norm = self.norm.normalize_dt_from_phys(dt_phys)
+
+        return dt_norm
 
     # ============================= Logging helpers ==============================
 
@@ -620,7 +687,7 @@ class FlowMapPairsDataset(Dataset):
             max_shard = max(shard_sizes) if shard_sizes else 0
             self._log.info(
                 "FlowMapPairsDataset init: split=%s, shards=%d, total_rows=%d, "
-                "T=%d, S=%d (raw=%d), G=%d (raw=%d), shared_time_grid=%s, dt_table_precomputed=%s, "
+                "T=%d, S=%d (raw=%d), G=%d (raw=%d), shared_time_grid=%s, "
                 "shard_size_range=[%d, %d], stage_device=%s, runtime_dtype=%s",
                 self.split,
                 num_shards,
@@ -631,7 +698,6 @@ class FlowMapPairsDataset(Dataset):
                 self.G,
                 self.G_raw,
                 bool(self._shared_time_grid),
-                bool(self.dt_table is not None),
                 min_shard,
                 max_shard,
                 str(self._stage_device),
@@ -683,6 +749,11 @@ class FlowMapPairsDataset(Dataset):
             self._did_log_first_batch_checks = True
 
 
+# =============================================================================
+# DataLoader Factory
+# =============================================================================
+
+
 def create_dataloader(
     dataset: FlowMapPairsDataset,
     batch_size: int,
@@ -694,26 +765,19 @@ def create_dataloader(
 ) -> DataLoader:
     """
     Create a DataLoader with reproducible per-epoch worker seeding.
-
-    Notes:
-      - A dedicated torch.Generator isolates DataLoader seeding from unrelated global RNG use.
-      - If staging tensors live on CUDA, DataLoader workers are forced to 0 (CUDA-in-fork is unsafe).
     """
     num_workers = int(num_workers)
     is_train = getattr(dataset, "split", "") == "train"
+    log = getattr(dataset, "_log", None)
 
-    # If staging tensors live on CUDA, do not use workers (CUDA-in-fork issues).
+    # If staging tensors live on CUDA, do not use workers
     if getattr(dataset, "_stage_device", None) is not None and getattr(dataset, "_stage_device").type == "cuda":
         if num_workers > 0:
-            log = getattr(dataset, "_log", None)
-            msg = (
-                "[dl] preload_to_gpu=True detected; forcing num_workers=0, "
-                "pin_memory=False, persistent_workers=False to avoid CUDA-in-fork issues."
-            )
             if log is not None:
-                log.warning(msg)
-            else:
-                print(msg)
+                log.warning(
+                    "preload_to_gpu=True detected; forcing num_workers=0, "
+                    "pin_memory=False, persistent_workers=False to avoid CUDA-in-fork issues."
+                )
 
         num_workers = 0
         persistent_workers = False
@@ -726,7 +790,7 @@ def create_dataloader(
         rank = int(torch.distributed.get_rank())
 
     gen = torch.Generator(device="cpu")
-    gen.manual_seed(base_seed + 1_000_003 * rank)
+    gen.manual_seed(base_seed + DDP_SEED_OFFSET * rank)
 
     def _worker_init_fn(worker_id: int) -> None:
         seed32 = int(torch.initial_seed() % (2**32))
@@ -751,6 +815,11 @@ def create_dataloader(
     return DataLoader(**kwargs)
 
 
+# =============================================================================
+# NPZ Reader
+# =============================================================================
+
+
 def _read_npz_triplet(
     path: Path,
     mmap_mode: Optional[str] = "r",
@@ -759,7 +828,7 @@ def _read_npz_triplet(
     Read a preprocessed NPZ shard with optional memory mapping.
 
     Expected keys:
-        - 'globals' or 'g_vec' or 'g_arr' : [N, G] global features (optional; may be missing)
+        - 'globals' or 'g_vec' or 'g_arr' : [N, G] global features (optional)
         - 't_vec'                         : [T] or [N, T] time grid(s)
         - 'y_mat' or 'y_arr'              : [N, T, S] species trajectories
     """
