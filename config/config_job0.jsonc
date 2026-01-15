@@ -1,11 +1,11 @@
 {
   "paths": {
     // Directory containing processed shards
-    "processed_data_dir": "data/processed",
+    "processed_data_dir": "data/processed_quarter",
     // List of raw HDF5 files (optional; auto-detect if empty)
     "raw_data_files": [],
     // Directory for logs/checkpoints/exports
-    "work_dir": "models/flowmap",
+    "work_dir": "models/mlp",
     // Delete existing work_dir before start
     "overwrite": false
   },
@@ -29,7 +29,7 @@
 
   "mixed_precision": {
     // AMP precision: "bf16", "fp16", or "fp32"/"none"
-    "mode": "bf16"
+    "mode": "fp32"
   },
 
   "data": {
@@ -78,7 +78,7 @@
 
   "dataset": {
     // Global training batch size
-    "batch_size_train": 1024,
+    "batch_size_train": 2048,
     // Optional: override dataset tensor dtype (null = use AMP dtype)
     "storage_dtype": null,
     // np.load mmap mode ("r" = memmap; null disables)
@@ -90,7 +90,7 @@
     // Return K targets per anchor
     "multi_time_per_anchor": true,
     // K: number of target steps per anchor
-    "times_per_anchor": 4,
+    "times_per_anchor": 24,
     // Use same offsets for entire batch
     "share_times_across_batch": false,
     // Assume all trajectories share the same time grid
@@ -117,7 +117,7 @@
     // =========================================================================
     
     // Use MLP-only architecture (no encoder/decoder, direct state prediction)
-    "mlp_only": false,
+    "mlp_only": true,
 
     // =========================================================================
     // Autoencoder Architecture (when mlp_only=false)
@@ -147,7 +147,7 @@
     // =========================================================================
     
     // Option 1: Explicit hidden layer dimensions (overrides all other options)
-    "mlp_hidden": [512, 512, 512, 512, 512, 512],
+    "mlp_hidden": [2048, 2048, 2048, 2048, 2048],
     
     // Option 2: Uniform layers shorthand
     // "mlp_num_layers": 6,
@@ -177,7 +177,7 @@
     // Total epochs to train
     "epochs": 100,
     // Clip grad-norm at this value (0 = disabled)
-    "gradient_clip": 1.0,
+    "gradient_clip": 0.0,
     // Gradient accumulation steps
     "accumulate_grad_batches": 1,
 
@@ -199,7 +199,7 @@
     // Linear warmup epochs before cosine
     "warmup_epochs": 10,
     // Cosine schedule minimum learning rate
-    "min_lr": 5e-7,
+    "min_lr": 1e-7,
 
     // =========================================================================
     // torch.compile (Optional)
@@ -244,9 +244,9 @@
     // Test fraction for preprocessing split
     "test_fraction": 0.1,
     // Minimum j−i offset for targets
-    "min_steps": 1,
+    "min_steps": 20,
     // Maximum j−i offset for targets (null = T-1)
-    "max_steps": null,
+    "max_steps": 65,
     // Anchors per trajectory per epoch
     "pairs_per_traj": 4,
 
@@ -258,7 +258,7 @@
       // Weight for log10-space physical loss
       "lambda_phys": 1.0,
       // Weight for z-space MSE loss
-      "lambda_z": 0.5,
+      "lambda_z": 0.25,
       // Use per-species weighting based on dynamic range
       "use_weighting": false,
       // Power for range-based weighting (0.5 = sqrt)
@@ -277,15 +277,15 @@
     
     "rollout": {
       // Enable rollout training (requires dataset.times_per_anchor >= steps)
-      "enabled": false,
+      "enabled": true,
       // Number of autoregressive steps per training sample
-      "steps": 4,
+      "steps": 16,
       
       // Curriculum learning: gradually increase rollout steps
       "curriculum": {
         "enabled": true,
         "start_steps": 1,
-        "end_steps": 8,
+        "end_steps": 16,
         "ramp_epochs": 20
       },
       
@@ -294,27 +294,27 @@
       "noise": {
         "enabled": true,
         // Standard deviation of Gaussian noise in log10 space
-        "log10_std": 0.01
+        "log10_std": 0.05
       },
       
       // Clipping in log10 space to prevent nonphysical values
       "clip": {
         "enabled": true,
         "log10_min": -30.0,
-        "log10_max": 10.0
+        "log10_max": 0.0
       },
       
       // Loss weighting across rollout steps: "uniform", "linear", "exponential"
-      "loss_weighting": "uniform",
+      "loss_weighting": "linear",
       // Discount factor for exponential weighting (weight[k] = discount^k)
-      "loss_discount": 0.9,
+      "loss_discount": 0.0,
       // Truncated BPTT: detach gradient every N steps (0 = disabled)
       "detach_every": 0,
       
       // Validation rollout: track long-horizon performance during validation
       "validation": {
-        "enabled": false,
-        "steps": 8
+        "enabled": true,
+        "steps": 16
       }
     }
   }

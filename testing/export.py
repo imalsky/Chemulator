@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-FlowMap Model Export Script (minimal)
-- CPU:  K=1, dynamic batch
-- CUDA: dynamic B,K
-- MPS:  dynamic B,K
+FlowMap Model Export Script
+
+Exports trained FlowMap models to torch.export format for inference.
+Configure the MODEL_DIR and DEVICES globals below, then run directly.
+
+Exported models can be loaded with:
+    ep = torch.export.load("export_cpu.pt2")
+    model = ep.module()
+    output = model(y_input, dt_input, g_input)
 """
 
 from __future__ import annotations
@@ -17,86 +22,94 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-# --------------------------------------------------------------------------------------
-# Paths / basic config
-# --------------------------------------------------------------------------------------
+# =============================================================================
+# Configuration — Edit these values
+# =============================================================================
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-#WORK_DIR = ROOT / "models" / "big_big_big"
-WORK_DIR = ROOT / "models" / "big_mlp"
+MODEL_DIR = ROOT / "models" / "big_mlp"
 
-CONFIG_PATH = WORK_DIR / "config.json"
+# Devices to export: "cpu", "cuda", "mps"
+DEVICES = ["cpu", "cuda", "mps"]
 
-CPU_OUT = WORK_DIR / "export_k1_cpu.pt2"
-GPU_OUT = WORK_DIR / "export_bk_gpu.pt2"
-MPS_OUT = WORK_DIR / "export_bk_mps.pt2"
-
+# Dynamic shape bounds
 MIN_BATCH, MAX_BATCH = 1, 4096
 MIN_K, MAX_K = 1, 1024
 
-os.chdir(ROOT)
-sys.path.insert(0, str(SRC))
+# =============================================================================
+# Device-specific settings
+# =============================================================================
 
-from model import create_model  # type: ignore
-
-try:
-    torch.serialization.add_safe_globals([pathlib.PosixPath, pathlib.WindowsPath])
-except Exception:
-    pass
-
-
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
-
-def parse_dtype(dtype_str: str) -> torch.dtype:
-    m = {
-        "float32": torch.float32, "float": torch.float32, "fp32": torch.float32,
-        "float16": torch.float16, "half": torch.float16, "fp16": torch.float16,
-        "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
-    }
-    return m.get(dtype_str.lower(), torch.float32)
-
-
-def find_ckpt(directory: Path) -> Path:
-    d = Path(directory)
-    if (d / "best.ckpt").exists():
-        return d / "best.ckpt"
-    if (d / "last.ckpt").exists():
-        return d / "last.ckpt"
-    ckpts = sorted(d.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if ckpts:
-        return ckpts[0]
-    pts = sorted(d.glob("*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if pts:
-        return pts[0]
-    raise FileNotFoundError(f"No checkpoint found in {d}")
+DEVICE_SETTINGS = {
+    "cpu": {
+        "dtype": torch.float32,
+        "filename": "export_cpu.pt2",
+        "dynamic_k": False,  # K=1 for simpler CPU inference
+    },
+    "cuda": {
+        "dtype": torch.bfloat16,
+        "filename": "export_cuda.pt2",
+        "dynamic_k": True,
+    },
+    "mps": {
+        "dtype": torch.float32,  # MPS has limited bfloat16 support
+        "filename": "export_mps.pt2",
+        "dynamic_k": True,
+    },
+}
 
 
-def load_weights(model: nn.Module, ckpt_path: Path) -> None:
-    payload = torch.load(ckpt_path, map_location="cpu")
-    if isinstance(payload, dict):
+# =============================================================================
+# Model Loading
+# =============================================================================
+
+def find_checkpoint(directory: Path) -> Path:
+    """Find best available checkpoint in directory."""
+    for name in ("best.ckpt", "last.ckpt"):
+        if (directory / name).exists():
+            return directory / name
+
+    for pattern in ("*.ckpt", "*.pt"):
+        candidates = sorted(directory.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            return candidates[0]
+
+    raise FileNotFoundError(f"No checkpoint found in {directory}")
+
+
+def load_weights(model: nn.Module, checkpoint_path: Path) -> None:
+    """Load weights from checkpoint, handling various formats and prefixes."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    # Extract state dict from checkpoint
+    if isinstance(checkpoint, dict):
         state = (
-            payload.get("state_dict")
-            or payload.get("model_state_dict")
-            or payload.get("model")
-            or payload.get("ema_model")
-            or {k: v for k, v in payload.items() if isinstance(v, torch.Tensor)}
+                checkpoint.get("state_dict")
+                or checkpoint.get("model_state_dict")
+                or checkpoint.get("model")
+                or {k: v for k, v in checkpoint.items() if isinstance(v, torch.Tensor)}
         )
     else:
-        state = payload
-    clean = {}
-    for k, v in state.items():
-        kk = k
+        state = checkpoint
+
+    # Strip wrapper prefixes (Lightning, DataParallel, torch.compile)
+    cleaned = {}
+    for key, value in state.items():
         for prefix in ("model.", "module.", "_orig_mod."):
-            if kk.startswith(prefix):
-                kk = kk[len(prefix):]
-        clean[kk] = v
-    model.load_state_dict(clean, strict=False)
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+        cleaned[key] = value
+
+    missing, unexpected = model.load_state_dict(cleaned, strict=False)
+    if missing:
+        print(f"  Warning - missing keys: {missing}")
+    if unexpected:
+        print(f"  Warning - unexpected keys: {unexpected}")
 
 
-def optimize_inference(model: nn.Module) -> nn.Module:
+def prepare_for_inference(model: nn.Module) -> nn.Module:
+    """Disable training-specific behavior."""
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -106,111 +119,107 @@ def optimize_inference(model: nn.Module) -> nn.Module:
     return model
 
 
-# --------------------------------------------------------------------------------------
-# Export routines
-# --------------------------------------------------------------------------------------
+# =============================================================================
+# Export
+# =============================================================================
 
-def export_cpu_k1(base: nn.Module) -> None:
-    print("\n" + "=" * 80)
-    print("Exporting CPU (K=1, dynamic B)")
-    print("=" * 80)
+def export_model(model: nn.Module, device: str) -> Path | None:
+    """Export model for a specific device. Returns output path or None if skipped."""
 
-    device = "cpu"
-    dtype = parse_dtype("float32")
-    model = optimize_inference(base.to(device))
+    # Check availability
+    if device == "cuda" and not torch.cuda.is_available():
+        print(f"[{device}] Skipping - CUDA not available")
+        return None
+    if device == "mps" and not torch.backends.mps.is_available():
+        print(f"[{device}] Skipping - MPS not available")
+        return None
 
-    S_in = int(getattr(model, "S_in"))
-    G = int(getattr(model, "G", getattr(model, "global_dim", 0)) or 0)
+    settings = DEVICE_SETTINGS[device]
+    dtype = settings["dtype"]
+    dynamic_k = settings["dynamic_k"]
+    output_path = MODEL_DIR / settings["filename"]
 
-    Bdim = torch.export.Dim("batch", min=MIN_BATCH, max=MAX_BATCH)
+    print(f"\n[{device}] Exporting (dtype={dtype}, dynamic_k={dynamic_k})")
 
-    B = 2
-    y = torch.zeros(B, S_in, dtype=dtype, device=device)  # [B,S]
-    dt = torch.zeros(B, 1, dtype=dtype, device=device)    # [B,1] (K=1)
-    g = torch.zeros(B, G, dtype=dtype, device=device) if G > 0 else torch.empty(B, 0, dtype=dtype, device=device)
+    # Prepare model
+    export_model = prepare_for_inference(model.to(device))
+    S = int(getattr(export_model, "S"))
+    G = int(getattr(export_model, "G", 0) or 0)
 
-    ep = torch.export.export(
-        model,
-        (y, dt, g),
-        dynamic_shapes=(
-            {0: Bdim},   # y: [B,S]
-            {0: Bdim},   # dt: [B,1]
-            {0: Bdim},   # g: [B,G]
-        ),
-    )
-
-    CPU_OUT.parent.mkdir(parents=True, exist_ok=True)
-    torch.export.save(ep, CPU_OUT)
-    print(f"  wrote {CPU_OUT}")
-
-
-def export_device_dynBK(base: nn.Module, device: str, out_path: Path, dtype_str: str) -> None:
-    pretty = "GPU (CUDA)" if device == "cuda" else "MPS (Apple Silicon)"
-    print("\n" + "=" * 80)
-    print(f"Exporting {pretty} (dynamic B,K)")
-    print("=" * 80)
-
-    dtype = parse_dtype(dtype_str)
-    model = optimize_inference(base.to(device))
-
-    S_in = int(getattr(model, "S_in"))
-    G = int(getattr(model, "G", getattr(model, "global_dim", 0)) or 0)
-
-    Bdim = torch.export.Dim("batch", min=MIN_BATCH, max=MAX_BATCH)
-    Kdim = torch.export.Dim("K", min=MIN_K, max=MAX_K)
-
+    # Create example inputs
     B, K = 2, 2
-    y = torch.randn(B, S_in, dtype=dtype, device=device)  # [B,S]
-    dt = torch.randn(B, K, 1, dtype=dtype, device=device) # [B,K,1]
+    y = torch.randn(B, S, dtype=dtype, device=device)
     g = torch.randn(B, G, dtype=dtype, device=device) if G > 0 else torch.empty(B, 0, dtype=dtype, device=device)
 
-    ep = torch.export.export(
-        model,
-        (y, dt, g),
-        dynamic_shapes=(
-            {0: Bdim},         # y: [B,S]
-            {0: Bdim, 1: Kdim},# dt: [B,K,1]
-            {0: Bdim},         # g: [B,G]
-        ),
-    )
+    if dynamic_k:
+        dt = torch.randn(B, K, 1, dtype=dtype, device=device)
+    else:
+        dt = torch.randn(B, 1, dtype=dtype, device=device)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.export.save(ep, out_path)
-    print(f"  wrote {out_path}")
+    # Define dynamic shapes
+    B_dim = torch.export.Dim("batch", min=MIN_BATCH, max=MAX_BATCH)
+
+    if dynamic_k:
+        K_dim = torch.export.Dim("K", min=MIN_K, max=MAX_K)
+        shapes = ({0: B_dim}, {0: B_dim, 1: K_dim}, {0: B_dim})
+    else:
+        shapes = ({0: B_dim}, {0: B_dim}, {0: B_dim})
+
+    # Export and save
+    ep = torch.export.export(export_model, (y, dt, g), dynamic_shapes=shapes)
+    torch.export.save(ep, output_path)
+
+    print(f"[{device}] Saved: {output_path}")
+    return output_path
 
 
-# --------------------------------------------------------------------------------------
+# =============================================================================
 # Main
-# --------------------------------------------------------------------------------------
+# =============================================================================
 
 def main() -> None:
-    print("=" * 80)
-    print("FlowMap Export: CPU K=1 + GPU/MPS dynamic-K")
-    print("=" * 80)
-    print(f"Config path: {CONFIG_PATH}")
+    # Setup paths
+    os.chdir(ROOT)
+    sys.path.insert(0, str(SRC))
 
-    cfg_json = json.loads(CONFIG_PATH.read_text())
-    base = create_model(cfg_json).eval().cpu()
+    # Allow Path objects in checkpoints
+    try:
+        torch.serialization.add_safe_globals([pathlib.PosixPath, pathlib.WindowsPath])
+    except AttributeError:
+        pass
 
-    ckpt = find_ckpt(WORK_DIR)
-    print(f"Loading checkpoint: {ckpt}")
-    load_weights(base, ckpt)
+    print("=" * 60)
+    print("FlowMap Export")
+    print("=" * 60)
+    print(f"Model dir: {MODEL_DIR}")
 
-    export_cpu_k1(base)
+    from model import create_model
 
-    if torch.cuda.is_available():
-        export_device_dynBK(base, "cuda", GPU_OUT, "bfloat16")
+    # Load model
+    config = json.loads((MODEL_DIR / "config.json").read_text())
+    model = create_model(config)
+
+    checkpoint = find_checkpoint(MODEL_DIR)
+    print(f"Checkpoint: {checkpoint.name}")
+    load_weights(model, checkpoint)
+
+    # Export for each device
+    exported = []
+    for device in DEVICES:
+        path = export_model(model, device)
+        if path:
+            exported.append(path)
+
+    # Summary
+    print("\n" + "=" * 60)
+    if exported:
+        print("Exported:")
+        for p in exported:
+            print(f"  {p.name} ({p.stat().st_size / 1024 / 1024:.1f} MB)")
     else:
-        print("[note] CUDA not available; skipping GPU export")
-
-    if torch.backends.mps.is_available():
-        export_device_dynBK(base, "mps", MPS_OUT, "float32")
-    else:
-        print("[note] MPS not available; skipping MPS export")
-
-    print("\nDone.")
+        print("No models exported.")
+    print("Done.")
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     main()

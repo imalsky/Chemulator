@@ -175,8 +175,7 @@ class AdaptiveStiffLoss(nn.Module):
         """
         Add Gaussian noise in log10 space for robust autoregressive training.
 
-        Key technique from Kelp (2020): forces the model to recover from
-        prediction errors that accumulate during inference rollouts.
+        Forces the model to recover from prediction errors that accumulate during inference rollouts.
         """
         log10_vals = self.z_to_log10(z)
         noise = torch.randn_like(log10_vals) * noise_std
@@ -241,6 +240,8 @@ class EpochCSVWriter:
         "val_phys",
         "val_z",
         "val_mult_err_proxy",
+        "val_rollout_final_abslog",
+        "val_rollout_final_mult_err",
     )
 
     def __init__(self, csv_path: Path, *, resume: bool) -> None:
@@ -329,7 +330,7 @@ class ModelTask(pl.LightningModule):
     """
     LightningModule wrapping the model + sample-weighted epoch metrics.
 
-    Supports both standard one-step training and autoregressive rollout training.
+    When rollout is enabled, both training *and validation* run the long-horizon autoregressive rollout.
     """
 
     def __init__(
@@ -342,6 +343,7 @@ class ModelTask(pl.LightningModule):
     ) -> None:
         super().__init__()
         self.model = model
+        # If the model predicts in physical log space and enforces mass conservation, project to simplex.
         self._enforce_simplex = bool(getattr(model, "predict_delta_log_phys", False))
         self.cfg = cfg
         self.work_dir = Path(work_dir)
@@ -382,6 +384,8 @@ class ModelTask(pl.LightningModule):
             "work_dir": str(work_dir),
         })
 
+    # --------------------------- Rollout config --------------------------------
+
     def _init_rollout_config(self, tcfg: Dict[str, Any]) -> None:
         """Initialize rollout training configuration."""
         rollout_cfg = tcfg.get("rollout", {})
@@ -407,7 +411,7 @@ class ModelTask(pl.LightningModule):
         self.clip_log10_min = float(clip_cfg.get("log10_min", -30.0))
         self.clip_log10_max = float(clip_cfg.get("log10_max", 10.0))
 
-        # Loss weighting
+        # Loss weighting across steps
         self.loss_weighting = str(rollout_cfg.get("loss_weighting", "uniform"))
         self.loss_discount = float(rollout_cfg.get("loss_discount", 0.9))
 
@@ -416,8 +420,11 @@ class ModelTask(pl.LightningModule):
 
         # Validation rollout
         val_rollout_cfg = rollout_cfg.get("validation", {})
-        self.val_rollout_enabled = bool(val_rollout_cfg.get("enabled", False))
+        # User request: if rollout is enabled, validation should also be long-rollout.
+        self.val_rollout_enabled = bool(self.rollout_enabled or val_rollout_cfg.get("enabled", False))
         self.val_rollout_steps = int(val_rollout_cfg.get("steps", self.rollout_steps))
+
+    # --------------------------- Data / loss setup -----------------------------
 
     def _resolve_target_indices(self) -> Optional[torch.Tensor]:
         data_cfg = self.cfg.get("data", {})
@@ -476,6 +483,8 @@ class ModelTask(pl.LightningModule):
             epsilon_phys=float(loss_cfg.get("epsilon_phys", LOSS_EPS_PHYS)),
         )
 
+    # --------------------------- Forward helpers -------------------------------
+
     def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         return self.model(y_i, dt_norm, g)
 
@@ -501,8 +510,8 @@ class ModelTask(pl.LightningModule):
             ramp_epochs=self.curriculum_ramp_epochs,
         )
 
-    def _apply_state_constraints(self, state: torch.Tensor, apply_noise: bool = False) -> torch.Tensor:
-        """Apply clipping, simplex projection, and optional noise to state."""
+    def _apply_state_constraints(self, state: torch.Tensor, apply_noise: bool) -> torch.Tensor:
+        """Apply clipping, simplex projection, and optional noise to a state in z-space."""
         if apply_noise and self.noise_enabled and self.training:
             state = self.criterion.add_noise_in_log10_space(state, noise_std=self.noise_log10_std)
 
@@ -516,6 +525,8 @@ class ModelTask(pl.LightningModule):
 
         return state
 
+    # --------------------------- Loss paths ------------------------------------
+
     def _onestep_forward_loss(
         self,
         y_i: torch.Tensor,
@@ -523,13 +534,14 @@ class ModelTask(pl.LightningModule):
         y_j: torch.Tensor,
         g: torch.Tensor,
     ) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Standard one-step forward pass and loss computation."""
+        """Standard one-step forward pass and loss computation over all K in one call."""
         pred = self(y_i, dt_in, g)
 
         if pred.shape != y_j.shape:
             raise RuntimeError(f"Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
 
         comps = self.criterion(pred, y_j, return_components=True)
+        comps["num_steps"] = torch.tensor(y_j.shape[1], device=y_j.device, dtype=torch.long)
         return comps["total"], comps
 
     def _rollout_forward_loss(
@@ -538,20 +550,28 @@ class ModelTask(pl.LightningModule):
         dt_in: torch.Tensor,
         y_j: torch.Tensor,
         g: torch.Tensor,
-    ) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        *,
+        num_steps_req: int,
+        apply_noise: bool,
+        record_step_abslog: bool = False,
+    ) -> Tuple[torch.Tensor, dict[str, torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Autoregressive rollout forward pass with noise injection.
+        Autoregressive rollout forward pass.
 
-        Key features for stable long-horizon prediction:
-        1. Feed model output as next input (autoregressive)
-        2. Add noise in log10 space to simulate prediction errors
-        3. Clip outputs to prevent nonphysical values
-        4. Accumulate loss over all rollout steps
+        - Feeds model output as next input (autoregressive)
+        - Optionally injects noise in log10 space (train only)
+        - Applies inference-time constraints (clip/simplex) at every step
+        - Accumulates a weighted rollout loss across steps
+
+        Returns:
+          loss, comps, step_abslog[B? aggregated], final_abslog (optional, validation-style)
         """
-        B, K, S = y_j.shape
+        B, K, _S = y_j.shape
         device = y_j.device
 
-        num_steps = min(self._get_rollout_steps_for_epoch(), K)
+        num_steps = min(int(num_steps_req), int(K))
+        if num_steps <= 0:
+            raise ValueError(f"Invalid rollout steps: requested={num_steps_req} K={K}")
 
         step_weights = compute_rollout_loss_weights(
             num_steps=num_steps,
@@ -568,14 +588,14 @@ class ModelTask(pl.LightningModule):
         total_z = torch.zeros((), device=device, dtype=torch.float32)
         total_abslog = torch.zeros((), device=device, dtype=torch.float32)
 
+        step_abslog_vec = torch.zeros((num_steps,), device=device, dtype=torch.float32) if record_step_abslog else None
+
         for step_idx in range(num_steps):
             dt_step = dt_in[:, step_idx : step_idx + 1, :]
             pred = self(state, dt_step, g).squeeze(1)
             true = y_j[:, step_idx, :]
 
-            step_comps = self.criterion(
-                pred.unsqueeze(1), true.unsqueeze(1), return_components=True
-            )
+            step_comps = self.criterion(pred.unsqueeze(1), true.unsqueeze(1), return_components=True)
 
             w = step_weights[step_idx]
             total_loss = total_loss + w * step_comps["total"]
@@ -583,8 +603,11 @@ class ModelTask(pl.LightningModule):
             total_z = total_z + w * step_comps["z"]
             total_abslog = total_abslog + w * step_comps["mean_abs_log10"]
 
-            # Apply constraints and prepare for next step
-            next_state = self._apply_state_constraints(pred, apply_noise=True)
+            if step_abslog_vec is not None:
+                step_abslog_vec[step_idx] = step_comps["mean_abs_log10"].detach().to(torch.float32)
+
+            # Prepare for next step (this is the *propagated* state)
+            next_state = self._apply_state_constraints(pred, apply_noise=apply_noise)
 
             # Optional truncated BPTT
             if self.detach_every > 0 and (step_idx + 1) % self.detach_every == 0:
@@ -597,11 +620,19 @@ class ModelTask(pl.LightningModule):
             "phys": total_phys,
             "z": total_z,
             "mean_abs_log10": total_abslog,
+            "num_steps": torch.tensor(num_steps, device=device, dtype=torch.long),
         }
 
-        return total_loss, comps
+        final_abslog = None
+        if record_step_abslog:
+            # Final-step abslog uses the CONSTRAINED state that is actually propagated.
+            final_pred_log = self.criterion.z_to_log10(state)
+            final_true_log = self.criterion.z_to_log10(y_j[:, num_steps - 1, :])
+            final_abslog = (final_pred_log - final_true_log).abs().mean().to(torch.float32)
 
-    # --------------------------- Optimizer / Scheduler --------------------------------
+        return total_loss, comps, step_abslog_vec, final_abslog
+
+    # --------------------------- Optimizer / Scheduler --------------------------
 
     def configure_optimizers(self):
         tcfg = self.cfg.get("training", {})
@@ -648,7 +679,7 @@ class ModelTask(pl.LightningModule):
 
         return [optimizer], [{"scheduler": scheduler, "interval": "epoch", "monitor": CKPT_MONITOR}]
 
-    # --------------------------- Training Steps --------------------------------
+    # --------------------------- Fit hooks -------------------------------------
 
     def on_fit_start(self) -> None:
         tr = getattr(self, "trainer", None)
@@ -656,6 +687,8 @@ class ModelTask(pl.LightningModule):
             return
         self._csv = EpochCSVWriter(self.work_dir / "metrics.csv", resume=self._resume)
         self._csv.ensure_initialized()
+
+    # --------------------------- Training --------------------------------------
 
     def on_train_epoch_start(self) -> None:
         self._epoch_t0 = time.time()
@@ -670,7 +703,13 @@ class ModelTask(pl.LightningModule):
         y_i, dt_in, y_j, g = self._unpack(batch)
 
         if self.rollout_enabled:
-            loss, comps = self._rollout_forward_loss(y_i, dt_in, y_j, g)
+            num_steps = self._get_rollout_steps_for_epoch()
+            loss, comps, _step_abslog, _final_abslog = self._rollout_forward_loss(
+                y_i, dt_in, y_j, g,
+                num_steps_req=num_steps,
+                apply_noise=True,
+                record_step_abslog=False,
+            )
         else:
             loss, comps = self._onestep_forward_loss(y_i, dt_in, y_j, g)
 
@@ -684,13 +723,12 @@ class ModelTask(pl.LightningModule):
             raise ValueError(f"[train] Non-finite mean_abs_log10 at batch {batch_idx}")
 
         with torch.no_grad():
-            B, K, _S = y_j.shape
-            valid_pairs = torch.tensor(B * K, device=y_j.device, dtype=torch.long)
-
-            if int(valid_pairs.item()) > 0:
-                S = torch.tensor(y_j.shape[-1], device=y_j.device, dtype=torch.float64)
-                weight = valid_pairs.to(torch.float64) * S
-
+            B = int(y_j.shape[0])
+            S = int(y_j.shape[-1])
+            used_steps = int(comps.get("num_steps", torch.tensor(y_j.shape[1], device=y_j.device)).item())
+            valid_pairs = B * used_steps
+            if valid_pairs > 0:
+                weight = torch.tensor(valid_pairs * S, device=y_j.device, dtype=torch.float64)
                 self._t_sum += comps["total"].detach().to(torch.float64) * weight
                 self._t_phys_sum += comps["phys"].detach().to(torch.float64) * weight
                 self._t_z_sum += comps["z"].detach().to(torch.float64) * weight
@@ -728,17 +766,18 @@ class ModelTask(pl.LightningModule):
             "train_mult_err_proxy": float(train_mult_err_proxy.detach().cpu().item()),
         }
         self._last_train_epoch_idx = int(self.current_epoch)
+
         self.log("train_loss", train_loss, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_phys", train_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_z", train_z, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("train_mult_err_proxy", train_mult_err_proxy, prog_bar=False, on_epoch=True, sync_dist=False)
 
-        self._report_epoch()
+        self._maybe_report_epoch()
 
         for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_abslog_sum", "_t_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
 
-    # --------------------------- Validation Steps --------------------------------
+    # --------------------------- Validation ------------------------------------
 
     def on_validation_epoch_start(self) -> None:
         dev = self.device if hasattr(self, "device") else next(self.parameters()).device
@@ -749,22 +788,46 @@ class ModelTask(pl.LightningModule):
         self._v_abslog_sum = torch.zeros((), dtype=torch.float64, device=dev)
 
         if self.val_rollout_enabled:
-            K = self.val_rollout_steps
+            K = int(self.val_rollout_steps)
             self._vr_step_abslog_sum = torch.zeros((K,), dtype=torch.float64, device=dev)
             self._vr_step_count = torch.zeros((K,), dtype=torch.float64, device=dev)
             self._vr_final_abslog_sum = torch.zeros((), dtype=torch.float64, device=dev)
             self._vr_final_count = torch.zeros((), dtype=torch.float64, device=dev)
 
     def validation_step(self, batch, batch_idx: int):
-        """Validation uses one-step prediction for consistent metrics."""
         y_i, dt_in, y_j, g = self._unpack(batch)
 
-        pred = self(y_i, dt_in, g)
+        if self.val_rollout_enabled:
+            loss, comps, step_abslog_vec, final_abslog = self._rollout_forward_loss(
+                y_i, dt_in, y_j, g,
+                num_steps_req=self.val_rollout_steps,
+                apply_noise=False,
+                record_step_abslog=True,
+            )
 
-        if pred.shape != y_j.shape:
-            raise RuntimeError(f"[val] Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
+            if step_abslog_vec is None or final_abslog is None:
+                raise RuntimeError("Internal error: rollout validation expected step/final metrics.")
 
-        comps = self.criterion(pred, y_j, return_components=True)
+            # Accumulate per-step abslog (raw per-step prediction quality)
+            B = int(y_j.shape[0])
+            used_steps = int(comps["num_steps"].item())
+            for step_idx in range(min(used_steps, int(self.val_rollout_steps))):
+                self._vr_step_abslog_sum[step_idx] += float(step_abslog_vec[step_idx].item()) * B
+                self._vr_step_count[step_idx] += B
+
+            # Final-step abslog (constrained propagated state)
+            self._vr_final_abslog_sum += float(final_abslog.item()) * B
+            self._vr_final_count += B
+
+        else:
+            # One-step validation (legacy)
+            pred = self(y_i, dt_in, g)
+            if pred.shape != y_j.shape:
+                raise RuntimeError(f"[val] Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
+            comps = self.criterion(pred, y_j, return_components=True)
+            loss = comps["total"]
+            comps["num_steps"] = torch.tensor(y_j.shape[1], device=y_j.device, dtype=torch.long)
+
         total = comps["total"].detach()
         phys = comps["phys"].detach()
         zstb = comps["z"].detach()
@@ -781,14 +844,15 @@ class ModelTask(pl.LightningModule):
         if abslog is not None and (not torch.isfinite(abslog)):
             raise ValueError(f"[val] Non-finite mean_abs_log10 at batch {batch_idx}")
 
-        B, K, _S = y_j.shape
-        valid_pairs = torch.tensor(B * K, device=y_j.device, dtype=torch.long)
+        B = int(y_j.shape[0])
+        S = int(y_j.shape[-1])
+        used_steps = int(comps.get("num_steps", torch.tensor(y_j.shape[1], device=y_j.device)).item())
+        valid_pairs = B * used_steps
 
-        if int(valid_pairs.item()) == 0:
-            raise ValueError(f"[val] Zero valid [B,K] pairs in batch {batch_idx}")
+        if valid_pairs <= 0:
+            raise ValueError(f"[val] Zero valid pairs in batch {batch_idx}")
 
-        S = torch.tensor(y_j.shape[-1], device=y_j.device, dtype=torch.float64)
-        weight = valid_pairs.to(torch.float64) * S
+        weight = torch.tensor(valid_pairs * S, device=y_j.device, dtype=torch.float64)
 
         self._v_sum += total.to(torch.float64) * weight
         self._v_phys_sum += phys.to(torch.float64) * weight
@@ -797,55 +861,7 @@ class ModelTask(pl.LightningModule):
             self._v_abslog_sum += abslog.to(torch.float64) * weight
         self._v_wsum += weight
 
-        if self.val_rollout_enabled:
-            self._accumulate_rollout_validation(y_i, dt_in, y_j, g)
-
         return total
-
-    def _accumulate_rollout_validation(
-        self,
-        y_i: torch.Tensor,
-        dt_in: torch.Tensor,
-        y_j: torch.Tensor,
-        g: torch.Tensor,
-    ) -> None:
-        """
-        Run autoregressive rollout and accumulate per-step metrics.
-
-        FIX: Compute final error using the CLIPPED prediction that is actually propagated,
-        not the raw prediction from the loop.
-        """
-        B, K, S = y_j.shape
-        num_steps = min(self.val_rollout_steps, K)
-
-        state = y_i
-
-        with torch.no_grad():
-            for step_idx in range(num_steps):
-                dt_step = dt_in[:, step_idx : step_idx + 1, :]
-
-                pred = self(state, dt_step, g).squeeze(1)
-                true = y_j[:, step_idx, :]
-
-                # Compute per-step error BEFORE constraints (raw prediction quality)
-                pred_log = self.criterion.z_to_log10(pred)
-                true_log = self.criterion.z_to_log10(true)
-                step_abslog = (pred_log - true_log).abs().mean()
-
-                self._vr_step_abslog_sum[step_idx] += step_abslog.to(torch.float64) * B
-                self._vr_step_count[step_idx] += B
-
-                # Apply inference-time constraints to get the propagated state
-                state = self._apply_state_constraints(pred, apply_noise=False)
-
-            # Final step error: use the CONSTRAINED state that was actually propagated
-            # This reflects true inference behavior
-            final_pred_log = self.criterion.z_to_log10(state)
-            final_true_log = self.criterion.z_to_log10(y_j[:, num_steps - 1, :])
-            final_abslog = (final_pred_log - final_true_log).abs().mean()
-
-            self._vr_final_abslog_sum += final_abslog.to(torch.float64) * B
-            self._vr_final_count += B
 
     def on_validation_epoch_end(self) -> None:
         tr = getattr(self, "trainer", None)
@@ -891,12 +907,16 @@ class ModelTask(pl.LightningModule):
         }
         self._last_val_epoch_idx = int(self.current_epoch)
 
+        # When rollout is enabled, val_loss/val_phys/val_z are the rollout metrics.
         self.log("val_loss", val_loss, prog_bar=True, on_epoch=True, sync_dist=False)
         self.log("val_phys", val_phys, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("val_z", val_z, prog_bar=False, on_epoch=True, sync_dist=False)
         self.log("val_mult_err_proxy", val_mult_err_proxy, prog_bar=False, on_epoch=True, sync_dist=False)
 
-        # Log rollout validation metrics
+        # Rollout-specific validation logs (per-step and final) if enabled.
+        final_abslog = None
+        final_mult_err = None
+
         if self.val_rollout_enabled and hasattr(self, "_vr_step_count"):
             if dist.is_available() and dist.is_initialized():
                 dist.all_reduce(self._vr_step_abslog_sum, op=dist.ReduceOp.SUM)
@@ -904,26 +924,66 @@ class ModelTask(pl.LightningModule):
                 dist.all_reduce(self._vr_final_abslog_sum, op=dist.ReduceOp.SUM)
                 dist.all_reduce(self._vr_final_count, op=dist.ReduceOp.SUM)
 
-            for step_idx in range(self.val_rollout_steps):
+            for step_idx in range(int(self.val_rollout_steps)):
                 count = self._vr_step_count[step_idx]
-                if count > 0:
+                if float(count.item()) > 0.0:
                     step_abslog = (self._vr_step_abslog_sum[step_idx] / count).to(torch.float32)
                     step_mult_err = torch.expm1(step_abslog * LN10)
-                    self.log(f"val_rollout_step{step_idx}_abslog", step_abslog, prog_bar=False, on_epoch=True, sync_dist=False)
-                    self.log(f"val_rollout_step{step_idx}_mult_err", step_mult_err, prog_bar=False, on_epoch=True, sync_dist=False)
+                    self.log(
+                        f"val_rollout_step{step_idx}_abslog",
+                        step_abslog,
+                        prog_bar=False,
+                        on_epoch=True,
+                        sync_dist=False,
+                    )
+                    self.log(
+                        f"val_rollout_step{step_idx}_mult_err",
+                        step_mult_err,
+                        prog_bar=False,
+                        on_epoch=True,
+                        sync_dist=False,
+                    )
 
-            if self._vr_final_count > 0:
+            if float(self._vr_final_count.item()) > 0.0:
                 final_abslog = (self._vr_final_abslog_sum / self._vr_final_count).to(torch.float32)
-                final_mult_err = torch.expm1(final_abslog * LN10)
+                final_mult_err = torch.expm1(final_abslog * LN10).to(torch.float32)
                 self.log("val_rollout_final_abslog", final_abslog, prog_bar=False, on_epoch=True, sync_dist=False)
                 self.log("val_rollout_final_mult_err", final_mult_err, prog_bar=True, on_epoch=True, sync_dist=False)
 
+                self._last_val_metrics["val_rollout_final_abslog"] = float(final_abslog.detach().cpu().item())
                 self._last_val_metrics["val_rollout_final_mult_err"] = float(final_mult_err.detach().cpu().item())
+
+        self._maybe_report_epoch()
 
         for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_abslog_sum", "_v_wsum"):
             setattr(self, name, torch.zeros_like(getattr(self, name)))
 
     # --------------------------- Epoch Reporting --------------------------------
+
+    def _maybe_report_epoch(self) -> None:
+        """
+        Report once per epoch, but only after the metrics for this epoch are available.
+
+        Lightning hook ordering can vary across versions/strategies; this guards against
+        printing/writing rows with stale train/val values.
+        """
+        tr = getattr(self, "trainer", None)
+        if tr is None:
+            return
+
+        cur_epoch_idx = int(self.current_epoch)
+        have_train = (self._last_train_epoch_idx == cur_epoch_idx)
+        have_val = (self._last_val_epoch_idx == cur_epoch_idx)
+
+        # If there is no validation loop, allow reporting with train-only.
+        try:
+            num_val_batches = getattr(tr, "num_val_batches", 0)
+            has_val_loop = bool(num_val_batches) and (sum(num_val_batches) if isinstance(num_val_batches, (list, tuple)) else int(num_val_batches)) > 0
+        except Exception:
+            has_val_loop = True
+
+        if have_train and (have_val or (not has_val_loop)):
+            self._report_epoch()
 
     def _report_epoch(self) -> None:
         tr = getattr(self, "trainer", None)
@@ -971,6 +1031,8 @@ class ModelTask(pl.LightningModule):
             "val_phys": fmt(val_m.get("val_phys")),
             "val_z": fmt(val_m.get("val_z")),
             "val_mult_err_proxy": fmt(val_m.get("val_mult_err_proxy")),
+            "val_rollout_final_abslog": fmt(val_m.get("val_rollout_final_abslog")),
+            "val_rollout_final_mult_err": fmt(val_m.get("val_rollout_final_mult_err")),
         }
         self._csv.write_epoch_row(epoch_1idx, row)
 
@@ -992,20 +1054,24 @@ class ModelTask(pl.LightningModule):
             return f"{m:d}:{s:02d}"
 
         if not self._printed_header:
-            self._logger.info("EPOCH | train       | val         | mult_err_proxy | lr         | time")
-            self._logger.info("----- | ----------- | ----------- | -------------- | ---------- | --------")
+            if self.val_rollout_enabled:
+                self._logger.info("EPOCH | train(loss)  | val(loss)    | val(final_mult) | lr         | time")
+                self._logger.info("----- | ----------- | ----------- | -------------- | ---------- | --------")
+            else:
+                self._logger.info("EPOCH | train       | val         | mult_err_proxy | lr         | time")
+                self._logger.info("----- | ----------- | ----------- | -------------- | ---------- | --------")
             self._printed_header = True
 
         tr_loss = train_m.get("train_loss")
         va_loss = val_m.get("val_loss")
-        va_proxy = val_m.get("val_mult_err_proxy")
+        va_final_mult = val_m.get("val_rollout_final_mult_err") if self.val_rollout_enabled else val_m.get("val_mult_err_proxy")
 
         epoch_str = f"E{epoch_1idx:04d}"
         line = (
             f"{epoch_str} | "
             f"{fmt_sci(tr_loss)} | "
             f"{fmt_sci(va_loss)} | "
-            f"{fmt_sci(va_proxy, width=14)} | "
+            f"{fmt_sci(va_final_mult, width=14)} | "
             f"{fmt_sci(lr)} | "
             f"{fmt_time(epoch_time)}"
         )
@@ -1019,7 +1085,7 @@ class ModelTask(pl.LightningModule):
 
 
 class Trainer:
-    """Compatibility wrapper: `from trainer import Trainer` -> .train() returns best val."""
+    """Compatibility wrapper: `from trainer import Trainer` -> .train() returns best monitored metric."""
 
     def __init__(
         self,
@@ -1079,11 +1145,11 @@ class Trainer:
         if rollout_cfg.get("enabled", False):
             val_rollout = rollout_cfg.get("validation", {})
             self.logger.info(
-                f"Rollout training enabled: steps={rollout_cfg.get('steps', 4)}, "
+                f"Rollout enabled: steps={rollout_cfg.get('steps', 4)}, "
                 f"noise={rollout_cfg.get('noise', {}).get('enabled', False)}, "
                 f"clip={rollout_cfg.get('clip', {}).get('enabled', False)}, "
                 f"curriculum={rollout_cfg.get('curriculum', {}).get('enabled', False)}, "
-                f"val_rollout={val_rollout.get('enabled', False)}"
+                f"val_rollout_steps={val_rollout.get('steps', rollout_cfg.get('steps', 4))}"
             )
 
     def _precision_from_cfg(self) -> Any:
@@ -1160,10 +1226,24 @@ class Trainer:
         self.model = self._maybe_compile(self.model)
         task = ModelTask(self.model, self.cfg, self.work_dir, resume=bool(ckpt_path))
 
+        # --------------------- CHECKPOINT MONITOR SELECTION ---------------------
+        # When rollout is enabled, checkpoint on final-step rollout abslog (true inference behavior).
+        # Otherwise fall back to one-step val_loss.
+        tcfg = self.cfg.get("training", {}) if isinstance(self.cfg, dict) else {}
+        rollout_cfg = tcfg.get("rollout", {}) if isinstance(tcfg, dict) else {}
+        use_rollout_ckpt = bool(rollout_cfg.get("enabled", False))
+        ckpt_monitor = "val_rollout_final_abslog" if use_rollout_ckpt else CKPT_MONITOR
+
+        self.logger.info(
+            f"checkpoint monitor: {ckpt_monitor} "
+            f"({'rollout' if use_rollout_ckpt else 'one-step'})"
+        )
+        # -----------------------------------------------------------------------
+
         ckpt_cb = ModelCheckpoint(
             dirpath=str(self.work_dir),
             filename=CKPT_FILENAME_BEST,
-            monitor=CKPT_MONITOR,
+            monitor=ckpt_monitor,
             mode=CKPT_MODE,
             save_top_k=1,
             save_last=True,
@@ -1238,6 +1318,8 @@ class Trainer:
             inference_mode=INFERENCE_MODE,
             benchmark=self.cudnn_benchmark,
             log_every_n_steps=LOG_EVERY_N_STEPS,
+            # Avoid Lightning sanity-check issues with a rollout-only monitor.
+            num_sanity_val_steps=0 if use_rollout_ckpt else 2,
             **trainer_kwargs,
         )
 

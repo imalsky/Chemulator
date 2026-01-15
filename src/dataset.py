@@ -100,18 +100,18 @@ class FlowMapPairsDataset(Dataset):
     """
 
     def __init__(
-        self,
-        processed_root: Path | str,
-        split: str,
-        config: Dict[str, Any],
-        pairs_per_traj: int,
-        min_steps: int,
-        max_steps: Optional[int],
-        preload_to_gpu: bool,
-        device: Optional[torch.device],
-        dtype: torch.dtype,
-        seed: int = 42,
-        logger: Optional[Any] = None,
+            self,
+            processed_root: Path | str,
+            split: str,
+            config: Dict[str, Any],
+            pairs_per_traj: int,
+            min_steps: int,
+            max_steps: Optional[int],
+            preload_to_gpu: bool,
+            device: Optional[torch.device],
+            dtype: torch.dtype,
+            seed: int = 42,
+            logger: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.root = _as_path(processed_root)
@@ -165,7 +165,7 @@ class FlowMapPairsDataset(Dataset):
         if not manifest_path.exists():
             raise FileNotFoundError(f"Missing normalization manifest: {manifest_path}")
         manifest = load_json(manifest_path)
-        self.norm = NormalizationHelper(manifest, device=self._stage_device)
+        self.norm = NormalizationHelper(manifest)
 
         # Processed meta
         meta = manifest.get("meta", {}) or {}
@@ -379,6 +379,26 @@ class FlowMapPairsDataset(Dataset):
 
         self._shared_time_grid = bool(shared_time_grid) if not self.assume_shared_grid else True
 
+        # =====================================================================
+        # Rollout config guard: check max_steps vs K early
+        # =====================================================================
+        if self.rollout_mode:
+            effective_max_steps = self.max_steps if self.max_steps is not None else (self.T - 1)
+            effective_max_steps = min(effective_max_steps, self.T - 1)
+            available_offsets = effective_max_steps - self.min_steps + 1
+
+            if available_offsets < self.K:
+                raise ValueError(
+                    f"Rollout mode config error: cannot sample K={self.K} distinct sequential offsets. "
+                    f"With min_steps={self.min_steps}, max_steps={effective_max_steps}, "
+                    f"only {available_offsets} offsets are available. "
+                    f"Either increase max_steps, decrease min_steps, or decrease dataset.times_per_anchor (K)."
+                )
+            log.info(
+                f"Rollout config validated: K={self.K}, min_steps={self.min_steps}, "
+                f"max_steps={effective_max_steps}, available_offsets={available_offsets}"
+            )
+
         # Second pass: preload + normalization
         self.t_shared: Optional[torch.Tensor] = None
         self.time_grid_per_row: Optional[torch.Tensor] = None
@@ -414,7 +434,8 @@ class FlowMapPairsDataset(Dataset):
                 if g_np.ndim != 2:
                     raise ValueError(f"{p.name}: expected globals with shape [N, G], got {g_np.shape}")
 
-                g_np_sel = np.asarray(g_np[:, self._globals_idx], dtype=np.float32) if self._globals_idx else np.asarray(g_np, dtype=np.float32)
+                g_np_sel = np.asarray(g_np[:, self._globals_idx],
+                                      dtype=np.float32) if self._globals_idx else np.asarray(g_np, dtype=np.float32)
                 g_t = torch.from_numpy(g_np_sel).to(device=self._stage_device, dtype=torch.float32, non_blocking=True)
                 g_t = self.norm.normalize(g_t, self.global_vars)
                 self.g[start:end].copy_(g_t.to(dtype=self._runtime_dtype), non_blocking=True)
@@ -499,7 +520,8 @@ class FlowMapPairsDataset(Dataset):
             max_off_batch = int(max_off_row.min().item())
             width = max(1, max_off_batch - low + 1)
 
-            offs_shared_cpu = torch.randint(low=0, high=width, size=(k,), device=torch.device("cpu"), dtype=torch.long) + low
+            offs_shared_cpu = torch.randint(low=0, high=width, size=(k,), device=torch.device("cpu"),
+                                            dtype=torch.long) + low
             offs = offs_shared_cpu.to(dev, non_blocking=True).view(1, k).expand(B, -1)
             return offs
 
@@ -512,9 +534,10 @@ class FlowMapPairsDataset(Dataset):
 
     def _sample_sequential_offsets(self, i_used: torch.Tensor) -> torch.Tensor:
         """
-        Sample K DISTINCT SORTED offsets for rollout training.
+        Sample K DISTINCT SORTED offsets for rollout training (VECTORIZED).
 
         In rollout mode, targets must be sequential (j_0 < j_1 < ... < j_{K-1}).
+        Uses Gumbel-top-k trick for efficient sampling without replacement.
         """
         if i_used.ndim != 1:
             raise ValueError(f"i_used must be 1D [B], got shape {tuple(i_used.shape)}")
@@ -542,20 +565,37 @@ class FlowMapPairsDataset(Dataset):
                 f"only have room for {bad_widths[:5]} offsets."
             )
 
-        offs_list = []
-        for b in range(B):
-            max_off_b = int(max_off_row[b].item())
-            width = max_off_b - low + 1
-            perm = torch.randperm(width, device="cpu")[:K]
-            offs_b = (perm + low).sort().values
-            offs_list.append(offs_b)
+        # Vectorized sampling using Gumbel-top-k trick
+        # Generate uniform random values and use top-k to select K distinct indices
+        max_width = int(width_row.max().item())
 
-        return torch.stack(offs_list, dim=0).to(dev, non_blocking=True)
+        # Create random values for all possible offsets [B, max_width]
+        # Use Gumbel noise: -log(-log(U)) where U ~ Uniform(0,1)
+        # This is equivalent to sampling without replacement when using top-k
+        u = torch.rand((B, max_width), device=dev)
+        # Add small epsilon to avoid log(0)
+        gumbel_noise = -torch.log(-torch.log(u.clamp(min=1e-10, max=1.0 - 1e-10)))
+
+        # Mask out invalid positions (beyond each row's width)
+        col_indices = torch.arange(max_width, device=dev).unsqueeze(0)  # [1, max_width]
+        valid_mask = col_indices < width_row.unsqueeze(1)  # [B, max_width]
+        gumbel_noise = gumbel_noise.masked_fill(~valid_mask, float('-inf'))
+
+        # Select top-K indices (these are the K largest Gumbel values = random sample without replacement)
+        _, topk_indices = gumbel_noise.topk(K, dim=1, largest=True, sorted=False)
+
+        # Sort the selected indices to get sequential offsets
+        sorted_indices, _ = topk_indices.sort(dim=1)
+
+        # Convert from 0-indexed within valid range to actual offsets
+        offs = sorted_indices + low
+
+        return offs
 
     # =============================== Collation ==================================
 
     def collate_batch(
-        self, batch: Sequence[_Index]
+            self, batch: Sequence[_Index]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Vectorized sampling for a batch of row indices.
@@ -603,7 +643,7 @@ class FlowMapPairsDataset(Dataset):
         return y_i, dt, y_j, g
 
     def _compute_cumulative_dt(
-        self, rows: torch.Tensor, i_used: torch.Tensor, j_idx: torch.Tensor
+            self, rows: torch.Tensor, i_used: torch.Tensor, j_idx: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute cumulative dt from anchor for standard (non-rollout) mode.
@@ -625,13 +665,26 @@ class FlowMapPairsDataset(Dataset):
             t_i = t_rows.gather(dim=1, index=i_used.view(B, 1)).squeeze(1)
             t_j = t_rows.gather(dim=1, index=j_idx)
 
-        dt_phys = (t_j - t_i.unsqueeze(1)).clamp_min(float(self.dt_epsilon))
+        dt_phys = t_j - t_i.unsqueeze(1)
+
+        # Explicit check for non-positive dt (indicates broken time grid)
+        non_positive = dt_phys <= 0
+        if non_positive.any():
+            bad_count = int(non_positive.sum().item())
+            min_dt = float(dt_phys.min().item())
+            raise RuntimeError(
+                f"Standard mode cumulative dt has {bad_count} non-positive values (min={min_dt:.3e}). "
+                f"This indicates a broken time grid (non-monotonic or repeated time indices) "
+                f"or invalid offset sampling (j <= i)."
+            )
+
+        dt_phys = dt_phys.clamp_min(float(self.dt_epsilon))
         dt_norm = self.norm.normalize_dt_from_phys(dt_phys)
 
         return dt_norm
 
     def _compute_incremental_dt(
-        self, rows: torch.Tensor, i_used: torch.Tensor, j_idx: torch.Tensor
+            self, rows: torch.Tensor, i_used: torch.Tensor, j_idx: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute incremental dt for rollout training.
@@ -713,11 +766,11 @@ class FlowMapPairsDataset(Dataset):
             self._did_log_init_summary = True
 
     def _log_first_batch_checks_once(
-        self,
-        y_i: torch.Tensor,
-        dt: torch.Tensor,
-        y_j: torch.Tensor,
-        g: torch.Tensor,
+            self,
+            y_i: torch.Tensor,
+            dt: torch.Tensor,
+            y_j: torch.Tensor,
+            g: torch.Tensor,
     ) -> None:
         if self._log is None or self._did_log_first_batch_checks:
             return
@@ -755,13 +808,13 @@ class FlowMapPairsDataset(Dataset):
 
 
 def create_dataloader(
-    dataset: FlowMapPairsDataset,
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-    persistent_workers: bool,
-    pin_memory: bool,
-    prefetch_factor: int,
+        dataset: FlowMapPairsDataset,
+        batch_size: int,
+        shuffle: bool,
+        num_workers: int,
+        persistent_workers: bool,
+        pin_memory: bool,
+        prefetch_factor: int,
 ) -> DataLoader:
     """
     Create a DataLoader with reproducible per-epoch worker seeding.
@@ -793,7 +846,7 @@ def create_dataloader(
     gen.manual_seed(base_seed + DDP_SEED_OFFSET * rank)
 
     def _worker_init_fn(worker_id: int) -> None:
-        seed32 = int(torch.initial_seed() % (2**32))
+        seed32 = int(torch.initial_seed() % (2 ** 32))
         np.random.seed(seed32)
 
     kwargs: Dict[str, Any] = dict(
@@ -821,8 +874,8 @@ def create_dataloader(
 
 
 def _read_npz_triplet(
-    path: Path,
-    mmap_mode: Optional[str] = "r",
+        path: Path,
+        mmap_mode: Optional[str] = "r",
 ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray]:
     """
     Read a preprocessed NPZ shard with optional memory mapping.
