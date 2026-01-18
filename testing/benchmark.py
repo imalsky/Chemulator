@@ -20,7 +20,7 @@ import torch
 import matplotlib.pyplot as plt
 
 # ====== GLOBALS ======
-MODEL_SUBDIR = "models/big_mlp"   # exporter target dir
+MODEL_SUBDIR = "models/big_flow"   # exporter target dir
 BENCH_K: int = 1                   # for BK exports; ignored by K1 exports
 
 WARMUP_STEPS: int = 10
@@ -38,9 +38,9 @@ PREFER_AOTI: Dict[str, bool] = {"CPU": False, "GPU": True, "MPS": True}
 
 # Match export.py filenames
 RAW_EXPORT = {
-    "CPU": "export_k1_cpu.pt2",   # K1
+    "CPU": "export_cpu.pt2",   # K1
     "GPU": "export_bk_gpu.pt2",   # BK
-    "MPS": "export_bk_mps.pt2",   # BK
+    "MPS": "export_mps.pt2",   # BK
 }
 AOTI_EXPORT = {
     "GPU": "export_bk_gpu.aoti",  # BK

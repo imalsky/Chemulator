@@ -35,7 +35,7 @@ plt.rcParams.update({"mathtext.default": "regular"})  # regular font for exponen
 # ---------------- Paths ----------------
 REPO = Path(__file__).resolve().parent.parent
 #MODEL_DIR = REPO / "models" / "big_big_big"
-MODEL_DIR = REPO / "models" / "big_mlp"
+MODEL_DIR = REPO / "models" / "mlp_paper_pf_steps96"
 
 PLOT_DIR = MODEL_DIR / "plots"
 OUTFILE = PLOT_DIR / "training.png"

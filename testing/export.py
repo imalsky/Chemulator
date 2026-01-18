@@ -28,7 +28,7 @@ import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-MODEL_DIR = ROOT / "models" / "big_mlp"
+MODEL_DIR = ROOT / "models" / "mlp_paper_pf_steps96"
 
 # Devices to export: "cpu", "cuda", "mps"
 DEVICES = ["cpu", "cuda", "mps"]

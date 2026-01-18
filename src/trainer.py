@@ -370,6 +370,16 @@ class ModelTask(pl.LightningModule):
         self._target_idx = self._resolve_target_indices()
         self.criterion = self._build_loss()
 
+        # dt normalization spec (needed for chunked temporal bundling)
+        # Populated by _build_loss() from normalization.json.
+        # These are floats (python scalars) and should be treated as read-only.
+        self._dt_log_min: float
+        self._dt_log_max: float
+        self._dt_log_range: float
+        self._dt_eps: float
+        self._dt_phys_min: float
+        self._dt_phys_max: float
+
         self.save_hyperparameters({
             "cfg_min": {
                 "training": {
@@ -418,6 +428,50 @@ class ModelTask(pl.LightningModule):
         # Truncated BPTT
         self.detach_every = int(rollout_cfg.get("detach_every", 0))
 
+        # Optional training modes
+        # 1) Pushforward loss mode: stopgrad through the propagated state each step (and optionally skip step-0 loss).
+        push_cfg = rollout_cfg.get("pushforward", {})
+        self.pushforward_enabled = bool(push_cfg.get("enabled", False))
+        self.pushforward_skip_first_loss = bool(push_cfg.get("skip_first_step_loss", True))
+
+        # Backward-compatible: if burn_in_steps is not provided, interpret
+        # skip_first_step_loss as burn_in_steps=1. burn_in_steps controls
+        # how many initial rollout steps contribute zero loss weight (but are
+        # still propagated).
+        self.pushforward_burn_in_steps = int(
+            push_cfg.get("burn_in_steps", 1 if self.pushforward_skip_first_loss else 0)
+        )
+        if self.pushforward_burn_in_steps < 0:
+            raise ValueError(
+                f"rollout.pushforward.burn_in_steps must be >= 0; got {self.pushforward_burn_in_steps}"
+            )
+
+        # Whether to apply pushforward behavior during validation rollout.
+        # Default: True (backward compatible). Set false if you want rollout
+        # validation metrics to reflect the fully backpropagating rollout loss.
+        self.pushforward_apply_in_validation = bool(push_cfg.get("apply_in_validation", True))
+
+        # Pushforward implementation mode.
+        #   - legacy: detach propagated state at each step/chunk and optionally mask early losses (backward compatible).
+        #   - paper: two-step pushforward stability loss as in arXiv:2202.03376 (temporal bundling + stop-grad through the first unroll).
+        self.pushforward_mode = str(push_cfg.get("mode", "legacy")).lower().strip()
+        if self.pushforward_mode not in ("legacy", "paper"):
+            raise ValueError(f"rollout.pushforward.mode must be \"legacy\" or \"paper\"; got {self.pushforward_mode!r}")
+
+        # Relative weighting of the stability (pushforward) term in paper mode.
+        self.pushforward_lambda_stability = float(push_cfg.get("lambda_stability", 1.0))
+        if self.pushforward_lambda_stability < 0.0:
+            raise ValueError("rollout.pushforward.lambda_stability must be >= 0")
+
+        # 2) Chunked temporal bundling: predict multiple consecutive rollout targets in one model call.
+        #    For a chunk of incremental dt, we build *cumulative* dt within the chunk, call the model once,
+        #    compute per-step losses against the corresponding ground truth, then propagate only the last state.
+        bund_cfg = rollout_cfg.get("bundling", {})
+        self.bundling_enabled = bool(bund_cfg.get("enabled", False))
+        self.bundling_chunk_size = int(bund_cfg.get("chunk_size", 1))
+        if self.bundling_chunk_size < 1:
+            raise ValueError(f"rollout.bundling.chunk_size must be >= 1; got {self.bundling_chunk_size}")
+
         # Validation rollout
         val_rollout_cfg = rollout_cfg.get("validation", {})
         # User request: if rollout is enabled, validation should also be long-rollout.
@@ -446,6 +500,25 @@ class ModelTask(pl.LightningModule):
         manifest_path = Path(self.cfg["paths"]["processed_data_dir"]) / "normalization.json"
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
+
+        # --- dt normalization spec (used by chunked temporal bundling) ---
+        dt_spec = manifest.get("dt", None)
+        if not isinstance(dt_spec, dict):
+            raise RuntimeError("normalization.json is missing top-level 'dt' spec (expected dict with log_min/log_max).")
+        try:
+            self._dt_log_min = float(dt_spec["log_min"])
+            self._dt_log_max = float(dt_spec["log_max"])
+        except Exception as e:
+            raise RuntimeError("Bad dt spec in normalization.json; expected {'log_min': <float>, 'log_max': <float>}.") from e
+
+        self._dt_log_range = float(self._dt_log_max - self._dt_log_min)
+        if not (self._dt_log_range > 0.0):
+            raise RuntimeError(f"Bad dt spec: log_max must be > log_min; got log_min={self._dt_log_min}, log_max={self._dt_log_max}")
+
+        # Match dataset.py behavior: dt_epsilon may live under dataset.dt_epsilon or normalization.epsilon.
+        self._dt_eps = float(self.cfg.get("dataset", {}).get("dt_epsilon", self.cfg.get("normalization", {}).get("epsilon", 1e-30)))
+        self._dt_phys_min = max((10.0 ** self._dt_log_min), self._dt_eps)
+        self._dt_phys_max = (10.0 ** self._dt_log_max)
 
         stats = manifest["per_key_stats"]
         meta = manifest.get("meta", {})
@@ -525,6 +598,36 @@ class ModelTask(pl.LightningModule):
 
         return state
 
+    # --------------------------- dt conversion helpers (for bundling) ---------
+
+    def _dt_norm_to_phys(self, dt_norm: torch.Tensor) -> torch.Tensor:
+        """Convert normalized dt in [0,1] to physical dt (seconds). Always returns float32."""
+        dt = dt_norm
+        if dt.ndim == 3 and dt.shape[-1] == 1:
+            dt = dt.squeeze(-1)
+        if dt.ndim != 2:
+            raise ValueError(f"dt_norm_to_phys expects [B,K] or [B,K,1]; got {tuple(dt_norm.shape)}")
+
+        dt_f32 = dt.to(torch.float32)
+        dt_f32 = torch.clamp(dt_f32, 0.0, 1.0)
+        dt_log = self._dt_log_min + dt_f32 * self._dt_log_range
+        dt_phys = torch.pow(10.0, dt_log)
+        return torch.clamp(dt_phys, min=self._dt_eps)
+
+    def _dt_phys_to_norm(self, dt_phys: torch.Tensor) -> torch.Tensor:
+        """Convert physical dt (seconds) to normalized dt in [0,1]. Always returns float32."""
+        dt = dt_phys
+        if dt.ndim == 3 and dt.shape[-1] == 1:
+            dt = dt.squeeze(-1)
+        if dt.ndim != 2:
+            raise ValueError(f"dt_phys_to_norm expects [B,K] or [B,K,1]; got {tuple(dt_phys.shape)}")
+
+        dt_f32 = dt.to(torch.float32)
+        dt_clamped = dt_f32.clamp(min=self._dt_phys_min, max=self._dt_phys_max)
+        dt_log = torch.log10(dt_clamped)
+        dt_norm = (dt_log - self._dt_log_min) / self._dt_log_range
+        return torch.clamp(dt_norm, 0.0, 1.0)
+
     # --------------------------- Loss paths ------------------------------------
 
     def _onestep_forward_loss(
@@ -543,6 +646,127 @@ class ModelTask(pl.LightningModule):
         comps = self.criterion(pred, y_j, return_components=True)
         comps["num_steps"] = torch.tensor(y_j.shape[1], device=y_j.device, dtype=torch.long)
         return comps["total"], comps
+
+
+    def _paper_pushforward_rollout_forward_loss(
+        self,
+        *,
+        y_i: torch.Tensor,
+        dt_in_3: torch.Tensor,
+        y_j: torch.Tensor,
+        g: torch.Tensor,
+        num_steps: int,
+        record_step_abslog: bool,
+    ) -> Tuple[torch.Tensor, dict[str, torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Paper-faithful pushforward + temporal bundling (arXiv:2202.03376).
+
+        Implements the *two-step* pushforward stability objective:
+          L_total = 0.5 * ( L_one_step + lambda * L_stability )
+
+        where:
+          - L_one_step compares predictions from the true state distribution (teacher-forced)
+          - L_stability compares predictions from the pushforward distribution, using the last
+            bundled prediction from the first call as the next input, with stop-grad through that input.
+
+        This path is intentionally strict:
+          - requires num_steps == 2 * bundle_size
+          - requires burn_in_steps == bundle_size (to avoid ambiguous configs)
+          - ignores loss weighting/discounting (uniform, matching the paper)
+        """
+        B, K, _S = y_j.shape
+        device = y_j.device
+
+        bundle_size = int(self.bundling_chunk_size) if (self.bundling_enabled and self.bundling_chunk_size > 1) else 1
+        if bundle_size < 1:
+            raise ValueError(f"Invalid bundle_size={bundle_size}")
+
+        expected_steps = 2 * bundle_size
+        if int(num_steps) != int(expected_steps):
+            raise ValueError(
+                f"pushforward.mode='paper' requires rollout.steps == 2 * bundling.chunk_size "
+                f"(expected {expected_steps}, got {num_steps})."
+            )
+
+        # burn_in_steps is a legacy knob; in paper mode, it must match exactly.
+        if int(self.pushforward_burn_in_steps) != int(bundle_size):
+            raise ValueError(
+                f"pushforward.mode='paper' requires pushforward.burn_in_steps == bundling.chunk_size "
+                f"(expected {bundle_size}, got {self.pushforward_burn_in_steps})."
+            )
+
+        if dt_in_3.shape[0] != B or dt_in_3.shape[1] < expected_steps or dt_in_3.shape[-1] != 1:
+            raise ValueError(
+                f"dt_in must have shape [B,>= {expected_steps},1] for paper pushforward; got {tuple(dt_in_3.shape)}"
+            )
+
+        def _build_dt_cum_norm_3(start: int, L: int) -> torch.Tensor:
+            dt_inc_norm = dt_in_3[:, start : start + L, :]      # [B,L,1]
+            dt_inc_phys = self._dt_norm_to_phys(dt_inc_norm)    # [B,L]
+            dt_cum_phys = torch.cumsum(dt_inc_phys, dim=1)      # [B,L]
+            dt_cum_norm = self._dt_phys_to_norm(dt_cum_phys)    # [B,L]
+            return dt_cum_norm.unsqueeze(-1)                    # [B,L,1]
+
+        lam = float(self.pushforward_lambda_stability)
+
+        # ---- One-step bundled loss on the true state distribution ----
+        dt1_cum_norm_3 = _build_dt_cum_norm_3(0, bundle_size)
+        true1 = y_j[:, 0:bundle_size, :]
+        pred1 = self(y_i, dt1_cum_norm_3, g)
+        if pred1.shape != true1.shape:
+            raise RuntimeError(f"paper pushforward: pred1/true1 shape mismatch {tuple(pred1.shape)} vs {tuple(true1.shape)}")
+        comps1 = self.criterion(pred1, true1, return_components=True)
+
+        # Propagate only the last state (constrained) to build the pushforward distribution.
+        last_pred1 = pred1[:, -1, :]
+        state1 = self._apply_state_constraints(last_pred1, apply_noise=False)
+
+        # ---- Stability bundled loss on the pushforward distribution (stop-grad through state1) ----
+        dt2_cum_norm_3 = _build_dt_cum_norm_3(bundle_size, bundle_size)
+        true2 = y_j[:, bundle_size : expected_steps, :]
+        pred2 = self(state1.detach(), dt2_cum_norm_3, g)
+        if pred2.shape != true2.shape:
+            raise RuntimeError(f"paper pushforward: pred2/true2 shape mismatch {tuple(pred2.shape)} vs {tuple(true2.shape)}")
+        comps2 = self.criterion(pred2, true2, return_components=True)
+
+        # Average across the two solver calls so logging/weighting matches num_steps.
+        total_loss = 0.5 * (comps1["total"] + lam * comps2["total"])
+        total_phys = 0.5 * (comps1["phys"] + lam * comps2["phys"])
+        total_z = 0.5 * (comps1["z"] + lam * comps2["z"])
+        total_abslog = 0.5 * (comps1["mean_abs_log10"] + lam * comps2["mean_abs_log10"])
+
+        comps = {
+            "total": total_loss,
+            "phys": total_phys,
+            "z": total_z,
+            "mean_abs_log10": total_abslog,
+            "num_steps": torch.tensor(int(expected_steps), device=device, dtype=torch.long),
+        }
+
+        step_abslog_vec = None
+        final_abslog = None
+        if record_step_abslog:
+            step_abslog_vec = torch.zeros((expected_steps,), device=device, dtype=torch.float32)
+
+            # Per-step unweighted abs-log10 (mean over batch + species).
+            pred1_log = self.criterion.z_to_log10(pred1)
+            true1_log = self.criterion.z_to_log10(true1)
+            abs1 = (pred1_log - true1_log).abs().to(torch.float32)              # [B,L,S]
+            step_abslog_vec[0:bundle_size] = abs1.mean(dim=(0, 2))
+
+            pred2_log = self.criterion.z_to_log10(pred2)
+            true2_log = self.criterion.z_to_log10(true2)
+            abs2 = (pred2_log - true2_log).abs().to(torch.float32)
+            step_abslog_vec[bundle_size:expected_steps] = abs2.mean(dim=(0, 2))
+
+            # Final-step abslog uses the CONSTRAINED state that is actually propagated.
+            last_pred2 = pred2[:, -1, :]
+            state2 = self._apply_state_constraints(last_pred2, apply_noise=False)
+            final_pred_log = self.criterion.z_to_log10(state2)
+            final_true_log = self.criterion.z_to_log10(y_j[:, expected_steps - 1, :])
+            final_abslog = (final_pred_log - final_true_log).abs().mean().to(torch.float32)
+
+        return total_loss, comps, step_abslog_vec, final_abslog
 
     def _rollout_forward_loss(
         self,
@@ -573,6 +797,30 @@ class ModelTask(pl.LightningModule):
         if num_steps <= 0:
             raise ValueError(f"Invalid rollout steps: requested={num_steps_req} K={K}")
 
+        # Normalize dt_in to [B,K,1] for consistent slicing.
+        if dt_in.ndim == 2:
+            dt_in_3 = dt_in.unsqueeze(-1)
+        else:
+            dt_in_3 = dt_in
+        if dt_in_3.ndim != 3 or dt_in_3.shape[-1] != 1:
+            raise ValueError(f"dt_in must be [B,K,1] or [B,K]; got {tuple(dt_in.shape)}")
+
+
+        # Decide whether to apply pushforward behavior in this pass.
+        apply_pushforward = bool(self.pushforward_enabled and (self.training or self.pushforward_apply_in_validation))
+        if apply_pushforward and self.pushforward_mode == "paper":
+            if apply_noise:
+                raise ValueError(
+                    "rollout.noise.enabled is incompatible with rollout.pushforward.mode='paper' (paper uses pushforward instead of Gaussian noise)."
+                )
+            return self._paper_pushforward_rollout_forward_loss(
+                y_i=y_i,
+                dt_in_3=dt_in_3,
+                y_j=y_j,
+                g=g,
+                num_steps=num_steps,
+                record_step_abslog=record_step_abslog,
+            )
         step_weights = compute_rollout_loss_weights(
             num_steps=num_steps,
             weighting=self.loss_weighting,
@@ -580,6 +828,28 @@ class ModelTask(pl.LightningModule):
             device=device,
             dtype=torch.float32,
         )
+
+        # Pushforward mode (paper-inspired, backward-compatible):
+        #   - stopgrad through the propagated state (implemented by detaching the *input state*
+        #     for steps/chunks > 0)
+        #   - optional burn-in region: first N steps contribute zero loss weight, but are still
+        #     propagated
+        #
+        # By default, burn_in_steps=1 when skip_first_step_loss=True, matching prior behavior.
+        burn_in_steps = int(self.pushforward_burn_in_steps) if apply_pushforward else 0
+        if burn_in_steps < 0:
+            raise ValueError(f"Invalid pushforward burn_in_steps={burn_in_steps}")
+        if burn_in_steps >= num_steps:
+            raise ValueError(
+                f"pushforward.burn_in_steps={burn_in_steps} must be < rollout steps={num_steps} "
+                f"(requested={num_steps_req}, K={K})"
+            )
+        if apply_pushforward and burn_in_steps > 0:
+            step_weights = step_weights.clone()
+            step_weights[:burn_in_steps] = 0.0
+            if not (float(step_weights.sum().item()) > 0.0):
+                raise ValueError("Internal error: pushforward step_weights sum became 0 after burn-in masking.")
+            step_weights = step_weights / step_weights.sum()
 
         state = y_i
 
@@ -590,30 +860,84 @@ class ModelTask(pl.LightningModule):
 
         step_abslog_vec = torch.zeros((num_steps,), device=device, dtype=torch.float32) if record_step_abslog else None
 
-        for step_idx in range(num_steps):
-            dt_step = dt_in[:, step_idx : step_idx + 1, :]
-            pred = self(state, dt_step, g).squeeze(1)
-            true = y_j[:, step_idx, :]
+        # ---- Chunked temporal bundling (one model call per chunk) ----
+        if self.bundling_enabled and self.bundling_chunk_size > 1:
+            step = 0
+            while step < num_steps:
+                L = min(int(self.bundling_chunk_size), int(num_steps - step))
 
-            step_comps = self.criterion(pred.unsqueeze(1), true.unsqueeze(1), return_components=True)
+                # dt_in is incremental in rollout mode. Build cumulative dt within this chunk.
+                dt_inc_norm = dt_in_3[:, step : step + L, :]              # [B,L,1]
+                dt_inc_phys = self._dt_norm_to_phys(dt_inc_norm)          # [B,L]
+                dt_cum_phys = torch.cumsum(dt_inc_phys, dim=1)            # [B,L]
+                dt_cum_norm = self._dt_phys_to_norm(dt_cum_phys)          # [B,L]
+                dt_cum_norm_3 = dt_cum_norm.unsqueeze(-1)                 # [B,L,1]
 
-            w = step_weights[step_idx]
-            total_loss = total_loss + w * step_comps["total"]
-            total_phys = total_phys + w * step_comps["phys"]
-            total_z = total_z + w * step_comps["z"]
-            total_abslog = total_abslog + w * step_comps["mean_abs_log10"]
+                # Pushforward: stopgrad through propagated state across *chunk boundaries*.
+                # Within a chunk, we do not propagate intermediate states, so there is no
+                # notion of per-step pushforward inside the chunk.
+                state_in = state.detach() if (apply_pushforward and step > 0) else state
+                pred_chunk = self(state_in, dt_cum_norm_3, g)             # [B,L,S]
+                if pred_chunk.ndim != 3 or pred_chunk.shape[1] != L:
+                    raise RuntimeError(f"Chunked rollout expected pred [B,{L},S]; got {tuple(pred_chunk.shape)}")
 
-            if step_abslog_vec is not None:
-                step_abslog_vec[step_idx] = step_comps["mean_abs_log10"].detach().to(torch.float32)
+                # Losses: computed per-step to support step-wise weights.
+                for j in range(L):
+                    step_idx = step + j
+                    pred = pred_chunk[:, j, :]
+                    true = y_j[:, step_idx, :]
+                    step_comps = self.criterion(pred.unsqueeze(1), true.unsqueeze(1), return_components=True)
 
-            # Prepare for next step (this is the *propagated* state)
-            next_state = self._apply_state_constraints(pred, apply_noise=apply_noise)
+                    w = step_weights[step_idx]
+                    total_loss = total_loss + w * step_comps["total"]
+                    total_phys = total_phys + w * step_comps["phys"]
+                    total_z = total_z + w * step_comps["z"]
+                    total_abslog = total_abslog + w * step_comps["mean_abs_log10"]
 
-            # Optional truncated BPTT
-            if self.detach_every > 0 and (step_idx + 1) % self.detach_every == 0:
-                next_state = next_state.detach()
+                    if step_abslog_vec is not None:
+                        step_abslog_vec[step_idx] = step_comps["mean_abs_log10"].detach().to(torch.float32)
 
-            state = next_state
+                # Propagate only the last predicted state in the chunk.
+                last_pred = pred_chunk[:, -1, :]
+                next_state = self._apply_state_constraints(last_pred, apply_noise=apply_noise)
+
+                # Truncated BPTT can only be applied at chunk boundaries (we do not have propagated intermediate states).
+                if (not apply_pushforward) and self.detach_every > 0 and (step + L) % self.detach_every == 0:
+                    next_state = next_state.detach()
+
+                state = next_state
+                step += L
+
+        # ---- Standard step-wise rollout (one model call per step) ----
+        else:
+            for step_idx in range(num_steps):
+                dt_step = dt_in_3[:, step_idx : step_idx + 1, :]
+
+                # Pushforward: stopgrad through propagated state.
+                state_in = state.detach() if (apply_pushforward and step_idx > 0) else state
+
+                pred = self(state_in, dt_step, g).squeeze(1)
+                true = y_j[:, step_idx, :]
+
+                step_comps = self.criterion(pred.unsqueeze(1), true.unsqueeze(1), return_components=True)
+
+                w = step_weights[step_idx]
+                total_loss = total_loss + w * step_comps["total"]
+                total_phys = total_phys + w * step_comps["phys"]
+                total_z = total_z + w * step_comps["z"]
+                total_abslog = total_abslog + w * step_comps["mean_abs_log10"]
+
+                if step_abslog_vec is not None:
+                    step_abslog_vec[step_idx] = step_comps["mean_abs_log10"].detach().to(torch.float32)
+
+                # Prepare for next step (this is the *propagated* state)
+                next_state = self._apply_state_constraints(pred, apply_noise=apply_noise)
+
+                # Optional truncated BPTT (ignored in pushforward mode, which already enforces stopgrad-by-input)
+                if (not apply_pushforward) and self.detach_every > 0 and (step_idx + 1) % self.detach_every == 0:
+                    next_state = next_state.detach()
+
+                state = next_state
 
         comps = {
             "total": total_loss,
@@ -704,10 +1028,16 @@ class ModelTask(pl.LightningModule):
 
         if self.rollout_enabled:
             num_steps = self._get_rollout_steps_for_epoch()
+            # Paper pushforward mode (K*2 unroll with stop-grad on the pushforward state)
+            # is incompatible with extra noise injection; the pushforward distribution is the perturbation.
+            apply_noise = True
+            if self.pushforward_enabled and getattr(self, 'pushforward_mode', 'legacy') == 'paper':
+                apply_noise = False
+
             loss, comps, _step_abslog, _final_abslog = self._rollout_forward_loss(
                 y_i, dt_in, y_j, g,
                 num_steps_req=num_steps,
-                apply_noise=True,
+                apply_noise=apply_noise,
                 record_step_abslog=False,
             )
         else:
@@ -1056,7 +1386,7 @@ class ModelTask(pl.LightningModule):
         if not self._printed_header:
             if self.val_rollout_enabled:
                 self._logger.info("EPOCH | train(loss)  | val(loss)    | val(final_mult) | lr         | time")
-                self._logger.info("----- | ----------- | ----------- | -------------- | ---------- | --------")
+                self._logger.info("----- | -----------  | -----------  | --------------- | ---------- | --------")
             else:
                 self._logger.info("EPOCH | train       | val         | mult_err_proxy | lr         | time")
                 self._logger.info("----- | ----------- | ----------- | -------------- | ---------- | --------")

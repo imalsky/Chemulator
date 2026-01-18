@@ -1,320 +1,417 @@
 {
   "paths": {
-    // Directory containing processed shards
     "processed_data_dir": "data/processed_quarter",
-    // List of raw HDF5 files (optional; auto-detect if empty)
     "raw_data_files": [],
-    // Directory for logs/checkpoints/exports
     "work_dir": "models/mlp",
-    // Delete existing work_dir before start
     "overwrite": false
   },
 
   "system": {
-    // Enable cuDNN autotuning (faster convs)
+    // cudnn_benchmark:
+    // - True can improve throughput (best for fixed shapes).
+    // - If shapes vary a lot, it can add overhead; usually fine here.
     "cudnn_benchmark": true,
-    // Model parameter dtype (fallback; preprocessing uses io_dtype)
+
+    // dtype:
+    // - "float32" is the safest default for stability/accuracy in stiff kinetics.
+    // - Even if mixed precision is enabled, this still matters for some ops / fallbacks.
     "dtype": "float32",
-    // On-disk NPZ dtype for preprocessing output
+
+    // io_dtype:
+    // - On-disk dtype for preprocessed NPZ shards.
+    // - Keeping float32 avoids precision surprises during normalization and dt transforms.
     "io_dtype": "float32",
-    // Allow TF32 tensor cores on Ampere/Hopper
+
+    // tf32:
+    // - Allows TensorFloat-32 on Ampere/Hopper for matmuls.
+    // - Usually a free speedup with minimal accuracy impact for this task.
     "tf32": true,
-    // Max OpenMP threads for CPU ops
+
+    // omp_num_threads:
+    // - CPU thread cap for dataload / CPU ops.
+    // - If you see dataloader stalls, tune this and num_workers/prefetch.
     "omp_num_threads": 4,
-    // Global RNG seed
+
     "seed": 42,
-    // Deterministic mode (slower but reproducible)
     "deterministic": false
   },
 
   "mixed_precision": {
-    // AMP precision: "bf16", "fp16", or "fp32"/"none"
+    // mode:
+    // - "bf16" is generally the best speed/stability trade for modern GPUs.
+    // - If you see rare NaNs: lower LR first; then consider fp16->bf16 (already bf16), or disable AMP.
     "mode": "bf16"
   },
 
   "data": {
-    // Global inputs (e.g., P, T)
+    // global_variables:
+    // - Static or slowly varying conditioning inputs (e.g., P,T, metallicity, etc.).
+    // - In your model forward signature these show up as "g" with shape [B,G].
     "global_variables": ["P", "T"],
-    // Name of the time column in raw files
+
+    // time_variable:
+    // - Raw time column name in the source data (used for grid checks / preprocessing).
+    // - Note: training uses dt_norm (normalized delta-time), not absolute time.
     "time_variable": "t_time",
-    // Species list; hydrated from artifacts if empty
+
+    // species_variables / target_species:
+    // - Empty means "use all species found in the processed shards".
+    // - If you later set these, you’re selecting the chemistry state vector columns.
     "species_variables": [],
-    // Subset of species to predict; empty = all (must equal species_variables)
     "target_species": []
   },
 
   "normalization": {
-    // Default normalization for unspecified keys
     "default_method": "log-standard",
-    // Small positive floor for log transforms
     "epsilon": 1e-30,
-    // Per-key normalization methods
     "methods": {
+      // P uses log scaling because it spans orders of magnitude.
       "P": "log-min-max",
+      // T is typically well-behaved linearly across your range.
       "T": "standard",
+      // dt is log-min-max in your pipeline (important: cumulative dt inside bundling can hit clamps).
       "dt": "log-min-max",
+      // absolute time is rarely used at inference but kept for completeness / plotting.
       "t_time": "log-min-max"
     },
-    // Minimum stddev to avoid division blow-up
     "min_std": 1e-10
   },
 
   "preprocessing": {
-    // Read chunk length for HDF5 (0 = full)
     "hdf5_chunk_size": 0,
-    // Drop profiles with any value below this (<=0 keeps all)
     "min_value_threshold": 1e-30,
-    // Compress NPZ shards (smaller, slower I/O)
     "npz_compressed": false,
-    // Workers for preprocessing (I/O bound)
     "num_workers": 32,
-    // Trajectories per output shard
     "trajectories_per_shard": 65536,
-    // Drop t=0 row when exporting shards
     "skip_first_timestep": false,
-    // Reuse the data if possible
     "overwrite_data": false
   },
 
   "dataset": {
-    // Global training batch size
-    "batch_size_train": 2048,
-    // Optional: override dataset tensor dtype (null = use AMP dtype)
+    "batch_size_train": 8192,
     "storage_dtype": "float32",
-    // np.load mmap mode ("r" = memmap; null disables)
     "mmap_mode": "r",
-    // Trust metadata; skip shard scan
     "skip_scan": true,
-    // Skip time-grid monotonicity checks
     "skip_validate_grids": true,
-    // Return K targets per anchor
+
+    // multi_time_per_anchor:
+    // - True: each sample returns ONE anchor state y_i plus K target times y_j[:,k] and dt[:,k].
+    // - This is required for bundling / rollout training to be meaningful.
     "multi_time_per_anchor": true,
-    // K: number of target steps per anchor
-    "times_per_anchor": 24,
-    // Use same offsets for entire batch
-    "share_times_across_batch": false,
-    // Assume all trajectories share the same time grid
+
+    // times_per_anchor (K):
+    // - Number of time targets per anchor returned by the dataset.
+    // - MUST be >= training.rollout.steps, otherwise rollout training will be capped.
+    // - Larger K increases compute per batch and can stress dt normalization if cumulative dt grows large.
+    "times_per_anchor": 48,
+
+    // share_times_across_batch:
+    // - True: all items in the batch use the same selected offsets/time indices.
+    // - This improves GPU efficiency (less raggedness) and makes bundled calls more coherent.
+    "share_times_across_batch": true,
+
     "assume_shared_grid": true,
-    // Δt clamp floor before normalization
     "dt_epsilon": 1e-30,
-    // Use the very first anchor point
+
+    // use_first_anchor:
+    // - If true, anchor is always the first time index in the trajectory.
+    // - If false, anchor can be randomized (more diversity, but can complicate reproducibility).
     "use_first_anchor": true,
-    // DataLoader workers
+
+    // Dataloader tuning:
+    // - num_workers/persistent_workers/prefetch_factor can dominate throughput at huge batch sizes.
     "num_workers": 4,
-    // Keep workers alive between epochs
     "persistent_workers": true,
-    // Pin memory for faster H2D copies
     "pin_memory": true,
-    // Prefetch batches per worker
     "prefetch_factor": 2,
-    // Stage entire set to GPU at init
+
+    // preload_to_gpu:
+    // - If true, dataset batches are moved to GPU in the dataloader worker pipeline.
+    // - Usually false unless CPU->GPU transfer is a proven bottleneck and memory allows it.
     "preload_to_gpu": false
   },
 
   "model": {
-    // =========================================================================
-    // Architecture Selection
-    // =========================================================================
-    
-    // Use MLP-only architecture (no encoder/decoder, direct state prediction)
+    // mlp_only:
+    // - true  => FlowMapMLP: directly maps (y_i, dt_norm, g) -> y_{i+dt} in z-space
+    // - false => FlowMapAutoencoder: encode y_i -> z_i, evolve in z, decode to y
+    //
+    // Performance note:
+    // - Both MLP and AE can produce K outputs in a single forward pass.
+    // - AE can be cheaper only if latent_dim is much smaller than state_dim and decoder isn’t huge.
+    // - If latent_dim is large (e.g., 512) and decoder is wide, AE may not be faster.
     "mlp_only": true,
 
-    // =========================================================================
-    // Autoencoder Architecture (when mlp_only=false)
-    // =========================================================================
-    
-    // Latent channel count for autoencoder
+    // latent_dim / encoder_hidden / dynamics_hidden / decoder_hidden:
+    // - Only used when mlp_only=false (AE path).
+    // - latent_dim: size of z state; too small hurts accuracy, too large hurts speed.
+    // - encoder_hidden/decoder_hidden: cost scales with state_dim; decoder dominates at large K.
+    // - dynamics_hidden: cost scales with latent_dim; this is where AE typically saves compute.
     "latent_dim": 512,
-    // Encoder MLP hidden sizes
     "encoder_hidden": [512, 512],
-    // Dynamics MLP hidden sizes
     "dynamics_hidden": [512, 512],
-    // Decoder MLP hidden sizes
     "decoder_hidden": [512, 512],
 
-    // =========================================================================
-    // MLP-Only Architecture (when mlp_only=true)
-    // Three ways to configure hidden layers (in order of precedence):
-    //
-    // 1. Explicit list (highest priority):
-    //    "mlp_hidden": [512, 512, 512, 512]
-    //
-    // 2. Shorthand (num_layers × hidden_dim):
-    //    "mlp_num_layers": 6,
-    //    "mlp_hidden_dim": 512
-    //
-    // 3. Fallback: concatenates encoder_hidden + dynamics_hidden + decoder_hidden
-    // =========================================================================
-    
-    // Option 1: Explicit hidden layer dimensions (overrides all other options)
+    // mlp_hidden:
+    // - Hidden layer widths for the direct MLP (used only when mlp_only=true).
+    // - Your current setting is extremely high capacity. With very large batches,
+    //   stability is more often driven by rollout objective, LR, clipping, and dt schedule than sheer width.
+    // - If you see instability/NaNs: reduce LR first; consider smaller widths second.
     "mlp_hidden": [2048, 2048, 2048, 2048, 2048],
-    
-    // Option 2: Uniform layers shorthand
-    // "mlp_num_layers": 6,
-    // "mlp_hidden_dim": 512,
 
-    // =========================================================================
-    // Shared Settings
-    // =========================================================================
-    
-    // Nonlinearity for MLPs: "relu", "gelu", "silu"/"swish", "tanh", "elu", "leaky_relu"
+    // activation:
+    // - "silu" is a strong default for smooth stiff-ish mappings.
+    // - ReLU can work but may introduce sharper transitions that amplify drift in rollouts.
     "activation": "silu",
-    // Dropout rate in MLPs
+
+    // dropout:
+    // - Usually not helpful for this style of surrogate when the dataset is massive.
+    // - Dropout can inject noise that worsens autoregressive drift unless carefully tuned.
     "dropout": 0.0,
-    // Use residual connections in dynamics/MLP
+
+    // dynamics_residual:
+    // - Enables residual blocks inside the MLP (or latent dynamics MLP in AE mode).
+    // - Helps optimize deeper networks; also tends to help rollout stability because it biases toward identity.
     "dynamics_residual": true,
-    // Decoder/MLP predicts Δy in z-space (added to input)
+
+    // predict_delta:
+    // - true: network predicts Δy in z-space; output is y_i + Δy (residual head).
+    // - This is usually beneficial for autoregressive stability because "do nothing" is easy to represent.
+    // - false: network predicts y directly, which can be harder to keep stable over long horizons.
     "predict_delta": true,
-    // Decoder/MLP predicts Δlog10(y) in physical space (enables simplex projection)
+
+    // predict_delta_log_phys:
+    // - true: predict Δlog10(y) in physical space. Useful if you want multiplicative error control.
+    // - This usually requires careful constraints (positivity, clipping, optional simplex).
+    // - In your current pipeline, enabling this changes which parts run in fp32 and how constraints apply.
     "predict_delta_log_phys": false
   },
 
   "training": {
-    // =========================================================================
-    // Basic Training
-    // =========================================================================
-    
-    // Total epochs to train
+    // epochs:
+    // - With rollout curricula, you want enough epochs AFTER reaching end_steps to actually converge.
+    // - If ramp_epochs=20 and epochs=100, you have 80 epochs at full horizon.
     "epochs": 100,
-    // Clip grad-norm at this value (0 = disabled)
-    "gradient_clip": 0.0,
-    // Gradient accumulation steps
+
+    // gradient_clip:
+    // - Strongly recommended for long-horizon training.
+    // - Clipping reduces rare gradient spikes that can destabilize bf16 training.
+    // - If training is sluggish, try 0.5–1.0; if unstable, try 1.0–2.0.
+    "gradient_clip": 1.0,
+
+    // accumulate_grad_batches:
+    // - If you hit GPU memory limits, increase this instead of reducing batch size (changes optimizer dynamics).
     "accumulate_grad_batches": 1,
 
-    // =========================================================================
-    // Optimizer
-    // =========================================================================
-    
-    // Optimizer choice: "adamw" or "lamb"
+    // optimizer:
+    // - adamw: robust default.
+    // - lamb: sometimes better for extremely large effective batch sizes; can allow larger LR.
     "optimizer": "adamw",
-    // Initial learning rate
-    "lr": 1e-4,
-    // Weight decay for AdamW
-    "weight_decay": 1e-4,
 
-    // =========================================================================
-    // Learning Rate Schedule
-    // =========================================================================
-    
-    // Linear warmup epochs before cosine
+    // lr:
+    // - Most sensitive knob for rollout stability.
+    // - If you see divergence during/after curriculum ramp, lower lr first (e.g., 3e-4 -> 2e-4 -> 1e-4).
+    "lr": 0.0003,
+
+    // weight_decay:
+    // - Regularization on weights; too high can bias toward underfitting long-horizon dynamics.
+    "weight_decay": 0.0001,
+
+    // warmup_epochs:
+    // - Important for very large batch + bf16 so you don’t shock the optimizer early.
     "warmup_epochs": 10,
-    // Cosine schedule minimum learning rate
+
+    // min_lr:
+    // - Floor for cosine schedule (if used in your trainer). Prevents LR from going to ~0.
     "min_lr": 1e-7,
 
-    // =========================================================================
-    // torch.compile (Optional)
-    // =========================================================================
-    
+    // torch_compile:
+    // - Can boost throughput, but compilation overhead and graph breaks can make debugging painful.
+    // - Turn on only after correctness/stability is confirmed.
     "torch_compile": false,
     "torch_compile_backend": "inductor",
     "torch_compile_mode": "default",
     "compile_dynamic": false,
     "compile_fullgraph": false,
 
-    // =========================================================================
-    // Stochastic Weight Averaging (Optional)
-    // =========================================================================
-    
+    // SWA:
+    // - Sometimes helps generalization, but for rollout problems it can blur sharp dynamics.
+    // - Only enable if validation rollouts improve empirically.
     "use_swa": false,
     "swa_epoch_start": 0.8,
     "swa_annealing_epochs": 10,
     "swa_annealing_strategy": "cos",
 
-    // =========================================================================
-    // Debugging / Limits
-    // =========================================================================
-    
-    // Limit training batches per epoch (0 = no limit)
+    // max_train_batches / max_val_batches:
+    // - Useful for fast smoke tests. Keep 0 for full epoch.
     "max_train_batches": 0,
-    // Limit validation batches per epoch (0 = no limit)
     "max_val_batches": 0,
-    // Checkpoint path to resume from (optional)
+
+    // resume / auto_resume:
+    // - auto_resume=true makes experiments less reproducible if you forget old checkpoints are present.
+    // - For clean ablations, set auto_resume=false and use explicit resume paths.
     "resume": null,
-    // Allow auto-resume from last.ckpt
     "auto_resume": true,
 
-    // =========================================================================
-    // Data Sampling
-    // =========================================================================
-    
-    // Subsample fraction of trajectories during preprocessing
+    // Fractions:
+    // - These are preprocessing split fractions. They do not “subsample” within an epoch.
     "use_fraction": 1.0,
-    // Validation fraction for preprocessing split
     "val_fraction": 0.1,
-    // Test fraction for preprocessing split
     "test_fraction": 0.1,
-    // Minimum j−i offset for targets
-    "min_steps": 20,
-    // Maximum j−i offset for targets (null = T-1)
-    "max_steps": 65,
-    // Anchors per trajectory per epoch
-    "pairs_per_traj": 4,
 
-    // =========================================================================
-    // Loss Function
-    // =========================================================================
-    
+    // min_steps / max_steps:
+    // - Defines the window of allowable target offsets (in index steps) relative to the anchor.
+    // - In rollout mode, the dataset samples K DISTINCT offsets in [min_steps, max_steps] and sorts them.
+    // - Hard constraint: (max_steps - min_steps + 1) must be >= dataset.times_per_anchor, or dataset will error.
+    //
+    // Rollout realism:
+    // - If you want rollouts that resemble “1,2,3,...,K” step-by-step, set max_steps = min_steps + K - 1.
+    // - With wider windows, you get larger gaps in time indices; dt increments can vary wildly.
+    "min_steps": 1,
+    "max_steps": 99,
+
+    // pairs_per_traj:
+    // - Number of anchor selections per trajectory.
+    // - In multi_time_per_anchor mode, each anchor yields K training targets, so this scales total samples heavily.
+    "pairs_per_traj": 2,
+
+    // adaptive_stiff_loss:
+    // - lambda_phys: main term in physical log10 space (more interpretable for kinetics)
+    // - lambda_z: stabilization term in z-space (helps keep latents/distribution in check)
+    // - use_weighting: per-species weighting by dynamic range; useful if a few species dominate the loss.
+    // - epsilon_phys: floor used in physical/log computations to avoid -inf/NaNs.
     "adaptive_stiff_loss": {
-      // Weight for log10-space physical loss
       "lambda_phys": 1.0,
-      // Weight for z-space MSE loss
       "lambda_z": 0.25,
-      // Use per-species weighting based on dynamic range
       "use_weighting": false,
-      // Power for range-based weighting (0.5 = sqrt)
       "weight_power": 0.5,
-      // Min/max clamps for species weights
       "w_min": 0.5,
       "w_max": 2.0,
-      // Epsilon for numerical stability
       "epsilon_phys": 1e-20
     },
 
-    // =========================================================================
-    // Rollout Training (for stable long-horizon autoregressive prediction)
-    // Based on Kelp (2020): noise injection, clipping, curriculum learning
-    // =========================================================================
-    
     "rollout": {
-      // Enable rollout training (requires dataset.times_per_anchor >= steps)
+      // enabled:
+      // - True enables autoregressive rollout training logic in the trainer.
+      // - Dataset must provide incremental dt and sequentially ordered targets for the selected offsets.
       "enabled": true,
-      // Number of autoregressive steps per training sample
-      "steps": 16,
-      
-      // Curriculum learning: gradually increase rollout steps
+
+      // steps:
+      // - Number of rollout steps used for training.
+      // - Trainer will cap effective steps to min(steps, dataset.times_per_anchor).
+      //
+      // IMPORTANT interaction with pushforward.mode="paper":
+      // - In your code, paper mode requires steps == 2 * bundling.chunk_size (strict check).
+      // - With the current values (steps=24, chunk_size=24), paper mode will NOT satisfy that constraint.
+      "steps": 24,
+
+      // curriculum:
+      // - Ramps rollout horizon from start_steps -> end_steps over ramp_epochs.
+      // - This often stabilizes long-horizon training by learning short-horizon consistency first.
+      //
+      // IMPORTANT interaction with pushforward.mode="paper":
+      // - Paper mode requires a fixed step count (it hard-checks steps), so curriculum typically must be disabled.
       "curriculum": {
         "enabled": true,
-        "start_steps": 1,
-        "end_steps": 16,
+        "start_steps": 4,
+        "end_steps": 24,
         "ramp_epochs": 20
       },
-      
-      // Noise injection in log10 space (KEY for robustness)
-      // Forces model to recover from prediction errors during training
+
+      // noise:
+      // - Injects Gaussian noise in log10 space during rollouts to improve robustness.
+      // - If enabled, start very small; too much noise creates off-manifold states and can destabilize training.
+      //
+      // IMPORTANT interaction with pushforward.mode="paper":
+      // - In your code, paper mode disallows rollout noise (strict check).
       "noise": {
-        "enabled": true,
-        // Standard deviation of Gaussian noise in log10 space
-        "log10_std": 0.05
+        "enabled": false,
+        "log10_std": 0.02
       },
-      
-      // Clipping in log10 space to prevent nonphysical values
+
+      // clip:
+      // - Applies per-step clamping in log10 space to keep states within a physically plausible range.
+      // - This is often essential for long rollouts to prevent runaway values from exploding loss/gradients.
+      //
+      // Note:
+      // - log10_max=0 means y <= 1.0; this is appropriate for mixing ratios but not for all state variables.
       "clip": {
         "enabled": true,
         "log10_min": -30.0,
         "log10_max": 0.0
       },
-      
-      // Loss weighting across rollout steps: "uniform", "linear", "exponential"
+
+      // loss_weighting:
+      // - "uniform": equal weight across all rollout steps.
+      // - "linear": increases weight toward later steps (directly targets long-horizon stability).
+      // - "exponential": weight[k] ~ discount^k (discount<1 downweights later steps).
+      //
+      // For true long-horizon stability, linear weighting is often a better default than exponential<1.
       "loss_weighting": "linear",
-      // Discount factor for exponential weighting (weight[k] = discount^k)
       "loss_discount": 0.95,
-      // Truncated BPTT: detach gradient every N steps (0 = disabled)
+
+      // detach_every:
+      // - Truncated BPTT cadence. 0 disables.
+      // - For long rollouts, detaching periodically can stabilize but also weakens long-horizon gradient signal.
+      // - If pushforward is enabled (legacy), detach_every often becomes redundant.
       "detach_every": 0,
-      
-      // Validation rollout: track long-horizon performance during validation
+
+      // pushforward:
+      // - enabled: modifies the rollout objective to include training on model-generated (shifted) inputs.
+      //
+      // mode:
+      // - "paper": strict 2-bundle construction: first bundle teacher-forced, second bundle from detached boundary state.
+      //           Requires steps == 2 * bundling.chunk_size and burn_in_steps == bundling.chunk_size.
+      // - "legacy": paper-inspired: detach propagated states at chunk boundaries; supports arbitrary steps/chunking.
+      //
+      // burn_in_steps:
+      // - Interpreted differently across modes in many codebases; in your code it is constrained:
+      //   * paper: MUST equal bundling.chunk_size
+      //   * legacy: MUST be < steps (otherwise invalid)
+      "pushforward": {
+        "enabled": true,
+        "mode": "paper",
+
+        // WARNING:
+        // - With mode="paper", this MUST equal bundling.chunk_size, AND steps MUST equal 2*chunk_size.
+        // - With the current values (burn_in_steps=24, chunk_size=24, steps=24), paper-mode constraints are not met.
+        "burn_in_steps": 24,
+
+        // lambda_stability:
+        // - Weight on the pushforward stability term (the part trained on shifted/model-generated inputs).
+        // - If stability improves but one-step accuracy degrades, reduce this; if rollouts drift, increase carefully.
+        "lambda_stability": 1.0,
+
+        // apply_in_validation:
+        // - If false, validation reflects the standard rollout loss/weights (often more representative of deployment).
+        // - If true, validation uses the pushforward-modified objective (can be harder to interpret).
+        "apply_in_validation": false
+      },
+
+      // bundling:
+      // - enabled: compute multiple future targets per model call by using cumulative dt within each chunk.
+      //
+      // chunk_size:
+      // - Number of incremental steps predicted per call.
+      // - Smaller chunks => more autoregressive boundaries (more “AR-ness”), but more calls and more shift events.
+      // - Larger chunks => fewer calls, but each call must forecast farther ahead from the same starting state.
+      //
+      // IMPORTANT interaction with pushforward.mode="paper":
+      // - Paper mode is defined as EXACTLY two bundles: steps must be 2*chunk_size.
+      // - So chunk_size=24 implies steps must be 48 (not 24).
+      "bundling": {
+        "enabled": true,
+        "chunk_size": 24
+      },
+
+      // validation:
+      // - Separate long-horizon rollout evaluation.
+      // - If steps > dataset.times_per_anchor, the trainer will effectively cap it.
+      // - It can be useful to set validation.steps > training.steps to detect drift early,
+      //   but only if your dataset provides enough targets.
       "validation": {
         "enabled": true,
-        "steps": 16
+        "steps": 48
       }
     }
   }

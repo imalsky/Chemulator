@@ -33,7 +33,7 @@ plt.style.use("science.mplstyle")
 # =============================================================================
 
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models" / "big_mlp"
+MODEL_DIR = REPO / "models" / "mlp_paper_pf_steps96"
 EP_FILENAME = "export_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))
@@ -41,15 +41,15 @@ from utils import load_json_config as load_json, seed_everything
 from normalizer import NormalizationHelper
 
 # Sample and plotting settings
-SAMPLE_IDX = 6
+SAMPLE_IDX = 1
 Q_COUNT = 100
 XMIN, XMAX = 1e-3, 1e8
 
 # Rollout schedule: "logspace" or "constant"
 ROLLOUT_SCHEDULE_MODE = "constant"
-ROLLOUT_N_JUMPS_TOTAL = 24
-ROLLOUT_MAX_STEPS = 24
-ROLLOUT_CONST_DT_SEC: Optional[float] = 1e2
+ROLLOUT_N_JUMPS_TOTAL = 1000
+ROLLOUT_MAX_STEPS = 1000
+ROLLOUT_CONST_DT_SEC: Optional[float] = 1e3
 
 # Truth sampling for error computation: "interp" or "nearest"
 PANEL2_TRUTH_SAMPLING = "interp"
@@ -59,8 +59,8 @@ DT_MIN_PHYS_OVERRIDE = 1e-3
 
 # Panel 2 plotting
 P2_MARKER = "s"
-P2_MS = 6
-P2_MAX_PLOT_POINTS = 30
+P2_MS = 5
+P2_MAX_PLOT_POINTS = 10
 
 # Inference-time constraints (should match training config)
 CLIP_ENABLED = True
