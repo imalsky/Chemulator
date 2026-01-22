@@ -48,8 +48,8 @@ XMIN, XMAX = 1e-3, 1e8
 # Rollout schedule: "logspace" or "constant"
 ROLLOUT_SCHEDULE_MODE = "constant"
 ROLLOUT_N_JUMPS_TOTAL = 500
-ROLLOUT_MAX_STEPS = 300
-ROLLOUT_CONST_DT_SEC: Optional[float] = 1e2
+ROLLOUT_MAX_STEPS = 500
+ROLLOUT_CONST_DT_SEC: Optional[float] = 1e3
 
 # Truth sampling for error computation: "interp" or "nearest"
 PANEL2_TRUTH_SAMPLING = "interp"
@@ -66,10 +66,15 @@ P2_MAX_PLOT_POINTS = 10
 CLIP_ENABLED = True
 CLIP_LOG10_MIN = -30.0
 CLIP_LOG10_MAX = 10.0
-SIMPLEX_ENABLED = True  # Set True if model.predict_delta_log_phys = True
+SIMPLEX_ENABLED = False  # Set True if model.predict_delta_log_phys = True
 
 # Species filter (empty = plot all)
 PLOT_SPECIES: List[str] = []
+
+# Metric over multiple TEST trajectories
+METRIC_N_TEST_TRAJECTORIES = 1   # number of distinct test trajectories to include
+METRIC_COMPARE_JUMP = 100          # compare jump 1 vs jump 100
+METRIC_PERCENTILES = (10, 50, 90, 95)
 
 
 # =============================================================================
@@ -87,22 +92,9 @@ def clamp_z_in_log10_space(
     Clamp z-normalized values in log10 space to prevent nonphysical drift.
 
     This matches AdaptiveStiffLoss.clamp_z_in_log10_space from trainer.py.
-
-    Args:
-        z: [B, S] normalized state
-        log_mean: [S] per-species log10 mean from normalization
-        log_std: [S] per-species log10 std from normalization
-        log10_min: lower bound in log10 space
-        log10_max: upper bound in log10 space
-
-    Returns:
-        z_clamped: [B, S] clamped normalized state
     """
-    # z -> log10
     log10_vals = z * log_std + log_mean
-    # Clamp
     log10_clamped = torch.clamp(log10_vals, min=log10_min, max=log10_max)
-    # log10 -> z
     return (log10_clamped - log_mean) / log_std
 
 
@@ -116,26 +108,15 @@ def project_z_to_simplex(
 
     This matches AdaptiveStiffLoss.project_z_to_simplex from trainer.py.
     Operates via: log10(y') = log10(y) - log10(sum_i 10^log10(y_i))
-
-    Args:
-        z: [B, S] normalized state
-        log_mean: [S] per-species log10 mean from normalization
-        log_std: [S] per-species log10 std from normalization
-
-    Returns:
-        z_proj: [B, S] projected normalized state
     """
     LN10 = 2.302585092994046
 
-    # z -> log10
     log10_vals = (z * log_std + log_mean).to(torch.float32)
 
-    # log10 -> ln, then logsumexp for normalization
     ln10 = torch.tensor(LN10, dtype=torch.float32, device=z.device)
     ln_raw = log10_vals * ln10
     ln_norm = ln_raw - torch.logsumexp(ln_raw, dim=-1, keepdim=True)
 
-    # ln -> log10 -> z
     log10_proj = ln_norm / ln10
     z_proj = (log10_proj - log_mean) / log_std
 
@@ -190,6 +171,29 @@ def load_data(data_dir: Path, sample_idx: int) -> Tuple[np.ndarray, np.ndarray, 
         t_phys = t_phys.astype(np.float32)
 
     return y, g, t_phys
+
+
+def iter_test_trajectories(data_dir: Path):
+    """
+    Iterate over trajectories from the TEST split only, across all test shards.
+
+    Yields: (y_mat_i [T,S_all], globals_i [G_all], t_vec_i [T])
+    """
+    shards = sorted((data_dir / "test").glob("shard_*.npz"))
+    if not shards:
+        raise FileNotFoundError(f"No test shards in {data_dir / 'test'}")
+
+    for shard in shards:
+        with np.load(shard) as d:
+            y_mat = d["y_mat"].astype(np.float32)      # [N,T,S]
+            g_mat = d["globals"].astype(np.float32)    # [N,G]
+            t_vec = d["t_vec"].astype(np.float32)      # [T] or [N,T]
+            n = y_mat.shape[0]
+            for i in range(n):
+                y_i = y_mat[i]
+                g_i = g_mat[i]
+                t_i = t_vec[i] if t_vec.ndim > 1 else t_vec
+                yield y_i, g_i, t_i
 
 
 def _indices(all_names: List[str], chosen: List[str]) -> List[int]:
@@ -320,7 +324,6 @@ def build_rollout_schedule(
         tau = np.concatenate([[0.0], tau])
         dt = np.diff(tau)
 
-        # Merge steps smaller than min_dt
         dt = _enforce_min_dt(dt, min_dt)
         return dt.astype(np.float32)
 
@@ -345,7 +348,6 @@ def _enforce_min_dt(dt: np.ndarray, min_dt: float) -> np.ndarray:
             dt[i - 1] += dt[i]
             dt = np.delete(dt, i)
 
-    # Fix floating point drift
     dt[-1] += total - dt.sum()
     return dt
 
@@ -365,55 +367,24 @@ def autoregressive_rollout(
         clip_log10_max: float = 10.0,
         simplex_enabled: bool = True,
 ) -> Tuple[np.ndarray, torch.Tensor]:
-    """
-    Autoregressive rollout with proper inference-time constraints.
-
-    CRITICAL: Applies the same constraints used during training after each step.
-    Without these, errors compound rapidly.
-
-    Args:
-        model: Exported model
-        y0_norm: [1, S] initial state (normalized)
-        g_norm: [1, G] global variables (normalized)
-        t0: Initial time
-        dt_steps: [N] array of dt values for each step
-        norm: NormalizationHelper for dt normalization
-        log_mean: [S] per-species log10 mean
-        log_std: [S] per-species log10 std
-        clip_enabled: Whether to clip in log10 space
-        clip_log10_min: Lower bound for clipping
-        clip_log10_max: Upper bound for clipping
-        simplex_enabled: Whether to project to simplex
-
-    Returns:
-        t_roll: [N] times at each step
-        y_roll: [N, S] states at each step (normalized)
-    """
+    """Autoregressive rollout with training-matching constraints."""
     if np.any(dt_steps <= 0):
         bad = np.where(dt_steps <= 0)[0][:5]
         raise RuntimeError(f"Non-positive dt at indices {bad.tolist()}")
 
-    # Compute cumulative times
     t_roll = (t0 + np.cumsum(dt_steps.astype(np.float64))).astype(np.float32)
 
-    # Initialize state
     y_state = y0_norm.clone().float()
     g_norm = g_norm.float()
 
-    # Move log stats to same device
     log_mean = log_mean.to(y_state.device)
     log_std = log_std.to(y_state.device)
 
     outputs = []
-
-    for k, dt_sec in enumerate(dt_steps):
-        # Normalize dt
+    for dt_sec in dt_steps:
         dt_norm = _dt_norm_local(float(dt_sec), norm)
-
-        # Model prediction
         y_state = model(y_state, dt_norm, g_norm)[:, 0, :]
 
-        # === APPLY CONSTRAINTS (matches training) ===
         y_state = apply_inference_constraints(
             z=y_state,
             log_mean=log_mean,
@@ -426,12 +397,69 @@ def autoregressive_rollout(
 
         outputs.append(y_state[0].clone())
 
-    if outputs:
-        y_roll = torch.stack(outputs, dim=0)
-    else:
-        y_roll = torch.empty((0, y0_norm.shape[1]), dtype=torch.float32)
-
+    y_roll = torch.stack(outputs, dim=0) if outputs else torch.empty((0, y0_norm.shape[1]), dtype=torch.float32)
     return t_roll, y_roll
+
+
+def precompute_dt_norm_steps(dt_steps: np.ndarray, norm: NormalizationHelper) -> List[torch.Tensor]:
+    """Precompute normalized dt tensors for the rollout steps (CPU)."""
+    return [_dt_norm_local(float(dt), norm) for dt in dt_steps]
+
+
+@torch.inference_mode()
+def autoregressive_step1_stepk_only(
+        model,
+        y0_norm: torch.Tensor,
+        g_norm: torch.Tensor,
+        dt_steps: np.ndarray,
+        dt_norm_steps: List[torch.Tensor],
+        k: int,
+        log_mean: torch.Tensor,
+        log_std: torch.Tensor,
+        clip_enabled: bool,
+        clip_log10_min: float,
+        clip_log10_max: float,
+        simplex_enabled: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float]:
+    """
+    Run rollout for k steps (k >= 1), returning:
+      - y after 1st step
+      - y after k-th step
+      - dt_first (physical)
+      - dt_total_to_k (sum of first k dt_steps)
+    """
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
+    if len(dt_steps) < k:
+        raise RuntimeError(f"Need at least {k} dt steps, got {len(dt_steps)}")
+    if len(dt_norm_steps) < k:
+        raise RuntimeError(f"Need at least {k} dt_norm_steps, got {len(dt_norm_steps)}")
+
+    y_state = y0_norm.clone().float()
+    g_norm = g_norm.float()
+    log_mean = log_mean.to(y_state.device)
+    log_std = log_std.to(y_state.device)
+
+    y_step1 = None
+    for i in range(k):
+        dt_norm = dt_norm_steps[i]
+        y_state = model(y_state, dt_norm, g_norm)[:, 0, :]
+        y_state = apply_inference_constraints(
+            z=y_state,
+            log_mean=log_mean,
+            log_std=log_std,
+            clip_enabled=clip_enabled,
+            clip_log10_min=clip_log10_min,
+            clip_log10_max=clip_log10_max,
+            simplex_enabled=simplex_enabled,
+        )
+        if i == 0:
+            y_step1 = y_state.clone()
+
+    assert y_step1 is not None
+    dt_first = float(dt_steps[0])
+    dt_total_to_k = float(np.sum(dt_steps[:k].astype(np.float64)))
+    return y_step1, y_state.clone(), dt_first, dt_total_to_k
 
 
 # =============================================================================
@@ -479,14 +507,13 @@ def downsample_log_uniform(
         return t, y, np.arange(N)
 
     tau = t.astype(np.float64) - t0
-    tau = np.maximum(tau, 1e-30)  # Avoid log(0)
+    tau = np.maximum(tau, 1e-30)
 
     tau_targets = np.logspace(np.log10(tau[0]), np.log10(tau[-1]), n_plot)
     idx = np.searchsorted(tau, tau_targets, side="left")
     idx = np.clip(idx, 0, N - 1)
     idx = np.unique(idx)
 
-    # Ensure endpoints
     if idx[0] != 0:
         idx = np.concatenate([[0], idx])
     if idx[-1] != N - 1:
@@ -495,11 +522,154 @@ def downsample_log_uniform(
     return t[idx], y[idx], idx
 
 
+def safe_frac_err_mean(y_pred: np.ndarray, y_true: np.ndarray, eps: float = 1e-30) -> float:
+    """
+    Mean fractional error over species:
+        mean_i |pred_i - true_i| / max(|true_i|, eps)
+    """
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    y_true = np.asarray(y_true, dtype=np.float64)
+    den = np.maximum(np.abs(y_true), eps)
+    return float(np.mean(np.abs(y_pred - y_true) / den))
+
+
+def print_percentiles(label: str, x: np.ndarray, pcts=METRIC_PERCENTILES) -> None:
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        print(f"[Metric] {label}: no finite values")
+        return
+    vals = np.percentile(x, pcts)
+    parts = [f"p{p}={v:.3e}" for p, v in zip(pcts, vals)]
+    print(f"[Metric] {label}: " + "  ".join(parts))
+
+
+def compute_jump1_vs_jumpk_metric(
+        model,
+        data_dir: Path,
+        norm: NormalizationHelper,
+        log_mean: torch.Tensor,
+        log_std: torch.Tensor,
+        dt_steps: np.ndarray,
+        dt_norm_steps: List[torch.Tensor],
+        species_in: List[str],
+        species_out: List[str],
+        globals_used: List[str],
+        idx_in: List[int],
+        idx_out: List[int],
+        idx_g: List[int],
+        n_traj_target: int,
+        truth_sampling: str,
+        k: int,
+) -> None:
+    """
+    Across N TEST trajectories:
+      - compute mean fractional error at jump 1
+      - compute mean fractional error at jump k
+    Then print p10/p50/p90/p99 for each.
+    """
+    truth_sampling = truth_sampling.strip().lower()
+    if truth_sampling not in ("interp", "nearest"):
+        raise ValueError(f"Unknown truth_sampling: {truth_sampling}")
+
+    if len(dt_steps) < k:
+        raise RuntimeError(f"Need dt_steps length >= {k} to compute jump-{k} metric, got {len(dt_steps)}")
+
+    errs_1 = []
+    errs_k = []
+
+    used = 0
+    scanned = 0
+    skipped_nonfinite = 0
+    skipped_short = 0
+
+    for y_all, g_all, t_phys in iter_test_trajectories(data_dir):
+        scanned += 1
+
+        if len(t_phys) < 2:
+            skipped_short += 1
+            continue
+
+        # Slice to model views
+        y_in = y_all[:, idx_in]
+        y_out = y_all[:, idx_out]
+        g = g_all[idx_g] if idx_g else np.empty((0,), dtype=np.float32)
+
+        y0 = y_in[0]
+        t0 = float(t_phys[0])
+
+        # Normalize inputs
+        y0_norm = norm.normalize(torch.from_numpy(y0[None, :]), species_in).float()
+        if globals_used:
+            g_norm = norm.normalize(torch.from_numpy(g[None, :]), globals_used).float()
+        else:
+            g_norm = torch.from_numpy(g[None, :]).float()
+
+        # Predict step 1 and step k (normalized)
+        y1_norm, yk_norm, dt_first, dt_total_to_k = autoregressive_step1_stepk_only(
+            model=model,
+            y0_norm=y0_norm,
+            g_norm=g_norm,
+            dt_steps=dt_steps,
+            dt_norm_steps=dt_norm_steps,
+            k=k,
+            log_mean=log_mean,
+            log_std=log_std,
+            clip_enabled=CLIP_ENABLED,
+            clip_log10_min=CLIP_LOG10_MIN,
+            clip_log10_max=CLIP_LOG10_MAX,
+            simplex_enabled=SIMPLEX_ENABLED,
+        )
+
+        # Denormalize predictions
+        y1 = norm.denormalize(y1_norm, species_out).cpu().numpy()[0]
+        yk = norm.denormalize(yk_norm, species_out).cpu().numpy()[0]
+
+        # Truth at the two query times
+        t1 = t0 + float(dt_first)
+        tk = t0 + float(dt_total_to_k)
+
+        if truth_sampling == "nearest":
+            idx_nn = nearest_indices(t_phys, np.array([t1, tk], dtype=np.float32))
+            y_true_1 = y_out[idx_nn[0]]
+            y_true_k = y_out[idx_nn[1]]
+            finite = np.isfinite(y_true_1).all() and np.isfinite(y_true_k).all()
+        else:
+            y_true_2 = truth_at_times_interp(t_phys, y_out, np.array([t1, tk], dtype=np.float32))
+            y_true_1 = y_true_2[0]
+            y_true_k = y_true_2[1]
+            finite = np.isfinite(y_true_2).all()
+
+        if not finite:
+            skipped_nonfinite += 1
+            continue
+
+        errs_1.append(safe_frac_err_mean(y1, y_true_1, eps=1e-30))
+        errs_k.append(safe_frac_err_mean(yk, y_true_k, eps=1e-30))
+
+        used += 1
+        if used >= n_traj_target:
+            break
+
+    print(f"\n[Metric] TEST trajectories requested: {n_traj_target}")
+    print(f"[Metric] Used: {used} | Scanned: {scanned} | Skipped(nonfinite): {skipped_nonfinite} | Skipped(short): {skipped_short}")
+
+    if used == 0:
+        print("[Metric] No usable trajectories; nothing to report.")
+        return
+
+    errs_1 = np.asarray(errs_1, dtype=np.float64)
+    errs_k = np.asarray(errs_k, dtype=np.float64)
+
+    print_percentiles("Jump 1 mean fractional error", errs_1)
+    print_percentiles(f"Jump {k} mean fractional error", errs_k)
+
+
 # =============================================================================
-# Plotting
+# Plotting (ONE PANEL, original style)
 # =============================================================================
 
-def plot_results_two_panel(
+def plot_results_one_panel(
         t_phys: np.ndarray,
         y_true_full: np.ndarray,
         t_pred1: np.ndarray,
@@ -510,9 +680,13 @@ def plot_results_two_panel(
         plot_species: List[str],
         out_path: Path,
 ) -> None:
-    """Two-panel plot: one-shot (left) and autoregressive rollout (right)."""
+    """
+    One-panel plot with the original style:
+      - Ground truth: solid (faint)
+      - One-shot: dashed
+      - Autoregressive: square markers only (sparse points)
+    """
 
-    # Filter species
     base_names = [n[:-10] if n.endswith("_evolution") else n for n in species_out]
     keep = [i for i, b in enumerate(base_names) if (not plot_species) or (b in plot_species)]
     labels = [base_names[i] for i in keep]
@@ -521,7 +695,6 @@ def plot_results_two_panel(
     y_pred1 = y_pred1[:, keep]
     y_pred2 = y_pred2[:, keep]
 
-    # Apply plotting bounds
     tiny = 1e-35
     m_gt = (t_phys >= XMIN) & (t_phys <= XMAX)
     t_gt = t_phys[m_gt]
@@ -535,9 +708,8 @@ def plot_results_two_panel(
     t_pr2 = t_pred2[m_pr2]
     y_pr2 = np.clip(y_pred2[m_pr2], tiny, None)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7), sharex=True, sharey=True)
+    fig, ax = plt.subplots(1, 1, figsize=(9, 7))
 
-    # Color by abundance rank
     n = len(keep)
     if y_gt.size and n > 0:
         max_gt = np.max(y_gt, axis=0)
@@ -548,42 +720,49 @@ def plot_results_two_panel(
         order = np.arange(n)
         colors = plt.cm.plasma(np.linspace(0.15, 0.95, max(n, 1)))
 
-    # Panel 1: One-shot
     for rank, idx in enumerate(order):
         col = colors[rank]
-        ax1.loglog(t_gt, y_gt[:, idx], "-", lw=3, alpha=0.3, color=col)
-        if t_gt.size:
-            ax1.loglog([t_gt[0]], [y_gt[0, idx]], "o", mfc="none", color=col, ms=5)
-        ax1.loglog(t_pr1, y_pr1[:, idx], "--", lw=3, alpha=1.0, color=col)
 
-    # Panel 2: Autoregressive rollout
-    for rank, idx in enumerate(order):
-        col = colors[rank]
-        ax2.loglog(t_gt, y_gt[:, idx], "-", lw=3, alpha=0.3, color=col)
+        # Ground truth
+        ax.loglog(t_gt, y_gt[:, idx], "-", lw=3, alpha=0.3, color=col)
         if t_gt.size:
-            ax2.loglog([t_gt[0]], [y_gt[0, idx]], "o", mfc="none", color=col, ms=5)
+            ax.loglog([t_gt[0]], [y_gt[0, idx]], "o", mfc="none", color=col, ms=5)
+
+        # One-shot
+        ax.loglog(t_pr1, y_pr1[:, idx], "--", lw=3, alpha=1.0, color=col)
+
+        # Autoregressive markers only
         if t_pr2.size:
-            ax2.loglog(t_pr2, y_pr2[:, idx], linestyle="None", marker=P2_MARKER,
-                       markersize=P2_MS, color=col, alpha=1.0, zorder=15)
+            ax.loglog(
+                t_pr2, y_pr2[:, idx],
+                linestyle="None",
+                marker=P2_MARKER,
+                markersize=P2_MS,
+                color=col,
+                alpha=1.0,
+                zorder=15,
+            )
 
-    for ax in (ax1, ax2):
-        ax.set_xlim(XMIN, XMAX)
-        ax.set_ylim(1e-30, 3)
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Relative Abundance")
-        ax.set_box_aspect(1)
+    ax.set_xlim(XMIN, XMAX)
+    ax.set_ylim(1e-30, 3)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Relative Abundance")
+    ax.set_box_aspect(1)
 
-    # Legends
+    # Species legend
     species_handles = [Line2D([0], [0], color=colors[r], lw=2.0) for r in range(n)]
     species_labels = [labels[i] for i in order]
-    ax1.legend(handles=species_handles, labels=species_labels, loc="best", title="Species", ncol=3)
+    leg_species = ax.legend(handles=species_handles, labels=species_labels, loc="lower left", title="Species", ncol=3)
 
+    # Style legend (separate, like the old right panel)
     style_handles = [
         Line2D([0], [0], color="black", lw=2.0, ls="-", label="Ground Truth"),
         Line2D([0], [0], color="black", lw=1.6, ls="--", label="One-Shot"),
         Line2D([0], [0], color="black", lw=0, marker=P2_MARKER, ms=P2_MS, label="Autoregressive"),
     ]
-    ax2.legend(handles=style_handles, loc="best")
+    leg_style = ax.legend(handles=style_handles, loc="lower right")
+
+    ax.add_artist(leg_species)
 
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -600,7 +779,6 @@ def main() -> None:
     os.chdir(REPO)
     seed_everything(42)
 
-    # Load config and metadata
     cfg = load_json(MODEL_DIR / "config.json")
     data_cfg = cfg.get("data", {}) or {}
     data_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
@@ -608,7 +786,6 @@ def main() -> None:
     manifest = load_json(data_dir / "normalization.json")
     meta = manifest.get("meta", {}) or {}
 
-    # Resolve species and globals
     species_all = list(meta.get("species_variables", []) or [])
     globals_all = list(meta.get("global_variables", []) or [])
 
@@ -623,16 +800,13 @@ def main() -> None:
     idx_out = _indices(species_all, species_out)
     idx_g = _indices(globals_all, globals_used) if globals_used else []
 
-    # Load model
     print(f"Loading model from {MODEL_DIR / EP_FILENAME}")
     ep = torch.export.load(MODEL_DIR / EP_FILENAME)
     model = ep.module()
 
-    # Setup normalization
     norm = NormalizationHelper(manifest)
     log_mean, log_std = get_log_stats(norm, species_in)
 
-    # Load data
     y_all, g_all, t_phys = load_data(data_dir, SAMPLE_IDX)
     y_in = y_all[:, idx_in]
     y_out = y_all[:, idx_out]
@@ -644,7 +818,7 @@ def main() -> None:
     print(f"Time range: [{t_phys[0]:.3e}, {t_phys[-1]:.3e}]")
     print(f"Constraints: clip={CLIP_ENABLED} [{CLIP_LOG10_MIN}, {CLIP_LOG10_MAX}], simplex={SIMPLEX_ENABLED}")
 
-    # === Panel 1: One-shot prediction ===
+    # === One-shot prediction ===
     y_batch, dt_batch, g_batch, q_idx, t_sel = prepare_batch(
         y0=y0, g=g, t_phys=t_phys, q_count=Q_COUNT,
         norm=norm, species_in=species_in, globals_used=globals_used,
@@ -653,14 +827,7 @@ def main() -> None:
     y_pred1_norm = run_inference(model, y_batch, dt_batch, g_batch)
     y_pred1 = norm.denormalize(y_pred1_norm, species_out).cpu().numpy()
 
-    # === Panel 2: Autoregressive rollout ===
-    y0_norm = norm.normalize(torch.from_numpy(y0[None, :]), species_in).float()
-    if globals_used:
-        g_norm = norm.normalize(torch.from_numpy(g[None, :]), globals_used).float()
-    else:
-        g_norm = torch.from_numpy(g[None, :]).float()
-
-    # Compute rollout horizon
+    # === Rollout schedule (shared by metric + sample rollout) ===
     if ROLLOUT_SCHEDULE_MODE.lower() == "constant" and ROLLOUT_CONST_DT_SEC is not None:
         t_max = t0 + ROLLOUT_CONST_DT_SEC * ROLLOUT_MAX_STEPS
     else:
@@ -669,7 +836,6 @@ def main() -> None:
     dt_total = t_max - t0
     print(f"Rollout: mode={ROLLOUT_SCHEDULE_MODE}, t_max={t_max:.3e}, dt_total={dt_total:.3e}")
 
-    # Build schedule
     dt_steps = build_rollout_schedule(
         dt_total=dt_total,
         mode=ROLLOUT_SCHEDULE_MODE,
@@ -680,7 +846,35 @@ def main() -> None:
     )
     print(f"Rollout steps: {len(dt_steps)}, dt range: [{dt_steps.min():.3e}, {dt_steps.max():.3e}]")
 
-    # Run rollout with constraints
+    dt_norm_steps = precompute_dt_norm_steps(dt_steps, norm)
+
+    # === Human-readable metric: jump 1 vs jump 100 percentiles across TEST set ===
+    compute_jump1_vs_jumpk_metric(
+        model=model,
+        data_dir=data_dir,
+        norm=norm,
+        log_mean=log_mean,
+        log_std=log_std,
+        dt_steps=dt_steps,
+        dt_norm_steps=dt_norm_steps,
+        species_in=species_in,
+        species_out=species_out,
+        globals_used=globals_used,
+        idx_in=idx_in,
+        idx_out=idx_out,
+        idx_g=idx_g,
+        n_traj_target=METRIC_N_TEST_TRAJECTORIES,
+        truth_sampling=PANEL2_TRUTH_SAMPLING,
+        k=METRIC_COMPARE_JUMP,
+    )
+
+    # === Autoregressive rollout for the plotted single sample ===
+    y0_norm = norm.normalize(torch.from_numpy(y0[None, :]), species_in).float()
+    if globals_used:
+        g_norm = norm.normalize(torch.from_numpy(g[None, :]), globals_used).float()
+    else:
+        g_norm = torch.from_numpy(g[None, :]).float()
+
     t_roll, y_roll_norm = autoregressive_rollout(
         model=model,
         y0_norm=y0_norm,
@@ -697,13 +891,13 @@ def main() -> None:
     )
     y_roll = norm.denormalize(y_roll_norm, species_out).cpu().numpy()
 
-    # Downsample for plotting
+    # Downsample for plotting (markers only)
     t_roll_plot, y_roll_plot, _ = downsample_log_uniform(t_roll, y_roll, P2_MAX_PLOT_POINTS, t0)
     print(f"Rollout computed: {len(t_roll)} points, plotting: {len(t_roll_plot)} points")
 
-    # === Plot ===
+    # === Plot (ONE PANEL) ===
     out_png = MODEL_DIR / "plots" / f"pred_{SAMPLE_IDX}.png"
-    plot_results_two_panel(
+    plot_results_one_panel(
         t_phys=t_phys,
         y_true_full=y_out,
         t_pred1=t_sel,
@@ -715,7 +909,7 @@ def main() -> None:
         out_path=out_png,
     )
 
-    # === Error metrics ===
+    # === Error metrics for the plotted single sample ===
     y_true_sel = y_out[q_idx, :]
     rel_err_1 = np.abs(y_pred1 - y_true_sel) / (np.abs(y_true_sel) + 1e-12)
     print(f"\nOne-shot error: mean={rel_err_1.mean():.3e}, max={rel_err_1.max():.3e}")

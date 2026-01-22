@@ -24,9 +24,9 @@ plt.style.use("science.mplstyle")
 
 # ---------------- Paths & settings ----------------
 REPO = Path(__file__).parent.parent
-MODEL_DIR = REPO / "models" / "big_mlp"
+MODEL_DIR = REPO / "models" / "mlp_paper_pf_steps96"
 #MODEL_DIR = REPO / "models" / "big_big_big"
-EP_FILENAME = "export_k1_cpu.pt2"
+EP_FILENAME = "export_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))
 from utils import load_json_config as load_json, seed_everything
