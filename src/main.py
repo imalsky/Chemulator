@@ -1,70 +1,59 @@
 #!/usr/bin/env python3
-"""
-main.py
-
-Entrypoint for training and evaluation.
-
-Typical usage:
-
-1) Preprocess raw HDF5 into processed NPZ shards:
-   python preprocessing.py --config config_job0.json
-
-2) Train:
-   python main.py --config config_job0.json --mode train
-
-3) Evaluate (runs validation_step on test split if present):
-   python main.py --config config_job0.json --mode eval
-
-Config is strict JSON (no comments).
-"""
 
 from __future__ import annotations
 
-import argparse
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import json
 import warnings
+import math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 
 from dataset import FlowMapRolloutDataset, create_dataloader
 from model import create_model
 from trainer import FlowMapRolloutModule, build_lightning_trainer
-from utils import load_json_config, seed_everything, ensure_dir
+from utils import atomic_write_json, ensure_dir, load_json_config, seed_everything
 
 
 def _resolve_path(base: Path, p: str) -> Path:
-    """Resolve a path relative to base if not absolute."""
     pp = Path(p)
     return pp if pp.is_absolute() else (base / pp).resolve()
 
 
+def _fixed_config_path() -> Path:
+    return (Path(__file__).resolve().parent.parent / "config" / "config.json").resolve()
+
+
+def _repo_root_from_config(config_path: Path) -> Path:
+    return config_path.resolve().parent.parent
+
+
 def resolve_paths(cfg: Dict, *, config_path: Path) -> Dict:
-    """Resolve relative paths in cfg['paths'] relative to the config file."""
     cfg = dict(cfg)
     pcfg = dict(cfg.get("paths", {}))
-    base = config_path.resolve().parent
 
-    # Default locations relative to config directory
+    repo_root = _repo_root_from_config(config_path)
+
     raw_dir = pcfg.get("raw_data_dir", "data/raw")
     processed_dir = pcfg.get("processed_data_dir", "data/processed")
     model_dir = pcfg.get("model_dir", "models")
 
-    pcfg["raw_data_dir"] = str(_resolve_path(base, str(raw_dir)))
-    pcfg["processed_data_dir"] = str(_resolve_path(base, str(processed_dir)))
-    pcfg["model_dir"] = str(_resolve_path(base, str(model_dir)))
+    pcfg["raw_data_dir"] = str(_resolve_path(repo_root, str(raw_dir)))
+    pcfg["processed_data_dir"] = str(_resolve_path(repo_root, str(processed_dir)))
+    pcfg["model_dir"] = str(_resolve_path(repo_root, str(model_dir)))
 
-    # Optional explicit work_dir (where checkpoints/logs go)
     if "work_dir" in pcfg:
-        pcfg["work_dir"] = str(_resolve_path(base, str(pcfg["work_dir"])))
+        pcfg["work_dir"] = str(_resolve_path(repo_root, str(pcfg["work_dir"])))
 
     cfg["paths"] = pcfg
     return cfg
 
 
 def pick_checkpoint(work_dir: Path) -> Optional[Path]:
-    """Pick a checkpoint from a work directory (best > last > newest)."""
     best = work_dir / "best.ckpt"
     last = work_dir / "last.ckpt"
     if best.exists():
@@ -76,190 +65,64 @@ def pick_checkpoint(work_dir: Path) -> Optional[Path]:
 
 
 def load_manifest(processed_dir: Path) -> Dict:
-    """Load the normalization manifest from processed data directory."""
     man_path = processed_dir / "normalization.json"
     if not man_path.exists():
-        raise FileNotFoundError(f"Missing {man_path}. Run preprocessing first.")
+        raise FileNotFoundError(
+            f"Missing {man_path}.\n"
+            f"Resolved processed_dir={processed_dir}\n"
+            "Expected convention is <repo_root>/data/processed/normalization.json."
+        )
     with open(man_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def reject_unsupported_config_keys(cfg: Dict) -> None:
-    """
-    Reject config keys that are no longer supported.
-    
-    This prevents silent misconfiguration when users expect removed features to work.
-    """
-    # target_species subsetting is no longer supported (S_in == S_out enforced)
-    if cfg.get("data", {}).get("target_species"):
+def validate_config_against_manifest(cfg: Dict, manifest: Dict) -> None:
+    spec = cfg.get("data", {})
+    species_cfg = spec.get("species_variables", [])
+    globals_cfg = spec.get("global_variables", [])
+
+    species_man = manifest.get("species_variables", [])
+    globals_man = manifest.get("global_variables", [])
+
+    if species_cfg and species_man and list(species_cfg) != list(species_man):
         raise ValueError(
-            "data.target_species is no longer supported. "
-            "This codebase now enforces S_in == S_out (all species predicted). "
-            "Remove data.target_species from your config."
+            "Config species_variables does not match normalization.json species_variables. "
+            "These must match exactly (same names and ordering)."
         )
-    
-    # allow_partial_simplex was only needed for target_species subsetting
-    if cfg.get("model", {}).get("allow_partial_simplex"):
+    if globals_cfg and globals_man and list(globals_cfg) != list(globals_man):
         raise ValueError(
-            "model.allow_partial_simplex is no longer supported. "
-            "Remove it from your config."
+            "Config global_variables does not match normalization.json global_variables. "
+            "These must match exactly (same names and ordering)."
         )
 
 
-def validate_species_ordering(cfg: Dict, manifest: Dict) -> List[str]:
-    """
-    Validate that species ordering in config matches manifest exactly.
-    
-    This is critical for correctness: the model's species dimension i must match
-    the loss's species dimension i. A mismatch would cause silent training failure.
-    
-    Args:
-        cfg: Configuration dictionary
-        manifest: Normalization manifest from preprocessing
-        
-    Returns:
-        The validated species_variables list
-        
-    Raises:
-        ValueError: If species ordering doesn't match or is missing
-    """
-    # Get species from config
-    cfg_species = list(cfg.get("data", {}).get("species_variables") or [])
-    if not cfg_species:
-        raise ValueError(
-            "data.species_variables must be set in config. "
-            "This ensures model dimensions match loss dimensions."
-        )
-    
-    # Get species from manifest (authoritative source from preprocessing)
-    manifest_species = list(manifest.get("species_variables") or [])
-    if not manifest_species:
-        raise ValueError(
-            "species_variables not found in normalization manifest. "
-            "Re-run preprocessing with data.species_variables set."
-        )
-    
-    # Check exact match (same names in same order)
-    if cfg_species != manifest_species:
-        raise ValueError(
-            f"Species ordering mismatch between config and manifest!\n"
-            f"Config species ({len(cfg_species)}):   {cfg_species}\n"
-            f"Manifest species ({len(manifest_species)}): {manifest_species}\n"
-            f"These must match exactly (same names, same order) to ensure "
-            f"model species dimension i matches loss species dimension i."
-        )
-    
-    return cfg_species
-
-
-def validate_global_ordering(cfg: Dict, manifest: Dict) -> List[str]:
-    """
-    Validate that global variable ordering in config matches manifest exactly.
-    
-    Preprocessing normalizes globals by iterating through cfg.global_variables in order
-    and writes that column order into each NPZ shard. If you reorder global_variables
-    between preprocessing and training, you'll feed wrong columns to the model.
-    
-    Args:
-        cfg: Configuration dictionary
-        manifest: Normalization manifest from preprocessing
-        
-    Returns:
-        The validated global_variables list
-        
-    Raises:
-        ValueError: If global ordering doesn't match or is missing
-    """
-    # Get globals from config
-    cfg_globals = list(cfg.get("data", {}).get("global_variables") or [])
-    
-    # Get globals from manifest (authoritative source from preprocessing)
-    manifest_globals = list(manifest.get("global_variables") or [])
-    
-    # Both empty is OK (no globals used)
-    if not cfg_globals and not manifest_globals:
-        return []
-    
-    # One empty but not the other is an error
-    if not cfg_globals and manifest_globals:
-        raise ValueError(
-            f"data.global_variables is empty in config but manifest has: {manifest_globals}\n"
-            "Set data.global_variables in config to match preprocessing."
-        )
-    if cfg_globals and not manifest_globals:
-        raise ValueError(
-            f"data.global_variables is set in config ({cfg_globals}) but manifest has none.\n"
-            "Re-run preprocessing with the same global_variables."
-        )
-    
-    # Check exact match (same names in same order)
-    if cfg_globals != manifest_globals:
-        raise ValueError(
-            f"Global variable ordering mismatch between config and manifest!\n"
-            f"Config globals ({len(cfg_globals)}):   {cfg_globals}\n"
-            f"Manifest globals ({len(manifest_globals)}): {manifest_globals}\n"
-            f"These must match exactly (same names, same order) to ensure "
-            f"global column i in the shard matches what the model expects."
-        )
-    
-    return cfg_globals
-
-
-def validate_config_against_manifest(cfg: Dict, manifest: Dict) -> Tuple[List[str], List[str]]:
-    """
-    Validate all config orderings against manifest.
-    
-    Returns:
-        (species_vars, global_vars) tuple of validated lists
-    """
-    species_vars = validate_species_ordering(cfg, manifest)
-    global_vars = validate_global_ordering(cfg, manifest)
-    return species_vars, global_vars
-
-
-def make_dataloaders(
-    cfg: Dict, *, device: torch.device
-) -> Tuple[object, object, Optional[object], Dict]:
-    """
-    Create train, validation, and optionally test dataloaders.
-    
-    Returns:
-        (train_dl, val_dl, test_dl, manifest) tuple
-    """
-    paths = cfg["paths"]
-    processed_dir = Path(paths["processed_data_dir"])
+def make_dataloaders(cfg: Dict, *, device: torch.device):
+    paths = cfg.get("paths", {})
+    processed_dir = Path(paths.get("processed_data_dir", "data/processed"))
 
     manifest = load_manifest(processed_dir)
-    
-    # Validate species and global ordering before proceeding
-    species_vars, global_vars = validate_config_against_manifest(cfg, manifest)
+    validate_config_against_manifest(cfg, manifest)
 
-    # Training configuration
     tcfg = cfg.get("training", {})
     rollout_steps = int(tcfg.get("rollout_steps", 1))
     burn_in_steps = int(tcfg.get("burn_in_steps", 0))
     total_steps = rollout_steps + burn_in_steps
 
-    # Dataset configuration
     dcfg = cfg.get("dataset", {})
     windows_per_trajectory = int(dcfg.get("windows_per_trajectory", 1))
     seed = int(cfg.get("system", {}).get("seed", 1234))
 
     preload_to_device = bool(dcfg.get("preload_to_device", False))
-    storage_dtype = torch.float32
 
-    # Warn about preload + multi-GPU incompatibility
     num_devices = int(tcfg.get("devices", 1))
     if preload_to_device and num_devices > 1:
         warnings.warn(
-            "dataset.preload_to_device=true with multiple GPUs (training.devices > 1) "
-            "may cause issues: each DDP process will preload to the same device. "
-            "Set preload_to_device=false for multi-GPU training.",
+            "dataset.preload_to_device=true with multiple GPUs (training.devices > 1) may cause issues; "
+            "set preload_to_device=false for multi-GPU training.",
             UserWarning,
             stacklevel=2,
         )
 
-    # Create datasets
     train_ds = FlowMapRolloutDataset(
         processed_dir,
         "train",
@@ -268,7 +131,7 @@ def make_dataloaders(
         seed=seed,
         preload_to_device=preload_to_device,
         device=device,
-        storage_dtype=storage_dtype,
+        storage_dtype=torch.float32,
     )
     val_ds = FlowMapRolloutDataset(
         processed_dir,
@@ -278,7 +141,7 @@ def make_dataloaders(
         seed=seed + 1,
         preload_to_device=preload_to_device,
         device=device,
-        storage_dtype=storage_dtype,
+        storage_dtype=torch.float32,
     )
 
     test_ds = None
@@ -291,13 +154,19 @@ def make_dataloaders(
             seed=seed + 2,
             preload_to_device=preload_to_device,
             device=device,
-            storage_dtype=storage_dtype,
+            storage_dtype=torch.float32,
         )
 
-    # DataLoader configuration
     bs = int(tcfg.get("batch_size", 256))
     num_workers = int(tcfg.get("num_workers", 0))
     pin_memory = bool(tcfg.get("pin_memory", device.type == "cuda"))
+    if pin_memory and device.type == "mps":
+        warnings.warn(
+            "training.pin_memory=true but torch MPS does not support pinned memory; disabling pin_memory.",
+            UserWarning,
+            stacklevel=2,
+        )
+        pin_memory = False
     persistent_workers = bool(tcfg.get("persistent_workers", num_workers > 0))
     prefetch_factor = int(tcfg.get("prefetch_factor", 2))
 
@@ -332,77 +201,114 @@ def make_dataloaders(
             prefetch_factor=prefetch_factor,
         )
 
+    # Diagnostics
+    try:
+        print(
+            f"Dataset sizes: train_samples={len(train_ds)}, val_samples={len(val_ds)}, "
+            f"test_samples={len(test_ds) if test_ds is not None else 0}; batch_size={bs}; "
+            f"train_batches={len(train_dl)}, val_batches={len(val_dl)}, test_batches={len(test_dl) if test_dl is not None else 0}",
+            flush=True,
+        )
+        if len(train_dl) == 0:
+            raise ValueError("Train DataLoader has zero batches. Reduce training.batch_size or ensure drop_last=False.")
+    except TypeError:
+        pass
+
     return train_dl, val_dl, test_dl, manifest
 
 
-def main() -> None:
-    """Main entry point for training and evaluation."""
-    ap = argparse.ArgumentParser(description="Train or evaluate flow-map model")
-    ap.add_argument("--config", type=str, required=True, help="Path to JSON config")
-    ap.add_argument("--mode", type=str, choices=["train", "eval"], default="train")
-    ap.add_argument("--ckpt", type=str, default=None, help="Optional checkpoint path (eval or resume)")
-    args = ap.parse_args()
+def _runtime_mode(cfg: Dict) -> str:
+    mode = str(cfg.get("runtime", {}).get("mode", "train")).strip().lower()
+    if mode not in ("train", "eval"):
+        raise ValueError(f"runtime.mode must be 'train' or 'eval', got: {mode!r}")
+    return mode
 
-    # Load and resolve configuration
-    cfg_path = Path(args.config).resolve()
+
+def _runtime_checkpoint(cfg: Dict, *, config_path: Path) -> Optional[Path]:
+    ckpt = cfg.get("runtime", {}).get("checkpoint", None)
+    if ckpt in (None, ""):
+        return None
+    repo_root = _repo_root_from_config(config_path)
+    return _resolve_path(repo_root, str(ckpt))
+
+
+def main() -> None:
+    cfg_path = _fixed_config_path()
+    if not cfg_path.exists():
+        raise FileNotFoundError(
+            f"Expected config at {cfg_path}, but it does not exist.\n"
+            "Required convention: <repo_root>/config/config.json"
+        )
+
     cfg = load_json_config(cfg_path)
     cfg = resolve_paths(cfg, config_path=cfg_path)
 
-    # Reject unsupported config keys early (before any expensive operations)
-    reject_unsupported_config_keys(cfg)
-
-    # Set random seeds for reproducibility
     seed = int(cfg.get("system", {}).get("seed", 1234))
     seed_everything(seed)
 
-    # Device choice: let Lightning handle it; still pass device to dataset preload
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device selection
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
-    # Work directory for logs/checkpoints
-    pcfg = cfg["paths"]
-    model_dir = Path(pcfg["model_dir"])
-    run_name = str(cfg.get("run_name") or cfg.get("experiment_name") or cfg.get("name") or "run")
-    work_dir = Path(pcfg.get("work_dir", model_dir / run_name))
-    ensure_dir(work_dir)
+    # Work/model dirs
+    paths = cfg.get("paths", {})
+    work_dir = ensure_dir(paths.get("work_dir", "models/run"))
+    ensure_dir(paths.get("model_dir", "models"))
 
-    # Create dataloaders (validates species and global ordering internally)
+
+    # Data
     train_dl, val_dl, test_dl, manifest = make_dataloaders(cfg, device=device)
+    # If using cosine warmup scheduler and total_steps is not set, compute a deterministic default.
+    sched_cfg = (cfg.get("training", {}) or {}).get("scheduler", {}) or {}
+    sched_name = str(sched_cfg.get("name", "none")).lower().strip()
+    if sched_name not in ("", "none", "null") and int(sched_cfg.get("total_steps", 0)) <= 0:
+        try:
+            steps_per_epoch = int(math.ceil(len(train_dl) / float(max(1, int(cfg.get("training", {}).get("accumulate_grad_batches", 1))))))
+            total_steps = steps_per_epoch * int(cfg.get("training", {}).get("max_epochs", 1))
+            cfg["training"].setdefault("scheduler", {})["total_steps"] = int(total_steps)
+        except Exception:
+            # Fall back to Lightning inference in configure_optimizers; may require manual total_steps.
+            pass
 
-    # Get validated species list (already checked in make_dataloaders)
+    # Save exact config used for this run next to checkpoints.
+    atomic_write_json(Path(work_dir) / "config.json", cfg)
+
+
+
+    # Model and Lightning module
     species_vars = list(manifest.get("species_variables") or [])
-
-    # Create model and Lightning module
     model = create_model(cfg)
     lit_module = FlowMapRolloutModule(
         cfg=cfg,
         model=model,
         normalization_manifest=manifest,
         species_variables=species_vars,
-        work_dir=work_dir,
+        work_dir=Path(work_dir),
     )
 
-    # Build trainer
-    trainer = build_lightning_trainer(cfg, work_dir=work_dir)
+    # Attach dataloaders to the module to satisfy Lightning versions that require them.
+    lit_module.set_dataloaders(train_dl, val_dl, test_dl)
 
-    # Determine checkpoint path
-    ckpt_path = Path(args.ckpt).resolve() if args.ckpt else None
+    trainer = build_lightning_trainer(cfg, work_dir=Path(work_dir))
+
+    mode = _runtime_mode(cfg)
+    ckpt_path = _runtime_checkpoint(cfg, config_path=cfg_path)
     if ckpt_path is None:
-        ckpt_path = pick_checkpoint(work_dir)
+        ckpt_path = pick_checkpoint(Path(work_dir))
 
-    if args.mode == "train":
+    if mode == "train":
         resume = bool(cfg.get("training", {}).get("resume", True))
-        trainer.fit(
-            lit_module,
-            train_dataloaders=train_dl,
-            val_dataloaders=val_dl,
-            ckpt_path=str(ckpt_path) if (resume and ckpt_path) else None,
-        )
-    else:
-        # Evaluate on test split if present, otherwise on validation split
-        dl = test_dl if test_dl is not None else val_dl
-        if ckpt_path is None:
-            raise FileNotFoundError(f"No checkpoint found in {work_dir} and --ckpt not provided.")
-        trainer.validate(lit_module, dataloaders=dl, ckpt_path=str(ckpt_path))
+        trainer.fit(lit_module, ckpt_path=str(ckpt_path) if (resume and ckpt_path) else None)
+        return
+
+    # eval
+    if ckpt_path is None:
+        raise FileNotFoundError(f"No checkpoint found in {work_dir} and runtime.checkpoint is not set.")
+    trainer.validate(lit_module, ckpt_path=str(ckpt_path))
 
 
 if __name__ == "__main__":

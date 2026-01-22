@@ -287,6 +287,7 @@ def create_dataloader(
     pin_memory: bool,
     persistent_workers: bool,
     prefetch_factor: int,
+    drop_last: Optional[bool] = None,
 ) -> DataLoader:
     """Create a DataLoader with sane defaults.
 
@@ -295,6 +296,9 @@ def create_dataloader(
         each worker separately loading shards onto GPU/CPU device memory.
       - torch DataLoader does not accept prefetch_factor when num_workers==0 on
         some versions; only pass it when num_workers>0.
+      - Do NOT default drop_last=True purely because shuffle=True. If the dataset is
+        smaller than batch_size, drop_last=True yields *zero* batches and Lightning
+        will stop with: "Trainer.fit stopped: No training batches".
     """
     if getattr(dataset, "preload_to_device", False) and num_workers != 0:
         raise ValueError("preload_to_device=True is incompatible with num_workers>0; set num_workers=0.")
@@ -302,14 +306,51 @@ def create_dataloader(
     if num_workers == 0:
         persistent_workers = False
 
+    # Fail fast for empty datasets.
+    try:
+        ds_len = len(dataset)
+    except Exception:
+        ds_len = None
+
+    if ds_len is not None and int(ds_len) == 0:
+        split = getattr(dataset, "split", None)
+        processed_dir = getattr(dataset, "processed_dir", None)
+        hint = ""
+        if processed_dir is not None and split is not None:
+            hint = f" (processed_dir={processed_dir}, split={split})"
+        raise ValueError(
+            "Dataset length is zero. This will produce zero DataLoader batches and training cannot run." + hint
+        )
+
+    # Resolve drop_last behavior.
+    if drop_last is None:
+        # Only drop the last incomplete batch if we have at least one full batch.
+        if shuffle and ds_len is not None and int(ds_len) >= int(batch_size):
+            drop_last_val = True
+        else:
+            drop_last_val = False
+    else:
+        drop_last_val = bool(drop_last)
+        # Guardrail: never allow drop_last=True to silently create 0 batches.
+        if drop_last_val and ds_len is not None and int(ds_len) < int(batch_size):
+            import warnings
+
+            warnings.warn(
+                f"drop_last=True with len(dataset)={ds_len} < batch_size={batch_size} would yield 0 batches; "
+                "forcing drop_last=False.",
+                UserWarning,
+                stacklevel=2,
+            )
+            drop_last_val = False
+
     dl_kwargs = dict(
         dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        drop_last=shuffle,  # drop_last on train only
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle),
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+        persistent_workers=bool(persistent_workers),
+        drop_last=bool(drop_last_val),
     )
     if num_workers > 0:
         dl_kwargs["prefetch_factor"] = int(prefetch_factor)

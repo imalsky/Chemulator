@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import math
 from contextlib import nullcontext
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -734,10 +734,41 @@ def create_model(config: Dict[str, Any], logger: Optional[logging.Logger] = None
     use_mlp_only = bool(mcfg.get("mlp_only", False))
 
     if use_mlp_only:
-        # MLP hidden sizes from encoder/dynamics/decoder lists
-        mlp_hidden = list(encoder_hidden) + list(dynamics_hidden) + list(decoder_hidden)
+        # Configurable MLP for mlp_only mode.
+        # Preferred (new): model.mlp = { "num_layers": N, "width": W } or { "widths": [..] } / { "hidden_dims": [..] }
+        mlp_hidden: List[int] = []
+
+        mlp_cfg = mcfg.get("mlp", None)
+        if isinstance(mlp_cfg, dict) and mlp_cfg:
+            if "hidden_dims" in mlp_cfg:
+                mlp_hidden = [int(x) for x in (mlp_cfg.get("hidden_dims") or [])]
+            elif "widths" in mlp_cfg:
+                mlp_hidden = [int(x) for x in (mlp_cfg.get("widths") or [])]
+            elif "layers" in mlp_cfg:
+                mlp_hidden = [int(x) for x in (mlp_cfg.get("layers") or [])]
+            else:
+                n_layers = int(mlp_cfg.get("num_layers", 0))
+                width = mlp_cfg.get("width", mlp_cfg.get("hidden_dim", None))
+                if n_layers > 0 and width is not None:
+                    if isinstance(width, (list, tuple)):
+                        widths = [int(x) for x in width]
+                        if len(widths) != n_layers:
+                            raise ValueError(
+                                f"model.mlp.width as a list must have length num_layers ({n_layers}), got {len(widths)}"
+                            )
+                        mlp_hidden = widths
+                    else:
+                        w = int(width)
+                        if w <= 0:
+                            raise ValueError(f"model.mlp.width must be > 0, got {w}")
+                        mlp_hidden = [w] * n_layers
+
+        # Backward-compatible (legacy): concatenate encoder/dynamics/decoder hidden lists.
+        if not mlp_hidden:
+            mlp_hidden = list(encoder_hidden) + list(dynamics_hidden) + list(decoder_hidden)
+
         if len(mlp_hidden) == 0:
-            raise ValueError("model.mlp_only=True requires non-empty hidden layer config")
+            raise ValueError("model.mlp_only=True requires non-empty MLP hidden layer config")
 
         return FlowMapMLP(
             state_dim=S,

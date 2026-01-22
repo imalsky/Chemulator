@@ -58,6 +58,33 @@ def load_json_config(path: Union[str, os.PathLike]) -> dict:
     except json.JSONDecodeError as e:
         raise ValueError(f"Failed to parse JSON at {file_path}: {e}") from e
 
+
+def resolve_training_unroll(cfg: Dict[str, Any]) -> Tuple[int, int, str]:
+    """
+    Resolve effective (rollout_steps, burn_in_steps, unroll_mode) from cfg.
+
+    Supported modes:
+      - scheduled_sampling (default): uses training.rollout_steps and training.burn_in_steps
+      - two_stage_autoregressive: uses training.two_stage_steps for BOTH burn-in and rollout
+
+    Returns:
+        (rollout_steps, burn_in_steps, unroll_mode)
+    """
+    tcfg = cfg.get("training", {}) if isinstance(cfg, dict) else {}
+    mode = str(tcfg.get("unroll_mode", "scheduled_sampling")).lower().strip()
+
+    if mode == "two_stage_autoregressive":
+        n = int(tcfg.get("two_stage_steps", 0))
+        if n <= 0:
+            raise ValueError("training.unroll_mode='two_stage_autoregressive' requires training.two_stage_steps > 0")
+        return n, n, mode
+
+    # Default/backward-compatible
+    rollout_steps = int(tcfg.get("rollout_steps", 1))
+    burn_in_steps = int(tcfg.get("burn_in_steps", 0))
+    return rollout_steps, burn_in_steps, mode
+
+
 def dump_json(path: Union[str, os.PathLike], obj: Any, *, indent: int = 2) -> None:
     path = Path(path)
     with open(path, "w") as f:
