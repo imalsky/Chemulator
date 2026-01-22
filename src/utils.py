@@ -1,287 +1,203 @@
+# utils.py
 #!/usr/bin/env python3
 """
-Utility Functions Module
+utils.py
+
+Small utilities used across the codebase.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 import os
-import random
-import re
+import time
 from pathlib import Path
-from typing import Any, Optional, Union, Tuple
-
-import numpy as np
-
-try:
-    import torch
-except ImportError:
-    torch = None
-
-# Module-level state for logging configuration
-_logging_configured = False
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 
-def setup_logging(
-        log_file: Optional[Union[str, os.PathLike]] = None,
-        level: int = logging.INFO
-) -> None:
+def now_ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_dir(path: Union[str, os.PathLike]) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def atomic_write_text(path: Union[str, os.PathLike], text: str) -> None:
     """
-    Configure root logger with console and optional file output.
+    Atomic-ish write: write to tmp then replace.
     """
-    global _logging_configured
-    root_logger = logging.getLogger()
-    root_logger.setLevel(level)
-
-    # Define consistent formatter for all handlers
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-7s | %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
-    # Configure console handler once
-    if not _logging_configured:
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(level)
-        console_handler.setFormatter(formatter)
-        root_logger.addHandler(console_handler)
-        _logging_configured = True
-
-    # Add file handler if requested and not already present
-    if log_file is not None:
-        # Check if file handler already exists for this path
-        file_path = Path(log_file).resolve()
-        has_file_handler = any(
-            isinstance(h, logging.FileHandler) and
-            Path(h.baseFilename).resolve() == file_path
-            for h in root_logger.handlers
-        )
-
-        if not has_file_handler:
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_handler = logging.FileHandler(file_path, encoding="utf-8")
-            file_handler.setLevel(level)
-            file_handler.setFormatter(formatter)
-            root_logger.addHandler(file_handler)
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
-def seed_everything(seed: int = 42) -> None:
-    """
-    Set random seeds
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-
-    # Set Python hash seed for consistent dictionary ordering
-    try:
-        os.environ["PYTHONHASHSEED"] = str(seed)
-    except Exception:
-        pass
-
-    # Seed PyTorch if available
-    if torch is not None:
-        try:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(seed)
-                torch.cuda.manual_seed_all(seed)
-        except Exception:
-            pass
+def atomic_write_json(path: Union[str, os.PathLike], obj: Any, *, indent: int = 2) -> None:
+    text = json.dumps(obj, indent=indent, sort_keys=True)
+    atomic_write_text(path, text + "\n")
 
 
-def strip_jsonc_comments(text: str) -> str:
-    """
-    Remove comments from JSONC (JSON with Comments).
-    """
-    # Remove block comments first
-    block_comment_pattern = re.compile(r"/\*.*?\*/", re.DOTALL)
-    text = block_comment_pattern.sub("", text)
-
-    # Process line-by-line to handle // comments while preserving strings
-    output_lines = []
-
-    for line in text.splitlines():
-        cleaned_chars = []
-        in_string = False
-        escaped = False
-        i = 0
-
-        while i < len(line):
-            ch = line[i]
-
-            # Handle string content
-            if in_string:
-                cleaned_chars.append(ch)
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-                i += 1
-                continue
-
-            # Start of string
-            if ch == '"':
-                in_string = True
-                cleaned_chars.append(ch)
-                i += 1
-                continue
-
-            # Check for line comment outside strings
-            if ch == "/" and i + 1 < len(line) and line[i + 1] == "/":
-                break  # Ignore rest of line
-
-            cleaned_chars.append(ch)
-            i += 1
-
-        output_lines.append("".join(cleaned_chars))
-
-    return "\n".join(output_lines)
+def setup_logging() -> None:
+    # Keep it minimal: use print() with timestamps for now
+    pass
 
 
 def load_json_config(path: Union[str, os.PathLike]) -> dict:
     """
-    Load JSON or JSONC configuration file.
+    Load a JSON configuration file.
+
+    This codebase expects **strict JSON** (no comments, no trailing commas).
     """
     file_path = Path(path)
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        raw_text = f.read()
-
-    # Try standard JSON first
     try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        pass
-
-    # Try json5 library for proper JSONC support
-    try:
-        import json5
-        return json5.loads(raw_text)
-    except (ImportError, Exception):
-        pass
-
-    # Fallback to manual comment stripping
-    cleaned_text = strip_jsonc_comments(raw_text)
-    try:
-        return json.loads(cleaned_text)
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse JSON/JSONC at {file_path}: {e}") from e
+        raise ValueError(f"Failed to parse JSON at {file_path}: {e}") from e
+
+def dump_json(path: Union[str, os.PathLike], obj: Any, *, indent: int = 2) -> None:
+    path = Path(path)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=indent, sort_keys=True)
+        f.write("\n")
 
 
-def dump_json(path: Union[str, os.PathLike], obj: Any, indent: int = 2) -> None:
-    """
-    Write JSON with consistent formatting.
-    """
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
+def human_bytes(num_bytes: float) -> str:
+    num = float(num_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
+        if abs(num) < 1024.0:
+            return f"{num:3.1f}{unit}"
+        num /= 1024.0
+    return f"{num:.1f}EB"
 
-    # Serialize with consistent formatting
-    json_text = json.dumps(
-        obj,
-        indent=indent,
-        sort_keys=True,
-        ensure_ascii=False
-    )
 
-    # Use atomic write pattern
-    temp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+def dict_get_path(d: Dict[str, Any], *keys: str, default: Optional[Any] = None) -> Any:
+    cur: Any = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def coerce_path(p: Union[str, os.PathLike], *, root: Optional[Path] = None) -> Path:
+    pp = Path(p)
+    if not pp.is_absolute() and root is not None:
+        pp = (root / pp).resolve()
+    return pp
+
+
+def safe_div(a: float, b: float, eps: float = 1e-12) -> float:
+    return float(a) / float(b if abs(b) > eps else (eps if b >= 0 else -eps))
+
+
+def seed_everything(seed: int) -> None:
+    import random
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed)
 
     try:
-        with open(temp_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(json_text)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-
-        temp_path.replace(file_path)
-
+        import torch
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     except Exception:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise
+        pass
 
 
-def _map_storage_dtype(name: Optional[str]) -> Optional['torch.dtype']:
+def get_git_revision(repo_root: Optional[Path] = None) -> str:
     """
-    Map dtype string to PyTorch dtype.
+    Best-effort git hash for reproducibility. Returns "" if not available.
     """
-    if torch is None or not name:
+    import subprocess
+
+    if repo_root is None:
+        repo_root = Path(__file__).resolve().parent.parent
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            stderr=subprocess.DEVNULL,
+        )
+        return out.decode("utf-8").strip()
+    except Exception:
+        return ""
+
+
+def find_latest_checkpoint(run_dir: Union[str, os.PathLike]) -> Optional[Path]:
+    run_dir = Path(run_dir)
+    if not run_dir.exists():
         return None
-
-    dtype_map = {
-        # bfloat16 variants
-        "bf16": torch.bfloat16,
-        "bfloat16": torch.bfloat16,
-        # float16 variants
-        "fp16": torch.float16,
-        "float16": torch.float16,
-        "half": torch.float16,
-        "16": torch.float16,
-        # float32 variants
-        "fp32": torch.float32,
-        "float32": torch.float32,
-        "32": torch.float32,
-    }
-
-    return dtype_map.get(str(name).strip().lower())
+    cands = sorted(run_dir.glob("*.ckpt"))
+    if not cands:
+        return None
+    # newest by mtime
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return cands[0]
 
 
-def resolve_precision_and_dtype(
-        cfg: dict,
-        device: 'torch.device',
-        logger: Optional[logging.Logger] = None
-) -> Tuple[Union[str, int], 'torch.dtype']:
+def flatten_dict(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        kk = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            out.update(flatten_dict(v, prefix=kk))
+        else:
+            out[kk] = v
+    return out
+
+
+def unflatten_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        parts = str(k).split(".")
+        cur = out
+        for p in parts[:-1]:
+            if p not in cur or not isinstance(cur[p], dict):
+                cur[p] = {}
+            cur = cur[p]
+        cur[parts[-1]] = v
+    return out
+
+
+def merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Resolve Lightning precision and runtime dtype from configuration.
+    Recursive dict merge, override wins.
     """
-    mp_cfg = cfg.get("mixed_precision", {}) or {}
-    mode = (
-        mp_cfg.get("mode")
-        or mp_cfg.get("precision")
-        or cfg.get("precision")
-        or "bf16"  # default
-    )
-    mode = str(mode).lower().strip()
+    out = dict(base)
+    for k, v in override.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = merge_dicts(out[k], v)
+        else:
+            out[k] = v
+    return out
 
-    # Lightning precision field and corresponding "AMP dtype" used for runtime dtype
-    if mode in {"bf16", "bfloat16", "bf16-mixed", "bfloat16-mixed"}:
-        pl_precision = "bf16-mixed"
-        amp_dtype = torch.bfloat16
-    elif mode in {"fp16", "float16", "16-mixed", "fp16-mixed"}:
-        pl_precision = "16-mixed"
-        amp_dtype = torch.float16
-    elif mode in {"fp32", "float32", "32"}:
-        pl_precision = 32
-        amp_dtype = torch.float32
-    else:
-        # Unknown => safe default
-        pl_precision = "bf16-mixed"
-        amp_dtype = torch.bfloat16
 
-    dataset_dtype_str = cfg.get("dataset", {}).get("storage_dtype")
-    runtime_dtype = _map_storage_dtype(dataset_dtype_str) or amp_dtype
+def ensure_keys(d: Dict[str, Any], keys: Iterable[str]) -> None:
+    missing = [k for k in keys if k not in d]
+    if missing:
+        raise KeyError(f"Missing required keys: {missing}")
 
-    dev_type = getattr(device, "type", str(device))
 
-    # Force FP32 on CPU
-    if dev_type == "cpu":
-        runtime_dtype = torch.float32
-        pl_precision = 32
-        if logger:
-            logger.info("CPU detected — forcing FP32 (Lightning=32, Dataset=float32).")
+def pretty_dict(d: Dict[str, Any]) -> str:
+    return json.dumps(d, indent=2, sort_keys=True)
 
-    # Force FP32 on Apple MPS (avoid BF16/FP16 matmul asserts)
-    if dev_type == "mps":
-        runtime_dtype = torch.float32
-        pl_precision = 32
-        if logger:
-            logger.info("MPS detected — forcing FP32 (Lightning=32, Dataset=float32).")
 
-    if logger:
-        logger.info(f"Precision config: Lightning={pl_precision}, Dataset={runtime_dtype}")
+def timed(msg: str):
+    """
+    Simple context manager for timing blocks.
+    """
+    class _Timer:
+        def __enter__(self):
+            self.t0 = time.time()
+            return self
 
-    return pl_precision, runtime_dtype
+        def __exit__(self, exc_type, exc, tb):
+            dt = time.time() - self.t0
+            print(f"{now_ts()} | {msg} | {dt:.3f}s", flush=True)
+
+    return _Timer()

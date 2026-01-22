@@ -2,993 +2,539 @@
 """
 trainer.py
 
-- CSV-only logging; checkpoints: best.ckpt / last.ckpt in work_dir
-- AMP precision from cfg (bf16/fp16/fp32); TF32/cudnn handled in main/hardware setup
-- Optional torch.compile (Inductor)
-- Cosine schedule with warmup
-- Vectorized K handling (fixed K per batch)
-- Sample-weighted epoch reduction for train/val (matches exactly)
+Autoregressive training with:
+  - Teacher forcing (scheduled sampling)
+  - Optional free-run burn-in (drift off-manifold before computing loss)
+  - Optional rollout curriculum (start short, ramp long)
+  - Configurable validation burn-in to match training regime
 
-Dataset structure: (y_i, dt_norm[B,K,1], y_j[B,K,S], g[B,G])
+Keeps:
+  - Same model architecture (model.py unchanged)
+  - Same loss structure (log-space + normalized-space terms)
 
-NOTE on "multiplicative error proxy":
-- This file logs/prints an *approximate multiplicative error proxy* derived from the epoch-mean |Δlog10| metric:
-    mult_err_proxy = expm1(ln(10) * mean_abs_log10_error)   # == 10**x - 1, but numerically stable
-- This is **not** a true fractional error; it is a proxy mapping log10-MAE to a typical multiplicative factor minus 1.
+This file uses Lightning if available. It supports both:
+  - lightning.pytorch (Lightning 2.x)
+  - pytorch_lightning (older)
 """
 
 from __future__ import annotations
 
-# ============================== CONSTANTS =====================================
-
-# Checkpointing / logging
-CKPT_FILENAME_BEST: str = "best"
-CKPT_MONITOR: str = "val_loss"
-CKPT_MODE: str = "min"
-LOG_EVERY_N_STEPS: int = 200
-ENABLE_CHECKPOINTING: bool = True
-ENABLE_PROGRESS_BAR: bool = False
-ENABLE_MODEL_SUMMARY: bool = False
-DETECT_ANOMALY: bool = False
-INFERENCE_MODE: bool = True
-
-# Training defaults (used when cfg keys absent)
-DEF_EPOCHS: int = 100
-DEF_GRAD_CLIP: float = 0.0
-DEF_ACCUMULATE: int = 1
-DEF_MAX_TRAIN_BATCHES: int = 0
-DEF_MAX_VAL_BATCHES: int = 0
-DEF_LR: float = 1e-3
-DEF_WEIGHT_DECAY: float = 1e-4
-DEF_WARMUP_EPOCHS: int = 0
-DEF_MIN_LR: float = 1e-6
-
-# torch.compile defaults
-COMPILE_ENABLE_DEFAULT: bool = True
-COMPILE_BACKEND: str | None = "inductor"
-COMPILE_MODE: str = "default"
-COMPILE_DYNAMIC: bool = False
-COMPILE_FULLGRAPH: bool = False
-
-# AdaptiveStiffLoss defaults / numerics
-LOSS_LAMBDA_PHYS: float = 1.0
-LOSS_LAMBDA_Z: float = 0.1
-LOSS_EPS_PHYS: float = 1e-20
-LOG_STD_CLAMP_MIN: float = 1e-10
-W_SPECIES_CLAMP_MIN: float = 0.5
-W_SPECIES_CLAMP_MAX: float = 2.0
-SPECIES_RANGE_EPS: float = 1e-6
-W_SPECIES_MEAN_EPS: float = 1e-12
-WARMUP_START_FACTOR: float = 0.1
-
-# ============================== IMPORTS =======================================
-
-import os
-import json
-import time
 import math
-import logging
-import inspect
-import csv
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import (
-    ModelCheckpoint,
-    StochasticWeightAveraging,
-)
+import torch.nn.functional as F
 
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+# Lightning import compatibility
+try:
+    import lightning.pytorch as pl
+    from lightning.pytorch.callbacks import ModelCheckpoint
+    from lightning.pytorch.loggers import CSVLogger
+except ModuleNotFoundError:  # pragma: no cover
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import ModelCheckpoint
+    from pytorch_lightning.loggers import CSVLogger
 
 
-# ============================== LOSS ==========================================
+# ---------------------------- Loss ----------------------------
+
+
+def _safe_clamp_std(std: torch.Tensor, min_std: float = 1e-10) -> torch.Tensor:
+    """Clamp standard deviation to avoid division by zero."""
+    return torch.clamp(std, min=min_std)
+
+
+def _stack_log_stats(
+    manifest: Dict, species_variables: List[str], device: torch.device, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Extract log-space statistics from manifest for all species.
+    
+    Returns:
+        (log_means, log_stds, log_mins, log_maxs) tensors of shape [S]
+    """
+    per = manifest.get("per_key_stats") or manifest.get("stats") or {}
+    log_means = []
+    log_stds = []
+    log_mins = []
+    log_maxs = []
+    
+    for s in species_variables:
+        st = per.get(s, {})
+        log_means.append(float(st.get("log_mean", 0.0)))
+        log_stds.append(float(st.get("log_std", 1.0)))
+        log_mins.append(float(st.get("log_min", -30.0)))
+        log_maxs.append(float(st.get("log_max", 10.0)))
+    
+    log_means_t = torch.tensor(log_means, device=device, dtype=dtype)
+    log_stds_t = _safe_clamp_std(torch.tensor(log_stds, device=device, dtype=dtype))
+    log_mins_t = torch.tensor(log_mins, device=device, dtype=dtype)
+    log_maxs_t = torch.tensor(log_maxs, device=device, dtype=dtype)
+    
+    return log_means_t, log_stds_t, log_mins_t, log_maxs_t
+
 
 class AdaptiveStiffLoss(nn.Module):
     """
-    Loss function: MSE in z plus MAE in log10-physical space with species weighting.
-
-    IMPORTANT: _z_to_log10 MUST remain differentiable. Do not decorate it with no_grad.
+    Combined loss for stiff ODE systems:
+      - L1 in log10-physical space (derived from z using log_mean/log_std)
+      - MSE in z-space
+      - Per-species weighting based on log-range to bias stiff species
     """
 
     def __init__(
         self,
+        *,
         log_means: torch.Tensor,
         log_stds: torch.Tensor,
-        species_log_min: torch.Tensor,
-        species_log_max: torch.Tensor,
-        *,
-        lambda_phys: float = LOSS_LAMBDA_PHYS,
-        lambda_z: float = LOSS_LAMBDA_Z,
-        use_weighting: bool = True,
-        weight_power: float = 0.5,
-        w_min: float = W_SPECIES_CLAMP_MIN,
-        w_max: float = W_SPECIES_CLAMP_MAX,
-        epsilon_phys: float = LOSS_EPS_PHYS,  # retained for signature compatibility
+        log_mins: torch.Tensor,
+        log_maxs: torch.Tensor,
+        lambda_phys: float = 1.0,
+        lambda_z: float = 0.1,
+        eps_phys: float = 1e-20,
+        w_species_clamp: Tuple[float, float] = (0.5, 2.0),
+        range_eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        
+        # Register statistics as buffers (will be moved to correct device)
+        self.register_buffer("log_means", log_means)
+        self.register_buffer("log_stds", log_stds)
+        self.register_buffer("log_mins", log_mins)
+        self.register_buffer("log_maxs", log_maxs)
 
-        # Buffers for Lightning device moves
-        self.register_buffer("log_means", log_means.detach().clone())
-        self.register_buffer("log_stds", torch.clamp(log_stds.detach().clone(), min=LOG_STD_CLAMP_MIN))
-        self.register_buffer("log_min", species_log_min.detach().clone())
-        self.register_buffer("log_max", species_log_max.detach().clone())
-
-        if use_weighting:
-            rng = torch.clamp(self.log_max - self.log_min, min=SPECIES_RANGE_EPS)
-            w = torch.pow(rng, float(weight_power))
-            w = w / (w.mean() + W_SPECIES_MEAN_EPS)
-            w_final = torch.clamp(w, float(w_min), float(w_max))
-        else:
-            w_final = torch.ones_like(self.log_means)
-
-        self.register_buffer("w_species", w_final)
-
+        # Loss weights
         self.lambda_phys = float(lambda_phys)
         self.lambda_z = float(lambda_z)
-        self.eps_phys = float(epsilon_phys)
+        self.eps_phys = float(eps_phys)
+        self.wmin = float(w_species_clamp[0])
+        self.wmax = float(w_species_clamp[1])
+        self.range_eps = float(range_eps)
 
-    def _z_to_log10(self, z: torch.Tensor) -> torch.Tensor:
-        """Convert normalized z back to log10 space (DIFFERENTIABLE)."""
+        # Compute per-species weights: wider log-range => heavier weight
+        log_range = torch.clamp(self.log_maxs - self.log_mins, min=self.range_eps)
+        w = log_range / torch.mean(log_range)
+        self.register_buffer("w_species", torch.clamp(w, self.wmin, self.wmax))
+
+    def z_to_log10(self, z: torch.Tensor) -> torch.Tensor:
+        """Convert z-space to log10-physical space."""
         return z * self.log_stds + self.log_means
 
-    @torch.no_grad()
-    def z_to_log10_nograd(self, z: torch.Tensor) -> torch.Tensor:
-        """Metrics-only helper (explicitly no-grad)."""
-        return self._z_to_log10(z)
+    def forward(self, pred_z: torch.Tensor, true_z: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Compute combined loss.
+        
+        Args:
+            pred_z: [B, K, S] predictions in z-space
+            true_z: [B, K, S] targets in z-space
+            
+        Returns:
+            Dictionary with loss components
+        """
+        # Z-space MSE loss
+        z_mse = F.mse_loss(pred_z, true_z, reduction="none")  # [B, K, S]
+        z_mse = (z_mse * self.w_species).mean()
 
-    def forward(
+        # Physical log-space L1 loss
+        pred_log = self.z_to_log10(pred_z)
+        true_log = self.z_to_log10(true_z)
+        phys_l1 = torch.abs(pred_log - true_log)  # [B, K, S]
+        phys_l1 = (phys_l1 * self.w_species).mean()
+
+        # Combined loss
+        total = self.lambda_phys * phys_l1 + self.lambda_z * z_mse
+
+        # Diagnostic metric (computed without gradient)
+        with torch.no_grad():
+            mean_abs_log10 = torch.abs(pred_log - true_log).mean()
+
+        return {
+            "loss_total": total,
+            "loss_phys_l1": phys_l1,
+            "loss_z_mse": z_mse,
+            "mean_abs_log10": mean_abs_log10,
+        }
+
+
+# ---------------------------- Schedules ----------------------------
+
+
+@dataclass(frozen=True)
+class TeacherForcingSchedule:
+    """Schedule for teacher forcing probability decay."""
+    start: float = 1.0
+    end: float = 0.0
+    decay_epochs: int = 0
+    mode: str = "linear"  # linear | cosine
+
+    def value(self, epoch: int) -> float:
+        """Get teacher forcing probability for given epoch."""
+        if self.decay_epochs <= 0:
+            return float(self.start)
+        t = min(max(epoch, 0), self.decay_epochs)
+        u = t / float(self.decay_epochs)
+        if self.mode == "cosine":
+            u = 0.5 * (1.0 - math.cos(math.pi * u))
+        return float(self.start + (self.end - self.start) * u)
+
+
+@dataclass(frozen=True)
+class RolloutCurriculum:
+    """Curriculum for gradually increasing rollout length."""
+    enabled: bool = False
+    start_steps: int = 1
+    ramp_epochs: int = 0  # ramp from start_steps to max over this many epochs
+
+    def steps(self, epoch: int, max_steps: int) -> int:
+        """Get number of rollout steps for given epoch."""
+        if not self.enabled:
+            return max_steps
+        if self.ramp_epochs <= 0:
+            return max_steps
+        t = min(max(epoch, 0), self.ramp_epochs)
+        u = t / float(self.ramp_epochs)
+        k = int(round(self.start_steps + (max_steps - self.start_steps) * u))
+        return max(1, min(max_steps, k))
+
+
+# ---------------------------- Lightning Module ----------------------------
+
+
+class FlowMapRolloutModule(pl.LightningModule):
+    """
+    Lightning module for autoregressive flow-map training.
+    
+    Features:
+      - Configurable burn-in for both training and validation
+      - Teacher forcing with scheduled decay
+      - Rollout curriculum (optional)
+    """
+
+    def __init__(
         self,
-        pred_z: torch.Tensor,                 # [B,K,S]
-        true_z: torch.Tensor,                 # [B,K,S]
-        return_components: bool = False,
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
-        # Promote reductions/metrics to float32 for stability under AMP.
-        # Keep the operation differentiable (casts still allow gradients).
-        diff_z_f = (pred_z - true_z).to(torch.float32)
-        loss_z_f = diff_z_f * diff_z_f  # [B,K,S] float32
-
-        # MAE in log10-physical space (MUST backprop to pred_z)
-        pred_log = self._z_to_log10(pred_z)
-        true_log = self._z_to_log10(true_z)
-        abs_log_f = (pred_log - true_log).abs().to(torch.float32)  # [B,K,S] float32
-
-        w_species_f = self.w_species.to(dtype=abs_log_f.dtype)
-        loss_phys_f = abs_log_f * w_species_f  # weighted |Δlog10|, float32
-        denom_f = torch.tensor(loss_phys_f.numel(), dtype=loss_phys_f.dtype, device=loss_phys_f.device)
-
-        mean_abs_log10 = abs_log_f.sum() / denom_f
-        weighted_mean_abs_log10 = loss_phys_f.sum() / denom_f
-
-        phys = self.lambda_phys * weighted_mean_abs_log10
-        zstb = self.lambda_z * (loss_z_f.sum() / denom_f)
-        total = phys + zstb
-
-        if return_components:
-            return {
-                "total": total,
-                "phys": phys,
-                "z": zstb,
-                "mean_abs_log10": mean_abs_log10,
-                "weighted_mean_abs_log10": weighted_mean_abs_log10,
-            }
-        return total
-
-
-# ============================== EPOCH CSV ====================================
-
-class EpochCSVWriter:
-    """
-    Single, epoch-level CSV writer that appends across restarts and avoids Lightning's versioned log dirs.
-
-    Behavior:
-      - Writes to work_dir/metrics.csv
-      - On resume: keeps existing file and overwrites the current epoch row if needed
-      - On fresh run in an existing work_dir: backs up the old file and starts a new one
-      - Writes atomically to avoid partial/corrupt rows
-
-    Columns are intentionally minimal and epoch-level only.
-    """
-
-    COLUMNS = (
-        "epoch",
-        "step",
-        "wall_time",
-        "epoch_time_sec",
-        "lr",
-        "train_loss",
-        "train_phys",
-        "train_z",
-        "train_mult_err_proxy",
-        "val_loss",
-        "val_phys",
-        "val_z",
-        "val_mult_err_proxy",
-    )
-
-    def __init__(self, csv_path: Path, *, resume: bool) -> None:
-        self.csv_path = Path(csv_path)
-        self.resume = bool(resume)
-
-    @staticmethod
-    def wall_time_str() -> str:
-        return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    def _backup_existing(self) -> None:
-        if not self.csv_path.exists():
-            return
-        ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-        bak = self.csv_path.with_name(f"{self.csv_path.stem}.bak.{ts}{self.csv_path.suffix}")
-        try:
-            self.csv_path.replace(bak)
-        except Exception:
-            try:
-                self.csv_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    def _read_rows(self) -> list[dict[str, str]]:
-        if not self.csv_path.exists():
-            return []
-        try:
-            with open(self.csv_path, "r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                if reader.fieldnames is None:
-                    return []
-                return [dict(r) for r in reader]
-        except Exception:
-            return []
-
-    def _write_rows_atomic(self, rows: list[dict[str, str]]) -> None:
-        tmp = self.csv_path.with_suffix(self.csv_path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(self.COLUMNS))
-            writer.writeheader()
-            for r in rows:
-                writer.writerow({k: r.get(k, "") for k in self.COLUMNS})
-        tmp.replace(self.csv_path)
-
-    def ensure_initialized(self) -> None:
-        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if (not self.resume) and self.csv_path.exists():
-            self._backup_existing()
-
-        if not self.csv_path.exists():
-            self._write_rows_atomic([])
-            return
-
-        # Validate header; if mismatched/corrupt, back it up and start clean.
-        try:
-            with open(self.csv_path, "r", encoding="utf-8", newline="") as f:
-                header = next(csv.reader(f), None)
-            if header is None or tuple(header) != tuple(self.COLUMNS):
-                self._backup_existing()
-                self._write_rows_atomic([])
-        except Exception:
-            self._backup_existing()
-            self._write_rows_atomic([])
-
-    def write_epoch_row(self, epoch_1idx: int, row: dict[str, str]) -> None:
-        rows = self._read_rows()
-        kept: list[dict[str, str]] = []
-        for r in rows:
-            try:
-                e = int(float(r.get("epoch", "0") or 0))
-            except Exception:
-                continue
-            if e < epoch_1idx:
-                kept.append(r)
-
-        kept.append({k: row.get(k, "") for k in self.COLUMNS})
-        self._write_rows_atomic(kept)
-
-
-# ============================== LIGHTNING TASK ================================
-
-class ModelTask(pl.LightningModule):
-    """LightningModule wrapping the model + sample-weighted epoch metrics."""
-    def __init__(self, model: nn.Module, cfg: Dict[str, Any], work_dir: Path, *, resume: bool = False) -> None:
+        *,
+        cfg: Dict,
+        model: nn.Module,
+        normalization_manifest: Dict,
+        species_variables: List[str],
+        work_dir: Path,
+    ) -> None:
         super().__init__()
-        self.model = model
         self.cfg = cfg
+        self.model = model
         self.work_dir = Path(work_dir)
 
-        self._resume = bool(resume)
-        self._csv: Optional[EpochCSVWriter] = None
-        self._epoch_t0: float | None = None
-        self._printed_header: bool = False
-        self._last_reported_epoch: int = -1
-        self._last_train_metrics: dict[str, float] = {}
-        self._last_val_metrics: dict[str, float] = {}
-        self._last_train_epoch_idx: int | None = None
-        self._last_val_epoch_idx: int | None = None
-
+        # Training configuration
         tcfg = cfg.get("training", {})
-        self.lr = float(tcfg.get("lr", DEF_LR))
-        self.weight_decay = float(tcfg.get("weight_decay", DEF_WEIGHT_DECAY))
-        self.warmup_epochs = int(tcfg.get("warmup_epochs", DEF_WARMUP_EPOCHS))
-        self.min_lr = float(tcfg.get("min_lr", DEF_MIN_LR))
+        self.rollout_steps = int(tcfg.get("rollout_steps", 1))
+        self.burn_in_steps = int(tcfg.get("burn_in_steps", 0))
+        self.total_steps = self.rollout_steps + self.burn_in_steps
 
-        # Optional GT slicing when target subset used
-        self._target_idx = self._resolve_target_indices()
+        # Burn-in configuration
+        self.burn_in_add_noise_std = float(tcfg.get("burn_in_additive_noise_std", 0.0))
+        self.burn_in_loss_weight = float(tcfg.get("burn_in_loss_weight", 0.0))
+        
+        # Validation burn-in: defaults to matching training burn-in
+        # Set to 0 for "cold start" validation if desired
+        self.val_burn_in_steps = int(tcfg.get("val_burn_in_steps", self.burn_in_steps))
 
-        # Build loss from normalization manifest
-        self.criterion = self._build_loss()
-
-        self.save_hyperparameters({
-            "cfg_min": {
-                "training": {
-                    "lr": self.lr,
-                    "weight_decay": self.weight_decay,
-                    "warmup_epochs": self.warmup_epochs,
-                    "min_lr": self.min_lr,
-                },
-                "paths": {"processed_data_dir": cfg.get("paths", {}).get("processed_data_dir", "")},
-            },
-            "work_dir": str(work_dir),
-        })
-
-    def _resolve_target_indices(self) -> Optional[torch.Tensor]:
-        data_cfg = self.cfg.get("data", {})
-        species = list(data_cfg.get("species_variables") or [])
-        targets = list(data_cfg.get("target_species") or species)
-
-        if not species or targets == species:
-            return None
-
-        name_to_idx = {n: i for i, n in enumerate(species)}
-        missing = [n for n in targets if n not in name_to_idx]
-        if missing:
-            raise ValueError(f"target_species contains unknown names: {missing}")
-
-        idx = [name_to_idx[n] for n in targets]
-        return torch.tensor(idx, dtype=torch.long)
-
-    def _build_loss(self) -> nn.Module:
-        manifest_path = Path(self.cfg["paths"]["processed_data_dir"]) / "normalization.json"
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-
-        stats = manifest["per_key_stats"]
-        meta = manifest.get("meta", {})
-
-        data_cfg = self.cfg.get("data", {})
-        targets = data_cfg.get("target_species")
-        if targets:
-            species_names = list(targets)
-        else:
-            species_names = list(data_cfg.get("species_variables") or meta.get("species_variables", []))
-            if not species_names:
-                raise RuntimeError("No species list available in config or manifest.")
-
-        log_means, log_stds, log_mins, log_maxs = [], [], [], []
-        for n in species_names:
-            s = stats[n]
-            log_means.append(float(s.get("log_mean", 0.0)))
-            log_stds.append(float(s.get("log_std", 1.0)))
-            log_mins.append(float(s.get("log_min", -30.0)))
-            log_maxs.append(float(s.get("log_max", 0.0)))
-
-        loss_cfg = self.cfg.get("training", {}).get("adaptive_stiff_loss", {})
-
-        return AdaptiveStiffLoss(
-            log_means=torch.tensor(log_means, dtype=torch.float32),
-            log_stds=torch.tensor(log_stds, dtype=torch.float32),
-            species_log_min=torch.tensor(log_mins, dtype=torch.float32),
-            species_log_max=torch.tensor(log_maxs, dtype=torch.float32),
-            lambda_phys=float(loss_cfg.get("lambda_phys", LOSS_LAMBDA_PHYS)),
-            lambda_z=float(loss_cfg.get("lambda_z", LOSS_LAMBDA_Z)),
-            use_weighting=bool(loss_cfg.get("use_weighting", True)),
-            weight_power=float(loss_cfg.get("weight_power", 0.5)),
-            w_min=float(loss_cfg.get("w_min", W_SPECIES_CLAMP_MIN)),
-            w_max=float(loss_cfg.get("w_max", W_SPECIES_CLAMP_MAX)),
-            epsilon_phys=float(loss_cfg.get("epsilon_phys", LOSS_EPS_PHYS)),
+        # Teacher forcing schedule
+        tf_cfg = tcfg.get("teacher_forcing", {})
+        self.tf_sched = TeacherForcingSchedule(
+            start=float(tf_cfg.get("start", 1.0)),
+            end=float(tf_cfg.get("end", 0.0)),
+            decay_epochs=int(tf_cfg.get("decay_epochs", 0)),
+            mode=str(tf_cfg.get("mode", "linear")).lower(),
         )
 
-    def forward(self, y_i: torch.Tensor, dt_norm: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        return self.model(y_i, dt_norm, g)
-
-    def _unpack(self, batch):
-        # (y_i, dt_norm, y_j, g)
-        if len(batch) != 4:
-            raise ValueError(
-                f"Expected batch to be a 4-tuple (y_i, dt_norm, y_j, g); got len={len(batch)}"
-            )
-        y_i, dt_norm, y_j, g = batch
-
-        if self._target_idx is not None:
-            idx = self._target_idx.to(y_j.device)
-            y_j = y_j.index_select(dim=-1, index=idx)
-        return y_i, dt_norm, y_j, g
-
-    # --------------------------- optim / sched --------------------------------
-
-    def configure_optimizers(self):
-        tcfg = self.cfg.get("training", {})
-        opt_name = str(tcfg.get("optimizer", "adamw")).lower().strip()
-
-        if opt_name == "adamw":
-            try:
-                has_fused_flag = ("fused" in inspect.signature(torch.optim.AdamW).parameters)
-            except Exception:
-                has_fused_flag = False
-
-            try:
-                clip_val = float(getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0)
-            except Exception:
-                clip_val = 0.0
-
-            use_fused = bool(torch.cuda.is_available() and has_fused_flag and clip_val == 0.0)
-
-            opt_kwargs = dict(lr=self.lr, weight_decay=self.weight_decay)
-            if use_fused:
-                opt_kwargs["fused"] = True
-            optimizer = torch.optim.AdamW(self.parameters(), **opt_kwargs)
-
-        elif opt_name == "lamb":
-            import torch_optimizer as torchopt
-            optimizer = torchopt.Lamb(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-
-        else:
-            raise ValueError(f"Unknown optimizer '{opt_name}'. Expected 'adamw' or 'lamb'.")
-
-        # warmup -> cosine
-        scheds = []
-        if self.warmup_epochs > 0:
-            scheds.append(
-                LinearLR(
-                    optimizer,
-                    start_factor=WARMUP_START_FACTOR,
-                    total_iters=max(1, self.warmup_epochs),
-                )
-            )
-
-        max_epochs = max(1, int(getattr(self.trainer, "max_epochs", 1) or 1))
-        t_max = max(1, max_epochs - self.warmup_epochs)
-        cosine = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=self.min_lr)
-
-        scheduler = cosine if not scheds else SequentialLR(
-            optimizer,
-            schedulers=[scheds[0], cosine],
-            milestones=[self.warmup_epochs],
+        # Rollout curriculum
+        cur_cfg = tcfg.get("curriculum", {})
+        self.curriculum = RolloutCurriculum(
+            enabled=bool(cur_cfg.get("enabled", False)),
+            start_steps=int(cur_cfg.get("start_steps", 1)),
+            ramp_epochs=int(cur_cfg.get("ramp_epochs", 0)),
         )
 
-        return [optimizer], [{"scheduler": scheduler, "interval": "epoch", "monitor": CKPT_MONITOR}]
+        # Build loss function (buffers created on CPU, moved in on_fit_start)
+        log_means, log_stds, log_mins, log_maxs = _stack_log_stats(
+            normalization_manifest,
+            species_variables,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        lcfg = tcfg.get("loss", {})
+        self.criterion = AdaptiveStiffLoss(
+            log_means=log_means,
+            log_stds=log_stds,
+            log_mins=log_mins,
+            log_maxs=log_maxs,
+            lambda_phys=float(lcfg.get("lambda_phys", 1.0)),
+            lambda_z=float(lcfg.get("lambda_z", 0.1)),
+            eps_phys=float(lcfg.get("eps_phys", 1e-20)),
+            w_species_clamp=tuple(lcfg.get("w_species_clamp", [0.5, 2.0])),
+            range_eps=float(lcfg.get("range_eps", 1e-6)),
+        )
 
-    # --------------------------- steps / epoch metrics ------------------------
+        # Optimizer parameters
+        self.lr = float(tcfg.get("lr", 1e-3))
+        self.weight_decay = float(tcfg.get("weight_decay", 1e-4))
 
     def on_fit_start(self) -> None:
-        tr = getattr(self, "trainer", None)
-        if tr is None or (not tr.is_global_zero) or getattr(tr, "sanity_checking", False):
-            return
-        self._csv = EpochCSVWriter(self.work_dir / "metrics.csv", resume=self._resume)
-        self._csv.ensure_initialized()
+        """Move criterion to correct device at start of training."""
+        # Simply move criterion to device; buffers are already float32
+        self.criterion = self.criterion.to(self.device)
 
-    def on_train_epoch_start(self) -> None:
-        self._epoch_t0 = time.time()
-        dev = self.device if hasattr(self, "device") else next(self.parameters()).device
-        self._t_sum = torch.zeros((), dtype=torch.float64, device=dev)
-        self._t_wsum = torch.zeros((), dtype=torch.float64, device=dev)
-        self._t_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)
-        self._t_z_sum = torch.zeros((), dtype=torch.float64, device=dev)
-        self._t_abslog_sum = torch.zeros((), dtype=torch.float64, device=dev)
+    def configure_optimizers(self):
+        """Configure optimizer."""
+        opt = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+        return opt
 
-    def training_step(self, batch, batch_idx: int):
-        y_i, dt_in, y_j, g = self._unpack(batch)
-        pred = self(y_i, dt_in, g)
+    def _autoregressive_unroll(
+        self,
+        y0: torch.Tensor,
+        dt_norm: torch.Tensor,
+        y_true: torch.Tensor,
+        g: torch.Tensor,
+        *,
+        teacher_forcing_p: float,
+        burn_in_steps: int,
+        add_noise_std: float,
+        max_rollout_steps: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Autoregressive unrolling with optional burn-in and teacher forcing.
+        
+        Args:
+            y0: [B, S] initial state in z-space
+            dt_norm: [B] or scalar normalized time step
+            y_true: [B, K, S] ground truth for next K steps
+            g: [B, G] global parameters
+            teacher_forcing_p: probability of using ground truth as next input
+            burn_in_steps: number of free-run steps before applying teacher forcing
+            add_noise_std: noise to add during burn-in (helps with off-manifold drift)
+            max_rollout_steps: maximum rollout steps (curriculum-controlled)
+            
+        Returns:
+            (pred_all, true_all): predictions and targets of shape [B, K_eff, S]
+        """
+        B, K_total, S = y_true.shape
+        K_eff = min(K_total, burn_in_steps + max_rollout_steps)
+        burn = min(burn_in_steps, K_eff)
 
-        if pred.shape != y_j.shape:
-            raise RuntimeError(f"Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
+        state = y0
+        preds: List[torch.Tensor] = []
 
-        comps = self.criterion(pred, y_j, return_components=True)
-        loss = comps["total"]
+        # Ensure dt shape is compatible with model: [B, 1, 1]
+        if dt_norm.ndim == 0:
+            dt_step = dt_norm.view(1).expand(B)
+        else:
+            dt_step = dt_norm
+        dt_step = dt_step.to(state.device)
 
-        # Fail fast on NaN/inf to avoid meaningless epoch aggregates.
-        if not torch.isfinite(loss):
-            raise ValueError(f"[train] Non-finite total loss at batch {batch_idx}")
-        if not torch.isfinite(comps["phys"]):
-            raise ValueError(f"[train] Non-finite phys loss at batch {batch_idx}")
-        if not torch.isfinite(comps["z"]):
-            raise ValueError(f"[train] Non-finite z loss at batch {batch_idx}")
-        if "mean_abs_log10" in comps and (not torch.isfinite(comps["mean_abs_log10"])):
-            raise ValueError(f"[train] Non-finite mean_abs_log10 at batch {batch_idx}")
+        for t in range(K_eff):
+            # Model expects dt_norm [B, 1, 1] to produce [B, 1, S]
+            out = self.model(state, dt_step.view(B, 1, 1), g)
+            pred = out[:, 0, :]  # [B, S]
+            preds.append(pred)
 
-        # sample-weighted accumulation (matches validation exactly)
-        with torch.no_grad():
-            B, K, _S = y_j.shape
-            valid_pairs = torch.tensor(B * K, device=y_j.device, dtype=torch.long)
+            # Stop after last prediction (no need to update state)
+            if t == K_eff - 1:
+                break
 
-            if int(valid_pairs.item()) > 0:
-                S = torch.tensor(y_j.shape[-1], device=y_j.device, dtype=torch.float64)
-                weight = valid_pairs.to(torch.float64) * S
+            # Determine next input state
+            if t < burn:
+                # Free-run burn-in: use prediction with optional noise
+                state = pred
+                if add_noise_std > 0.0:
+                    state = state + add_noise_std * torch.randn_like(state)
+            else:
+                # Scheduled sampling: mix ground truth and predictions
+                if teacher_forcing_p >= 1.0:
+                    state = y_true[:, t, :]
+                elif teacher_forcing_p <= 0.0:
+                    state = pred
+                else:
+                    mask = (torch.rand((B,), device=state.device) < teacher_forcing_p).view(B, 1)
+                    state = torch.where(mask, y_true[:, t, :], pred)
 
-                self._t_sum += (comps["total"].detach().to(torch.float64) * weight)
-                self._t_phys_sum += (comps["phys"].detach().to(torch.float64) * weight)
-                self._t_z_sum += (comps["z"].detach().to(torch.float64) * weight)
-                if "mean_abs_log10" in comps:
-                    self._t_abslog_sum += (comps["mean_abs_log10"].detach().to(torch.float64) * weight)
-                self._t_wsum += weight
+        pred_all = torch.stack(preds, dim=1)  # [B, K_eff, S]
+        true_all = y_true[:, :K_eff, :]       # [B, K_eff, S]
+        return pred_all, true_all
+
+    def training_step(self, batch, batch_idx):
+        """Training step with burn-in and teacher forcing."""
+        y0, dt_norm, y_seq, g = batch
+
+        # Get curriculum-adjusted rollout steps and teacher forcing probability
+        k_roll = self.curriculum.steps(int(self.current_epoch), self.rollout_steps)
+        tf_p = self.tf_sched.value(int(self.current_epoch))
+
+        # Autoregressive unroll
+        pred_all, true_all = self._autoregressive_unroll(
+            y0=y0,
+            dt_norm=dt_norm,
+            y_true=y_seq,
+            g=g,
+            teacher_forcing_p=tf_p,
+            burn_in_steps=self.burn_in_steps,
+            add_noise_std=self.burn_in_add_noise_std,
+            max_rollout_steps=k_roll,
+        )
+
+        # Compute loss on post-burn-in predictions
+        burn = min(self.burn_in_steps, pred_all.shape[1])
+        main_pred = pred_all[:, burn:, :]
+        main_true = true_all[:, burn:, :]
+        comps_main = self.criterion(main_pred, main_true)
+
+        loss = comps_main["loss_total"]
+
+        # Optionally add burn-in loss with reduced weight
+        if burn > 0 and self.burn_in_loss_weight > 0.0:
+            comps_burn = self.criterion(pred_all[:, :burn, :], true_all[:, :burn, :])
+            loss = loss + self.burn_in_loss_weight * comps_burn["loss_total"]
+
+        # Log metrics
+        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("train_mean_abs_log10", comps_main["mean_abs_log10"], on_step=False, on_epoch=True)
+        self.log("tf_prob", torch.tensor(tf_p, device=self.device), on_step=False, on_epoch=True)
+        self.log("k_roll", torch.tensor(k_roll, device=self.device), on_step=False, on_epoch=True)
 
         return loss
 
-    def on_train_epoch_end(self) -> None:
-        import torch.distributed as dist
+    def validation_step(self, batch, batch_idx):
+        """
+        Validation step with configurable burn-in.
+        
+        By default, validation uses the same burn-in as training to ensure metrics
+        are comparable. Set training.val_burn_in_steps=0 in config for cold-start
+        validation (evaluating model's ability to predict from arbitrary initial states).
+        """
+        y0, dt_norm, y_seq, g = batch
 
-        # Reduce epoch accumulators across ranks (we handle sync manually).
-        if dist.is_available() and dist.is_initialized():
-            for t in (self._t_sum, self._t_phys_sum, self._t_z_sum, self._t_abslog_sum, self._t_wsum):
-                dist.all_reduce(t, op=dist.ReduceOp.SUM)
-
-        if float(self._t_wsum.item()) <= 0.0:
-            for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_abslog_sum", "_t_wsum"):
-                setattr(self, name, torch.zeros_like(getattr(self, name)))
-            return
-
-        w = self._t_wsum
-        train_loss = (self._t_sum / w).to(torch.float32)
-        train_phys = (self._t_phys_sum / w).to(torch.float32)
-        train_z = (self._t_z_sum / w).to(torch.float32)
-
-        mean_abslog = (self._t_abslog_sum / w).to(torch.float64)
-        mean_abslog = torch.clamp(mean_abslog, min=0.0)
-        train_mult_err_proxy = torch.expm1(mean_abslog * math.log(10.0)).to(torch.float32)
-
-        self._last_train_metrics = {
-            "train_loss": float(train_loss.detach().cpu().item()),
-            "train_phys": float(train_phys.detach().cpu().item()),
-            "train_z": float(train_z.detach().cpu().item()),
-            "train_mult_err_proxy": float(train_mult_err_proxy.detach().cpu().item()),
-        }
-        self._last_train_epoch_idx = int(self.current_epoch)
-        self.log("train_loss", train_loss, prog_bar=False, on_epoch=True, sync_dist=False)
-        self.log("train_phys", train_phys, prog_bar=False, on_epoch=True, sync_dist=False)
-        self.log("train_z", train_z, prog_bar=False, on_epoch=True, sync_dist=False)
-        self.log("train_mult_err_proxy", train_mult_err_proxy, prog_bar=False, on_epoch=True, sync_dist=False)
-
-        # Always report here.
-        # Lightning finalizes the epoch (including any validation) before this hook returns,
-        # so both train and val metrics for the current epoch (if any) are available.
-        self._report_epoch()
-
-        for name in ("_t_sum", "_t_phys_sum", "_t_z_sum", "_t_abslog_sum", "_t_wsum"):
-            setattr(self, name, torch.zeros_like(getattr(self, name)))
-
-    def on_validation_epoch_start(self) -> None:
-        dev = self.device if hasattr(self, "device") else next(self.parameters()).device
-        self._v_sum = torch.zeros((), dtype=torch.float64, device=dev)
-        self._v_wsum = torch.zeros((), dtype=torch.float64, device=dev)
-        self._v_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)
-        self._v_z_sum = torch.zeros((), dtype=torch.float64, device=dev)
-        self._v_abslog_sum = torch.zeros((), dtype=torch.float64, device=dev)
-
-    def validation_step(self, batch, batch_idx: int):
-        y_i, dt_in, y_j, g = self._unpack(batch)
-        pred = self(y_i, dt_in, g)
-
-        if pred.shape != y_j.shape:
-            raise RuntimeError(f"[val] Pred/GT shape mismatch: {pred.shape} vs {y_j.shape}")
-
-        comps = self.criterion(pred, y_j, return_components=True)
-        total = comps["total"].detach()
-        phys = comps["phys"].detach()
-        zstb = comps["z"].detach()
-        abslog = comps.get("mean_abs_log10", None)
-        if abslog is not None:
-            abslog = abslog.detach()
-
-        if not torch.isfinite(total):
-            raise ValueError(f"[val] Non-finite total loss at batch {batch_idx}")
-        if not torch.isfinite(phys):
-            raise ValueError(f"[val] Non-finite phys loss at batch {batch_idx}")
-        if not torch.isfinite(zstb):
-            raise ValueError(f"[val] Non-finite z loss at batch {batch_idx}")
-        if abslog is not None and (not torch.isfinite(abslog)):
-            raise ValueError(f"[val] Non-finite mean_abs_log10 at batch {batch_idx}")
-
-        B, K, _S = y_j.shape
-        valid_pairs = torch.tensor(B * K, device=y_j.device, dtype=torch.long)
-
-        if int(valid_pairs.item()) == 0:
-            B, K, S = y_j.shape
-            raise ValueError(f"[val] Zero valid [B,K] pairs in batch {batch_idx} (B={B}, K={K}, S={S}).")
-
-        S = torch.tensor(y_j.shape[-1], device=y_j.device, dtype=torch.float64)
-        weight = valid_pairs.to(torch.float64) * S
-
-        self._v_sum += (total.to(torch.float64) * weight)
-        self._v_phys_sum += (phys.to(torch.float64) * weight)
-        self._v_z_sum += (zstb.to(torch.float64) * weight)
-        if abslog is not None:
-            self._v_abslog_sum += (abslog.to(torch.float64) * weight)
-        self._v_wsum += weight
-
-        return total
-
-    def on_validation_epoch_end(self) -> None:
-        tr = getattr(self, "trainer", None)
-        if tr is not None and getattr(tr, "sanity_checking", False):
-            for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_abslog_sum", "_v_wsum"):
-                if hasattr(self, name):
-                    setattr(self, name, torch.zeros_like(getattr(self, name)))
-            return
-
-        import torch.distributed as dist
-
-        if not hasattr(self, "_v_wsum"):
-            dev = self.device if hasattr(self, "device") else next(self.parameters()).device
-            self._v_sum = torch.zeros((), dtype=torch.float64, device=dev)
-            self._v_phys_sum = torch.zeros((), dtype=torch.float64, device=dev)
-            self._v_z_sum = torch.zeros((), dtype=torch.float64, device=dev)
-            self._v_abslog_sum = torch.zeros((), dtype=torch.float64, device=dev)
-            self._v_wsum = torch.zeros((), dtype=torch.float64, device=dev)
-
-        # Reduce epoch accumulators across ranks (we handle sync manually).
-        if dist.is_available() and dist.is_initialized():
-            for t in (self._v_sum, self._v_phys_sum, self._v_z_sum, self._v_abslog_sum, self._v_wsum):
-                dist.all_reduce(t, op=dist.ReduceOp.SUM)
-
-        if float(self._v_wsum.item()) <= 0.0:
-            for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_abslog_sum", "_v_wsum"):
-                setattr(self, name, torch.zeros_like(getattr(self, name)))
-            return
-
-        w = self._v_wsum
-        val_loss = (self._v_sum / w).to(torch.float32)
-        val_phys = (self._v_phys_sum / w).to(torch.float32)
-        val_z = (self._v_z_sum / w).to(torch.float32)
-
-        mean_abslog = (self._v_abslog_sum / w).to(torch.float64)
-        mean_abslog = torch.clamp(mean_abslog, min=0.0)
-        val_mult_err_proxy = torch.expm1(mean_abslog * math.log(10.0)).to(torch.float32)
-
-        self._last_val_metrics = {
-            "val_loss": float(val_loss.detach().cpu().item()),
-            "val_phys": float(val_phys.detach().cpu().item()),
-            "val_z": float(val_z.detach().cpu().item()),
-            "val_mult_err_proxy": float(val_mult_err_proxy.detach().cpu().item()),
-        }
-        self._last_val_epoch_idx = int(self.current_epoch)
-
-        self.log("val_loss", val_loss, prog_bar=True, on_epoch=True, sync_dist=False)
-        self.log("val_phys", val_phys, prog_bar=False, on_epoch=True, sync_dist=False)
-        self.log("val_z", val_z, prog_bar=False, on_epoch=True, sync_dist=False)
-        self.log("val_mult_err_proxy", val_mult_err_proxy, prog_bar=False, on_epoch=True, sync_dist=False)
-
-        for name in ("_v_sum", "_v_phys_sum", "_v_z_sum", "_v_abslog_sum", "_v_wsum"):
-            setattr(self, name, torch.zeros_like(getattr(self, name)))
-
-    def _report_epoch(self) -> None:
-        tr = getattr(self, "trainer", None)
-        if tr is None or (not tr.is_global_zero) or getattr(tr, "sanity_checking", False):
-            return
-        if self._csv is None:
-            self._csv = EpochCSVWriter(self.work_dir / "metrics.csv", resume=self._resume)
-            self._csv.ensure_initialized()
-
-        epoch_1idx = int(self.current_epoch) + 1
-        step = int(getattr(tr, "global_step", 0) or 0)
-
-        epoch_time = float("nan") if self._epoch_t0 is None else (time.time() - float(self._epoch_t0))
-
-        lr: Optional[float] = None
-        try:
-            if tr.optimizers and tr.optimizers[0].param_groups:
-                lr = float(tr.optimizers[0].param_groups[0].get("lr", None))
-        except Exception:
-            lr = None
-
-        # Also expose LR as a Lightning metric (available in callback_metrics even with logger=False)
-        if lr is not None:
-            self.log("lr", float(lr), prog_bar=False, on_step=False, on_epoch=True, sync_dist=False)
-
-        cur_epoch_idx = int(self.current_epoch)
-        train_m = self._last_train_metrics if self._last_train_epoch_idx == cur_epoch_idx else {}
-        val_m = self._last_val_metrics if self._last_val_epoch_idx == cur_epoch_idx else {}
-
-        def fmt(x: Optional[float]) -> str:
-            if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-                return ""
-            return f"{x:.6e}"
-
-        row: dict[str, str] = {
-            "epoch": str(epoch_1idx),
-            "step": str(step),
-            "wall_time": self._csv.wall_time_str(),
-            "epoch_time_sec": ("" if (not math.isfinite(epoch_time)) else f"{epoch_time:.6f}"),
-            "lr": ("" if lr is None else f"{lr:.6e}"),
-            "train_loss": fmt(train_m.get("train_loss")),
-            "train_phys": fmt(train_m.get("train_phys")),
-            "train_z": fmt(train_m.get("train_z")),
-            "train_mult_err_proxy": fmt(train_m.get("train_mult_err_proxy")),
-            "val_loss": fmt(val_m.get("val_loss")),
-            "val_phys": fmt(val_m.get("val_phys")),
-            "val_z": fmt(val_m.get("val_z")),
-            "val_mult_err_proxy": fmt(val_m.get("val_mult_err_proxy")),
-        }
-        self._csv.write_epoch_row(epoch_1idx, row)
-
-        if epoch_1idx == self._last_reported_epoch:
-            return
-
-        def fmt_sci(x: Optional[float], width: int = 11) -> str:
-            if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-                return f"{'—':>{width}}"
-            return f"{x:>{width}.3e}"
-
-        def fmt_time(seconds: float) -> str:
-            if not math.isfinite(seconds) or seconds < 0:
-                seconds = 0.0
-            m, s = divmod(int(seconds), 60)
-            h, m = divmod(m, 60)
-            if h > 0:
-                return f"{h:d}:{m:02d}:{s:02d}"
-            return f"{m:d}:{s:02d}"
-
-        if not self._printed_header:
-            print("EPOCH | train       | val         | mult_err_proxy | lr         | time", flush=True)
-            print("----- | ----------- | ----------- | -------------- | ---------- | --------", flush=True)
-            self._printed_header = True
-
-        tr_loss = train_m.get("train_loss")
-        va_loss = val_m.get("val_loss")
-        va_proxy = val_m.get("val_mult_err_proxy")
-
-        epoch_str = f"E{epoch_1idx:04d}"
-        line = (
-            f"{epoch_str} | "
-            f"{fmt_sci(tr_loss)} | "
-            f"{fmt_sci(va_loss)} | "
-            f"{fmt_sci(va_proxy, width=14)} | "
-            f"{fmt_sci(lr)} | "
-            f"{fmt_time(epoch_time)}"
+        # Pure autoregressive (no teacher forcing, no noise)
+        # Use full rollout steps (no curriculum in validation)
+        pred_all, true_all = self._autoregressive_unroll(
+            y0=y0,
+            dt_norm=dt_norm,
+            y_true=y_seq,
+            g=g,
+            teacher_forcing_p=0.0,
+            burn_in_steps=self.val_burn_in_steps,
+            add_noise_std=0.0,
+            max_rollout_steps=self.rollout_steps,
         )
-        print(line, flush=True)
-        self._last_reported_epoch = epoch_1idx
+
+        # Compute loss on post-burn-in predictions (matching training regime)
+        burn = min(self.val_burn_in_steps, pred_all.shape[1])
+        main_pred = pred_all[:, burn:, :]
+        main_true = true_all[:, burn:, :]
+        comps = self.criterion(main_pred, main_true)
+
+        # Log metrics
+        self.log("val_loss", comps["loss_total"], prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_mean_abs_log10", comps["mean_abs_log10"], on_step=False, on_epoch=True)
+
+        # Also log cold-start metrics if using burn-in
+        if self.val_burn_in_steps > 0:
+            comps_cold = self.criterion(pred_all, true_all)
+            self.log("val_loss_cold_start", comps_cold["loss_total"], on_step=False, on_epoch=True)
+            self.log("val_mean_abs_log10_cold_start", comps_cold["mean_abs_log10"], on_step=False, on_epoch=True)
+
+        return comps["loss_total"]
 
 
-# ============================== WRAPPER =======================================
-
-class Trainer:
-    """Compatibility wrapper: `from trainer import Trainer` -> .train() returns best val."""
-    def __init__(
-        self,
-        model: nn.Module,
-        train_loader: torch.utils.data.DataLoader,
-        val_loader: Optional[torch.utils.data.DataLoader],
-        cfg: Dict[str, Any],
-        work_dir: Path,
-        device: torch.device,
-        logger: Optional[logging.Logger] = None,
-        *,
-        pl_precision_override: Any = None,
-    ) -> None:
-        self.model = model
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.cfg = cfg
-        self.work_dir = Path(work_dir)
-        self.device = device
-        self.pl_precision_override = pl_precision_override
-
-        self.logger = logger or logging.getLogger("trainer")
-        if not self.logger.handlers:
-            h = logging.StreamHandler()
-            h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
-            self.logger.addHandler(h)
-            self.logger.setLevel(logging.INFO)
-
-        # Silence non-zero ranks to avoid duplicate INFO lines
-        if int(os.getenv("RANK", "0") or "0") != 0:
-            self.logger.propagate = False
-            self.logger.setLevel(logging.WARNING)
-
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-
-        tcfg = cfg.get("training", {})
-        syscfg = cfg.get("system", {})
-
-        self.epochs = int(tcfg.get("epochs", DEF_EPOCHS))
-        self.grad_clip = float(tcfg.get("gradient_clip", DEF_GRAD_CLIP))
-        self.accumulate = int(tcfg.get("accumulate_grad_batches", DEF_ACCUMULATE))
-        self.torch_compile = bool(tcfg.get("torch_compile", COMPILE_ENABLE_DEFAULT))
-
-        # Determinism / cudnn benchmark (keep aligned with main)
-        self.deterministic = bool(syscfg.get("deterministic", False))
-        self.cudnn_benchmark = bool(syscfg.get("cudnn_benchmark", True)) and not self.deterministic
-
-        # SWA config
-        self.use_swa = bool(tcfg.get("use_swa", False))
-        self.swa_lrs = tcfg.get("swa_lrs", None)
-        self.swa_epoch_start = tcfg.get("swa_epoch_start", 0.8)
-        self.swa_annealing_epochs = int(tcfg.get("swa_annealing_epochs", 10))
-        self.swa_annealing_strategy = str(tcfg.get("swa_annealing_strategy", "cos"))
-
-        # Compile knobs
-        self.compile_backend = tcfg.get("torch_compile_backend", COMPILE_BACKEND)
-        self.compile_mode = tcfg.get("torch_compile_mode", COMPILE_MODE)
-        self.compile_dynamic = bool(tcfg.get("compile_dynamic", COMPILE_DYNAMIC))
-        self.compile_fullgraph = bool(tcfg.get("compile_fullgraph", COMPILE_FULLGRAPH))
-
-        # Optional limits (PL "limit_*_batches")
-        self.limit_train_batches = int(tcfg.get("max_train_batches", DEF_MAX_TRAIN_BATCHES) or 0)
-        self.limit_val_batches = int(tcfg.get("max_val_batches", DEF_MAX_VAL_BATCHES) or 0)
-
-    def _precision_from_cfg(self) -> Any:
-        if self.pl_precision_override is not None:
-            return self.pl_precision_override
-
-        mp = str(self.cfg.get("mixed_precision", {}).get("mode", "32-true")).lower().strip()
-        aliases = {
-            "bf16": "bf16-mixed",
-            "bfloat16": "bf16-mixed",
-            "bf16-mixed": "bf16-mixed",
-            "bfloat16-mixed": "bf16-mixed",
-            "fp16": "16-mixed",
-            "float16": "16-mixed",
-            "16": "16-mixed",
-            "16-mixed": "16-mixed",
-            "none": "32-true",
-            "fp32": "32-true",
-            "32": "32-true",
-            "32-true": "32-true",
-        }
-        return aliases.get(mp, "32-true")
-
-    def _accelerator_from_device(self) -> str:
-        if self.device.type == "cuda":
-            return "gpu"
-        if self.device.type == "mps":
-            return "mps"
-        return "cpu"
-
-    def _resolve_resume_ckpt(self) -> Optional[str]:
-        tcfg = self.cfg.get("training", {})
-        p_cfg = tcfg.get("resume_path") or tcfg.get("resume")
-        if isinstance(p_cfg, str) and p_cfg.strip():
-            p = Path(p_cfg)
-            return str(p) if p.is_file() else None
-
-        env_resume = os.environ.get("RESUME", "").strip()
-        if env_resume and env_resume.lower() != "auto":
-            p = Path(env_resume)
-            return str(p) if p.is_file() else None
-
-        if env_resume.lower() == "auto" or bool(tcfg.get("auto_resume", True)):
-            p = self.work_dir / "last.ckpt"
-            if p.is_file():
-                return str(p)
-
-        return None
-
-    def _maybe_compile(self, model: nn.Module) -> nn.Module:
-        if not self.torch_compile:
-            return model
-        try:
-            compiled = torch.compile(
-                model,
-                backend=self.compile_backend,
-                mode=self.compile_mode,
-                dynamic=self.compile_dynamic,
-                fullgraph=self.compile_fullgraph,
+def _get_precision_for_accelerator(cfg_precision: str, accelerator: str) -> str:
+    """
+    Get appropriate precision string for the given accelerator.
+    
+    bf16-mixed requires GPU support. On CPU, fall back to 32-bit.
+    
+    Args:
+        cfg_precision: Requested precision from config
+        accelerator: "gpu" or "cpu"
+        
+    Returns:
+        Valid precision string for the accelerator
+    """
+    # Normalize precision string
+    precision = str(cfg_precision).lower().strip()
+    
+    # CPU doesn't support bf16-mixed or 16-mixed well
+    if accelerator == "cpu":
+        if precision in ("bf16-mixed", "16-mixed", "bf16", "16"):
+            import warnings
+            warnings.warn(
+                f"Precision '{cfg_precision}' is not well-supported on CPU. "
+                f"Falling back to '32-true'. Set training.precision='32-true' to silence this warning.",
+                UserWarning,
+                stacklevel=3,
             )
-            self.logger.info(
-                f"torch.compile enabled (backend={self.compile_backend}, mode={self.compile_mode}, "
-                f"dynamic={self.compile_dynamic}, fullgraph={self.compile_fullgraph})"
-            )
-            return compiled
-        except Exception as e:
-            self.logger.warning(f"torch.compile disabled ({e})")
-            return model
+            return "32-true"
+    
+    return precision
 
-    def train(self) -> float:
-        # Resolve resume checkpoint before constructing the task (task needs resume flag for CSV behavior)
-        ckpt_path = self._resolve_resume_ckpt()
-        self.logger.info(f"resume: {ckpt_path if ckpt_path else 'fresh'}")
 
-        self.model = self._maybe_compile(self.model)
-        task = ModelTask(self.model, self.cfg, self.work_dir, resume=bool(ckpt_path))
+def build_lightning_trainer(cfg: Dict, *, work_dir: Path) -> pl.Trainer:
+    """
+    Build PyTorch Lightning Trainer from configuration.
+    
+    Args:
+        cfg: Configuration dictionary
+        work_dir: Directory for checkpoints and logs
+        
+    Returns:
+        Configured Trainer instance
+    """
+    tcfg = cfg.get("training", {})
+    max_epochs = int(tcfg.get("max_epochs", 100))
 
-        ckpt_cb = ModelCheckpoint(
-            dirpath=str(self.work_dir),
-            filename=CKPT_FILENAME_BEST,
-            monitor=CKPT_MONITOR,
-            mode=CKPT_MODE,
-            save_top_k=1,
+    # Checkpointing configuration
+    cpcfg = cfg.get("checkpoint", {})
+    ckpt_every = int(cpcfg.get("save_every_n_epochs", 1))
+
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=str(work_dir),
+            filename="best",
+            monitor="val_loss",
+            mode="min",
             save_last=True,
-            verbose=False,
+            save_top_k=1,
+            every_n_epochs=ckpt_every,
         )
-        callbacks = [ckpt_cb]
+    ]
 
-        if self.use_swa:
-            swa_kwargs = dict(
-                swa_epoch_start=self.swa_epoch_start,
-                annealing_epochs=self.swa_annealing_epochs,
-                annealing_strategy=self.swa_annealing_strategy,
-            )
-            if self.swa_lrs is not None:
-                swa_kwargs["swa_lrs"] = self.swa_lrs
-            callbacks.append(StochasticWeightAveraging(**swa_kwargs))
+    # Logger
+    logger = CSVLogger(save_dir=str(work_dir), name="csv", flush_logs_every_n_steps=100)
 
-        accelerator = self._accelerator_from_device()
-        precision = self._precision_from_cfg()
+    # Hardware configuration
+    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+    devices = int(tcfg.get("devices", 1)) if accelerator == "gpu" else 1
+    
+    # Get precision with CPU fallback
+    cfg_precision = str(tcfg.get("precision", "bf16-mixed"))
+    precision = _get_precision_for_accelerator(cfg_precision, accelerator)
 
-        trainer_kwargs: Dict[str, Any] = {}
-        if self.limit_train_batches > 0:
-            trainer_kwargs["limit_train_batches"] = self.limit_train_batches
-        if self.limit_val_batches > 0:
-            trainer_kwargs["limit_val_batches"] = self.limit_val_batches
+    trainer = pl.Trainer(
+        max_epochs=max_epochs,
+        accelerator=accelerator,
+        devices=devices,
+        precision=precision,
+        logger=logger,
+        callbacks=callbacks,
+        log_every_n_steps=int(tcfg.get("log_every_n_steps", 200)),
+        enable_checkpointing=True,
+        enable_progress_bar=bool(tcfg.get("enable_progress_bar", False)),
+        gradient_clip_val=float(tcfg.get("grad_clip", 0.0)),
+        accumulate_grad_batches=int(tcfg.get("accumulate_grad_batches", 1)),
+    )
 
-        # Correct behavior for externally launched DDP (torchrun/srun):
-        # each process should use exactly one device.
-        world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
-        externally_launched = world_size > 1
-
-        devices_env = os.getenv("PL_DEVICES", "").strip()
-        if not externally_launched:
-            devices = 1
-            strategy = "auto"
-            if devices_env:
-                try:
-                    req = int(devices_env)
-                    if req != 1:
-                        self.logger.warning(
-                            "PL_DEVICES=%s requested, but non-DDP multi-device is not supported here; forcing devices=1. "
-                            "Use torchrun/mpirun/srun for multi-GPU.",
-                            devices_env,
-                        )
-                except Exception:
-                    pass
-        else:
-            devices = 1
-            strategy = "ddp"
-            # Multi-node hint (optional)
-            try:
-                num_nodes = int(os.getenv("SLURM_NNODES", os.getenv("NUM_NODES", "1")))
-            except Exception:
-                num_nodes = 1
-            if num_nodes > 1:
-                trainer_kwargs["num_nodes"] = num_nodes
-
-        trainer_kwargs.update(
-            accelerator=accelerator,
-            devices=devices,
-            strategy=strategy,
-            precision=precision,
-        )
-
-        base_kwargs: Dict[str, Any] = dict(
-            max_epochs=self.epochs,
-            accumulate_grad_batches=max(1, self.accumulate),
-            gradient_clip_val=float(self.grad_clip),
-            logger=False,  # we own CSV logging
-            callbacks=callbacks,
-            enable_checkpointing=ENABLE_CHECKPOINTING,
-            enable_progress_bar=ENABLE_PROGRESS_BAR,
-            enable_model_summary=ENABLE_MODEL_SUMMARY,
-            detect_anomaly=DETECT_ANOMALY,
-            inference_mode=INFERENCE_MODE,
-            benchmark=self.cudnn_benchmark,
-            log_every_n_steps=LOG_EVERY_N_STEPS,
-            **trainer_kwargs,
-        )
-
-        trainer_params = set(inspect.signature(pl.Trainer).parameters.keys())
-        filtered = {k: v for k, v in base_kwargs.items() if k in trainer_params}
-        if "deterministic" in trainer_params:
-            filtered["deterministic"] = self.deterministic
-
-        pl_trainer = pl.Trainer(**filtered)
-
-        pl_trainer.fit(
-            task,
-            train_dataloaders=self.train_loader,
-            val_dataloaders=self.val_loader,
-            ckpt_path=ckpt_path,
-        )
-
-        best = ckpt_cb.best_model_score
-        return float(best.item()) if best is not None else float("nan")
+    return trainer
