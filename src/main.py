@@ -1,63 +1,59 @@
+# main.py
 #!/usr/bin/env python3
 """
-main.py - Entry point for flow-map training and evaluation.
+main.py - Entry point for training and evaluation.
 
-Usage:
-    python main.py
-
-Configuration is loaded from <repo_root>/config/config.json.
-Set runtime.mode to 'train' or 'eval' in the config.
-
-Directory Structure:
-    <repo_root>/
-        config/config.json          # Configuration file
-        data/processed/             # Preprocessed data shards
-        models/                     # Saved checkpoints
+Responsibilities:
+- load config
+- build datasets/dataloaders
+- construct model
+- run training, validation, or testing
 """
 
 from __future__ import annotations
 
 import gc
 import json
-import os
 import sys
 import warnings
 from pathlib import Path
 from typing import Dict, Optional
 
-# Environment setup (must be before torch import)
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-
 import torch
+torch.set_float32_matmul_precision("high")
+from lightning.pytorch import seed_everything  # type: ignore
 
 from dataset import FlowMapRolloutDataset, create_dataloader
 from model import create_model
 from trainer import FlowMapRolloutModule, build_lightning_trainer
-from utils import atomic_write_json, ensure_dir, load_json_config, seed_everything
+from utils import atomic_write_json, ensure_dir, load_json_config
 
 
 # ==============================================================================
-# Path Resolution
+# Configuration and Paths
 # ==============================================================================
-
-
-def _config_path() -> Path:
-    """Get the fixed config path: <repo_root>/config/config.json."""
-    return (Path(__file__).resolve().parent.parent / "config" / "config.json").resolve()
 
 
 def _repo_root(config_path: Path) -> Path:
-    """Derive repo root from config path."""
-    return config_path.resolve().parent.parent
+    """Infer repo root as parent of config/ directory or config file."""
+    config_path = Path(config_path).resolve()
+    if config_path.name == "config.json" and config_path.parent.name == "config":
+        return config_path.parent.parent
+    return config_path.parent
 
 
-def _resolve_path(base: Path, p: str) -> Path:
-    """Resolve path relative to base if not absolute."""
+def _resolve_path(root: Path, p: str) -> Path:
+    """Resolve path p relative to root if not absolute."""
     pp = Path(p)
-    return pp if pp.is_absolute() else (base / pp).resolve()
+    return pp if pp.is_absolute() else (root / pp).resolve()
+
+
+def _config_path() -> Path:
+    """Default config path: <repo_root>/config/config.json."""
+    # assume this file is <repo_root>/main.py
+    here = Path(__file__).resolve()
+    root = here.parent
+    return root / "config" / "config.json"
 
 
 def resolve_paths(cfg: Dict, config_path: Path) -> Dict:
@@ -155,7 +151,25 @@ def create_dataloaders(cfg: Dict, device: torch.device):
     tcfg = cfg.get("training", {})
     rollout_steps = int(tcfg.get("rollout_steps", 1))
     burn_in_steps = int(tcfg.get("burn_in_steps", 0))
-    total_steps = rollout_steps + burn_in_steps
+    val_burn_in_steps = int(tcfg.get("val_burn_in_steps", burn_in_steps))
+
+    # Determine the required window length. The Lightning module can optionally
+    # override rollout length during the final epochs ("long_rollout"), so the
+    # dataset windows must be long enough to support the maximum horizon used
+    # by train/val/test.
+    long_cfg = dict(tcfg.get("long_rollout", {}) or {})
+    long_enabled = bool(long_cfg.get("enabled", False))
+    long_rollout_steps = int(long_cfg.get("long_rollout_steps", 0) or 0)
+    apply_long_to_val = bool(long_cfg.get("apply_to_validation", True))
+    apply_long_to_test = bool(long_cfg.get("apply_to_test", True))
+
+    candidates = [burn_in_steps + rollout_steps, val_burn_in_steps + rollout_steps]
+    if long_enabled and long_rollout_steps > 0:
+        candidates.append(burn_in_steps + long_rollout_steps)
+        if apply_long_to_val or apply_long_to_test:
+            candidates.append(val_burn_in_steps + long_rollout_steps)
+
+    total_steps = max(candidates)
 
     dcfg = cfg.get("dataset", {})
     windows_per_traj = int(dcfg.get("windows_per_trajectory", 1))
@@ -235,7 +249,14 @@ def create_dataloaders(cfg: Dict, device: torch.device):
     print(f"  Batch size:         {batch_size}")
     print(f"  Train batches:      {len(train_dl):,}")
     print(f"  Val batches:        {len(val_dl):,}")
-    print(f"  Rollout steps:      {rollout_steps}")
+    print(f"  Burn-in steps (train): {burn_in_steps}")
+    print(f"  Burn-in steps (val):   {val_burn_in_steps}")
+    print(f"  Rollout steps (base):  {rollout_steps}")
+    print(f"  Window steps (y_seq):  {total_steps}")
+    if long_enabled and long_rollout_steps > 0:
+        long_ft_epochs = int(long_cfg.get("long_ft_epochs", long_cfg.get("final_epochs", 0)) or 0)
+        print(f"  Long rollout steps:    {long_rollout_steps} (final {long_ft_epochs} epochs)")
+        print(f"  Apply long to val/test: val={apply_long_to_val}, test={apply_long_to_test}")
     print("=" * 60 + "\n")
 
     if len(train_dl) == 0:
@@ -321,7 +342,7 @@ def main() -> int:
         sys_cfg = cfg.get("system", {})
         seed = int(sys_cfg.get("seed", 1234))
         deterministic = bool(sys_cfg.get("deterministic", False))
-        seed_everything(seed, deterministic=deterministic)
+        seed_everything(seed, workers=True)
 
         # Select device
         device = select_device()
@@ -426,38 +447,25 @@ def main() -> int:
             trainer.test(lit_module, ckpt_path=str(ckpt_path), dataloaders=test_dl)
 
         else:
-            print(f"Error: Unknown runtime.mode: {mode}", file=sys.stderr)
+            print(f"Error: Unknown mode '{mode}'", file=sys.stderr)
             return 1
-
-        print("\n" + "=" * 60)
-        print("  Completed successfully!")
-        print("=" * 60)
 
         return 0
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
-        return 130  # Standard exit code for SIGINT
+        return 130
 
     except Exception as e:
-        print(f"\nError: {e}", file=sys.stderr)
-        import traceback
-
-        traceback.print_exc()
+        print(f"Error: {e}", file=sys.stderr)
         return 1
 
     finally:
-        # Clean up trainer resources
-        if trainer is not None:
-            try:
-                if hasattr(trainer, "strategy") and trainer.strategy is not None:
-                    if hasattr(trainer.strategy, "teardown"):
-                        trainer.strategy.teardown()
-            except Exception:
-                pass
-
-        cleanup()
+        try:
+            cleanup()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

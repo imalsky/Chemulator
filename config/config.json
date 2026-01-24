@@ -1,6 +1,9 @@
 {
   "data": {
-    "global_variables": ["P", "T"],
+    "global_variables": [
+      "P",
+      "T"
+    ],
     "species_variables": [
       "H_evolution",
       "H2_evolution",
@@ -27,14 +30,30 @@
     "dropout": 0.0,
     "predict_delta": true,
     "mlp": {
-      "hidden_dims": [512, 512, 512, 512, 512, 512],
+      "hidden_dims": [
+        512,
+        512,
+        512,
+        512,
+        512,
+        512
+      ],
       "residual": true
     },
     "autoencoder": {
       "latent_dim": 256,
-      "encoder_hidden": [512, 512],
-      "dynamics_hidden": [512, 512],
-      "decoder_hidden": [512, 512],
+      "encoder_hidden": [
+        512,
+        512
+      ],
+      "dynamics_hidden": [
+        512,
+        512
+      ],
+      "decoder_hidden": [
+        512,
+        512
+      ],
       "residual": true,
       "dynamics_residual": true
     }
@@ -47,14 +66,18 @@
   },
   "preprocessing": {
     "dt": 100.0,
-    "n_steps": 200,
-    "output_trajectories_per_file": 50000,
+    "n_steps": 500,
+    "output_trajectories_per_file": 1000000,
     "samples_per_source_trajectory": 50,
     "seed": 1234,
     "shard_size": 4096,
     "source_trajectories_per_file": 9999999999999999,
     "test_fraction": 0.1,
-    "time_keys": ["t_time", "time", "t"],
+    "time_keys": [
+      "t_time",
+      "time",
+      "t"
+    ],
     "val_fraction": 0.1
   },
   "runtime": {
@@ -68,60 +91,53 @@
   "training": {
     "accelerator": "auto",
     "devices": 1,
-
-    "batch_size": 256,
-    "max_epochs": 100,
+    "batch_size": 2048,
+    "max_epochs": 200,
     "lr": 0.0001,
     "weight_decay": 0.0001,
     "grad_clip": 0.0,
     "precision": "bf16-mixed",
-
     "rollout_steps": 100,
-    "burn_in_steps": 30,
-
-    "val_burn_in_steps": 30,
+    "burn_in_steps": 25,
+    "val_burn_in_steps": 25,
     "burn_in_noise_std": 0.0,
     "burn_in_loss_weight": 0.0,
-
     "accumulate_grad_batches": 1,
     "num_workers": 0,
     "pin_memory": true,
     "persistent_workers": false,
     "prefetch_factor": 2,
     "num_sanity_val_steps": 0,
-
     "loss": {
       "lambda_phys": 1.0,
       "lambda_z": 0.1,
-      "w_species_clamp": [1.0, 1.0]
+      "w_species_clamp": [
+        1.0,
+        1.0
+      ]
     },
-
     "scheduler": {
       "name": "cosine_warmup",
       "warmup_epochs": 5,
       "min_lr_ratio": 0.01
     },
-
     "teacher_forcing": {
       "start": 1.0,
       "end": 0.0,
       "decay_epochs": 50,
       "mode": "linear"
     },
-
     "curriculum": {
       "enabled": false,
       "start_steps": 1,
       "ramp_epochs": 0
     },
-
     "checkpointing": {
       "save_top_k": 1,
       "monitor": "val_loss",
       "mode": "min",
       "every_n_epochs": 1
     },
-
     "early_stopping": {
       "enabled": false,
       "monitor": "val_loss",
@@ -130,9 +146,15 @@
       "min_delta": 0.0,
       "verbose": true
     },
-
-    "enable_progress_bar": false,
+    "enable_progress_bar": true,
     "enable_model_summary": true,
-    "resume": false
+    "resume": false,
+    "long_rollout": {
+      "enabled": false,
+      "long_rollout_steps": 0,
+      "long_ft_epochs": 0,
+      "apply_to_validation": true,
+      "apply_to_test": true
+    }
   }
 }

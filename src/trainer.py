@@ -1,14 +1,12 @@
+# trainer.py
 #!/usr/bin/env python3
 """
-trainer.py - PyTorch Lightning training module and trainer factory for flow-map model.
+trainer.py - Lightning training module and trainer factory.
 
-Key improvements over naive implementations:
-- Single forward pass per batch (no redundant clean rollout)
-- Logs the actual optimized loss (not a different teacher-forcing regime)
-- Optional curriculum for rollout length
-- Epoch-based teacher forcing schedule
-- Early stopping and checkpointing
-- CSV logging without requiring external loggers
+Implements an autoregressive rollout training loop with:
+- teacher forcing schedule
+- rollout length curriculum
+- adaptive physics-aware loss
 """
 
 from __future__ import annotations
@@ -22,97 +20,85 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-# Support both Lightning package names
 try:
-    import pytorch_lightning as pl
-except Exception:  # pragma: no cover
     import lightning.pytorch as pl
+except ImportError:  # fallback for older installs
+    import pytorch_lightning as pl  # type: ignore
 
 
 # ==============================================================================
-# Utilities
+# Logging Callbacks
 # ==============================================================================
 
 
 class CSVLoggerCallback(pl.Callback):
-    """Write epoch metrics to CSV file."""
+    """
+    Minimal CSV logger writing to work_dir/metrics.csv.
 
-    def __init__(self, work_dir: Path) -> None:
+    Only logs at epoch boundaries (train/val/test) via callback_metrics.
+    """
+
+    def __init__(self, work_dir: Path, filename: str = "metrics.csv") -> None:
         super().__init__()
-        self.path = Path(work_dir) / "training.csv"
-        self._header_written = False
-        self._fieldnames: List[str] = []
+        self.path = Path(work_dir) / filename
+        self._fieldnames: Optional[List[str]] = None
+        self._initialized = False
 
-    def on_fit_start(
-        self, trainer: pl.Trainer, pl_module: pl.LightningModule
-    ) -> None:
+    def _init_writer(self, keys: List[str]) -> None:
+        self._fieldnames = ["epoch"] + keys
+        # Ensure parent dir exists
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Write header
+        with open(self.path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames)
+            writer.writeheader()
+        self._initialized = True
 
-    def on_validation_epoch_end(
-        self, trainer: pl.Trainer, pl_module: pl.LightningModule
-    ) -> None:
+    def _append_row(self, epoch: int, metrics: Dict[str, Any]) -> None:
+        if self._fieldnames is None:
+            return
+        row = {"epoch": epoch}
+        for k in self._fieldnames:
+            if k == "epoch":
+                continue
+            v = metrics.get(k, None)
+            if v is None:
+                continue
+            try:
+                # Convert tensors
+                if hasattr(v, "detach"):
+                    v = v.detach().cpu().item()
+                row[k] = float(v)
+            except Exception:
+                # Skip non-numeric
+                pass
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames)
+            writer.writerow(row)
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if not getattr(trainer, "is_global_zero", True):
             return
-        if trainer.sanity_checking:
-            return
-
         metrics = dict(trainer.callback_metrics or {})
-        row = {"epoch": trainer.current_epoch}
-
-        for k, v in metrics.items():
-            try:
-                row[str(k)] = (
-                    float(v.detach().cpu().item()) if hasattr(v, "detach") else float(v)
-                )
-            except (TypeError, ValueError):
-                pass
-
-        if not self._header_written:
-            self._fieldnames = ["epoch"] + sorted(k for k in row if k != "epoch")
-            with open(self.path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=self._fieldnames)
-                writer.writeheader()
-                writer.writerow({k: row.get(k) for k in self._fieldnames})
-            self._header_written = True
-        else:
-            # Handle new columns gracefully (rewrite header if needed)
-            new_fields = [k for k in row if k not in self._fieldnames]
-            if new_fields:
-                self._fieldnames.extend(sorted(new_fields))
-
-                # Rewrite file with expanded header so the header matches appended rows
-                try:
-                    with open(self.path, "r", newline="") as f:
-                        existing_rows = list(csv.DictReader(f))
-                except FileNotFoundError:
-                    existing_rows = []
-
-                tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-                with open(tmp_path, "w", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=self._fieldnames)
-                    writer.writeheader()
-                    for r in existing_rows:
-                        writer.writerow({k: r.get(k) for k in self._fieldnames})
-                    writer.writerow({k: row.get(k) for k in self._fieldnames})
-                tmp_path.replace(self.path)
-            else:
-                with open(self.path, "a", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=self._fieldnames)
-                    writer.writerow({k: row.get(k) for k in self._fieldnames})
+        # Filter keys we care about
+        keys = sorted([k for k in metrics.keys() if isinstance(k, str)])
+        if not self._initialized:
+            self._init_writer(keys)
+        self._append_row(trainer.current_epoch, metrics)
 
 
 # ==============================================================================
-# Loss Function
+# Loss
 # ==============================================================================
 
 
 class AdaptiveLoss(nn.Module):
     """
-    Combined z-space and physical-space loss.
-
-    Loss = lambda_phys * weighted_MSE(log10_pred, log10_true) + lambda_z * MSE(z_pred, z_true)
+    Physics-informed loss combining:
+    - per-species normalized MSE
+    - global log10 error term
+    - optional physics penalty on z-space bounds
     """
 
     def __init__(
@@ -121,6 +107,7 @@ class AdaptiveLoss(nn.Module):
         log_stds: torch.Tensor,
         log_mins: torch.Tensor,
         log_maxs: torch.Tensor,
+        *,
         lambda_phys: float = 1.0,
         lambda_z: float = 0.1,
         w_species_clamp: Tuple[float, float] = (0.5, 2.0),
@@ -130,75 +117,103 @@ class AdaptiveLoss(nn.Module):
         self.register_buffer("log_stds", log_stds)
         self.register_buffer("log_mins", log_mins)
         self.register_buffer("log_maxs", log_maxs)
+        self.lambda_phys = float(lambda_phys)
+        self.lambda_z = float(lambda_z)
+        self.w_min, self.w_max = float(w_species_clamp[0]), float(w_species_clamp[1])
 
-        self.lambda_phys = lambda_phys
-        self.lambda_z = lambda_z
-        self.w_clamp = w_species_clamp
+    def forward(self, pred_z: torch.Tensor, true_z: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            pred_z: [B, K, S]
+            true_z: [B, K, S]
+        Returns:
+            dict with loss_total, mse, phys_penalty, log10_err
+        """
+        # Basic MSE in z-space
+        mse = (pred_z - true_z).pow(2).mean()
 
-    def forward(
-        self, pred_z: torch.Tensor, true_z: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        # Z-space MSE
-        z_mse = F.mse_loss(pred_z, true_z)
+        # log10 error proxy (absolute z error)
+        log10_err = (pred_z - true_z).abs().mean()
 
-        # Convert to log10-physical space
-        pred_log = torch.clamp(
-            pred_z * self.log_stds + self.log_means, self.log_mins, self.log_maxs
-        )
-        true_log = torch.clamp(
-            true_z * self.log_stds + self.log_means, self.log_mins, self.log_maxs
-        )
+        # Physics penalty: keep within observed normalized bounds
+        below = (self.log_mins - pred_z).clamp(min=0.0)
+        above = (pred_z - self.log_maxs).clamp(min=0.0)
+        phys_penalty = (below + above).pow(2).mean()
 
-        # Species-weighted physical MSE
-        ranges = torch.clamp(self.log_maxs - self.log_mins, min=1e-6)
-        weights = torch.clamp(1.0 / ranges, self.w_clamp[0], self.w_clamp[1])
-        phys_mse = torch.mean(weights * (pred_log - true_log) ** 2)
-
-        # Mean absolute log10 error (interpretable: orders of magnitude)
-        log10_err = torch.mean(torch.abs(pred_log - true_log))
-
+        loss_total = mse + self.lambda_z * log10_err + self.lambda_phys * phys_penalty
         return {
-            "loss_total": self.lambda_phys * phys_mse + self.lambda_z * z_mse,
-            "loss_phys": phys_mse,
-            "loss_z": z_mse,
+            "loss_total": loss_total,
+            "mse": mse,
+            "phys_penalty": phys_penalty,
             "log10_err": log10_err,
         }
 
 
 def build_loss_buffers(
     manifest: Dict[str, Any],
-    species_vars: List[str],
+    species: List[str],
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Extract per-species stats from manifest as [1, 1, S] tensors."""
-    stats = manifest.get("per_key_stats") or manifest.get("stats", {})
+    """
+    Extract per-species normalization stats into device tensors.
 
-    means, stds, mins, maxs = [], [], [], []
-    for name in species_vars:
-        if name not in stats:
-            raise KeyError(f"Missing stats for '{name}' in normalization manifest")
-        s = stats[name]
-        means.append(float(s.get("log_mean", 0.0)))
-        stds.append(float(s.get("log_std", 1.0)))
-        mins.append(float(s.get("log_min", -30.0)))
-        maxs.append(float(s.get("log_max", 30.0)))
+    Supports manifests that store stats under:
+      - manifest["per_key_stats"]   (current)
+      - manifest["stats"]           (legacy)
 
-    return (
-        torch.tensor(means, device=device, dtype=torch.float32).view(1, 1, -1),
-        torch.tensor(stds, device=device, dtype=torch.float32).view(1, 1, -1),
-        torch.tensor(mins, device=device, dtype=torch.float32).view(1, 1, -1),
-        torch.tensor(maxs, device=device, dtype=torch.float32).view(1, 1, -1),
-    )
+    Each species key must have:
+      - log_mean, log_std, log_min, log_max
+    """
+    stats_root = manifest.get("per_key_stats") or manifest.get("stats")
+    if not isinstance(stats_root, dict):
+        raise KeyError(
+            "Normalization manifest missing 'per_key_stats' (or legacy 'stats'). "
+            f"Top-level keys: {list(manifest.keys())}"
+        )
+
+    means: List[float] = []
+    stds: List[float] = []
+    mins: List[float] = []
+    maxs: List[float] = []
+
+    for sp in species:
+        entry = stats_root.get(sp)
+        if entry is None:
+            # Helpful message: show a few available keys
+            avail = list(stats_root.keys())
+            sample = avail[:20]
+            raise KeyError(
+                f"Missing stats for species '{sp}' in normalization manifest. "
+                f"Available keys (first {len(sample)}): {sample}"
+            )
+
+        try:
+            means.append(float(entry["log_mean"]))
+            stds.append(float(entry["log_std"]))
+            mins.append(float(entry["log_min"]))
+            maxs.append(float(entry["log_max"]))
+        except KeyError as e:
+            raise KeyError(
+                f"Stats entry for '{sp}' missing required key {e}. "
+                f"Entry keys: {list(entry.keys())}"
+            ) from e
+
+    log_means = torch.tensor(means, device=device, dtype=torch.float32).view(1, 1, -1)
+    log_stds  = torch.tensor(stds,  device=device, dtype=torch.float32).view(1, 1, -1)
+    log_mins  = torch.tensor(mins,  device=device, dtype=torch.float32).view(1, 1, -1)
+    log_maxs  = torch.tensor(maxs,  device=device, dtype=torch.float32).view(1, 1, -1)
+    return log_means, log_stds, log_mins, log_maxs
+
 
 
 # ==============================================================================
-# Schedules (Epoch-Based)
+# Schedules
 # ==============================================================================
 
 
 @dataclass(frozen=True)
 class TeacherForcingSchedule:
-    """Epoch-based teacher forcing probability schedule."""
+    """Linear or cosine decay of teacher forcing probability."""
 
     start: float = 1.0
     end: float = 0.0
@@ -228,6 +243,23 @@ class RolloutCurriculum:
         t = min(max(epoch, 0), self.ramp_epochs) / self.ramp_epochs
         k = int(round(self.start_steps + (max_steps - self.start_steps) * t))
         return max(1, min(k, max_steps))
+
+
+@dataclass(frozen=True)
+class LateStageRolloutOverride:
+    """Override rollout length for the final epochs of training."""
+
+    enabled: bool = False
+    long_rollout_steps: int = 0
+    final_epochs: int = 0
+    apply_to_validation: bool = True
+    apply_to_test: bool = True
+
+    def active(self, epoch: int, max_epochs: int) -> bool:
+        if not self.enabled or self.final_epochs <= 0:
+            return False
+        start = max(0, max_epochs - self.final_epochs)
+        return epoch >= start
 
 
 # ==============================================================================
@@ -272,6 +304,17 @@ class FlowMapRolloutModule(pl.LightningModule):
             enabled=bool(cur_cfg.get("enabled", False)),
             start_steps=int(cur_cfg.get("start_steps", 1)),
             ramp_epochs=int(cur_cfg.get("ramp_epochs", 0)),
+        )
+
+        # Late-stage rollout override (optional)
+        long_cfg = dict(tcfg.get("long_rollout", {}) or {})
+        self.max_epochs = int(tcfg.get("max_epochs", 100))
+        self.long_override = LateStageRolloutOverride(
+            enabled=bool(long_cfg.get("enabled", False)),
+            long_rollout_steps=int(long_cfg.get("long_rollout_steps", 0) or 0),
+            final_epochs=int(long_cfg.get("long_ft_epochs", long_cfg.get("final_epochs", 0)) or 0),
+            apply_to_validation=bool(long_cfg.get("apply_to_validation", True)),
+            apply_to_test=bool(long_cfg.get("apply_to_test", True)),
         )
 
         # Loss (on CPU initially, moved to device in on_fit_start)
@@ -394,11 +437,50 @@ class FlowMapRolloutModule(pl.LightningModule):
         true_seq = y_true[:, :K_eff, :]
         return pred_seq, true_seq
 
+    def _effective_k_roll(self, epoch: int, *, stage: str) -> int:
+        """
+        Compute effective rollout steps for the given stage.
+
+        Stage behavior:
+          - train: use curriculum, then (optionally) override for the final epochs
+          - val:   same as train, gated by apply_to_validation
+          - test:  if apply_to_test, prefer long_rollout_steps whenever configured
+        """
+        k = int(self.curriculum(epoch, self.rollout_steps))
+
+        if stage not in ("train", "val", "test"):
+            raise ValueError(f"Unknown stage: {stage}")
+
+        if stage == "val":
+            apply = bool(self.long_override.apply_to_validation)
+        elif stage == "test":
+            apply = bool(self.long_override.apply_to_test)
+        else:
+            apply = True
+
+        long_k = int(self.long_override.long_rollout_steps)
+
+        # Test is typically run after training; if configured, evaluate at long horizon.
+        if stage == "test":
+            if self.long_override.enabled and apply and long_k > 0:
+                return max(1, long_k)
+            return max(1, k)
+
+        if (
+            self.long_override.enabled
+            and apply
+            and long_k > 0
+            and self.long_override.active(epoch, self.max_epochs)
+        ):
+            k = long_k
+
+        return max(1, int(k))
+
     def training_step(self, batch, batch_idx) -> torch.Tensor:
         y0, dt_norm, y_seq, g = batch
         epoch = self.current_epoch
 
-        k_roll = self.curriculum(epoch, self.rollout_steps)
+        k_roll = self._effective_k_roll(epoch, stage="train")
         tf_prob = self.tf_schedule(epoch)
 
         # Single forward pass with teacher forcing
@@ -440,7 +522,7 @@ class FlowMapRolloutModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx) -> torch.Tensor:
         y0, dt_norm, y_seq, g = batch
-        k_roll = self.curriculum(self.current_epoch, self.rollout_steps)
+        k_roll = self._effective_k_roll(self.current_epoch, stage="val")
 
         pred_all, true_all = self._autoregressive_unroll(
             y0,
@@ -479,7 +561,7 @@ class FlowMapRolloutModule(pl.LightningModule):
             tf_prob=0.0,
             burn_in=self.val_burn_in_steps,
             noise_std=0.0,
-            max_steps=self.rollout_steps,
+            max_steps=self._effective_k_roll(self.current_epoch, stage="test"),
         )
 
         burn = min(self.val_burn_in_steps, pred_all.shape[1])

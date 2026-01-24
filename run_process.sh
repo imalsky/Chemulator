@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J preprocess
-#SBATCH -o preprocess.o%j
-#SBATCH -e preprocess.e%j
+#SBATCH -o job_proc.o%j
+#SBATCH -e job_proc.e%j
 #SBATCH -p compute
 #SBATCH -N 1
 #SBATCH -n 1
@@ -34,3 +34,4 @@ echo "Python: $(which python)"
 python -u processing/preprocessing.py
 
 echo "Preprocessing complete."
+
