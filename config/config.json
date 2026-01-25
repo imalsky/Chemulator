@@ -151,7 +151,7 @@
     "resume": false,
     "long_rollout": {
       "enabled": false,
-      "long_rollout_steps": 0,
+      "long_rollout_steps": 500,
       "long_ft_epochs": 0,
       "apply_to_validation": true,
       "apply_to_test": true
