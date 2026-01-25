@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-predictions.py - Autoregressive constant-timestep evaluation on test data.
+predictions.py - Autoregressive 1-step evaluation on test data (constant dt).
 
-This script is intentionally specialized for the "constant dt" setting:
-    - The test shard provides a single shared t_vec with uniform spacing.
-    - dt is inferred from t_vec and normalized using normalization.json.
-    - Predictions are produced autoregressively:
-          y[t+1] = model(y[t], dt_norm, g)
-    - Ground truth vs predictions are compared at matching discrete time indices.
-
-Ground truth = thick solid lines (medium alpha).
-Predictions  = dotted lines with dot markers (high alpha).
+Assumptions for the NEW codebase:
+  - Test shards are produced by preprocessing.py and contain:
+      y_mat        : [N, T, S]  (z-space; species are log-standardized)
+      globals      : [N, G]     (already normalized)
+      dt_norm_mat  : [N, T-1]   (dt normalized to [0,1] via log10 + min-max)
+  - normalization.json (in processed_data_dir) contains:
+      per_key_stats[species]["log_mean"], ["log_std"]
+      dt["log_min"], dt["log_max"]
+  - Exported model is a 1-step autoregressive wrapper (K=1) saved as .pt2, and
+    accepts inputs: (y: [B,S], dt: [B], g: [B,G]).
 """
 
 import sys
@@ -25,140 +26,132 @@ from matplotlib.lines import Line2D
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from utils import load_json_config
-from normalizer import NormalizationHelper
 
 # ============================================================================
-# Settings - EDIT THESE
+# SETTINGS (edit these)
 # ============================================================================
 
-MODEL_DIR = ROOT / "models" / "rollout_run"
+RUN_DIR = (ROOT / "models" / "run").resolve()                 # where export_*.pt2 lives
+PROCESSED_DIR = (ROOT / "data" / "processed").resolve()       # where shards + normalization.json live
+EXPORT_NAME = "export_cpu_1step.pt2"                          # exported 1-step model (CPU)
 
-SAMPLE_IDX = 1            # Trajectory index within the first test shard
-START_INDEX = 0           # Time index in the trajectory to start autoregression from
-N_STEPS = 5000              # Number of autoregressive steps to evaluate
+SAMPLE_IDX = 1
+START_INDEX = 0
+N_STEPS = 10
 
-PLOT_SPECIES: List[str] = []  # Empty = all species (labels without "_evolution")
+PLOT_SPECIES: List[str] = []  # labels without "_evolution"; [] => all
 YMIN, YMAX = 1e-28, 3
 
-# Styling
 TRUE_LW = 3.0
 TRUE_ALPHA = 0.45
-
 PRED_LW = 2.0
 PRED_ALPHA = 1.0
-PRED_LS = ":"                 # dotted
+PRED_LS = ":"
 PRED_MARKER = "o"
 PRED_MS = 3
 
 
 # ============================================================================
-# Data Loading (Constant dt)
+# Helpers
 # ============================================================================
 
-def load_test_trajectory(
-    processed_dir: Path,
-    idx: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Load one test trajectory from the first test shard (already in z-space).
+def load_json(path: Path) -> dict:
+    import json
+    return json.loads(path.read_text(encoding="utf-8"))
 
+
+def load_test_trajectory(processed_dir: Path, idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    """
     Returns:
-        y_z: [T, S] float32
-        g_z: [G] float32
-        t_vec: [T] float64
+      y_z:        [T, S] float32 (z-space)
+      g_z:        [G] float32    (normalized globals)
+      dt_norm:    [T-1] float32  (normalized dt per step)
+      species:    list[str]      (from normalization.json manifest)
     """
     shards = sorted((processed_dir / "test").glob("shard_*.npz"))
     if not shards:
         raise FileNotFoundError(f"No test shards in {processed_dir / 'test'}")
 
     with np.load(shards[0]) as f:
-        y_all = np.asarray(f["y_mat"], dtype=np.float32)
-        g_all = np.asarray(f["globals"], dtype=np.float32)
-        t_vec = np.asarray(f["t_vec"], dtype=np.float64)
+        y_all = np.asarray(f["y_mat"], dtype=np.float32)            # [N,T,S]
+        g_all = np.asarray(f["globals"], dtype=np.float32)          # [N,G]
+        dt_all = np.asarray(f["dt_norm_mat"], dtype=np.float32)     # [N,T-1]
 
-    if y_all.ndim != 3 or g_all.ndim != 2 or t_vec.ndim != 1:
-        raise ValueError("Expected y_mat[N,T,S], globals[N,G], t_vec[T]")
+    if y_all.ndim != 3 or g_all.ndim != 2 or dt_all.ndim != 2:
+        raise ValueError("Expected y_mat[N,T,S], globals[N,G], dt_norm_mat[N,T-1]")
 
     if idx < 0 or idx >= y_all.shape[0]:
-        raise IndexError(f"SAMPLE_IDX={idx} out of range for shard with N={y_all.shape[0]} trajectories")
+        raise IndexError(f"SAMPLE_IDX={idx} out of range for shard with N={y_all.shape[0]}")
 
-    return y_all[idx], g_all[idx], t_vec
+    manifest = load_json(processed_dir / "normalization.json")
+    species = list(manifest.get("species_variables", []))
+    if not species:
+        raise KeyError("normalization.json missing species_variables")
 
-
-def infer_constant_dt_seconds(t_vec: np.ndarray) -> float:
-    """Infer constant dt from t_vec and validate uniform spacing."""
-    if t_vec.size < 2:
-        raise ValueError("t_vec must have at least 2 points")
-    diffs = np.diff(t_vec)
-    dt = float(diffs[0])
-    atol = 1e-12 * max(1.0, abs(dt))
-    if not np.allclose(diffs, dt, rtol=1e-6, atol=atol):
-        raise ValueError("t_vec is not uniformly spaced; this script assumes constant dt")
-    return dt
+    return y_all[idx], g_all[idx], dt_all[idx], species
 
 
-# ============================================================================
-# Normalization Helpers
-# ============================================================================
+def dt_norm_to_seconds(dt_norm_scalar: float, manifest: dict) -> float:
+    """
+    Invert preprocessing dt normalization:
+      dt_norm = (log10(dt) - log_min) / (log_max - log_min)
+    """
+    log_min = float(manifest["dt"]["log_min"])
+    log_max = float(manifest["dt"]["log_max"])
+    rng = max(log_max - log_min, 1e-12)
+    logdt = float(dt_norm_scalar) * rng + log_min
+    return float(10.0 ** logdt)
 
-def denormalize_matrix(z: torch.Tensor, keys: List[str], norm: NormalizationHelper) -> torch.Tensor:
-    """Denormalize last dimension of z using corresponding keys."""
-    out = torch.empty_like(z)
-    for i, key in enumerate(keys):
-        out[..., i] = norm.denormalize(z[..., i], key)
-    return out
+
+def denormalize_species_z(y_z: np.ndarray, species: List[str], manifest: dict) -> np.ndarray:
+    """
+    Species are normalized as:
+      z = (log10(max(y, eps)) - log_mean) / log_std
+    Invert:
+      y = 10 ** (z * log_std + log_mean)
+    """
+    stats = manifest["per_key_stats"]
+    S = len(species)
+    mu = np.array([stats[s]["log_mean"] for s in species], dtype=np.float64).reshape(1, S)
+    sd = np.array([stats[s]["log_std"] for s in species], dtype=np.float64).reshape(1, S)
+    z = y_z.astype(np.float64, copy=False)
+    return 10.0 ** (z * sd + mu)
 
 
-# ============================================================================
-# Autoregressive Inference (Constant dt)
-# ============================================================================
+def model_step_out_to_state(out: torch.Tensor) -> torch.Tensor:
+    """Support either [B,S] or [B,1,S] outputs; return [B,S]."""
+    if out.ndim == 3:
+        return out[:, 0, :]
+    if out.ndim == 2:
+        return out
+    raise ValueError(f"Unexpected model output shape: {tuple(out.shape)}")
+
 
 @torch.inference_mode()
-def run_autoregressive_constant_dt(
-    model,
-    y0_z: np.ndarray,
-    g_z: np.ndarray,
-    dt_norm: torch.Tensor,
-    n_steps: int,
-) -> np.ndarray:
+def run_autoregressive_constant_dt(model, y0_z: np.ndarray, g_z: np.ndarray, dt_norm_scalar: float, n_steps: int) -> np.ndarray:
     """
-    Run constant-dt autoregressive steps in z-space.
+    Autoregressive rollout in z-space using a constant dt_norm scalar.
 
-    Important: export_cpu.pt2 expects dt input shape [B, 1] (not [B,1,1]).
+    Exported 1-step wrapper expects:
+      y:  [B,S]
+      dt: [B]
+      g:  [B,G]
     """
-    if dt_norm.ndim != 0:
-        dt_norm = dt_norm.view(())
+    state = torch.from_numpy(y0_z).float().unsqueeze(0)   # [1,S]
+    g = torch.from_numpy(g_z).float().unsqueeze(0)        # [1,G]
+    dt = torch.tensor([float(dt_norm_scalar)], dtype=torch.float32)  # [1]
 
-    state = torch.from_numpy(y0_z).float().unsqueeze(0)     # [B=1, S]
-    g_batch = torch.from_numpy(g_z).float().unsqueeze(0)    # [B=1, G]
-
-    B = state.shape[0]
-    dt_batch = dt_norm.to(dtype=torch.float32).view(1, 1).expand(B, 1)  # [B, 1]
-
-    preds: List[torch.Tensor] = []
+    preds = []
     for _ in range(int(n_steps)):
-        next_state = model(state, dt_batch, g_batch)[:, 0, :]  # [B, S]
-        preds.append(next_state)
-        state = next_state
+        out = model(state, dt, g)
+        state = model_step_out_to_state(out)
+        preds.append(state)
 
-    y_pred_z = torch.cat(preds, dim=0)  # [n_steps, S] since B=1
-    return y_pred_z.cpu().numpy()
+    y_pred = torch.cat(preds, dim=0)  # [n_steps, S]
+    return y_pred.cpu().numpy()
 
 
-# ============================================================================
-# Plotting
-# ============================================================================
-
-def plot_results(
-    t: np.ndarray,
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    species: List[str],
-    plot_species: List[str],
-    out_path: Path,
-) -> None:
-    """Plot ground truth vs autoregressive predictions (constant dt)."""
+def plot_results(t: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, species: List[str], plot_species: List[str], out_path: Path) -> None:
     labels = [s.replace("_evolution", "") for s in species]
 
     if plot_species:
@@ -169,15 +162,9 @@ def plot_results(
         y_true = y_true[:, keep]
         y_pred = y_pred[:, keep]
 
-    # Use AR extent for x-limits (exactly the evaluated horizon)
-    x_min = float(t[0])
-    x_max = float(t[-1])
-
-    # Clip for numerical stability on log scale
     y_true = np.clip(y_true, 1e-35, None)
     y_pred = np.clip(y_pred, 1e-35, None)
 
-    # Order by max ground truth abundance
     order = np.argsort(y_true.max(axis=0))[::-1]
     colors = plt.cm.plasma(np.linspace(0.15, 0.95, len(order))[::-1])
 
@@ -185,35 +172,21 @@ def plot_results(
 
     for rank, idx in enumerate(order):
         c = colors[rank]
-        # Ground truth: thick solid line, medium alpha
+        ax.loglog(t, y_true[:, idx], linestyle="-", linewidth=TRUE_LW, alpha=TRUE_ALPHA, color=c)
         ax.loglog(
-            t,
-            y_true[:, idx],
-            linestyle="-",
-            linewidth=TRUE_LW,
-            alpha=TRUE_ALPHA,
-            color=c,
-        )
-        # Prediction: dotted + dots, high alpha
-        ax.loglog(
-            t,
-            y_pred[:, idx],
-            linestyle=PRED_LS,
-            linewidth=PRED_LW,
-            marker=PRED_MARKER,
-            markersize=PRED_MS,
-            alpha=PRED_ALPHA,
-            color=c,
+            t, y_pred[:, idx],
+            linestyle=PRED_LS, linewidth=PRED_LW,
+            marker=PRED_MARKER, markersize=PRED_MS,
+            alpha=PRED_ALPHA, color=c
         )
 
-    ax.set_xlim(x_min, x_max)
+    ax.set_xlim(float(t[0]), float(t[-1]))
     ax.set_ylim(YMIN, YMAX)
-    ax.set_xlabel("Time (s)")
+    ax.set_xlabel("Time (s) (relative)")
     ax.set_ylabel("Relative Abundance")
     ax.set_title(f"Autoregressive (constant dt): {len(t)} steps")
     ax.set_box_aspect(1)
 
-    # Legends
     species_handles = [Line2D([0], [0], color=colors[r], lw=2) for r in range(len(order))]
     leg1 = ax.legend(
         species_handles,
@@ -234,7 +207,7 @@ def plot_results(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {out_path}")
+    print(f"Saved: {out_path}")
 
 
 # ============================================================================
@@ -243,40 +216,27 @@ def plot_results(
 
 def main() -> None:
     print("=" * 60)
-    print("  AUTOREGRESSIVE CONSTANT-DT EVALUATION")
+    print("AUTOREGRESSIVE CONSTANT-DT EVALUATION (1-step export)")
     print("=" * 60)
 
-    cfg = load_json_config(MODEL_DIR / "config.json")
+    processed_dir = PROCESSED_DIR
+    run_dir = RUN_DIR
 
-    data_dir = Path(cfg["paths"]["processed_data_dir"])
-    if not data_dir.is_absolute():
-        data_dir = ROOT / data_dir
+    manifest_path = processed_dir / "normalization.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing normalization.json: {manifest_path}")
+    manifest = load_json(manifest_path)
 
-    data_cfg = cfg.get("data", {})
-    species = list(data_cfg.get("species_variables", []))
-    if not species:
-        raise KeyError("data.species_variables must be present in config.json")
-
-    manifest = load_json_config(data_dir / "normalization.json")
-    norm = NormalizationHelper(manifest)
-
-    export_path = MODEL_DIR / "export_cpu.pt2"
+    export_path = run_dir / EXPORT_NAME
     if not export_path.exists():
-        raise FileNotFoundError(f"Missing exported model: {export_path}. Run export.py first.")
+        raise FileNotFoundError(f"Missing exported model: {export_path} (run export.py first)")
 
     model = torch.export.load(export_path).module()
-    print(f"  Model: {export_path.name}")
+    print(f"Model: {export_path.name}")
 
-    y_traj_z, g_z, t_vec = load_test_trajectory(data_dir, SAMPLE_IDX)
-    T = int(t_vec.shape[0])
-
-    dt_seconds = infer_constant_dt_seconds(t_vec)
-    dt_norm = norm.normalize_dt_from_phys(float(dt_seconds)).to(dtype=torch.float32).view(())
-
-    print(f"  Test shard: {data_dir / 'test'} (first shard)")
-    print(f"  Trajectory index: {SAMPLE_IDX}")
-    print(f"  Trajectory length: T={T}")
-    print(f"  Inferred dt: {dt_seconds:.6g} seconds")
+    y_traj_z, g_z, dt_norm_vec, species = load_test_trajectory(processed_dir, SAMPLE_IDX)
+    T, S = y_traj_z.shape
+    print(f"Test: {processed_dir / 'test'} (first shard) | sample={SAMPLE_IDX} | T={T} | S={S}")
 
     if START_INDEX < 0 or START_INDEX >= T - 1:
         raise ValueError(f"START_INDEX={START_INDEX} must satisfy 0 <= START_INDEX <= T-2 (T={T})")
@@ -286,36 +246,41 @@ def main() -> None:
     if n_steps <= 0:
         raise ValueError("N_STEPS must be >= 1 within the available trajectory length")
 
-    print(f"  Start index: {START_INDEX}")
-    print(f"  Evaluating steps: {n_steps} (requested {N_STEPS}, available {max_steps})")
-    print(f"  Total horizon: {n_steps * dt_seconds:.3e} seconds")
+    # Constant-dt check over the evaluated horizon
+    dt_slice = dt_norm_vec[START_INDEX: START_INDEX + n_steps]
+    dt0 = float(dt_slice[0])
+    if not np.allclose(dt_slice, dt0, rtol=1e-5, atol=1e-6):
+        raise ValueError("dt_norm_mat is not constant over the selected horizon; this script assumes constant dt.")
+
+    dt_seconds = dt_norm_to_seconds(dt0, manifest)
+    print(f"START_INDEX={START_INDEX} | steps={n_steps} | dt≈{dt_seconds:.6g}s | horizon≈{n_steps * dt_seconds:.3e}s")
 
     y0_z = y_traj_z[START_INDEX]
     y_true_z = y_traj_z[START_INDEX + 1: START_INDEX + 1 + n_steps]
-    t_eval = t_vec[START_INDEX + 1: START_INDEX + 1 + n_steps]
+    y_pred_z = run_autoregressive_constant_dt(model, y0_z, g_z, dt0, n_steps)
 
-    y_pred_z = run_autoregressive_constant_dt(model, y0_z, g_z, dt_norm, n_steps)
+    y_true = denormalize_species_z(y_true_z, species, manifest)
+    y_pred = denormalize_species_z(y_pred_z, species, manifest)
 
-    y_true = denormalize_matrix(torch.from_numpy(y_true_z), species, norm).numpy()
-    y_pred = denormalize_matrix(torch.from_numpy(y_pred_z), species, norm).numpy()
+    t_eval = dt_seconds * np.arange(1, n_steps + 1, dtype=np.float64)
 
-    out_path = MODEL_DIR / "plots" / f"autoregressive_constdt_{SAMPLE_IDX}_t{START_INDEX}.png"
+    out_path = run_dir / "plots" / f"autoregressive_constdt_{SAMPLE_IDX}_t{START_INDEX}.png"
     plot_results(t_eval, y_true, y_pred, species, PLOT_SPECIES, out_path)
 
     rel_err = np.abs(y_pred - y_true) / (np.abs(y_true) + 1e-12)
     mae = np.mean(np.abs(y_pred - y_true))
-    print("\n  Error summary (physical space):")
-    print(f"    rel_err mean = {rel_err.mean():.3e}")
-    print(f"    rel_err max  = {rel_err.max():.3e}")
-    print(f"    MAE          = {mae:.3e}")
+    print("\nError summary (physical space):")
+    print(f"  rel_err mean = {rel_err.mean():.3e}")
+    print(f"  rel_err max  = {rel_err.max():.3e}")
+    print(f"  MAE          = {mae:.3e}")
 
     y_true_clip = np.clip(y_true, 1e-35, None)
     y_pred_clip = np.clip(y_pred, 1e-35, None)
     log10_err = np.mean(np.abs(np.log10(y_pred_clip) - np.log10(y_true_clip)))
-    print("\n  Error summary (log10 space):")
-    print(f"    mean |Δlog10| = {log10_err:.3f} (orders of magnitude)")
+    print("\nError summary (log10 space):")
+    print(f"  mean |Δlog10| = {log10_err:.3f} (orders of magnitude)")
 
-    print("\n" + "=" * 60)
+    print("=" * 60)
 
 
 if __name__ == "__main__":

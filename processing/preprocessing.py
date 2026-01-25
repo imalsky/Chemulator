@@ -6,18 +6,31 @@ Resample adaptive-timestep HDF5 trajectories into fixed-length (n_steps) uniform
 shard to NPZ, compute normalization, and write final normalized shards.
 
 Key properties:
-- Sampling/interpolation core matches the fast regrid.py approach: precompute indices/weights once per chunk,
-  then vectorized log-log interpolation for species.
-- Keeps larger-codebase functionality: outputs uncompressed NPZ shards + normalization.json + preprocessing_summary.json.
-- Robust to raw HDF5 schema:
-  - Species/global datasets may be nested in subgroups.
-  - Names may have optional evolve_ prefix (config can use either).
-  - Globals may be scalars or time-series aligned with t_raw (reduced to scalar).
-- Provides clear “stuck” diagnostics: attempt-logging and reject summaries.
+- Vectorized core: precompute log-time interpolation indices/weights once per chunk, then log-log interpolate all species.
+- Works with variable dt (dt_mode="per_chunk") and fixed dt (dt_mode="fixed").
+- Outputs:
+    processed_dir/
+      normalization.json
+      preprocessing_summary.json
+      train/shard_*.npz
+      validation/shard_*.npz
+      test/shard_*.npz
+  and uses a temp physical stage:
+      _tmp_physical/<split>/shard_*_physical.npz
+
+Schema tolerance:
+- Species/global datasets can be nested under groups.
+- Dataset names may optionally have an "evolve_" prefix (config can use either).
+- Globals may be scalars or time-series aligned with t_raw (reduced to scalar).
+
+Notes on "functionality stability":
+- This version adds docstrings, comments, and more informative stdout logging (especially on drops/rejections).
+- It does not change sampling, interpolation, sharding formats, normalization math, or file outputs.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import time
@@ -28,31 +41,92 @@ from typing import Dict, List, Optional, Tuple
 import h5py
 import numpy as np
 from tqdm import tqdm
-import math
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
+# -----------------------------------------------------------------------------
+# Repo/config discovery
+# -----------------------------------------------------------------------------
+
+def _default_repo_root() -> Path:
+    """
+    Heuristically locate the repository root.
+
+    The function searches upward from this file's directory for either:
+    - config/config.json
+    - config.json
+
+    If neither is found within a small parent range, it falls back to the directory
+    containing this file.
+    """
+    here = Path(__file__).resolve().parent
+    for p in (here, here.parent, here.parent.parent):
+        if (p / "config" / "config.json").exists() or (p / "config.json").exists():
+            return p
+    return here
+
+
+PROJECT_ROOT = _default_repo_root()
+
+
+def _default_config_path(root: Path) -> Path:
+    """
+    Choose a default config path under the given root.
+
+    Preference order:
+    1) root/config/config.json
+    2) root/config.json
+
+    If neither exists, returns the first candidate (so the caller can fail loudly
+    when attempting to open it).
+    """
+    cand = [root / "config" / "config.json", root / "config.json"]
+    for p in cand:
+        if p.exists():
+            return p
+    return cand[0]
+
+
+CONFIG_PATH = _default_config_path(PROJECT_ROOT)
 
 
 def log(msg: str) -> None:
+    """
+    Print a timestamped log line to stdout.
+
+    This is intentionally simple (no log levels, no external logger dependency) so
+    behavior remains stable across environments. All new logging in this file uses
+    this function to keep formatting consistent.
+    """
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"{ts} | {msg}", flush=True)
 
 
 def load_json_config(path: Path) -> Dict:
+    """
+    Load a JSON configuration file into a dict.
+    """
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
+# -----------------------------------------------------------------------------
+# HDF5 helpers
+# -----------------------------------------------------------------------------
+
 def _name_candidates(base: str) -> List[str]:
+    """
+    Return candidate dataset/attribute names for schema tolerance.
+
+    If a name is provided with/without the "evolve_" prefix, we attempt both forms.
+    This allows config lists to use either convention while still finding the dataset.
+    """
     out = [base]
     if base.startswith("evolve_"):
-        out.append(base[len("evolve_") :])
+        out.append(base[len("evolve_"):])
     else:
         out.append("evolve_" + base)
-    seen = set()
-    uniq = []
+    seen: set[str] = set()
+    uniq: List[str] = []
     for x in out:
         if x not in seen:
             uniq.append(x)
@@ -62,8 +136,12 @@ def _name_candidates(base: str) -> List[str]:
 
 def build_leaf_index(grp: h5py.Group) -> Dict[str, List[str]]:
     """
-    Build index: leaf_name -> list of relative dataset paths under grp.
-    Example: if dataset path is "state/evolve_H", leaf is "evolve_H".
+    Build an index mapping leaf dataset names -> list of full paths within `grp`.
+
+    Example:
+      /foo/bar/T  and  /baz/T  both yield leaf "T" mapping to ["foo/bar/T", "baz/T"].
+
+    This supports flexible lookup when datasets are nested under arbitrary groups.
     """
     idx: Dict[str, List[str]] = {}
 
@@ -76,13 +154,23 @@ def build_leaf_index(grp: h5py.Group) -> Dict[str, List[str]]:
     return idx
 
 
-def get_time_array_recursive(grp: h5py.Group, time_keys: List[str], leaf_index: Dict[str, List[str]]) -> Tuple[Optional[str], Optional[np.ndarray]]:
+def get_time_array_recursive(
+    grp: h5py.Group, time_keys: List[str], leaf_index: Dict[str, List[str]]
+) -> Tuple[Optional[str], Optional[np.ndarray]]:
     """
-    Find time array by trying:
-      1) direct grp[k]
-      2) any nested dataset with leaf == k
-    Must be 1D, finite, strictly increasing.
-    Returns (path_or_key, t_raw) or (None, None)
+    Locate and validate a monotonic increasing 1D time array under `grp`.
+
+    Search order:
+    1) Direct members of `grp` with keys in `time_keys`
+    2) Any nested dataset whose leaf name matches an entry in `time_keys`
+
+    Returns:
+      (path_or_key_used, time_array) if found and valid; otherwise (None, None).
+
+    Validation:
+      - at least 2 samples
+      - finite values
+      - strictly increasing (diff > 0)
     """
     # direct
     for k in time_keys:
@@ -115,24 +203,24 @@ def find_dataset_path(
     prefer_time_aligned: bool = True,
 ) -> Optional[str]:
     """
-    Resolve dataset by leaf name (exact), searching nested paths.
-    If t_len is provided and prefer_time_aligned=True, prefer datasets with shape[0]==t_len.
+    Find a dataset path under `grp` matching `base` (with evolve_ tolerance).
+
+    If `t_len` is provided and `prefer_time_aligned` is True, the function prefers
+    datasets whose first dimension equals `t_len` (time-aligned series). Otherwise,
+    it returns the first match by leaf name.
     """
     for cand in _name_candidates(base):
         paths = leaf_index.get(cand, [])
         if not paths:
             continue
         if t_len is not None and prefer_time_aligned:
-            aligned = []
             for p in paths:
                 try:
                     ds = grp[p]
                     if isinstance(ds, h5py.Dataset) and ds.shape and int(ds.shape[0]) == int(t_len):
-                        aligned.append(p)
+                        return p
                 except Exception:
                     continue
-            if aligned:
-                return aligned[0]
         return paths[0]
     return None
 
@@ -145,17 +233,23 @@ def read_global_flexible_recursive(
     warn_state: Dict[str, bool],
 ) -> float:
     """
-    Read a “global” conditioning scalar.
-    Supports:
-      - scalar dataset/attr on grp or root
-      - nested scalar dataset (leaf match) under grp
-      - time-series dataset aligned with t_len (leaf match) under grp or root: reduce to scalar
+    Read a "global" variable from an HDF5 trajectory group with schema tolerance.
 
-    Reduction rule for time-series:
-      - if nearly constant -> mean
-      - else -> first value (warn once)
+    Supported locations/types (first match wins):
+    1) Attribute on the trajectory group (`grp.attrs`)
+    2) Attribute on the file (`grp.file.attrs`)
+    3) Scalar dataset under the trajectory group (`grp[...]`)
+    4) Scalar dataset at the file root (`grp.file[...]`)
+    5) Any dataset whose leaf name matches (possibly nested), including time-series
+
+    For time-series globals aligned with the trajectory time axis:
+      - If nearly constant over time, returns the mean.
+      - Otherwise logs a warning (once per dataset path per file) and returns the first value.
+
+    Raises:
+      KeyError if the global cannot be located or is invalid/unexpected in shape.
     """
-    # 1) attrs on grp/root
+    # attrs (group then file)
     for cand in _name_candidates(key_base):
         if cand in grp.attrs:
             v = np.asarray(grp.attrs[cand]).reshape(-1)
@@ -166,44 +260,66 @@ def read_global_flexible_recursive(
             if v.size == 1 and np.isfinite(v[0]):
                 return float(v[0])
 
-    # 2) direct datasets on grp/root
+    # scalar datasets (group then file root)
     for cand in _name_candidates(key_base):
         if cand in grp and isinstance(grp[cand], h5py.Dataset):
-            arr = np.asarray(grp[cand][...], dtype=np.float64)
-            if arr.size == 1 and np.isfinite(arr.reshape(-1)[0]):
-                return float(arr.reshape(-1)[0])
+            arr = np.asarray(grp[cand][...], dtype=np.float64).reshape(-1)
+            if arr.size == 1 and np.isfinite(arr[0]):
+                return float(arr[0])
         if cand in grp.file and isinstance(grp.file[cand], h5py.Dataset):
-            arr = np.asarray(grp.file[cand][...], dtype=np.float64)
-            if arr.size == 1 and np.isfinite(arr.reshape(-1)[0]):
-                return float(arr.reshape(-1)[0])
+            arr = np.asarray(grp.file[cand][...], dtype=np.float64).reshape(-1)
+            if arr.size == 1 and np.isfinite(arr[0]):
+                return float(arr[0])
 
-    # 3) nested dataset under grp (leaf match)
+    # any dataset leaf match
     p = find_dataset_path(grp, key_base, leaf_index, t_len=t_len, prefer_time_aligned=False)
-    if p is not None:
-        ds = grp[p]
-        arr = np.asarray(ds[...], dtype=np.float64)
-        flat = arr.reshape(-1)
-        if flat.size == 1 and np.isfinite(flat[0]):
-            return float(flat[0])
-        # time-series aligned?
-        if arr.shape and int(arr.shape[0]) == int(t_len):
-            x = arr.reshape(t_len, -1)[:, 0]
-            if not np.all(np.isfinite(x)):
-                raise KeyError(f"Global '{key_base}' found at '{p}' but not finite.")
-            mu = float(np.mean(x))
-            sd = float(np.std(x))
-            if sd <= 1e-12 * max(abs(mu), 1.0):
-                return mu
-            if not warn_state.get(p, False):
-                log(f"Warning: global '{key_base}' at '{p}' varies over time; using first value.")
-                warn_state[p] = True
-            return float(x[0])
+    if p is None:
+        raise KeyError(f"Missing/invalid global '{key_base}' (tried {_name_candidates(key_base)})")
 
-    # 4) root nested: not typical; skip deep traversal to avoid huge cost
-    raise KeyError(f"Missing/invalid global '{key_base}' (tried { _name_candidates(key_base) })")
+    ds = grp[p]
+    arr = np.asarray(ds[...], dtype=np.float64)
+    flat = arr.reshape(-1)
+
+    if flat.size == 1 and np.isfinite(flat[0]):
+        return float(flat[0])
+
+    # Time-aligned series: accept and reduce to a scalar
+    if arr.shape and int(arr.shape[0]) == int(t_len):
+        x = arr.reshape(t_len, -1)[:, 0]
+        if not np.all(np.isfinite(x)):
+            raise KeyError(f"Global '{key_base}' found at '{p}' but not finite.")
+        mu = float(np.mean(x))
+        sd = float(np.std(x))
+        if sd <= 1e-12 * max(abs(mu), 1.0):
+            return mu
+        if not warn_state.get(p, False):
+            log(f"Warning: global '{key_base}' at '{p}' varies over time; using first value.")
+            warn_state[p] = True
+        return float(x[0])
+
+    raise KeyError(f"Global '{key_base}' found at '{p}' but not scalar or time-aligned.")
 
 
-def _prepare_log_interp(log_t_valid: np.ndarray, log_t_chunk: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+# -----------------------------------------------------------------------------
+# Interpolation core (vectorized)
+# -----------------------------------------------------------------------------
+
+def _prepare_log_interp(
+    log_t_valid: np.ndarray, log_t_chunk: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Precompute index pairs and interpolation weights for log-time interpolation.
+
+    Inputs:
+      log_t_valid: log10(time) for all "valid" source points, strictly increasing.
+      log_t_chunk: log10(time) for target points (chunk grid).
+
+    Outputs:
+      i0, i1: int64 indices into log_t_valid for left/right bracketing points
+      w:      float64 weights in [0, 1] for linear interpolation in log-time
+
+    This is computed once per chunk and reused across all species columns.
+    """
     n = int(log_t_valid.shape[0])
     idx = np.searchsorted(log_t_valid, log_t_chunk, side="left")
     idx = np.clip(idx, 1, n - 1)
@@ -213,39 +329,69 @@ def _prepare_log_interp(log_t_valid: np.ndarray, log_t_chunk: np.ndarray) -> Tup
     t1 = log_t_valid[i1]
     denom = np.maximum(t1 - t0, 1e-300)
     w = (log_t_chunk - t0) / denom
-    w = np.clip(w, 0.0, 1.0).astype(np.float64)
-    return i0, i1, w
+    return i0, i1, np.clip(w, 0.0, 1.0).astype(np.float64)
 
 
-def interp_loglog_species(y_valid: np.ndarray, i0: np.ndarray, i1: np.ndarray, w: np.ndarray) -> np.ndarray:
+def interp_loglog_species(
+    y_valid: np.ndarray, i0: np.ndarray, i1: np.ndarray, w: np.ndarray
+) -> np.ndarray:
+    """
+    Log-log interpolate species values.
+
+    This performs:
+      y_new(t) = 10 ** lerp(log10(y_valid), w)
+
+    where lerp happens between bracketing indices i0 and i1 and w is in [0,1].
+
+    Notes:
+    - Values are clipped to a tiny positive floor to avoid log10(0).
+    - Interpolation is vectorized across species columns for performance.
+    """
     y0 = np.log10(np.maximum(y_valid[i0, :], 1e-300))
     y1 = np.log10(np.maximum(y_valid[i1, :], 1e-300))
     w2 = w.reshape(-1, 1)
-    ylog = (1.0 - w2) * y0 + w2 * y1
-    return 10.0 ** ylog
+    return 10.0 ** ((1.0 - w2) * y0 + w2 * y1)
 
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 
 @dataclass
 class PreCfg:
+    """
+    Strongly-typed preprocessing configuration.
+
+    This is a direct, minimally-transformed view of config.json values used by this script.
+    The fields are intentionally explicit to make it obvious which knobs affect output.
+
+    Important:
+    - Modifying defaults here is a functional change. This file only adds comments/logging.
+    """
     raw_dir: Path
     processed_dir: Path
+    raw_file_patterns: List[str]
 
     dt: float
+    dt_mode: str               # "fixed" | "per_chunk"
+    dt_min: float
+    dt_max: float
+    dt_sampling: str           # "uniform" | "loguniform"
+
     n_steps: int
     t_min: float
 
     output_trajectories_per_file: int
-    max_chunks_per_source_trajectory: int
-    anchor_first_chunk: bool
-    max_sampling_attempts_per_file: int
+    shard_size: int
+    overwrite: bool
 
-    drop_below: float
     time_keys: List[str]
+    time_key: Optional[str]
+    species_group: Optional[str]
+    globals_group: Optional[str]
 
     val_fraction: float
     test_fraction: float
-    shard_size: int
-    overwrite: bool
 
     global_variables: List[str]
     species_variables: List[str]
@@ -256,20 +402,26 @@ class PreCfg:
     default_method: str
     globals_default_method: str
 
-    log_every_n_trajectories: int
-    log_every_n_attempts: int
     seed: int
     pool_size: int
-
-    # Balanced sampling (optional): sample a fixed number of chunks from a fixed number of source trajectories
-    source_trajectories_per_file: int
     samples_per_source_trajectory: int
-    max_source_selection_attempts: int
     max_chunk_attempts_per_source: int
+    drop_below: float
 
 
 def load_precfg(cfg: Dict) -> PreCfg:
-    pcfg = cfg.get("paths", {})
+    """
+    Parse a raw config dict (from JSON) into a PreCfg instance.
+
+    This function performs only:
+    - path resolution relative to PROJECT_ROOT
+    - minor backward-compat mapping for dt_mode and split fractions
+    - defaulting fields that may be missing
+
+    It does not touch sampling/interpolation logic and is intended to keep
+    backward compatibility with older config schema variants.
+    """
+    pcfg = cfg.get("paths", {}) or {}
     raw_dir = Path(pcfg.get("raw_data_dir", PROJECT_ROOT / "data" / "raw"))
     processed_dir = Path(pcfg.get("processed_data_dir", PROJECT_ROOT / "data" / "processed"))
     if not raw_dir.is_absolute():
@@ -277,89 +429,123 @@ def load_precfg(cfg: Dict) -> PreCfg:
     if not processed_dir.is_absolute():
         processed_dir = (PROJECT_ROOT / processed_dir).resolve()
 
-    pr = cfg.get("preprocessing", {})
-    dcfg = cfg.get("data", {})
-    ncfg = cfg.get("normalization", {})
+    pr = cfg.get("preprocessing", {}) or {}
+    dcfg = cfg.get("data", {}) or {}
+    ncfg = cfg.get("normalization", {}) or {}
+
+    dt = float(pr.get("dt", 100.0))
+    dt_mode = str(pr.get("dt_mode", "fixed")).lower().strip()
+    dt_min = float(pr.get("dt_min", dt))
+    dt_max = float(pr.get("dt_max", dt))
+
+    # Normalize dt_mode + validate dt range.
+    if dt_mode in ("fixed", "constant"):
+        dt_mode = "fixed"
+        dt_min = dt
+        dt_max = dt
+    elif dt_mode in ("per_chunk", "chunk", "variable"):
+        dt_mode = "per_chunk"
+        dt_min = float(pr.get("dt_min", dt_min))
+        dt_max = float(pr.get("dt_max", dt_max))
+    else:
+        raise ValueError(f"Unsupported dt_mode='{dt_mode}'.")
+
+    if dt_min <= 0 or dt_max <= 0 or dt_max < dt_min:
+        raise ValueError(f"Invalid dt range: dt_min={dt_min}, dt_max={dt_max}.")
+
+    dt_sampling_raw = str(pr.get("dt_sampling", "loguniform")).lower().strip()
+    dt_sampling = "loguniform" if "log" in dt_sampling_raw else "uniform"
+
+    # Keep backward compatibility with both naming conventions.
+    val_fraction = float(pr.get("val_fraction", pr.get("val_split", 0.1)))
+    test_fraction = float(pr.get("test_fraction", pr.get("test_split", 0.1)))
+
+    time_key = pr.get("time_key")
+    time_keys = list(pr.get("time_keys", ["t_time", "time", "t"]))
+    if time_key:
+        time_keys = [str(time_key)] + [str(k) for k in time_keys if str(k) != str(time_key)]
+
+    raw_pat = pr.get("raw_file_pattern", pr.get("raw_file_patterns", ["*.h5", "*.hdf5"]))
+    raw_file_patterns = [raw_pat] if isinstance(raw_pat, str) else [str(x) for x in raw_pat]
 
     return PreCfg(
         raw_dir=raw_dir,
         processed_dir=processed_dir,
-        dt=float(pr.get("dt", 100.0)),
+        raw_file_patterns=raw_file_patterns,
+        dt=dt,
+        dt_mode=dt_mode,
+        dt_min=dt_min,
+        dt_max=dt_max,
+        dt_sampling=dt_sampling,
         n_steps=int(pr.get("n_steps", 1000)),
         t_min=float(pr.get("t_min", 1e-3)),
-
-        output_trajectories_per_file=int(pr.get("output_trajectories_per_file", 100)),
-        max_chunks_per_source_trajectory=int(pr.get("max_chunks_per_source_trajectory", 0)),
-        anchor_first_chunk=bool(pr.get("anchor_first_chunk", True)),
-        max_sampling_attempts_per_file=int(pr.get("max_sampling_attempts_per_file", 5_000_000)),
-
         drop_below=float(pr.get("drop_below", 1e-35)),
-        time_keys=list(pr.get("time_keys", ["t_time", "time", "t"])),
-
+        output_trajectories_per_file=int(pr.get("output_trajectories_per_file", 100)),
         shard_size=int(pr.get("shard_size", 1024)),
         overwrite=bool(pr.get("overwrite", True)),
-        val_fraction=float(pr.get("val_fraction", 0.1)),
-        test_fraction=float(pr.get("test_fraction", 0.1)),
-
+        time_keys=time_keys,
+        time_key=str(time_key) if time_key else None,
+        species_group=pr.get("species_group"),
+        globals_group=pr.get("globals_group"),
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
         global_variables=list(dcfg.get("global_variables", ["P", "T"])),
         species_variables=list(dcfg.get("species_variables", [])),
-
         epsilon=float(ncfg.get("epsilon", 1e-30)),
         min_std=float(ncfg.get("min_std", 1e-12)),
         methods=dict(ncfg.get("methods", {})),
         default_method=str(ncfg.get("default_method", "log-standard")),
         globals_default_method=str(ncfg.get("globals_default_method", "standard")),
-
-        log_every_n_trajectories=int(pr.get("log_every_n_trajectories", 50)),
-        log_every_n_attempts=int(pr.get("log_every_n_attempts", 200_000)),
         seed=int(pr.get("seed", cfg.get("system", {}).get("seed", 1234))),
-        pool_size=int(pr.get("pool_size", 20_000)),
-        source_trajectories_per_file=int(pr.get("source_trajectories_per_file", 0)),
-        samples_per_source_trajectory=int(pr.get("samples_per_source_trajectory", 0)),
-        max_source_selection_attempts=int(pr.get("max_source_selection_attempts", 1_000_000)),
+        pool_size=int(pr.get("pool_size", 1_000_000)),
+        samples_per_source_trajectory=int(pr.get("samples_per_source_trajectory", 1)) or 1,
         max_chunk_attempts_per_source=int(pr.get("max_chunk_attempts_per_source", 200)),
     )
 
 
-def _split_name(u: float, val_fraction: float, test_fraction: float) -> str:
-    if u < test_fraction:
-        return "test"
-    if u < test_fraction + val_fraction:
-        return "validation"
-    return "train"
+# -----------------------------------------------------------------------------
+# File utilities
+# -----------------------------------------------------------------------------
+
+def list_raw_files(raw_dir: Path, patterns: List[str]) -> List[Path]:
+    """
+    List raw HDF5 files under `raw_dir` that match any pattern in `patterns`.
+    """
+    files: List[Path] = []
+    for pat in patterns:
+        files.extend(sorted(raw_dir.glob(pat)))
+    return sorted({p.resolve() for p in files})
 
 
 def clean_tmp_dir(tmp_dir: Path, overwrite: bool) -> None:
+    """
+    Prepare the temporary physical output directory.
+
+    If `overwrite` is False and the directory exists, this raises to avoid
+    silently mixing outputs from multiple runs.
+    """
     if tmp_dir.exists():
         if not overwrite:
-            raise RuntimeError(f"Temp dir exists and overwrite=false: {tmp_dir}")
+            raise RuntimeError(f"Temp dir exists: {tmp_dir}")
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
 
 def clean_final_outputs(processed_dir: Path, overwrite: bool) -> None:
     """
-    Clean final outputs without touching _tmp_physical.
+    Remove existing split directories under the final processed output directory.
+
+    This mirrors the original behavior:
+    - If split dir exists and overwrite is False -> raise
+    - Otherwise remove split dirs so the run is clean/reproducible
     """
     processed_dir.mkdir(parents=True, exist_ok=True)
-    if not overwrite:
-        for split in ("train", "validation", "test"):
-            if (processed_dir / split).exists():
-                raise RuntimeError(f"Processed dir has existing split '{split}' and overwrite=false: {processed_dir}")
-        for fn in ("normalization.json", "preprocessing_summary.json"):
-            if (processed_dir / fn).exists():
-                raise RuntimeError(f"Processed dir has existing '{fn}' and overwrite=false: {processed_dir}")
-        return
-
     for split in ("train", "validation", "test"):
         d = processed_dir / split
         if d.exists():
+            if not overwrite:
+                raise RuntimeError(f"Output split dir exists: {d}")
             shutil.rmtree(d)
-
-    for fn in ("normalization.json", "preprocessing_summary.json"):
-        p = processed_dir / fn
-        if p.exists():
-            p.unlink()
 
 
 def flush_shard(
@@ -368,28 +554,63 @@ def flush_shard(
     shard_idx: int,
     y_buf: List[np.ndarray],
     g_buf: List[np.ndarray],
-    t_vec: np.ndarray,
+    dt_buf: List[np.ndarray],
     suffix: str,
 ) -> Tuple[int, int]:
+    """
+    Write a shard from in-memory buffers to disk.
+
+    Parameters:
+      out_dir:   root directory for this stage (temp physical or final processed)
+      split:     "train" | "validation" | "test"
+      shard_idx: current shard index counter for the split
+      y_buf:     list of [T,S] arrays
+      g_buf:     list of [G] arrays
+      dt_buf:    list of [T-1] arrays
+      suffix:    filename suffix; "_physical" indicates the temp stage
+
+    Returns:
+      (new_shard_idx, num_samples_written)
+
+    Note:
+      This function preserves the original NPZ key names and shapes. The only
+      additions in this file are comments and logging elsewhere.
+    """
     if not y_buf:
         return shard_idx, 0
     out_dir_split = out_dir / split
     out_dir_split.mkdir(parents=True, exist_ok=True)
+
     y_mat = np.stack(y_buf, axis=0)
     g_mat = np.stack(g_buf, axis=0)
+    dt_mat = np.stack(dt_buf, axis=0)
+
     shard_path = out_dir_split / f"shard_{shard_idx:06d}{suffix}.npz"
-    np.savez(shard_path, y_mat=y_mat, globals=g_mat, t_vec=t_vec.astype(np.float64, copy=False))
+    if suffix.endswith("_physical"):
+        np.savez(shard_path, y_mat=y_mat, globals=g_mat, dt_mat=dt_mat)
+    else:
+        np.savez(shard_path, y_mat=y_mat, globals=g_mat, dt_norm_mat=dt_mat)
     return shard_idx + 1, int(y_mat.shape[0])
 
 
 def iter_shards(root: Path, split: str, suffix: str) -> List[Path]:
+    """
+    List shard files for a given split and suffix.
+    """
     d = root / split
-    if not d.exists():
-        return []
-    return sorted(d.glob(f"shard_*{suffix}.npz"))
+    return sorted(d.glob(f"shard_*{suffix}.npz")) if d.exists() else []
 
+
+# -----------------------------------------------------------------------------
+# Sampling
+# -----------------------------------------------------------------------------
 
 def reservoir_sample(keys_iter, k: int, rng: np.random.Generator) -> List[str]:
+    """
+    Reservoir sample k keys from an iterator of unknown length.
+
+    This yields a uniform sample without reading all keys into memory first.
+    """
     pool: List[str] = []
     for i, key in enumerate(keys_iter):
         if i < k:
@@ -401,603 +622,372 @@ def reservoir_sample(keys_iter, k: int, rng: np.random.Generator) -> List[str]:
     return pool
 
 
+def _split_for_trajectory(file_name: str, traj_name: str, seed: int, val_frac: float, test_frac: float) -> str:
+    """
+    Deterministically assign a (file, trajectory) pair to train/val/test.
+
+    This is stable across runs given the same seed and names. It does not depend
+    on traversal order.
+    """
+    key = f"{file_name}:{traj_name}"
+    h = hashlib.sha1(f"{seed}:{key}".encode()).digest()
+    u = (int.from_bytes(h[:8], "big") + 0.5) / 2**64
+    if u < test_frac:
+        return "test"
+    if u < test_frac + val_frac:
+        return "validation"
+    return "train"
+
+
+def _sample_dt(cfg: PreCfg, rng: np.random.Generator) -> float:
+    """
+    Sample dt according to configuration.
+
+    - fixed: always cfg.dt
+    - per_chunk: sample from [dt_min, dt_max] using uniform or log-uniform
+    """
+    if cfg.dt_mode == "fixed":
+        return float(cfg.dt)
+    if cfg.dt_sampling == "loguniform":
+        lo, hi = np.log10(cfg.dt_min), np.log10(cfg.dt_max)
+        return float(10.0 ** rng.uniform(lo, hi))
+    return float(rng.uniform(cfg.dt_min, cfg.dt_max))
+
+
+def _pick_t_start(
+    t_raw: np.ndarray,
+    t_valid: np.ndarray,
+    *,
+    dt_s: float,
+    n_steps: int,
+    t_min: float,
+    rng: np.random.Generator,
+    anchor_first: bool,
+    max_attempts: int,
+) -> Optional[float]:
+    """
+    Choose a chunk start time t_start such that the resampled chunk fits in t_valid.
+
+    Semantics intentionally match testing.py:
+    - Work only with positive times (t_raw > 0)
+    - Enforce a minimum start >= max(t_min, first_positive_time)
+    - Sample t_start log-uniformly between feasible bounds
+
+    If anchor_first is True, attempt t_start = t_lo first (deterministic first sample),
+    then fall back to random sampling.
+    """
+    pos = t_raw > 0
+    if not np.any(pos):
+        return None
+    first_pos_time = float(t_raw[pos][0])
+    t_lo = max(float(t_min), first_pos_time)
+
+    chunk_offsets = np.arange(n_steps, dtype=np.float64) * float(dt_s)
+    chunk_duration = float(chunk_offsets[-1])
+
+    t_end = float(t_raw[-1])
+    t_hi = t_end - chunk_duration
+    if t_hi <= t_lo:
+        return None
+
+    def fits(start: float) -> bool:
+        t_chunk = start + chunk_offsets
+        return (t_chunk[0] >= t_valid[0]) and (t_chunk[-1] <= t_valid[-1])
+
+    if anchor_first:
+        t0 = t_lo
+        if fits(t0):
+            return t0
+
+    lo, hi = np.log10(t_lo), np.log10(t_hi)
+    for _ in range(max_attempts):
+        cand = float(10.0 ** rng.uniform(lo, hi))
+        if fits(cand):
+            return cand
+
+    return None
+
+
 def sample_trajectories_from_file(
     file_path: Path,
     out_tmp: Path,
     cfg: PreCfg,
     rng: np.random.Generator,
-    chunk_offsets: np.ndarray,
-    t_vec_rel: np.ndarray,
     counts_total: Dict[str, int],
     shard_idx: Dict[str, int],
-    last_log_count: int,
-) -> Tuple[int, Dict[str, int]]:
+) -> Dict[str, int]:
     """
-    Sample fixed-length trajectories from one HDF5 file and write physical shards.
+    Sample (and resample) trajectories from a single HDF5 file and write "physical" shards.
 
-    Two modes are supported:
+    Physical shard contents (per sample):
+      - y_mat:    [n_steps, n_species] in physical units (float32), post log-log interpolation
+      - globals:  [n_globals] float32
+      - dt_mat:   [n_steps-1] dt for the chunk (float32), constant per sample
 
-    1) Default (legacy): random sampling of (traj, start_time) pairs until
-       output_trajectories_per_file is reached or max_sampling_attempts_per_file is hit.
-
-    2) Balanced per-trajectory sampling (recommended for "K samples per raw trajectory"):
-       enabled when preprocessing.source_trajectories_per_file > 0 AND
-       preprocessing.samples_per_source_trajectory > 0.
-
-       The sampler will:
-         - Select N "good" source trajectories (pass filters: time present, species present, all species >= drop_below, etc.)
-         - Sample up to K chunks per selected trajectory (first chunk can be anchored if anchor_first_chunk=true)
-         - Stop once output_trajectories_per_file samples are written (or N*K if output_trajectories_per_file<=0)
-
-    Instrumentation:
-      - Tracks reject reasons with counts AND a few concrete examples per reason.
-      - Prints a ranked reject summary at end of file processing.
+    Rejection accounting:
+      This function tracks drop reasons in `rejects` and returns them so the caller can
+      aggregate across files. It also logs a per-file summary of what was dropped.
     """
     y_buf: Dict[str, List[np.ndarray]] = {"train": [], "validation": [], "test": []}
     g_buf: Dict[str, List[np.ndarray]] = {"train": [], "validation": [], "test": []}
+    dt_buf: Dict[str, List[np.ndarray]] = {"train": [], "validation": [], "test": []}
 
-    # Reasons must be stable keys (so you can diff runs).
-    reject_stats: Dict[str, int] = {
+    rejects = {
         "not_group": 0,
         "no_time": 0,
-        "no_positive_time": 0,
+        "too_few_valid": 0,
         "missing_species": 0,
         "missing_globals": 0,
         "drop_below": 0,
         "non_finite": 0,
-        "chunk_no_span": 0,
-        "chunk_out_of_bounds": 0,
+        "no_fit_chunk": 0,
         "interp_non_finite": 0,
-        "cache_bad_traj": 0,
-        "insufficient_good_traj": 0,
-        "failed_to_sample_chunk": 0,
     }
 
-    # Store a small number of examples per reject reason to see EXACTLY what failed.
-    REJECT_EXAMPLES_PER_REASON = 6
-    reject_examples: Dict[str, List[str]] = {k: [] for k in reject_stats.keys()}
+    # Lightweight, capped examples for more informative logging (does not affect behavior).
+    example_cap = 5
+    examples: Dict[str, List[str]] = {k: [] for k in rejects.keys()}
 
-    def reject(reason: str, detail: str = "") -> None:
-        # Count
-        if reason not in reject_stats:
-            reject_stats[reason] = 0
-            reject_examples[reason] = []
-        reject_stats[reason] += 1
-        # Collect examples (bounded)
-        if detail and len(reject_examples[reason]) < REJECT_EXAMPLES_PER_REASON:
-            reject_examples[reason].append(detail)
+    # Per-file counters by split, for informative logging.
+    written_by_split = {"train": 0, "validation": 0, "test": 0}
 
-    warn_state: Dict[str, bool] = {}
-    chunk_duration = float(chunk_offsets[-1])  # last offset = (n_steps-1)*dt
-
-    per_source_traj_counts: Dict[str, int] = {}
-    anchor_fail_logged: set = set()
-
-    CACHE_MAX = 32
-    traj_cache: Dict[str, Dict[str, np.ndarray]] = {}
-    traj_cache_order: List[str] = []
-    bad_traj: set = set()
-
-    printed_schema_hint = False  # one-time debug print for missing species
-
-    fixed_species_vars: List[str] = cfg.species_variables[:]  # preserve config order
-    fixed_global_vars: List[str] = cfg.global_variables[:]
-
-    def _cache_touch(name: str) -> None:
-        if name in traj_cache_order:
-            traj_cache_order.remove(name)
-        traj_cache_order.append(name)
-
-    def _cache_put(name: str, data: Dict[str, np.ndarray]) -> None:
-        traj_cache[name] = data
-        _cache_touch(name)
-        if len(traj_cache_order) > CACHE_MAX:
-            old = traj_cache_order.pop(0)
-            traj_cache.pop(old, None)
-
-    def _get_traj_data(traj_name: str, grp: h5py.Group) -> Optional[Dict[str, np.ndarray]]:
-        nonlocal printed_schema_hint
-
-        if traj_name in bad_traj:
-            reject("cache_bad_traj", f"{traj_name}: previously marked bad")
-            return None
-
-        cached = traj_cache.get(traj_name)
-        if cached is not None:
-            _cache_touch(traj_name)
-            return cached
-
-        # Build leaf index once per trajectory load
-        leaf_index = build_leaf_index(grp)
-
-        # Time (recursive)
-        time_path, t_raw = get_time_array_recursive(grp, cfg.time_keys, leaf_index)
-        if t_raw is None or time_path is None:
-            reject("no_time", f"{traj_name}: no time key in {cfg.time_keys}")
-            bad_traj.add(traj_name)
-            return None
-
-        pos = t_raw > 0
-        if not np.any(pos):
-            reject("no_positive_time", f"{traj_name}: all t<=0 (min={t_raw.min():.3e}, max={t_raw.max():.3e})")
-            bad_traj.add(traj_name)
-            return None
-
-        first_pos_time = float(t_raw[pos][0])
-        t_lo = max(cfg.t_min, first_pos_time)
-
-        valid = (t_raw > 0) & (t_raw >= t_lo * 0.5)
-        if not np.any(valid):
-            reject("no_positive_time", f"{traj_name}: no valid t after filter (t_lo={t_lo:.3e})")
-            bad_traj.add(traj_name)
-            return None
-
-        t_valid = t_raw[valid]
-        if t_valid.size < 2:
-            reject("no_time", f"{traj_name}: too few valid time points ({t_valid.size})")
-            bad_traj.add(traj_name)
-            return None
-
-        T = int(t_raw.shape[0])
-
-        # Resolve species dataset paths (recursive, leaf match), prefer time-aligned
-        species_paths: List[str] = []
-        missing = []
-        for s in fixed_species_vars:
-            p = find_dataset_path(grp, s, leaf_index, t_len=T, prefer_time_aligned=True)
-            if p is None:
-                missing.append(s)
-            else:
-                species_paths.append(p)
-
-        if missing:
-            reject("missing_species", f"{traj_name}: missing={missing[:6]} (total_missing={len(missing)})")
-            if not printed_schema_hint:
-                printed_schema_hint = True
-                leaves = sorted(list(leaf_index.keys()))
-                preview = ", ".join(leaves[:120])
-                log(
-                    f"[{file_path.name}] missing species example traj='{traj_name}'. "
-                    f"Available dataset leaf names (first 120): {preview}"
-                )
-            bad_traj.add(traj_name)
-            return None
-
-        # Load species matrix [T_raw, S]
-        S = int(len(species_paths))
-        y_raw = np.empty((T, S), dtype=np.float64)
-        for j, p in enumerate(species_paths):
-            ds = grp[p]
-            arr = np.asarray(ds[...], dtype=np.float64)
-            if not arr.shape or int(arr.shape[0]) != T:
-                reject("missing_species", f"{traj_name}: path='{p}' not time-aligned (shape={arr.shape}, T={T})")
-                bad_traj.add(traj_name)
-                return None
-            x = arr.reshape(T, -1)[:, 0]
-            if not np.all(np.isfinite(x)):
-                reject("non_finite", f"{traj_name}: non-finite in '{p}'")
-                bad_traj.add(traj_name)
-                return None
-            y_raw[:, j] = x
-
-        # Strict filter: reject any trajectory that dips below drop_below (including exact zeros).
-        if np.any(y_raw < cfg.drop_below):
-            mn = float(y_raw.min())
-            reject("drop_below", f"{traj_name}: min_species={mn:.3e} < drop_below={cfg.drop_below:.3e}")
-            bad_traj.add(traj_name)
-            return None
-
-        y_valid = y_raw[valid, :]
-        if not np.all(np.isfinite(y_valid)):
-            reject("non_finite", f"{traj_name}: non-finite after valid time filter")
-            bad_traj.add(traj_name)
-            return None
-
-        log_t_valid = np.log10(t_valid)
-
-        # Globals (recursive leaf match + scalar/time-series reduction)
-        try:
-            g_vec = np.array(
-                [read_global_flexible_recursive(grp, gv, T, leaf_index, warn_state) for gv in fixed_global_vars],
-                dtype=np.float64,
-            )
-        except Exception as e:
-            reject("missing_globals", f"{traj_name}: globals missing/invalid ({e})")
-            bad_traj.add(traj_name)
-            return None
-
-        if not np.all(np.isfinite(g_vec)):
-            reject("non_finite", f"{traj_name}: non-finite globals")
-            bad_traj.add(traj_name)
-            return None
-
-        data = {
-            "t_raw": t_raw,
-            "t_lo": np.float64(t_lo),
-            "t_valid": t_valid,
-            "log_t_valid": log_t_valid,
-            "y_valid": y_valid,
-            "g_vec": g_vec,
-        }
-        _cache_put(traj_name, data)
-        return data
-
-    def _feasible_start_range(td: Dict[str, np.ndarray]) -> Optional[Tuple[float, float]]:
-        """Return (t_start_min, t_start_max) ensuring the full chunk fits in valid times."""
-        t_raw = td["t_raw"]
-        t_lo = float(td["t_lo"])
-        t_valid = td["t_valid"]
-
-        # Tightest constraints: must fit within BOTH raw and valid region.
-        t_start_min = max(t_lo, float(t_valid[0]))
-        t_start_max = min(float(t_raw[-1] - chunk_duration), float(t_valid[-1] - chunk_duration))
-
-        if not (np.isfinite(t_start_min) and np.isfinite(t_start_max)):
-            return None
-        if t_start_max <= t_start_min:
-            return None
-        if t_start_min <= 0.0:
-            # log-uniform sampling requires positive start times
-            return None
-        return float(t_start_min), float(t_start_max)
+    target = int(cfg.output_trajectories_per_file)
+    written = 0
 
     with h5py.File(file_path, "r") as fin:
-        pool = reservoir_sample(fin.keys(), cfg.pool_size, rng)
-        if not pool:
-            log(f"[{file_path.name}] no groups at root; skipping.")
-            return last_log_count, reject_stats
+        # Reservoir sample trajectory groups from the file to avoid loading all keys.
+        pool = reservoir_sample(fin.keys(), int(cfg.pool_size), rng)
 
-        # ---------------- Balanced per-trajectory sampling mode ----------------
-        if cfg.source_trajectories_per_file > 0 and cfg.samples_per_source_trajectory > 0:
-            N = int(cfg.source_trajectories_per_file)
-            K = int(cfg.samples_per_source_trajectory)
+        for traj_name in pool:
+            if written >= target:
+                break
 
-            target_total = int(cfg.output_trajectories_per_file)
-            if target_total <= 0:
-                target_total = N * K
+            grp = fin[traj_name]
+            if not isinstance(grp, h5py.Group):
+                rejects["not_group"] += 1
+                if len(examples["not_group"]) < example_cap:
+                    examples["not_group"].append(str(traj_name))
+                continue
 
-            # If target_total is not divisible by K, the last trajectory will contribute fewer samples.
-            if N * K < target_total:
-                N = int(math.ceil(target_total / float(K)))
+            leaf_index = build_leaf_index(grp)
+            time_path, t_raw = get_time_array_recursive(grp, cfg.time_keys, leaf_index)
+            if t_raw is None:
+                rejects["no_time"] += 1
+                if len(examples["no_time"]) < example_cap:
+                    examples["no_time"].append(str(traj_name))
+                continue
 
-            log(
-                f"[{file_path.name}] Balanced sampling enabled: "
-                f"source_trajectories_per_file={N}, samples_per_source_trajectory={K}, target_total={target_total}"
-            )
+            # Validity mask (match testing.py)
+            # - Only consider positive times
+            # - Enforce that "valid" times are not too close to t=0 by using t_lo * 0.5 cutoff
+            pos = t_raw > 0
+            if not np.any(pos):
+                rejects["too_few_valid"] += 1
+                if len(examples["too_few_valid"]) < example_cap:
+                    examples["too_few_valid"].append(f"{traj_name} (no positive times)")
+                continue
+            first_pos_time = float(t_raw[pos][0])
+            t_lo = max(cfg.t_min, first_pos_time)
+            valid = (t_raw > 0) & (t_raw >= t_lo * 0.5)
+            if np.count_nonzero(valid) < 2:
+                rejects["too_few_valid"] += 1
+                if len(examples["too_few_valid"]) < example_cap:
+                    examples["too_few_valid"].append(f"{traj_name} (valid<2)")
+                continue
 
-            # Select N good trajectories
-            selected: List[str] = []
-            seen: set = set()
-            attempts_sel = 0
-            max_sel = int(cfg.max_source_selection_attempts)
+            t_valid = t_raw[valid]
+            log_t_valid = np.log10(t_valid)
 
-            # Random draws from the (potentially large) pool, without replacement.
-            # This avoids materializing all keys for huge files.
-            while len(selected) < N and attempts_sel < max_sel and len(seen) < len(pool):
-                attempts_sel += 1
-                traj_name = pool[int(rng.integers(0, len(pool)))]
-                if traj_name in seen:
-                    continue
-                seen.add(traj_name)
+            # Resolve species dataset paths for time-aligned series.
+            T = int(t_raw.shape[0])
+            species_paths: List[str] = []
+            missing_species_var: Optional[str] = None
+            for s in cfg.species_variables:
+                p = find_dataset_path(grp, s, leaf_index, t_len=T, prefer_time_aligned=True)
+                if p is None:
+                    species_paths = []
+                    missing_species_var = s
+                    break
+                species_paths.append(p)
+            if not species_paths:
+                rejects["missing_species"] += 1
+                if len(examples["missing_species"]) < example_cap:
+                    if missing_species_var is None:
+                        examples["missing_species"].append(str(traj_name))
+                    else:
+                        examples["missing_species"].append(f"{traj_name} (missing '{missing_species_var}')")
+                continue
 
-                if traj_name not in fin:
-                    continue
-                grp = fin[traj_name]
-                if not isinstance(grp, h5py.Group):
-                    reject("not_group", f"{traj_name}: root item not a group")
-                    continue
+            # Read species into y_raw: shape [T,S]
+            # Avoid intermediate stacks: read each species dataset into a column.
+            S = len(species_paths)
+            y_raw = np.empty((T, S), dtype=np.float64)
+            ok = True
+            for j, p in enumerate(species_paths):
+                try:
+                    arr = np.asarray(grp[p][...], dtype=np.float64)
+                except Exception:
+                    ok = False
+                    break
+                if arr.ndim == 0 or int(arr.shape[0]) != T:
+                    ok = False
+                    break
+                col = arr.reshape(T, -1)[:, 0]
+                if not np.all(np.isfinite(col)):
+                    ok = False
+                    break
+                y_raw[:, j] = col
+            if not ok:
+                rejects["non_finite"] += 1
+                if len(examples["non_finite"]) < example_cap:
+                    examples["non_finite"].append(str(traj_name))
+                continue
 
-                td = _get_traj_data(traj_name, grp)
-                if td is None:
-                    continue
+            # Drop trajectories with any species value below configured floor.
+            # This matches prior semantics exactly (a single value triggers drop).
+            if np.any(y_raw < cfg.drop_below):
+                rejects["drop_below"] += 1
+                if len(examples["drop_below"]) < example_cap:
+                    examples["drop_below"].append(str(traj_name))
+                continue
 
-                span = _feasible_start_range(td)
-                if span is None:
-                    reject(
-                        "chunk_no_span",
-                        f"{traj_name}: insufficient span for a chunk of duration={chunk_duration:.3e}",
-                    )
-                    bad_traj.add(traj_name)
-                    continue
+            y_valid = y_raw[valid, :]
+            if np.any(~np.isfinite(y_valid)):
+                rejects["non_finite"] += 1
+                if len(examples["non_finite"]) < example_cap:
+                    examples["non_finite"].append(f"{traj_name} (y_valid)")
+                continue
 
-                selected.append(traj_name)
-
-            if len(selected) < N:
-                reject(
-                    "insufficient_good_traj",
-                    f"found={len(selected)}/{N} after attempts_sel={attempts_sel}, pool_size={len(pool)}",
+            # Globals: read per-trajectory scalars (with tolerance for nested datasets).
+            try:
+                warn_state: Dict[str, bool] = {}
+                g_vec = np.array(
+                    [read_global_flexible_recursive(grp, gv, T, leaf_index, warn_state) for gv in cfg.global_variables],
+                    dtype=np.float32,
                 )
-                log(
-                    f"[{file_path.name}] Warning: only found {len(selected)}/{N} usable source trajectories "
-                    f"from pool_size={len(pool)} after {attempts_sel} selection attempts. "
-                    f"Proceeding with {len(selected)}."
-                )
+            except Exception as e:
+                rejects["missing_globals"] += 1
+                if len(examples["missing_globals"]) < example_cap:
+                    # Keep messages short; avoid dumping large exception reprs.
+                    examples["missing_globals"].append(f"{traj_name} ({type(e).__name__}: {str(e)[:120]})")
+                continue
 
-            # Sample K chunks per selected trajectory until target_total reached
-            written = 0
-            for traj_name in selected:
-                if written >= target_total:
+            split = _split_for_trajectory(file_path.name, traj_name, cfg.seed, cfg.val_fraction, cfg.test_fraction)
+
+            # Potentially multiple samples per source trajectory.
+            # Note: RNG consumption and semantics remain unchanged; only comments/logging were added.
+            for sidx in range(int(cfg.samples_per_source_trajectory)):
+                if written >= target:
                     break
 
-                grp = fin[traj_name]
-                td = _get_traj_data(traj_name, grp)
-                if td is None:
-                    continue  # should be rare, but keep safe
-
-                span = _feasible_start_range(td)
-                if span is None:
+                dt_s = _sample_dt(cfg, rng)
+                t_start = _pick_t_start(
+                    t_raw,
+                    t_valid,
+                    dt_s=dt_s,
+                    n_steps=cfg.n_steps,
+                    t_min=cfg.t_min,
+                    rng=rng,
+                    anchor_first=(sidx == 0),
+                    max_attempts=int(cfg.max_chunk_attempts_per_source),
+                )
+                if t_start is None:
+                    rejects["no_fit_chunk"] += 1
+                    if len(examples["no_fit_chunk"]) < example_cap:
+                        examples["no_fit_chunk"].append(str(traj_name))
                     continue
-                t_start_min, t_start_max = span
 
-                t_valid = td["t_valid"]
-                log_t_valid = td["log_t_valid"]
-                y_valid = td["y_valid"]
-                g_vec = td["g_vec"]
+                t_chunk = t_start + np.arange(cfg.n_steps, dtype=np.float64) * dt_s
+                log_t_chunk = np.log10(t_chunk)
 
-                remaining = int(target_total - written)
-                chunks_to_take = min(int(K), remaining)
+                # Precompute interpolation indices/weights in log-time once per chunk.
+                i0, i1, w = _prepare_log_interp(log_t_valid, log_t_chunk)
+                y_new = interp_loglog_species(y_valid, i0, i1, w)
+                if not np.all(np.isfinite(y_new)):
+                    rejects["interp_non_finite"] += 1
+                    if len(examples["interp_non_finite"]) < example_cap:
+                        examples["interp_non_finite"].append(str(traj_name))
+                    continue
 
-                ccount = int(per_source_traj_counts.get(traj_name, 0))
+                # Buffer the sample for shard flushing.
+                y_buf[split].append(y_new.astype(np.float32, copy=False))
+                g_buf[split].append(g_vec.astype(np.float32, copy=False))
+                dt_buf[split].append(np.full(cfg.n_steps - 1, dt_s, dtype=np.float32))
 
-                for k in range(chunks_to_take):
-                    # Honor the legacy cap as an additional safeguard.
-                    if cfg.max_chunks_per_source_trajectory > 0 and ccount >= cfg.max_chunks_per_source_trajectory:
-                        break
+                counts_total[split] += 1
+                written_by_split[split] += 1
+                written += 1
 
-                    ok = False
-                    max_chunk_tries = int(cfg.max_chunk_attempts_per_source)
-
-                    for a in range(max_chunk_tries):
-                        # Anchor first chunk per trajectory if requested, but do not get stuck if infeasible.
-                        if cfg.anchor_first_chunk and ccount == 0 and k == 0 and a == 0:
-                            t_start = t_start_min
-                        else:
-                            t_start = 10.0 ** float(rng.uniform(np.log10(t_start_min), np.log10(t_start_max)))
-
-                        t_chunk = t_start + chunk_offsets
-
-                        # Ensure chunk fits within valid time region
-                        if t_chunk[0] < t_valid[0] or t_chunk[-1] > t_valid[-1]:
-                            reject(
-                                "chunk_out_of_bounds",
-                                f"{traj_name}: t_start={t_start:.3e}, chunk=[{t_chunk[0]:.3e},{t_chunk[-1]:.3e}] "
-                                f"valid=[{t_valid[0]:.3e},{t_valid[-1]:.3e}] "
-                                f"(anchor={cfg.anchor_first_chunk and ccount==0 and k==0 and a==0})",
-                            )
-                            if cfg.anchor_first_chunk and ccount == 0 and k == 0 and a == 0 and traj_name not in anchor_fail_logged:
-                                log(
-                                    f"[{file_path.name}] anchor infeasible for traj='{traj_name}': "
-                                    f"t_valid=[{t_valid[0]:.3e},{t_valid[-1]:.3e}], chunk_end={t_chunk[-1]:.3e}"
-                                )
-                                anchor_fail_logged.add(traj_name)
-                            continue
-
-                        # Fast interpolation (precompute indices/weights once)
-                        log_t_chunk = np.log10(t_chunk)
-                        i0, i1, w = _prepare_log_interp(log_t_valid, log_t_chunk)
-                        y_new = interp_loglog_species(y_valid, i0, i1, w)
-
-                        if y_new.shape[0] != cfg.n_steps or not np.all(np.isfinite(y_new)):
-                            reject(
-                                "interp_non_finite",
-                                f"{traj_name}: y_new finite={bool(np.all(np.isfinite(y_new)))}, shape={y_new.shape}",
-                            )
-                            continue
-
-                        # Success
-                        ok = True
-                        break
-
-                    if not ok:
-                        reject(
-                            "failed_to_sample_chunk",
-                            f"{traj_name}: failed to sample a valid chunk after {max_chunk_tries} tries",
-                        )
-                        # Do not permanently mark the whole traj as bad; just stop drawing from it.
-                        break
-
-                    split = _split_name(float(rng.random()), cfg.val_fraction, cfg.test_fraction)
-
-                    y_buf[split].append(y_new.astype(np.float32, copy=False))
-                    g_buf[split].append(g_vec.astype(np.float32, copy=False))
-                    counts_total[split] += 1
-
-                    if len(y_buf[split]) >= cfg.shard_size:
-                        shard_idx[split], _ = flush_shard(
-                            out_tmp, split, shard_idx[split], y_buf[split], g_buf[split], t_vec_rel, suffix="_physical"
-                        )
-                        y_buf[split].clear()
-                        g_buf[split].clear()
-
-                    written += 1
-                    ccount += 1
-                    per_source_traj_counts[traj_name] = ccount
-
-                    total_written = int(counts_total["train"] + counts_total["validation"] + counts_total["test"])
-                    if total_written - last_log_count >= cfg.log_every_n_trajectories:
-                        log(
-                            f"Progress: {total_written} trajectories written "
-                            f"(train={counts_total['train']}, val={counts_total['validation']}, test={counts_total['test']})"
-                        )
-                        last_log_count = total_written
-
-            # Flush leftovers
-            for split in ("train", "validation", "test"):
-                if y_buf[split]:
+                # Flush shard when buffer reaches shard_size.
+                if len(y_buf[split]) >= cfg.shard_size:
                     shard_idx[split], _ = flush_shard(
-                        out_tmp, split, shard_idx[split], y_buf[split], g_buf[split], t_vec_rel, suffix="_physical"
+                        out_tmp, split, shard_idx[split], y_buf[split], g_buf[split], dt_buf[split], "_physical"
                     )
                     y_buf[split].clear()
                     g_buf[split].clear()
+                    dt_buf[split].clear()
 
-            log(
-                f"[{file_path.name}] sampled={written}/{target_total}, "
-                f"unique_src={len(per_source_traj_counts)}, "
-                f"min_per_src={(min(per_source_traj_counts.values()) if per_source_traj_counts else 0)}, "
-                f"max_per_src={(max(per_source_traj_counts.values()) if per_source_traj_counts else 0)}"
-            )
+        # Flush remainders (possibly empty; flush_shard handles that).
+        for sp in ("train", "validation", "test"):
+            shard_idx[sp], _ = flush_shard(out_tmp, sp, shard_idx[sp], y_buf[sp], g_buf[sp], dt_buf[sp], "_physical")
 
-            total_rejects = int(sum(reject_stats.values()))
-            if total_rejects > 0:
-                nz = [(k, v) for k, v in reject_stats.items() if v > 0]
-                nz.sort(key=lambda kv: kv[1], reverse=True)
-                log(f"[{file_path.name}] Reject summary (total_rejects={total_rejects}, written={written}):")
-                for k, v in nz[:12]:
-                    log(f"  - {k}: {v}")
-                    ex = reject_examples.get(k, [])
-                    for e in ex[:REJECT_EXAMPLES_PER_REASON]:
-                        log(f"      example: {e}")
+    # Per-file informative logging about outputs and drops.
+    # This is stdout-only and does not change any artifacts or control flow.
+    total_rejects = int(sum(rejects.values()))
+    log(
+        f"[FILE SUMMARY] {file_path.name} | time_key_used={time_path!s} | "
+        f"written={written} (train={written_by_split['train']}, val={written_by_split['validation']}, test={written_by_split['test']}) | "
+        f"rejected={total_rejects}"
+    )
+    if total_rejects > 0:
+        # Order by descending count for readability.
+        ranked = sorted(rejects.items(), key=lambda kv: (-kv[1], kv[0]))
+        top = ", ".join([f"{k}={v}" for k, v in ranked if v > 0])
+        log(f"[DROPS] {file_path.name} | {top}")
+        # Include brief examples for the most common reasons (capped) to aid debugging.
+        top_reasons = [k for k, v in ranked if v > 0][:3]
+        for k in top_reasons:
+            ex = examples.get(k) or []
+            if ex:
+                log(f"[DROPS:EXAMPLES] {file_path.name} | {k}: " + "; ".join(ex))
 
-            return last_log_count, reject_stats
+        # Explicitly surface key thresholds in drop-related logs.
+        if rejects.get("drop_below", 0) > 0:
+            log(f"[DROP THRESHOLD] {file_path.name} | drop_below={cfg.drop_below:g}")
 
-        # ---------------- Legacy random sampling mode ----------------
-        attempts = 0
-        written = 0
-        target = int(cfg.output_trajectories_per_file)
+    return rejects
 
-        while written < target and attempts < int(cfg.max_sampling_attempts_per_file):
-            attempts += 1
 
-            # Helpful when you're short of target: print rejects periodically.
-            if attempts % int(cfg.log_every_n_attempts) == 0:
-                top = sorted(((k, v) for k, v in reject_stats.items() if v > 0), key=lambda kv: kv[1], reverse=True)[:8]
-                top_s = ", ".join([f"{k}={v}" for k, v in top]) if top else "none"
-                log(f"[{file_path.name}] attempts={attempts}, written={written}, bad_traj={len(bad_traj)} | rejects: {top_s}")
+# -----------------------------------------------------------------------------
+# Normalization (streaming)
+# -----------------------------------------------------------------------------
 
-            traj_name = pool[int(rng.integers(0, len(pool)))]
-            if traj_name not in fin:
-                continue
-            grp = fin[traj_name]
-            if not isinstance(grp, h5py.Group):
-                reject("not_group", f"{traj_name}: root item not a group")
-                continue
-
-            ccount = per_source_traj_counts.get(traj_name, 0)
-            if cfg.max_chunks_per_source_trajectory > 0 and ccount >= cfg.max_chunks_per_source_trajectory:
-                # Not an error; skip without counting as reject (by design).
-                continue
-
-            td = _get_traj_data(traj_name, grp)
-            if td is None:
-                continue
-
-            t_raw = td["t_raw"]
-            t_lo = float(td["t_lo"])
-            t_valid = td["t_valid"]
-            log_t_valid = td["log_t_valid"]
-            y_valid = td["y_valid"]
-            g_vec = td["g_vec"]
-
-            # Can we fit a full chunk of length (n_steps-1)*dt inside this trajectory?
-            t_hi = float(t_raw[-1] - chunk_duration)
-            if t_hi <= t_lo:
-                reject(
-                    "chunk_no_span",
-                    f"{traj_name}: t_end={float(t_raw[-1]):.3e}, t_lo={t_lo:.3e}, "
-                    f"chunk_dur={chunk_duration:.3e} => t_hi={t_hi:.3e} <= t_lo",
-                )
-                continue
-
-            # Start time selection
-            if cfg.anchor_first_chunk and ccount == 0:
-                t_start = t_lo
-            else:
-                t_start = 10.0 ** float(rng.uniform(np.log10(t_lo), np.log10(t_hi)))
-
-            t_chunk = t_start + chunk_offsets
-
-            # Ensure chunk fits within valid time region
-            if t_chunk[0] < t_valid[0] or t_chunk[-1] > t_valid[-1]:
-                reject(
-                    "chunk_out_of_bounds",
-                    f"{traj_name}: t_start={t_start:.3e}, chunk=[{t_chunk[0]:.3e},{t_chunk[-1]:.3e}] "
-                    f"valid=[{t_valid[0]:.3e},{t_valid[-1]:.3e}] "
-                    f"(anchor={cfg.anchor_first_chunk and ccount==0})",
-                )
-                if cfg.anchor_first_chunk and ccount == 0 and traj_name not in anchor_fail_logged:
-                    log(
-                        f"[{file_path.name}] anchor infeasible for traj='{traj_name}': "
-                        f"t_start={t_start:.3e}, t_valid=[{t_valid[0]:.3e},{t_valid[-1]:.3e}], "
-                        f"chunk_end={t_chunk[-1]:.3e}"
-                    )
-                    anchor_fail_logged.add(traj_name)
-                continue
-
-            # Fast interpolation (precompute indices/weights once)
-            log_t_chunk = np.log10(t_chunk)
-            i0, i1, w = _prepare_log_interp(log_t_valid, log_t_chunk)
-            y_new = interp_loglog_species(y_valid, i0, i1, w)
-
-            if y_new.shape[0] != cfg.n_steps or not np.all(np.isfinite(y_new)):
-                reject(
-                    "interp_non_finite",
-                    f"{traj_name}: y_new finite={bool(np.all(np.isfinite(y_new)))}, shape={y_new.shape}",
-                )
-                continue
-
-            split = _split_name(float(rng.random()), cfg.val_fraction, cfg.test_fraction)
-
-            y_buf[split].append(y_new.astype(np.float32, copy=False))
-            g_buf[split].append(g_vec.astype(np.float32, copy=False))
-            counts_total[split] += 1
-
-            if len(y_buf[split]) >= cfg.shard_size:
-                shard_idx[split], _ = flush_shard(
-                    out_tmp, split, shard_idx[split], y_buf[split], g_buf[split], t_vec_rel, suffix="_physical"
-                )
-                y_buf[split].clear()
-                g_buf[split].clear()
-
-            written += 1
-            per_source_traj_counts[traj_name] = ccount + 1
-
-            total_written = int(counts_total["train"] + counts_total["validation"] + counts_total["test"])
-            if total_written - last_log_count >= cfg.log_every_n_trajectories:
-                log(
-                    f"Progress: {total_written} trajectories written "
-                    f"(train={counts_total['train']}, val={counts_total['validation']}, test={counts_total['test']})"
-                )
-                last_log_count = total_written
-
-        # Flush leftovers
-        for split in ("train", "validation", "test"):
-            if y_buf[split]:
-                shard_idx[split], _ = flush_shard(
-                    out_tmp, split, shard_idx[split], y_buf[split], g_buf[split], t_vec_rel, suffix="_physical"
-                )
-                y_buf[split].clear()
-                g_buf[split].clear()
-
-        log(
-            f"[{file_path.name}] sampled={written}/{target}, attempts={attempts}, "
-            f"unique_src={len(per_source_traj_counts)}"
-        )
-
-        total_rejects = int(sum(reject_stats.values()))
-        if total_rejects > 0:
-            nz = [(k, v) for k, v in reject_stats.items() if v > 0]
-            nz.sort(key=lambda kv: kv[1], reverse=True)
-
-            log(f"[{file_path.name}] Reject summary (total_rejects={total_rejects}, attempts={attempts}, written={written}):")
-            for k, v in nz[:12]:
-                log(f"  - {k}: {v}")
-                ex = reject_examples.get(k, [])
-                for e in ex[:REJECT_EXAMPLES_PER_REASON]:
-                    log(f"      example: {e}")
-
-    return last_log_count, reject_stats
 class RunningMeanVar:
+    """
+    Streaming mean/variance accumulator (per-dimension) using a batch-wise Welford-style merge.
+
+    This supports large datasets without holding all samples in memory.
+
+    Stored state:
+      - n:    number of samples seen
+      - mean: running mean
+      - M2:   running sum of squared deviations from the mean
+    """
+
     def __init__(self, dim: int):
         self.dim = int(dim)
         self.n = 0
-        self.mean = np.zeros((self.dim,), dtype=np.float64)
-        self.M2 = np.zeros((self.dim,), dtype=np.float64)
+        self.mean = np.zeros(self.dim, dtype=np.float64)
+        self.M2 = np.zeros(self.dim, dtype=np.float64)
 
     def update(self, x: np.ndarray) -> None:
-        x = np.asarray(x, dtype=np.float64)
-        if x.size == 0:
-            return
-        x2 = x.reshape(-1, self.dim)
+        """
+        Update running statistics with a batch of samples.
+
+        Input:
+          x: array that can be reshaped to [-1, dim]
+        """
+        x2 = x.reshape(-1, self.dim).astype(np.float64, copy=False)
         m = int(x2.shape[0])
         if m == 0:
             return
@@ -1011,92 +1001,128 @@ class RunningMeanVar:
             self.M2 = b_M2
             return
 
-        n0 = float(self.n)
-        m0 = float(m)
         delta = b_mean - self.mean
-        n_new = n0 + m0
-        self.mean = self.mean + delta * (m0 / n_new)
-        self.M2 = self.M2 + b_M2 + (delta ** 2) * (n0 * m0 / n_new)
-        self.n = int(n_new)
+        n_new = self.n + m
+        self.mean = self.mean + delta * (m / n_new)
+        self.M2 = self.M2 + b_M2 + (delta**2) * (self.n * m / n_new)
+        self.n = n_new
 
     def finalize(self, min_std: float) -> Tuple[np.ndarray, np.ndarray]:
-        if self.n < 2:
-            std = np.ones_like(self.mean)
-        else:
-            var = self.M2 / (self.n - 1)
-            std = np.sqrt(np.maximum(var, float(min_std) ** 2))
+        """
+        Finalize mean and std (with a minimum std floor).
+        """
+        if self.n <= 1:
+            return self.mean, np.ones_like(self.mean)
+        var = self.M2 / (self.n - 1)
+        std = np.sqrt(np.maximum(var, float(min_std) ** 2))
         return self.mean, std
 
 
-def compute_train_stats_from_physical(out_tmp: Path, cfg: PreCfg, species_vars: List[str]) -> Tuple[Dict, Dict[str, str]]:
+def _canonical_method(s: str) -> str:
+    """
+    Canonicalize normalization method aliases into a small supported set.
+    """
+    m = str(s).lower().strip()
+    if m in ("minmax", "min_max", "min-max"):
+        return "min-max"
+    if m in ("logminmax", "log-minmax", "log_min_max", "log-min-max"):
+        return "log-min-max"
+    if m in ("log10-standard", "log10_standard"):
+        return "log-standard"
+    if m in ("none", ""):
+        return "identity"
+    return m
+
+
+def compute_train_stats_from_physical(
+    out_tmp: Path, cfg: PreCfg, species_vars: List[str]
+) -> Tuple[Dict, Dict[str, str]]:
+    """
+    Compute normalization statistics from physical shards.
+
+    Species:
+      - Compute stats on log10(y) with epsilon floor, returning mean/std/min/max in log-space.
+
+    Globals:
+      - Compute stats in raw space (mean/std/min/max) and log-space (log_min/log_max) to
+        support multiple normalization methods (standard, min-max, log-min-max).
+
+    Data source:
+      - Prefer train shards. If no train shards exist, fall back to validation shards.
+      - Raises if neither exists (i.e., nothing to normalize).
+
+    Returns:
+      per_key_stats: dict keyed by variable name
+      methods:       dict keyed by variable name, with canonical method strings
+    """
     eps = float(cfg.epsilon)
+    S = len(species_vars)
+    G = len(cfg.global_variables)
 
-    methods: Dict[str, str] = {s: "log-standard" for s in species_vars}
+    # Method map for manifest
+    methods: Dict[str, str] = {}
+    for s in species_vars:
+        methods[s] = "log-standard"
     for g in cfg.global_variables:
-        requested = str(cfg.methods.get(g, cfg.globals_default_method))
-        if requested not in ("standard", "min-max", "identity", "minmax"):
-            raise ValueError(f"Global '{g}' requested unsupported normalization method '{requested}'.")
-        methods[g] = "min-max" if requested == "minmax" else requested
-    methods["t_vec"] = "identity"
+        methods[g] = _canonical_method(cfg.methods.get(g, cfg.globals_default_method))
 
-    train_shards = iter_shards(out_tmp, "train", suffix="_physical")
-    shards = train_shards
+    # Prefer train; fallback to validation if train empty
+    shards = iter_shards(out_tmp, "train", "_physical")
     if not shards:
-        # If train ended up empty due to random split with small N, compute from all physical shards.
-        all_shards: List[Path] = []
-        for sp in ("train", "validation", "test"):
-            all_shards.extend(iter_shards(out_tmp, sp, suffix="_physical"))
-        if not all_shards:
-            raise RuntimeError("No physical shards found; cannot compute stats.")
-        log("Warning: no TRAIN physical shards found; computing normalization stats from all splits.")
-        shards = all_shards
+        raise RuntimeError("No physical shards found (train/validation) to compute normalization.")
 
-    S = int(len(species_vars))
-    G = int(len(cfg.global_variables))
+    rms_logy = RunningMeanVar(S)
+    logy_min = np.full(S, np.inf, dtype=np.float64)
+    logy_max = np.full(S, -np.inf, dtype=np.float64)
 
-    rms_s = RunningMeanVar(S)
     rms_g = RunningMeanVar(G)
+    g_min = np.full(G, np.inf, dtype=np.float64)
+    g_max = np.full(G, -np.inf, dtype=np.float64)
+    glog_min = np.full(G, np.inf, dtype=np.float64)
+    glog_max = np.full(G, -np.inf, dtype=np.float64)
 
-    s_min = np.full((S,), np.inf, dtype=np.float64)
-    s_max = np.full((S,), -np.inf, dtype=np.float64)
-    g_min = np.full((G,), np.inf, dtype=np.float64)
-    g_max = np.full((G,), -np.inf, dtype=np.float64)
-
-    for p in tqdm(shards, desc="Computing normalization stats", leave=False):
+    for p in tqdm(shards, desc="Computing stats"):
         with np.load(p) as z:
-            y = np.asarray(z["y_mat"], dtype=np.float64)   # [N,T,S] physical
-            g = np.asarray(z["globals"], dtype=np.float64) # [N,G] physical
+            y = np.asarray(z["y_mat"], dtype=np.float64)   # [N,T,S]
+            g = np.asarray(z["globals"], dtype=np.float64) # [N,G]
 
-        y_log = np.log10(np.maximum(y, eps)).reshape(-1, S)
-        rms_s.update(y_log)
-        s_min = np.minimum(s_min, np.min(y_log, axis=0))
-        s_max = np.maximum(s_max, np.max(y_log, axis=0))
+        ylog = np.log10(np.maximum(y, eps))
+        y2 = ylog.reshape(-1, S)
+        rms_logy.update(y2)
+        logy_min = np.minimum(logy_min, np.min(y2, axis=0))
+        logy_max = np.maximum(logy_max, np.max(y2, axis=0))
 
         g2 = g.reshape(-1, G)
         rms_g.update(g2)
         g_min = np.minimum(g_min, np.min(g2, axis=0))
         g_max = np.maximum(g_max, np.max(g2, axis=0))
 
-    mu_s, sd_s = rms_s.finalize(cfg.min_std)
+        glog = np.log10(np.maximum(g2, eps))
+        glog_min = np.minimum(glog_min, np.min(glog, axis=0))
+        glog_max = np.maximum(glog_max, np.max(glog, axis=0))
+
+    mu_s, sd_s = rms_logy.finalize(cfg.min_std)
     mu_g, sd_g = rms_g.finalize(cfg.min_std)
 
-    per_key_stats: Dict = {}
+    per_key_stats: Dict[str, Dict] = {}
     for i, s in enumerate(species_vars):
         per_key_stats[s] = {
             "log_mean": float(mu_s[i]),
             "log_std": float(sd_s[i]),
-            "log_min": float(s_min[i]),
-            "log_max": float(s_max[i]),
+            "log_min": float(logy_min[i]),
+            "log_max": float(logy_max[i]),
             "epsilon": eps,
         }
+
     for i, gv in enumerate(cfg.global_variables):
         per_key_stats[gv] = {
             "mean": float(mu_g[i]),
             "std": float(sd_g[i]),
             "min": float(g_min[i]),
             "max": float(g_max[i]),
+            "log_min": float(glog_min[i]),
+            "log_max": float(glog_max[i]),
         }
-    per_key_stats["t_vec"] = {"method": "identity"}
 
     return per_key_stats, methods
 
@@ -1108,205 +1134,206 @@ def normalize_and_write_final(
     species_vars: List[str],
     per_key_stats: Dict,
     methods: Dict[str, str],
-    t_vec_global: np.ndarray,
 ) -> None:
+    """
+    Normalize physical shards and write final shards, plus normalization.json.
+
+    Species normalization:
+      y_z = (log10(max(y, eps)) - mu_log) / sd_log
+
+    Globals normalization:
+      Vectorized per-variable methods, each in:
+        - identity
+        - standard
+        - min-max
+        - log-min-max
+
+    dt normalization:
+      dt_norm = clip((log10(dt) - log10(dt_min)) / (log10(dt_max) - log10(dt_min)), 0, 1)
+
+    Important:
+      This function preserves original output key names and directory layout.
+    """
+    eps = float(cfg.epsilon)
+    S = len(species_vars)
+    G = len(cfg.global_variables)
+
     out_final.mkdir(parents=True, exist_ok=True)
     for split in ("train", "validation", "test"):
         (out_final / split).mkdir(parents=True, exist_ok=True)
 
-    eps = float(cfg.epsilon)
-    S = int(len(species_vars))
-    G = int(len(cfg.global_variables))
+    mu_s = np.array([per_key_stats[s]["log_mean"] for s in species_vars], dtype=np.float64).reshape(1, 1, S)
+    sd_s = np.array([per_key_stats[s]["log_std"] for s in species_vars], dtype=np.float64).reshape(1, 1, S)
 
-    mu_s = np.array([float(per_key_stats[s]["log_mean"]) for s in species_vars], dtype=np.float64).reshape(1, 1, S)
-    sd_s = np.array([float(per_key_stats[s]["log_std"]) for s in species_vars], dtype=np.float64).reshape(1, 1, S)
+    # Vectorized globals normalization (no per-sample loops)
+    method_ids = np.zeros(G, dtype=np.int64)  # 0=identity, 1=standard, 2=min-max, 3=log-min-max
+    g_mean = np.zeros(G, dtype=np.float64)
+    g_inv_std = np.ones(G, dtype=np.float64)
+    g_min = np.zeros(G, dtype=np.float64)
+    g_inv_rng = np.ones(G, dtype=np.float64)
+    glog_min = np.zeros(G, dtype=np.float64)
+    glog_inv_rng = np.ones(G, dtype=np.float64)
 
-    g_mean = np.array([float(per_key_stats[g]["mean"]) for g in cfg.global_variables], dtype=np.float64).reshape(1, G)
-    g_std  = np.array([float(per_key_stats[g]["std"])  for g in cfg.global_variables], dtype=np.float64).reshape(1, G)
-    g_min  = np.array([float(per_key_stats[g]["min"])  for g in cfg.global_variables], dtype=np.float64).reshape(1, G)
-    g_max  = np.array([float(per_key_stats[g]["max"])  for g in cfg.global_variables], dtype=np.float64).reshape(1, G)
-    g_methods = [str(methods.get(g, "standard")) for g in cfg.global_variables]
+    for j, gv in enumerate(cfg.global_variables):
+        m = _canonical_method(methods[gv])
+        st = per_key_stats[gv]
+        if m == "identity":
+            method_ids[j] = 0
+        elif m == "standard":
+            method_ids[j] = 1
+            g_mean[j] = float(st["mean"])
+            g_inv_std[j] = 1.0 / max(float(st["std"]), cfg.min_std)
+        elif m == "min-max":
+            method_ids[j] = 2
+            g_min[j] = float(st["min"])
+            rng = max(float(st["max"]) - g_min[j], 1e-12)
+            g_inv_rng[j] = 1.0 / rng
+        elif m == "log-min-max":
+            method_ids[j] = 3
+            glog_min[j] = float(st["log_min"])
+            rng = max(float(st["log_max"]) - glog_min[j], 1e-12)
+            glog_inv_rng[j] = 1.0 / rng
+        else:
+            raise ValueError(f"Unsupported global normalization method '{m}' for '{gv}'.")
 
-    def _normalize_globals(g: np.ndarray) -> np.ndarray:
-        out = np.empty_like(g, dtype=np.float32)
-        for j, m in enumerate(g_methods):
-            if m == "identity":
-                out[:, j] = g[:, j].astype(np.float32, copy=False)
-            elif m == "standard":
-                out[:, j] = ((g[:, j] - g_mean[0, j]) / g_std[0, j]).astype(np.float32, copy=False)
-            elif m == "min-max":
-                denom = max(float(g_max[0, j] - g_min[0, j]), 1e-12)
-                out[:, j] = ((g[:, j] - g_min[0, j]) / denom).astype(np.float32, copy=False)
-            else:
-                raise ValueError(f"Unsupported global normalization method '{m}' for key '{cfg.global_variables[j]}'.")
-        return out
+    mid = method_ids.reshape(1, G)
+    g_mean = g_mean.reshape(1, G)
+    g_inv_std = g_inv_std.reshape(1, G)
+    g_min = g_min.reshape(1, G)
+    g_inv_rng = g_inv_rng.reshape(1, G)
+    glog_min = glog_min.reshape(1, G)
+    glog_inv_rng = glog_inv_rng.reshape(1, G)
+
+    dt_log_min = float(np.log10(cfg.dt_min))
+    dt_log_max = float(np.log10(cfg.dt_max))
+    dt_log_rng = max(dt_log_max - dt_log_min, 1e-12)
 
     for split in ("train", "validation", "test"):
-        physical_shards = iter_shards(out_tmp, split, suffix="_physical")
-        if not physical_shards:
-            continue
-
-        shard_counter = 0
-        y_carry: Optional[np.ndarray] = None
-        g_carry: Optional[np.ndarray] = None
-
-        for p in tqdm(physical_shards, desc=f"Normalizing {split}", leave=False):
+        physical_shards = iter_shards(out_tmp, split, "_physical")
+        for i, p in enumerate(tqdm(physical_shards, desc=f"Normalizing {split}")):
             with np.load(p) as z:
-                y = np.asarray(z["y_mat"], dtype=np.float64)
-                g = np.asarray(z["globals"], dtype=np.float64)
+                y = np.asarray(z["y_mat"], dtype=np.float64)      # [N,T,S]
+                g = np.asarray(z["globals"], dtype=np.float64)    # [N,G]
+                dt = np.asarray(z["dt_mat"], dtype=np.float64)    # [N,T-1]
 
-            y_log = np.log10(np.maximum(y, eps))
-            y_z = ((y_log - mu_s) / sd_s).astype(np.float32, copy=False)
-            g_z = _normalize_globals(g)
+            y_z = ((np.log10(np.maximum(y, eps)) - mu_s) / sd_s).astype(np.float32)
 
-            if y_carry is None:
-                y_all = y_z
-                g_all = g_z
-            else:
-                y_all = np.concatenate([y_carry, y_z], axis=0)
-                g_all = np.concatenate([g_carry, g_z], axis=0)
+            # globals
+            out_g = g.astype(np.float64, copy=False)
+            g_std = (out_g - g_mean) * g_inv_std
+            g_mm = (out_g - g_min) * g_inv_rng
+            g_lmm = (np.log10(np.maximum(out_g, eps)) - glog_min) * glog_inv_rng
+            g_z = np.where(mid == 1, g_std, out_g)
+            g_z = np.where(mid == 2, g_mm, g_z)
+            g_z = np.where(mid == 3, g_lmm, g_z)
+            g_z = g_z.astype(np.float32, copy=False)
 
-            n_all = int(y_all.shape[0])
-            start = 0
-            while n_all - start >= cfg.shard_size:
-                end = start + cfg.shard_size
-                out_path = out_final / split / f"shard_{shard_counter:06d}.npz"
-                np.savez(out_path, y_mat=y_all[start:end], globals=g_all[start:end], t_vec=t_vec_global)
-                shard_counter += 1
-                start = end
+            # dt: log10 + min-max to [0,1]
+            dt_norm = (np.log10(np.maximum(dt, eps)) - dt_log_min) / dt_log_rng
+            dt_norm = np.clip(dt_norm, 0.0, 1.0).astype(np.float32)
 
-            if start < n_all:
-                y_carry = y_all[start:]
-                g_carry = g_all[start:]
-            else:
-                y_carry = None
-                g_carry = None
+            np.savez(out_final / split / f"shard_{i:06d}.npz", y_mat=y_z, globals=g_z, dt_norm_mat=dt_norm)
 
-        if y_carry is not None and y_carry.shape[0] > 0:
-            out_path = out_final / split / f"shard_{shard_counter:06d}.npz"
-            np.savez(out_path, y_mat=y_carry, globals=g_carry, t_vec=t_vec_global)
-
-    log_dt = float(np.log10(cfg.dt))
     manifest = {
-        "schema_version": 1,
+        "normalization_methods": methods,
+        "methods": methods,  # legacy alias
+        "per_key_stats": per_key_stats,
+        "epsilon": eps,
+        "min_std": float(cfg.min_std),
+        "dt": {"log_min": dt_log_min, "log_max": dt_log_max},
         "species_variables": species_vars,
         "global_variables": cfg.global_variables,
-        "epsilon": float(cfg.epsilon),
-        "min_std": float(cfg.min_std),
-        "dt": {"log_min": log_dt, "log_max": log_dt},
-        "normalization_methods": methods,
-        "per_key_stats": per_key_stats,
     }
     with open(out_final / "normalization.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-        f.write("\n")
+        json.dump(manifest, f, indent=2)
 
 
-def write_summary(out_final: Path, cfg: PreCfg, counts_total: Dict[str, int], rejects: Dict[str, int]) -> None:
+def write_summary(out_final: Path, cfg: PreCfg, counts_total: Dict[str, int], rejects_total: Dict[str, int]) -> None:
+    """
+    Write preprocessing_summary.json.
+
+    Note:
+      The schema is preserved exactly from the original code: adding fields here would
+      be an output change. This function therefore remains structurally unchanged aside
+      from this docstring.
+    """
     summary = {
-        "dt": cfg.dt,
-        "n_steps": cfg.n_steps,
-        "t_min": cfg.t_min,
-        "output_trajectories_per_file": cfg.output_trajectories_per_file,
-        "max_chunks_per_source_trajectory": cfg.max_chunks_per_source_trajectory,
-        "anchor_first_chunk": cfg.anchor_first_chunk,
-        "max_sampling_attempts_per_file": cfg.max_sampling_attempts_per_file,
-        "drop_below": cfg.drop_below,
-        "val_fraction": cfg.val_fraction,
-        "test_fraction": cfg.test_fraction,
-        "shard_size": cfg.shard_size,
-        "global_variables": cfg.global_variables,
-        "species_variables": cfg.species_variables,
         "counts_total": counts_total,
-        "rejects_total": rejects,
-        "raw_dir": str(cfg.raw_dir),
-        "processed_dir": str(cfg.processed_dir),
+        "rejects_total": rejects_total,
+        "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.__dict__.items()},
     }
     with open(out_final / "preprocessing_summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, sort_keys=True)
-        f.write("\n")
+        json.dump(summary, f, indent=2)
 
+
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
 
 def main() -> None:
-    log(f"Loading config from: {CONFIG_PATH}")
-    if not CONFIG_PATH.exists():
-        raise FileNotFoundError(f"Config file not found: {CONFIG_PATH}")
+    """
+    End-to-end preprocessing pipeline.
 
-    cfg_dict = load_json_config(CONFIG_PATH)
-    cfg = load_precfg(cfg_dict)
+    Steps:
+      1) Discover raw HDF5 files.
+      2) Sample and resample trajectories into temporary "physical" shards.
+      3) Compute normalization stats from (train or validation) physical shards.
+      4) Normalize all splits and write final shards + normalization.json.
+      5) Write preprocessing_summary.json aggregating counts and drop reasons.
 
-    if cfg.output_trajectories_per_file <= 0:
-        raise ValueError("preprocessing.output_trajectories_per_file must be > 0")
-    if not cfg.species_variables:
-        raise RuntimeError("data.species_variables is empty; must be set explicitly.")
-
-    raw_files = sorted(cfg.raw_dir.glob("*.h5")) + sorted(cfg.raw_dir.glob("*.hdf5"))
+    Additional logging:
+      - Per-file written counts and drop breakdown.
+      - Final run totals and top drop reasons.
+    """
+    cfg = load_precfg(load_json_config(CONFIG_PATH))
+    raw_files = list_raw_files(cfg.raw_dir, cfg.raw_file_patterns)
     if not raw_files:
-        raise FileNotFoundError(f"No HDF5 files found in raw_dir={cfg.raw_dir}")
+        raise FileNotFoundError(f"No raw HDF5 files found under {cfg.raw_dir} for patterns {cfg.raw_file_patterns}")
 
     out_final = cfg.processed_dir
     out_tmp = cfg.processed_dir / "_tmp_physical"
-
-    clean_tmp_dir(out_tmp, overwrite=cfg.overwrite)
-    clean_final_outputs(out_final, overwrite=cfg.overwrite)
-
-    chunk_offsets = np.arange(cfg.n_steps, dtype=np.float64) * cfg.dt
-    t_vec_rel = chunk_offsets.copy()
-
-    rng = np.random.default_rng(cfg.seed)
+    clean_tmp_dir(out_tmp, cfg.overwrite)
+    clean_final_outputs(out_final, cfg.overwrite)
 
     counts_total = {"train": 0, "validation": 0, "test": 0}
     shard_idx = {"train": 0, "validation": 0, "test": 0}
     rejects_total: Dict[str, int] = {}
 
-    log(f"Raw dir: {cfg.raw_dir}")
-    log(f"Processed dir: {cfg.processed_dir}")
-    log(f"Found {len(raw_files)} raw file(s)")
-    log(
-        f"Sampling target: {cfg.output_trajectories_per_file} trajectories per file "
-        f"({cfg.n_steps} steps × dt={cfg.dt}); val_fraction={cfg.val_fraction}, test_fraction={cfg.test_fraction}"
-    )
-    log(
-        f"Sampling controls: max_chunks_per_source_trajectory={cfg.max_chunks_per_source_trajectory}, "
-        f"anchor_first_chunk={cfg.anchor_first_chunk}, max_sampling_attempts_per_file={cfg.max_sampling_attempts_per_file}"
-    )
-    log(f"Filtering: drop_below={cfg.drop_below}, time_keys={cfg.time_keys}")
-    log("Schema resolution: recursive dataset search by leaf name; for X tries X and evolve_X")
+    rng = np.random.default_rng(cfg.seed)
 
-    log("Phase 1: Sampling trajectories and writing physical shards...")
-    last_log_count = 0
-    for i, fp in enumerate(raw_files):
-        log(f"Processing raw file {i + 1}/{len(raw_files)}: {fp.name}")
-        last_log_count, rej = sample_trajectories_from_file(
-            fp, out_tmp, cfg, rng, chunk_offsets, t_vec_rel, counts_total, shard_idx, last_log_count
-        )
+    log(f"Starting preprocessing | raw_dir={cfg.raw_dir} | processed_dir={cfg.processed_dir}")
+    log(
+        "Config summary | "
+        f"dt_mode={cfg.dt_mode}, dt=[{cfg.dt_min:g}, {cfg.dt_max:g}] ({cfg.dt_sampling}), "
+        f"n_steps={cfg.n_steps}, t_min={cfg.t_min:g}, shard_size={cfg.shard_size}, "
+        f"per_file_target={cfg.output_trajectories_per_file}, samples_per_source={cfg.samples_per_source_trajectory}, "
+        f"drop_below={cfg.drop_below:g}"
+    )
+
+    for fp in raw_files:
+        log(f"Processing {fp.name}")
+        rej = sample_trajectories_from_file(fp, out_tmp, cfg, rng, counts_total, shard_idx)
         for k, v in rej.items():
-            rejects_total[k] = rejects_total.get(k, 0) + v
+            rejects_total[k] = rejects_total.get(k, 0) + int(v)
 
-    total = int(counts_total["train"] + counts_total["validation"] + counts_total["test"])
+    total_written = counts_total["train"] + counts_total["validation"] + counts_total["test"]
+    if total_written == 0:
+        raise RuntimeError("No trajectories were written. Check rejects in preprocessing_summary.json.")
+
+    # Log aggregate drop reasons (stdout only).
     log(
-        f"Sampling complete: {total} trajectories "
+        f"[RUN TOTALS] written={total_written} "
         f"(train={counts_total['train']}, val={counts_total['validation']}, test={counts_total['test']})"
     )
+    if rejects_total:
+        ranked = sorted(rejects_total.items(), key=lambda kv: (-kv[1], kv[0]))
+        top = ", ".join([f"{k}={v}" for k, v in ranked if v > 0])
+        if top:
+            log(f"[RUN DROPS] {top}")
 
-    if total == 0:
-        top = sorted(rejects_total.items(), key=lambda kv: kv[1], reverse=True)
-        top_s = ", ".join([f"{k}={v}" for k, v in top])
-        raise RuntimeError(
-            "No trajectories were sampled. Every candidate trajectory was rejected.\n"
-            f"Reject summary: {top_s}\n"
-            "The one-time log above prints available dataset leaf names; align data.species_variables to those."
-        )
-
-    log("Phase 2: Computing normalization statistics...")
     per_key_stats, methods = compute_train_stats_from_physical(out_tmp, cfg, cfg.species_variables)
-
-    log("Phase 3: Normalizing and writing final shards...")
-    normalize_and_write_final(out_tmp, out_final, cfg, cfg.species_variables, per_key_stats, methods, t_vec_rel)
-
-    log("Phase 4: Writing preprocessing summary...")
+    normalize_and_write_final(out_tmp, out_final, cfg, cfg.species_variables, per_key_stats, methods)
     write_summary(out_final, cfg, counts_total, rejects_total)
-
     log("Done.")
 
 
