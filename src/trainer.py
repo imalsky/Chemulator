@@ -2,22 +2,27 @@
 """
 trainer.py - PyTorch Lightning training module and trainer factory.
 
-Training and evaluation are always autoregressive rollouts:
+Core behavior:
 
-- Training performs autoregressive unroll with (optional) stochastic teacher forcing.
-- Validation/test always run open-loop autoregressive rollouts (no teacher forcing).
+- Training loss (train_loss) is computed under the *training* rollout procedure:
+    * autoregressive unroll with stochastic teacher forcing (per epoch schedule)
+    * training burn-in settings
+    * optional vectorized fast-path when teacher forcing probability is 1.0 and burn-in is 0
+  This is the optimization objective and is the metric you'll usually see decrease fastest.
 
-Performance optimization:
-- When teacher forcing probability is exactly 1.0 and burn-in is disabled, training uses
-  a fully-vectorized "bundled one-step" path that is equivalent to teacher-forced
-  autoregressive rollout but avoids the Python-level unroll loop.
+- Validation/test losses (val_loss/test_loss) are computed under *evaluation* rollouts:
+    * open-loop autoregressive unroll (no teacher forcing)
+    * validation burn-in settings
+
+Because train_loss and val_loss are defined under different rollout procedures, they are
+not directly comparable. A rank-zero warning is emitted at fit start.
 
 Loss:
 - Two-term loss: (lambda_log10_mae * mean(|Δlog10(y)|)) + (lambda_z_mse * mean((Δz)^2))
 - Optional burn-in downweighting via per-step weights.
 
 Logging (epoch-level only):
-- train_loss (computed open-loop, same procedure as val_loss; train vs val sets)
+- train_loss (teacher-forced / training procedure; not directly comparable to val_loss)
 - val_loss
 - val_loss_log10_mae (component)
 - val_loss_z_mse (component)
@@ -26,13 +31,14 @@ Logging (epoch-level only):
 - train_tf_prob
 - train_rollout_steps
 
-This file is not backward compatible with older configuration keys. In particular, it
-removes train_mode/eval_mode/one_jump_k_roll and requires explicit loss weights.
+This file is intentionally strict about configuration (not backward compatible with older
+keys like train_mode/eval_mode/one_jump_k_roll).
 """
 
 from __future__ import annotations
 
 import csv
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -48,6 +54,16 @@ try:
     import lightning.pytorch as pl
 except ImportError:
     import pytorch_lightning as pl  # type: ignore
+
+# Rank-zero warning helper (Lightning has moved this around across versions).
+try:
+    from lightning_utilities.core.rank_zero import rank_zero_warn  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from pytorch_lightning.utilities.rank_zero import rank_zero_warn  # type: ignore
+    except Exception:  # pragma: no cover
+        def rank_zero_warn(msg: str, *args: Any, **kwargs: Any) -> None:  # type: ignore
+            logging.getLogger(__name__).warning(msg)
 
 
 # ==============================================================================
@@ -209,6 +225,7 @@ class CSVLoggerCallback(pl.Callback):
         # the most recent validation-epoch metrics (val_*) are available.
         self._write_epoch_row(trainer)
 
+
 # ==============================================================================
 # Loss
 # ==============================================================================
@@ -252,7 +269,6 @@ class AdaptiveLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         if pred_z.shape != true_z.shape:
             raise ValueError(f"Shape mismatch: pred_z={tuple(pred_z.shape)} true_z={tuple(true_z.shape)}")
-
         if pred_z.ndim != 3:
             raise ValueError(f"Expected pred_z/true_z shape [B, K, S], got {tuple(pred_z.shape)}")
 
@@ -301,12 +317,12 @@ def build_loss_buffers(
     """
     Extract (log_mean, log_std) buffers from the normalization manifest.
 
-    Required structure:
-        manifest["per_key_stats"][species_name]["log_mean"]
-        manifest["per_key_stats"][species_name]["log_std"]
+    Accepts either:
+        per_key_stats[species]["log_mean"/"log_std"]
+    or (legacy):
+        per_key_stats[species]["log10_mean"/"log10_std"]
 
-    Raises:
-        KeyError if required fields are missing.
+    Raises KeyError if required fields are missing.
     """
     stats = manifest.get("per_key_stats")
     if not isinstance(stats, Mapping):
@@ -321,13 +337,15 @@ def build_loss_buffers(
         if not isinstance(entry, Mapping):
             raise TypeError(f"per_key_stats[{s}] must be a mapping/dict, got {type(entry).__name__}")
 
-        if "log_mean" not in entry or "log_std" not in entry:
+        mu = entry.get("log_mean", entry.get("log10_mean"))
+        sd = entry.get("log_std", entry.get("log10_std"))
+        if mu is None or sd is None:
             raise KeyError(
-                f"per_key_stats[{s}] must contain 'log_mean' and 'log_std' (log10-space statistics)."
+                f"per_key_stats[{s}] must contain 'log_mean'/'log_std' (or legacy 'log10_mean'/'log10_std')."
             )
 
-        means.append(float(entry["log_mean"]))
-        stds.append(float(entry["log_std"]))
+        means.append(float(mu))
+        stds.append(float(sd))
 
     log_means = torch.tensor(means, device=device, dtype=torch.float32).view(1, 1, -1)
     log_stds = torch.tensor(stds, device=device, dtype=torch.float32).view(1, 1, -1)
@@ -393,7 +411,6 @@ class RolloutCurriculum:
     def k_roll(self, epoch: int, max_epochs: int) -> int:
         if not self.enabled:
             return int(self.max_k)
-
         if self.ramp_epochs <= 0:
             return int(self.max_k)
 
@@ -529,6 +546,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         self._val_dl = None
         self._test_dl = None
 
+        self._warned_metric_mismatch = False
+
         # Only persist the training section. This is intentionally strict/non-backward compatible.
         self.save_hyperparameters({"training": dict(tcfg)})
 
@@ -548,6 +567,16 @@ class FlowMapRolloutModule(pl.LightningModule):
 
     def on_fit_start(self) -> None:
         self.criterion.to(self.device)
+
+        # Make the definitional mismatch explicit. This is deliberate (older strategy),
+        # but it can look like a "bug" if you expect train/val to be directly comparable.
+        if not self._warned_metric_mismatch:
+            rank_zero_warn(
+                "train_loss is computed under training rollouts (may include teacher forcing and training burn-in), "
+                "while val_loss is computed open-loop (no teacher forcing) with validation burn-in. "
+                "These metrics are not directly comparable."
+            )
+            self._warned_metric_mismatch = True
 
     def on_train_epoch_start(self) -> None:
         # Epoch-level training stats that are stable across batches.
@@ -616,9 +645,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         if burn_in > 0 and self.burn_in_noise_std > 0.0:
             burn_noise = torch.randn((B, burn_in, S), device=y0.device, dtype=y0.dtype) * self.burn_in_noise_std
 
-        use_tf = tf_prob > 0.0
         tf_mask: Optional[torch.Tensor] = None
-        if use_tf:
+        if tf_prob > 0.0:
             tf_mask = torch.rand((B, K), device=y0.device) < float(tf_prob)
 
         y_pred = y0.new_empty((B, K, S))
@@ -651,9 +679,9 @@ class FlowMapRolloutModule(pl.LightningModule):
         """
         Vectorized teacher-forced rollout (bundled jumps).
 
-        This is equivalent to autoregressive rollout with teacher forcing probability 1.0
-        and burn_in == 0, but computed in a single forward_step call by flattening (B, K)
-        into the batch dimension.
+        Equivalent to autoregressive rollout with teacher forcing probability 1.0
+        and burn_in == 0, but computed in a single forward_step call by flattening
+        (B, K) into the batch dimension.
         """
         if y_in.ndim != 3:
             raise ValueError(f"y_in must have shape [B, K, S], got {tuple(y_in.shape)}")
@@ -679,9 +707,7 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         y_next_flat = self.model.forward_step(y_flat, dt_flat, g_flat)
         if y_next_flat.shape != (B * K, S):
-            raise RuntimeError(
-                f"model.forward_step returned {tuple(y_next_flat.shape)}, expected {(B * K, S)}"
-            )
+            raise RuntimeError(f"model.forward_step returned {tuple(y_next_flat.shape)}, expected {(B * K, S)}")
 
         return y_next_flat.view(B, K, S)
 
@@ -698,16 +724,12 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         B, K_full, S = y.shape
         transitions = max(1, int(K_full) - 1)
-
         epoch = int(self.current_epoch)
 
         # Normalize dt to [B, transitions] and slice to the desired rollout length(s).
         dt_full = normalize_dt_shape(dt, batch_size=B, seq_len=transitions, context=f"{stage}_unroll_full")
 
         if stage == "train":
-            # ------------------------------------------------------------------
-            # Optimization loss (may use teacher forcing / training-specific burn-in)
-            # ------------------------------------------------------------------
             k_train = int(max(1, min(self._effective_k_roll(epoch, stage="train"), transitions)))
             burn_in_train = int(self._get_burn_in_steps("train"))
             if burn_in_train >= k_train:
@@ -737,44 +759,11 @@ class FlowMapRolloutModule(pl.LightningModule):
             losses_train = self.criterion(y_pred_train, y_true_train, step_weights=step_weights_train)
             loss_opt = losses_train["loss_total"]
 
-            # ------------------------------------------------------------------
-            # Comparable metric: compute train_loss EXACTLY like validation
-            # (open-loop rollout, tf_prob=0, validation burn-in + rollout schedule).
-            # This makes train_loss and val_loss directly comparable (train vs val sets).
-            # ------------------------------------------------------------------
-            k_eval = int(max(1, min(self._effective_k_roll(epoch, stage="val"), transitions)))
-            burn_in_eval = int(self._get_burn_in_steps("val"))
-            if burn_in_eval >= k_eval:
-                raise ValueError(f"train(eval): burn_in ({burn_in_eval}) must be < rollout steps ({k_eval}).")
-
-            dt_eval = dt_full[:, :k_eval]
-            y_true_eval = y[:, 1 : 1 + k_eval, :]
-            y0_eval = y[:, 0, :]
-
-            with torch.no_grad():
-                was_training = bool(self.training)
-                self.eval()
-                try:
-                    y_pred_eval, step_weights_eval = self._autoregressive_unroll(
-                        y0=y0_eval,
-                        y_true=y_true_eval,
-                        dt_bk=dt_eval,
-                        g=g,
-                        tf_prob=0.0,
-                        burn_in=burn_in_eval,
-                    )
-                    losses_eval = self.criterion(y_pred_eval, y_true_eval, step_weights=step_weights_eval)
-                    loss_eval = losses_eval["loss_total"]
-                finally:
-                    # Restore train/eval mode expected by Lightning's train loop.
-                    self.train(was_training)
-
-            self.log("train_loss", loss_eval, on_step=False, on_epoch=True, prog_bar=True)
+            # Log the optimization loss as train_loss (older strategy).
+            self.log("train_loss", loss_opt.detach(), on_step=False, on_epoch=True, prog_bar=True)
             return loss_opt
 
-        # ----------------------------------------------------------------------
-        # Validation/test: always open-loop autoregressive rollout (no teacher forcing).
-        # ----------------------------------------------------------------------
+        # Validation/test: open-loop autoregressive rollout (no teacher forcing).
         k_roll_sched = self._effective_k_roll(epoch, stage=stage)
         k_roll = int(max(1, min(int(k_roll_sched), transitions)))
 
@@ -806,6 +795,7 @@ class FlowMapRolloutModule(pl.LightningModule):
             self.log("test_loss", loss_total, on_step=False, on_epoch=True, prog_bar=True)
 
         return loss_total
+
     def training_step(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         return self._shared_step(batch, stage="train")
 

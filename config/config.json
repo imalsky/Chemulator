@@ -33,9 +33,10 @@
     "windows_per_trajectory": 10,
     "preload_to_device": true,
     "shard_cache_size": 2,
-    "use_mmap": false
+    "use_mmap": true
   },
   "model": {
+    "compile": true,
     "type": "mlp",
     "activation": "silu",
     "dropout": 0.0,
