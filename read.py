@@ -1,31 +1,66 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import csv
 import json
-import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCI_DIGITS = 3  # digits after decimal in scientific notation (e.g., 2.975e-02)
 
 
-def _find_repo_root(start: Path) -> Path:
-    """Walk up until we find a directory that contains 'models'."""
-    cur = start.resolve()
-    for p in [cur] + list(cur.parents):
-        if (p / "models").is_dir():
-            return p
-    return start.resolve()
+# ----------------------------
+# path resolution (robust to where you run it)
+# ----------------------------
 
 
-def _latest_run_dir(repo_root: Path) -> Path:
-    """Pick the run directory that contains the newest metrics.csv under models/**."""
-    metrics_files = list((repo_root / "models").glob("**/metrics.csv"))
-    if not metrics_files:
-        raise SystemExit(f"No metrics.csv found under: {repo_root / 'models'}")
-    metrics_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return metrics_files[0].parent
+def _infer_models_dir() -> Path:
+    """
+    Locate the models/ directory without searching/globbing.
+
+    Works for either:
+      - running from repo root (./models exists)
+      - running from inside ./models
+      - read.py placed in repo root or in ./models
+    """
+    cwd = Path.cwd().resolve()
+    script_dir = Path(__file__).resolve().parent
+
+    if (cwd / "models").is_dir():
+        return (cwd / "models").resolve()
+    if cwd.name == "models":
+        return cwd
+
+    if (script_dir / "models").is_dir():
+        return (script_dir / "models").resolve()
+    if script_dir.name == "models":
+        return script_dir.resolve()
+
+    raise SystemExit("Could not locate models/ directory (run from repo root or from ./models).")
+
+
+def _resolve_run_dir(models_dir: Path, name: str) -> Path:
+    # Allow passing "v1" (preferred) or "models/v1" (tolerated).
+    p = Path(name)
+    if len(p.parts) >= 2 and p.parts[0] == "models":
+        p = Path(*p.parts[1:])
+
+    candidate = (models_dir / p).resolve()
+
+    # Confine under models_dir (avoid ../../ escapes).
+    if candidate != models_dir and models_dir not in candidate.parents:
+        raise SystemExit(f"Run dir must be under models/: {name}")
+
+    if not candidate.is_dir():
+        raise SystemExit(f"Run dir not found under models/: {p.as_posix()}")
+
+    return candidate
+
+
+# ----------------------------
+# file parsing helpers
+# ----------------------------
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -45,14 +80,14 @@ def _read_metrics_csv(path: Path) -> List[Dict[str, Any]]:
                 if v is None:
                     rr[k] = None
                     continue
-                vv = v.strip()
-                if vv == "":
+                s = v.strip()
+                if not s:
                     rr[k] = None
                     continue
                 try:
-                    rr[k] = float(vv) if k != "epoch" else int(float(vv))
+                    rr[k] = int(float(s)) if k == "epoch" else float(s)
                 except Exception:
-                    rr[k] = vv
+                    rr[k] = s
             rows.append(rr)
     return rows
 
@@ -66,177 +101,260 @@ def _get(cfg: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     return d
 
 
-def _best(rows: List[Dict[str, Any]], key: str, mode: str = "min") -> Optional[Tuple[int, float]]:
+def _best(rows: Iterable[Dict[str, Any]], key: str, mode: str = "min") -> Optional[Tuple[int, float]]:
     vals: List[Tuple[int, float]] = []
     for r in rows:
-        if key in r and isinstance(r[key], (int, float)) and isinstance(r.get("epoch"), int):
-            vals.append((r["epoch"], float(r[key])))
+        ep = r.get("epoch")
+        v = r.get(key)
+        if isinstance(ep, int) and isinstance(v, (int, float)):
+            vals.append((ep, float(v)))
     if not vals:
         return None
-    if mode == "max":
-        return max(vals, key=lambda t: t[1])
-    return min(vals, key=lambda t: t[1])
+    return max(vals, key=lambda t: t[1]) if mode == "max" else min(vals, key=lambda t: t[1])
 
 
 def _fmt(v: Any, *, digits: int = SCI_DIGITS) -> str:
-    """Format floats in scientific notation consistently."""
+    if v is None:
+        return ""
+    if isinstance(v, int):
+        return str(v)
     if isinstance(v, float):
         return f"{v:.{digits}e}"
     return str(v)
 
 
-def main() -> int:
-    repo_root = _find_repo_root(Path.cwd())
+def _pipes(items: Sequence[str]) -> str:
+    return " | ".join([s for s in items if s])
 
-    # Accept either a run dir or a metrics.csv path; otherwise pick newest under models/**
-    arg = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else None
-    if arg:
-        arg = (repo_root / arg).resolve() if not arg.is_absolute() else arg.resolve()
-        if arg.is_dir():
-            run_dir = arg
-        elif arg.is_file() and arg.name == "metrics.csv":
-            run_dir = arg.parent
-        else:
-            raise SystemExit(f"Argument must be a run directory or metrics.csv file. Got: {arg}")
-    else:
-        run_dir = _latest_run_dir(repo_root)
+
+# ----------------------------
+# summaries (concise)
+# ----------------------------
+
+
+def _model_summary(cfg: Dict[str, Any], run_dir_name: str) -> str:
+    m = _get(cfg, "model", default={}) or {}
+    mtype = _get(m, "type", default=None) or _get(m, "name", default=None) or run_dir_name
+
+    parts: List[str] = [str(mtype)]
+
+    act = _get(m, "activation", default=None)
+    drop = _get(m, "dropout", default=None)
+    delta = _get(m, "predict_delta", default=None)
+    ln = _get(m, "layer_norm", default=None)
+
+    if act is not None:
+        parts.append(f"act={act}")
+    if drop is not None:
+        parts.append(f"drop={drop}")
+    if delta is not None:
+        parts.append(f"delta={delta}")
+    if ln is not None:
+        parts.append(f"ln={ln}")
+
+    if str(mtype).lower() == "mlp":
+        h = _get(m, "mlp", "hidden_dims", default=None)
+        res = _get(m, "mlp", "residual", default=None)
+        if h is not None:
+            parts.append(f"h={h}")
+        if res is not None:
+            parts.append(f"res={res}")
+
+    if str(mtype).lower() == "autoencoder":
+        ae = _get(m, "autoencoder", default={}) or {}
+        z = _get(ae, "latent_dim", default=None)
+        if z is not None:
+            parts.append(f"z={z}")
+
+    species = _get(cfg, "data", "species_variables", default=None)
+    globals_ = _get(cfg, "data", "global_variables", default=None)
+    if isinstance(species, list):
+        parts.append(f"S={len(species)}")
+    if isinstance(globals_, list):
+        parts.append(f"G={len(globals_)}")
+
+    return " ".join(parts)
+
+
+def _train_summary(cfg: Dict[str, Any]) -> str:
+    t = _get(cfg, "training", default={}) or {}
+    parts: List[str] = []
+
+    batch = t.get("batch_size")
+    lr = t.get("lr")
+    wd = t.get("weight_decay")
+    epochs = t.get("max_epochs")
+
+    if batch is not None:
+        parts.append(f"batch={batch}")
+    if isinstance(lr, (int, float)):
+        parts.append(f"lr={_fmt(float(lr))}")
+    elif lr is not None:
+        parts.append(f"lr={lr}")
+    if isinstance(wd, (int, float)):
+        parts.append(f"wd={_fmt(float(wd))}")
+    elif wd is not None:
+        parts.append(f"wd={wd}")
+    if epochs is not None:
+        parts.append(f"max_epochs={epochs}")
+
+    return " | ".join(parts) if parts else ""
+
+
+# ----------------------------
+# column selection (no empty columns)
+# ----------------------------
+
+
+def _select_table_cols(header: Sequence[str], max_cols: int = 6) -> List[str]:
+    """
+    Pick <= max_cols columns that actually exist in the CSV, prioritizing the
+    most decision-driving metrics. Always includes 'epoch' if present.
+    """
+    header_set = set(header)
+
+    # Priority list tuned for your current CSV schema.
+    priority = [
+        "epoch",
+        "val_loss",
+        "val_log_mae",
+        "val_mean_abs_log10",
+        "val_mse",
+        "val_mse_log",
+        "val_z_mae",
+        "val_phys",
+        "val_phys_penalty",
+        "val_weighted_mean_abs_log10",
+        "val_mse_z",
+        "val_z",
+        # common alternates some runs might have
+        "train_loss",
+        "train_log_mae",
+        "train_mean_abs_log10",
+        "lr",
+    ]
+
+    cols: List[str] = [c for c in priority if c in header_set]
+    cols = cols[:max_cols]
+
+    # If still short, fill with any remaining numeric-ish columns in CSV order.
+    if len(cols) < max_cols:
+        for c in header:
+            if c in cols:
+                continue
+            if c == "":
+                continue
+            cols.append(c)
+            if len(cols) >= max_cols:
+                break
+
+    return cols
+
+
+def _best_lines(rows: List[Dict[str, Any]], header: Sequence[str]) -> List[str]:
+    """
+    Print a couple of best-* lines for the best available validation keys
+    (rather than assuming specific names).
+    """
+    header_set = set(header)
+    candidates = [
+        ("best_val_loss", "val_loss"),
+        ("best_val_log_mae", "val_log_mae"),
+        ("best_val_mean_abs_log10", "val_mean_abs_log10"),
+        ("best_val_mse", "val_mse"),
+        ("best_val_mse_log", "val_mse_log"),
+        ("best_val_z_mae", "val_z_mae"),
+    ]
+
+    out: List[str] = []
+    for label, key in candidates:
+        if key not in header_set:
+            continue
+        b = _best(rows, key, "min")
+        if b:
+            out.append(f"{label}={_fmt(b[1])}@{b[0]}")
+        if len(out) >= 2:
+            break  # keep it concise
+    return out
+
+
+# ----------------------------
+# main
+# ----------------------------
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="read.py",
+        description="Concise training run summary from ./models/<name>/metrics.csv",
+    )
+    ap.add_argument(
+        "name",
+        help="Run directory name under ./models (e.g., 'v1'). You may also pass 'models/v1'.",
+    )
+    ap.add_argument(
+        "--tail",
+        type=int,
+        default=10,
+        help="Print last N epochs as a piped table. Default: 10 (0 disables).",
+    )
+    args = ap.parse_args()
+
+    models_dir = _infer_models_dir()
+    run_dir = _resolve_run_dir(models_dir, args.name)
 
     metrics_path = run_dir / "metrics.csv"
     cfg_path = run_dir / "config.json"
 
     if not metrics_path.exists():
-        raise SystemExit(f"Missing: {metrics_path}")
+        raise SystemExit(f"Missing: {run_dir.name}/metrics.csv")
 
     cfg = _read_json(cfg_path)
     rows = _read_metrics_csv(metrics_path)
     if not rows:
-        raise SystemExit(f"No rows found in: {metrics_path}")
+        raise SystemExit(f"No rows found in: {run_dir.name}/metrics.csv")
 
-    # Auto-grab model name/type
-    model_type = _get(cfg, "model", "type", default=None) or _get(cfg, "model", "name", default=None)
-    if not model_type:
-        model_type = run_dir.name  # fallback
+    header = list(rows[0].keys())
+    cols = _select_table_cols(header, max_cols=6)
 
-    # Pull a few “important” config fields if present
-    max_epochs = _get(cfg, "training", "max_epochs", default=None)
-    batch_size = _get(cfg, "training", "batch_size", default=None)
-    lr = _get(cfg, "training", "lr", default=None)
-    wd = _get(cfg, "training", "weight_decay", default=None)
-    precision = _get(cfg, "training", "precision", default=None)
-    devices = _get(cfg, "training", "devices", default=None)
-    accelerator = _get(cfg, "training", "accelerator", default=None)
-
-    # Last row / epoch
     last = rows[-1]
-    last_epoch = last.get("epoch", "?")
 
-    # Best metrics (if present)
-    best_val_loss = _best(rows, "val_loss", "min")
-    best_val_log10 = _best(rows, "val_log10_err", "min")
+    print(_pipes([f"run={run_dir.name}"]))
+    model_line = _model_summary(cfg, run_dir.name)
+    if model_line:
+        print(_pipes([f"model={model_line}"]))
+    train_line = _train_summary(cfg)
+    if train_line:
+        print(_pipes([f"train={train_line}"]))
 
-    # Build a “final metrics” line using common keys if present
-    final_keys = ["train_loss", "val_loss", "train_log10_err", "val_log10_err", "train_loss_main", "train_burn_loss"]
-    final_present = [(k, last.get(k)) for k in final_keys if k in last and isinstance(last.get(k), (int, float))]
+    # last line: only include columns that exist and are non-empty
+    last_bits = [f"{c}={_fmt(last.get(c))}" for c in cols if last.get(c) is not None]
+    if last_bits:
+        print(_pipes(["last"] + last_bits))
 
-    # Print summary
-    print("\n" + "=" * 72)
-    print("TRAINING RUN SUMMARY")
-    print("=" * 72)
-    print(f"Repo:      {repo_root}")
-    print(f"Run dir:   {run_dir}")
-    print(f"Model:     {model_type}")
+    best_bits = _best_lines(rows, header)
+    if best_bits:
+        print(_pipes(best_bits))
 
-    cfg_bits = []
-    if precision is not None:
-        cfg_bits.append(f"precision={precision}")
-    if devices is not None:
-        cfg_bits.append(f"devices={devices}")
-    if accelerator is not None:
-        cfg_bits.append(f"accel={accelerator}")
-    if batch_size is not None:
-        cfg_bits.append(f"batch={batch_size}")
-    if lr is not None:
-        cfg_bits.append(f"lr={_fmt(float(lr)) if isinstance(lr, (int, float)) else lr}")
-    if wd is not None:
-        cfg_bits.append(f"wd={_fmt(float(wd)) if isinstance(wd, (int, float)) else wd}")
-    if max_epochs is not None:
-        cfg_bits.append(f"max_epochs={max_epochs}")
-    if cfg_bits:
-        print("Config:    " + " | ".join(cfg_bits))
+    if args.tail and args.tail > 0:
+        tail = rows[-args.tail :] if len(rows) > args.tail else rows
 
-    print(f"Logged:    {len(rows)} epoch rows (last epoch={last_epoch})")
-
-    if best_val_loss:
-        print(f"Best val:  val_loss={_fmt(best_val_loss[1])} @ epoch {best_val_loss[0]}")
-    if best_val_log10:
-        print(f"Best val:  val_log10_err={_fmt(best_val_log10[1])} @ epoch {best_val_log10[0]}")
-
-    if final_present:
-        print("Final:     " + " | ".join([f"{k}={_fmt(float(v))}" for k, v in final_present]))
-
-    # Print last N epochs as a nicer table with more columns (floats in scientific notation)
-    N = 10
-    tail = rows[-N:] if len(rows) > N else rows
-
-    def _is_num(x: Any) -> bool:
-        return isinstance(x, (int, float)) and x is not None
-
-    def _cell(x: Any) -> str:
-        if x is None:
-            return ""
-        if isinstance(x, int):
-            return str(x)  # keep epoch and ints as ints
-        if isinstance(x, float):
-            return f"{x:.{SCI_DIGITS}e}"
-        return str(x)
-
-    if len(tail) > 1:
-        keys = list(rows[0].keys())  # preserves CSV header order
-
-        preferred = [
-            "epoch",
-            "train_loss",
-            "val_loss",
-            "train_log10_err",
-            "val_log10_err",
-            "train_z_mae",
-            "val_z_mae",
-            "train_loss_main",
-            "train_burn_loss",
-            "lr",
+        headers = cols
+        table = [[_fmt(r.get(c)) for c in cols] for r in tail]
+        widths = [
+            max(len(headers[i]), max((len(row[i]) for row in table), default=0))
+            for i in range(len(headers))
         ]
-        cols = [k for k in preferred if k in keys and (k == "epoch" or any(_is_num(r.get(k)) for r in tail))]
 
-        extras = [k for k in keys if k not in cols and k != "epoch" and any(_is_num(r.get(k)) for r in tail)]
-
-        MAX_COLS = 12  # total columns including epoch
-        cols += extras[: max(0, MAX_COLS - len(cols))]
-
-        labels = {
-            "train_loss": "train",
-            "val_loss": "val",
-            "train_log10_err": "tr_log10",
-            "val_log10_err": "va_log10",
-            "train_z_mae": "tr_z_mae",
-            "val_z_mae": "va_z_mae",
-            "train_loss_main": "train_main",
-            "train_burn_loss": "burn",
-        }
-        headers = [labels.get(c, c) for c in cols]
-
-        table = [[_cell(r.get(c)) for c in cols] for r in tail]
-        widths = [max(len(headers[i]), max((len(row[i]) for row in table), default=0)) for i in range(len(cols))]
-
-        def _fmt_row(items: List[str]) -> str:
+        def fmt_row(items: List[str]) -> str:
             return " | ".join(items[i].rjust(widths[i]) for i in range(len(items)))
 
-        print("\nRecent epochs:")
-        print("  " + _fmt_row(headers))
-        print("  " + "-+-".join("-" * w for w in widths))
-        for row in table:
-            print("  " + _fmt_row(row))
+        print("\nrecent:")
+        print(fmt_row(headers))
+        print("-+-".join("-" * w for w in widths))
+        for r in table:
+            print(fmt_row(r))
 
-    print("=" * 72 + "\n")
     return 0
 
 
