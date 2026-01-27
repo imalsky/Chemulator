@@ -84,6 +84,7 @@ def _read_metrics_csv(path: Path) -> List[Dict[str, Any]]:
                 if not s:
                     rr[k] = None
                     continue
+                # epoch is always int; everything else is float-ish
                 try:
                     rr[k] = int(float(s)) if k == "epoch" else float(s)
                 except Exception:
@@ -134,8 +135,7 @@ def _pipes(items: Sequence[str]) -> str:
 
 def _model_summary(cfg: Dict[str, Any], run_dir_name: str) -> str:
     m = _get(cfg, "model", default={}) or {}
-    mtype = _get(m, "type", default=None) or _get(m, "name", default=None) or run_dir_name
-
+    mtype = _get(m, "type", default=None) or run_dir_name
     parts: List[str] = [str(mtype)]
 
     act = _get(m, "activation", default=None)
@@ -180,101 +180,80 @@ def _train_summary(cfg: Dict[str, Any]) -> str:
     t = _get(cfg, "training", default={}) or {}
     parts: List[str] = []
 
-    batch = t.get("batch_size")
+    def add(k: str, v: Any) -> None:
+        if v is None:
+            return
+        parts.append(f"{k}={v}")
+
+    add("batch", t.get("batch_size"))
     lr = t.get("lr")
     wd = t.get("weight_decay")
-    epochs = t.get("max_epochs")
+    add("lr", _fmt(float(lr)) if isinstance(lr, (int, float)) else lr)
+    add("wd", _fmt(float(wd)) if isinstance(wd, (int, float)) else wd)
+    add("max_epochs", t.get("max_epochs"))
+    add("rollout", t.get("rollout_steps"))
 
-    if batch is not None:
-        parts.append(f"batch={batch}")
-    if isinstance(lr, (int, float)):
-        parts.append(f"lr={_fmt(float(lr))}")
-    elif lr is not None:
-        parts.append(f"lr={lr}")
-    if isinstance(wd, (int, float)):
-        parts.append(f"wd={_fmt(float(wd))}")
-    elif wd is not None:
-        parts.append(f"wd={wd}")
-    if epochs is not None:
-        parts.append(f"max_epochs={epochs}")
+    tf = t.get("teacher_forcing", {}) or {}
+    if isinstance(tf, dict) and ("start" in tf or "end" in tf):
+        tf_start = tf.get("start", None)
+        tf_end = tf.get("end", None)
+        tf_mode = tf.get("mode", None)
+        if tf_start is not None and tf_end is not None:
+            parts.append(f"tf={tf_start}->{tf_end}{'' if tf_mode is None else f'({tf_mode})'}")
 
-    return " | ".join(parts) if parts else ""
+    cur = t.get("curriculum", {}) or {}
+    if isinstance(cur, dict) and bool(cur.get("enabled", False)):
+        parts.append(f"cur={cur.get('start_k')}->{cur.get('max_k')}@{cur.get('ramp_epochs')}e")
+
+    longr = t.get("long_rollout", {}) or {}
+    if isinstance(longr, dict) and bool(longr.get("enabled", False)):
+        parts.append(f"long={longr.get('long_rollout_steps')}@last{longr.get('final_epochs')}e")
+
+    return " | ".join([p for p in parts if p]) if parts else ""
 
 
 # ----------------------------
-# column selection (no empty columns)
+# column selection (new trainer schema)
 # ----------------------------
 
 
-def _select_table_cols(header: Sequence[str], max_cols: int = 6) -> List[str]:
-    """
-    Pick <= max_cols columns that actually exist in the CSV, prioritizing the
-    most decision-driving metrics. Always includes 'epoch' if present.
-    """
+def _select_table_cols(header: Sequence[str], max_cols: int = 8) -> List[str]:
     header_set = set(header)
 
-    # Priority list tuned for your current CSV schema.
+    # New trainer default CSV schema (fixed fields).
     priority = [
         "epoch",
-        "val_loss",
-        "val_log_mae",
-        "val_mean_abs_log10",
-        "val_mse",
-        "val_mse_log",
-        "val_z_mae",
-        "val_phys",
-        "val_phys_penalty",
-        "val_weighted_mean_abs_log10",
-        "val_mse_z",
-        "val_z",
-        # common alternates some runs might have
         "train_loss",
-        "train_log_mae",
-        "train_mean_abs_log10",
+        "val_loss",
+        "val_loss_log10_mae",
+        "val_loss_z_mse",
         "lr",
+        "epoch_time_sec",
+        "train_tf_prob",
+        "train_rollout_steps",
     ]
 
-    cols: List[str] = [c for c in priority if c in header_set]
-    cols = cols[:max_cols]
-
-    # If still short, fill with any remaining numeric-ish columns in CSV order.
-    if len(cols) < max_cols:
-        for c in header:
-            if c in cols:
-                continue
-            if c == "":
-                continue
-            cols.append(c)
-            if len(cols) >= max_cols:
-                break
-
-    return cols
+    cols = [c for c in priority if c in header_set]
+    return cols[:max_cols]
 
 
 def _best_lines(rows: List[Dict[str, Any]], header: Sequence[str]) -> List[str]:
-    """
-    Print a couple of best-* lines for the best available validation keys
-    (rather than assuming specific names).
-    """
     header_set = set(header)
     candidates = [
-        ("best_val_loss", "val_loss"),
-        ("best_val_log_mae", "val_log_mae"),
-        ("best_val_mean_abs_log10", "val_mean_abs_log10"),
-        ("best_val_mse", "val_mse"),
-        ("best_val_mse_log", "val_mse_log"),
-        ("best_val_z_mae", "val_z_mae"),
+        ("best_val_loss", "val_loss", "min"),
+        ("best_val_log10_mae", "val_loss_log10_mae", "min"),
+        ("best_val_z_mse", "val_loss_z_mse", "min"),
     ]
 
     out: List[str] = []
-    for label, key in candidates:
+    for label, key, mode in candidates:
         if key not in header_set:
             continue
-        b = _best(rows, key, "min")
+        b = _best(rows, key, mode=mode)
         if b:
             out.append(f"{label}={_fmt(b[1])}@{b[0]}")
-        if len(out) >= 2:
-            break  # keep it concise
+        if len(out) >= 3:
+            break
     return out
 
 
@@ -296,7 +275,7 @@ def main() -> int:
         "--tail",
         type=int,
         default=10,
-        help="Print last N epochs as a piped table. Default: 10 (0 disables).",
+        help="Print last N epochs as a table. Default: 10 (0 disables).",
     )
     args = ap.parse_args()
 
@@ -315,19 +294,20 @@ def main() -> int:
         raise SystemExit(f"No rows found in: {run_dir.name}/metrics.csv")
 
     header = list(rows[0].keys())
-    cols = _select_table_cols(header, max_cols=6)
+    cols = _select_table_cols(header, max_cols=8)
 
     last = rows[-1]
 
     print(_pipes([f"run={run_dir.name}"]))
+
     model_line = _model_summary(cfg, run_dir.name)
     if model_line:
         print(_pipes([f"model={model_line}"]))
+
     train_line = _train_summary(cfg)
     if train_line:
         print(_pipes([f"train={train_line}"]))
 
-    # last line: only include columns that exist and are non-empty
     last_bits = [f"{c}={_fmt(last.get(c))}" for c in cols if last.get(c) is not None]
     if last_bits:
         print(_pipes(["last"] + last_bits))
@@ -339,8 +319,8 @@ def main() -> int:
     if args.tail and args.tail > 0:
         tail = rows[-args.tail :] if len(rows) > args.tail else rows
 
-        headers = cols
-        table = [[_fmt(r.get(c)) for c in cols] for r in tail]
+        headers = cols if cols else header
+        table = [[_fmt(r.get(c)) for c in headers] for r in tail]
         widths = [
             max(len(headers[i]), max((len(row[i]) for row in table), default=0))
             for i in range(len(headers))
@@ -350,7 +330,7 @@ def main() -> int:
             return " | ".join(items[i].rjust(widths[i]) for i in range(len(items)))
 
         print("\nrecent:")
-        print(fmt_row(headers))
+        print(fmt_row(list(headers)))
         print("-+-".join("-" * w for w in widths))
         for r in table:
             print(fmt_row(r))

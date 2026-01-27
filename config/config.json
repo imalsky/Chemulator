@@ -4,13 +4,9 @@
       "T": "min-max",
       "P": "log-min-max"
     },
-    "_comment__methods": "Per-feature normalization overrides. Use log-min-max for strictly-positive globals like pressure; min-max for temperature.",
     "default_method": "log-standard",
-    "_comment__default_method": "Default for species: log10 then standardize using per-species stats in normalization.json.",
     "globals_default_method": "standard",
-    "_comment__globals_default_method": "Default for global variables (P,T) unless overridden in methods.",
     "epsilon": 1e-30,
-    "_comment__epsilon": "Numerical floor used during log transforms / clamping to avoid log(0). Must match preprocessing assumptions.",
     "min_std": 1e-12
   },
   "data": {
@@ -31,16 +27,12 @@
     "global_variables": [
       "P",
       "T"
-    ],
-    "_comment__data": "Species are modeled in log space; globals condition the dynamics model."
+    ]
   },
   "dataset": {
     "windows_per_trajectory": 10,
-    "_comment__windows_per_trajectory": "How many training windows (subsequences) sampled per full trajectory; increases data reuse.",
     "preload_to_device": true,
-    "_comment__preload_to_device": "If true, cache tensors on GPU/accelerator for throughput; set false if OOM or multi-worker CPU loading.",
     "shard_cache_size": 2,
-    "_comment__shard_cache_size": "How many shard files to keep hot in the dataset cache (I/O vs RAM tradeoff).",
     "use_mmap": false
   },
   "model": {
@@ -48,7 +40,6 @@
     "activation": "silu",
     "dropout": 0.0,
     "predict_delta": true,
-    "_comment__predict_delta": "If true, model predicts delta in (normalized log) state; improves stability for small time steps.",
     "mlp": {
       "hidden_dims": [
         1024,
@@ -83,74 +74,74 @@
     "batch_size": 2048,
     "lr": 0.0003,
     "weight_decay": 0.0001,
+
     "rollout_steps": 50,
-    "_comment_rollout_steps": "Number of predicted steps used for training (one_jump) and eval rollout length (autoregressive).",
+
     "burn_in_steps": 0,
-    "_comment_burn_in_steps": "If >0, first N rollout steps are propagated but downweighted (burn_in_loss_weight) to stabilize training.",
     "val_burn_in_steps": 0,
-    "_comment_val_burn_in_steps": "Validation counterpart of burn_in_steps; keep 0 for clean metrics unless matching training objective.",
     "burn_in_noise_std": 0.0,
-    "_comment__burn_in_noise_std": "Std of noise injected during burn-in propagation (log/normalized space, depending on implementation). 0 disables.",
     "burn_in_loss_weight": 0.0,
-    "_comment__burn_in_loss_weight": "Relative loss weight for burn-in steps. 0 means burn-in steps do not contribute to loss.",
-    "grad_clip": 1.0,
-    "precision": "bf16-mixed",
-    "devices": "auto",
-    "accelerator": "auto",
-    "num_workers": 0,
-    "pin_memory": true,
-    "persistent_workers": false,
-    "prefetch_factor": 2,
-    "accumulate_grad_batches": 1,
-    "num_sanity_val_steps": 0,
-    "enable_progress_bar": true,
-    "enable_model_summary": true,
-    "resume": true,
-    "_comment__resume": "If true, trainer attempts to resume from latest/explicit checkpoint in work_dir (implementation-dependent).",
+
     "teacher_forcing": {
       "start": 1.0,
       "end": 1.0,
       "decay_epochs": 1,
-      "mode": "linear",
-      "_comment__teacher_forcing": "Teacher forcing probability schedule for autoregressive training. With one_jump, this is effectively always 1.0.",
-      "decay": 1.0
+      "mode": "linear"
     },
+
     "curriculum": {
       "enabled": false,
-      "start_steps": 2,
-      "ramp_epochs": 250,
-      "_comment__curriculum": "If enabled, gradually increases rollout length over ramp_epochs (stability → long-horizon competence)."
+      "start_k": 2,
+      "max_k": 50,
+      "ramp_epochs": 250
     },
+
     "long_rollout": {
       "enabled": false,
       "long_rollout_steps": 300,
-      "long_ft_epochs": 40,
+      "final_epochs": 40,
       "apply_to_validation": false,
-      "apply_to_test": true,
-      "_comment__long_rollout": "Optional late-stage long-horizon fine-tuning. Can override rollout length for final epochs/val/test."
+      "apply_to_test": true
     },
+
     "loss": {
       "lambda_log10_mae": 1.0,
-      "_comment__lambda_log10_mae": "Weight on mean absolute error in log10 physical space (primary accuracy term).",
-      "lambda_z_mse": 0.1,
-      "_comment__lambda_z_mse": "Weight on MSE in normalized space (stability/regularization term).",
-      "_comment__loss": "Two-term loss only: log10-MAE + z-MSE (no species weights, no physical penalty)."
+      "lambda_z_mse": 0.1
     },
+
     "scheduler": {
-      "name": "cosine_warmup",
+      "type": "cosine_with_warmup",
       "warmup_epochs": 10,
-      "min_lr_ratio": 0.01,
-      "_comment__scheduler": "Cosine decay after warmup. min_lr_ratio sets final LR as (min_lr_ratio * lr)."
+      "min_lr_ratio": 0.01
     },
+
+    "grad_clip": 1.0,
+    "precision": "bf16-mixed",
+    "devices": "auto",
+    "accelerator": "auto",
+    "accumulate_grad_batches": 1,
+
+    "num_workers": 0,
+    "pin_memory": true,
+    "persistent_workers": false,
+    "prefetch_factor": 2,
+
+    "num_sanity_val_steps": 0,
+    "enable_progress_bar": true,
+    "enable_model_summary": true,
+    "resume": true,
+
+    "metrics_csv": "metrics.csv",
+
     "checkpointing": {
       "enabled": true,
       "save_top_k": 1,
       "monitor": "val_loss",
       "mode": "min",
       "save_last": true,
-      "every_n_epochs": 1,
-      "_comment__checkpointing": "Monitor selects which logged metric decides 'best'. Keep consistent with eval_mode for meaningful selection."
+      "every_n_epochs": 1
     },
+
     "early_stopping": {
       "enabled": false,
       "monitor": "val_loss",
@@ -158,27 +149,16 @@
       "mode": "min",
       "min_delta": 0.0,
       "verbose": true
-    },
-    "train_mode": "one_jump",
-    "_comment__train_mode": "one_jump = parallel one-step transitions from ground truth (fast). autoregressive = sequential rollout (realistic, slower).",
-    "eval_mode": "autoregressive",
-    "_comment__eval_mode": "Use autoregressive for metrics that reflect true open-loop rollout performance.",
-    "one_jump_k_roll": 50,
-    "_comment__one_jump_k_roll": "Caps how many one-step transitions per window are used in one_jump mode (compute/throughput knob)."
+    }
   },
   "preprocessing": {
     "drop_below": 1e-30,
-    "_comment__drop_below": "Floor applied before log transforms when building processed trajectories.",
     "output_trajectories_per_file": 500000,
-    "_comment__output_trajectories_per_file": "Controls shard size on disk; larger = fewer files, heavier I/O bursts.",
     "dt_sampling": "loguniform",
-    "_comment__dt_sampling": "How time deltas are sampled when constructing windows (loguniform covers decades of dt).",
     "dt_mode": "per_chunk",
-    "_comment__dt_mode": "Defines how dt is represented per step/window chunk (must match dataset/model expectations).",
     "dt_min": 10,
     "dt_max": 100,
     "n_steps": 500,
-    "_comment__n_steps": "Number of steps per trajectory after preprocessing/resampling; defines maximum horizon available.",
     "train_split": 0.8,
     "val_split": 0.1,
     "test_split": 0.1,
@@ -191,17 +171,14 @@
     "raw_data_dir": "data/raw",
     "processed_data_dir": "data/processed",
     "model_dir": "models",
-    "work_dir": "models/v1",
-    "_comment__work_dir": "Run output directory (checkpoints, metrics). Changing this is the cleanest way to separate experiments."
+    "work_dir": "models/v1"
   },
   "runtime": {
     "mode": "train",
-    "checkpoint": null,
-    "_comment__checkpoint": "Optional explicit checkpoint path to load (if supported by runner). Overrides resume auto-detection in some setups."
+    "checkpoint": null
   },
   "system": {
     "seed": 1234,
-    "deterministic": false,
-    "_comment__deterministic": "If true, enforces deterministic kernels (slower); useful for debugging/regression tests."
+    "deterministic": false
   }
 }
