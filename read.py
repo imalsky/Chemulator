@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+SCI_DIGITS = 3  # digits after decimal in scientific notation (e.g., 2.975e-02)
+
 
 def _find_repo_root(start: Path) -> Path:
     """Walk up until we find a directory that contains 'models'."""
@@ -38,7 +40,6 @@ def _read_metrics_csv(path: Path) -> List[Dict[str, Any]]:
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for r in reader:
-            # Convert numeric fields where possible
             rr: Dict[str, Any] = {}
             for k, v in (r or {}).items():
                 if v is None:
@@ -77,10 +78,10 @@ def _best(rows: List[Dict[str, Any]], key: str, mode: str = "min") -> Optional[T
     return min(vals, key=lambda t: t[1])
 
 
-def _fmt(v: Any) -> str:
+def _fmt(v: Any, *, digits: int = SCI_DIGITS) -> str:
+    """Format floats in scientific notation consistently."""
     if isinstance(v, float):
-        # compact, human-friendly float formatting
-        return f"{v:.6g}"
+        return f"{v:.{digits}e}"
     return str(v)
 
 
@@ -146,13 +147,20 @@ def main() -> int:
     print(f"Model:     {model_type}")
 
     cfg_bits = []
-    if precision is not None: cfg_bits.append(f"precision={precision}")
-    if devices is not None: cfg_bits.append(f"devices={devices}")
-    if accelerator is not None: cfg_bits.append(f"accel={accelerator}")
-    if batch_size is not None: cfg_bits.append(f"batch={batch_size}")
-    if lr is not None: cfg_bits.append(f"lr={_fmt(lr)}")
-    if wd is not None: cfg_bits.append(f"wd={_fmt(wd)}")
-    if max_epochs is not None: cfg_bits.append(f"max_epochs={max_epochs}")
+    if precision is not None:
+        cfg_bits.append(f"precision={precision}")
+    if devices is not None:
+        cfg_bits.append(f"devices={devices}")
+    if accelerator is not None:
+        cfg_bits.append(f"accel={accelerator}")
+    if batch_size is not None:
+        cfg_bits.append(f"batch={batch_size}")
+    if lr is not None:
+        cfg_bits.append(f"lr={_fmt(float(lr)) if isinstance(lr, (int, float)) else lr}")
+    if wd is not None:
+        cfg_bits.append(f"wd={_fmt(float(wd)) if isinstance(wd, (int, float)) else wd}")
+    if max_epochs is not None:
+        cfg_bits.append(f"max_epochs={max_epochs}")
     if cfg_bits:
         print("Config:    " + " | ".join(cfg_bits))
 
@@ -164,24 +172,69 @@ def main() -> int:
         print(f"Best val:  val_log10_err={_fmt(best_val_log10[1])} @ epoch {best_val_log10[0]}")
 
     if final_present:
-        print("Final:     " + " | ".join([f"{k}={_fmt(v)}" for k, v in final_present]))
+        print("Final:     " + " | ".join([f"{k}={_fmt(float(v))}" for k, v in final_present]))
 
-    # Print last N epochs as a compact table
+    # Print last N epochs as a nicer table with more columns (floats in scientific notation)
     N = 10
     tail = rows[-N:] if len(rows) > N else rows
-    cols = ["epoch"] + [k for k in ["train_loss", "val_loss", "train_log10_err", "val_log10_err"] if k in rows[0] or any(k in r for r in rows)]
-    cols = [c for c in cols if any(c in r for r in tail)]
 
-    if cols and len(tail) > 1:
+    def _is_num(x: Any) -> bool:
+        return isinstance(x, (int, float)) and x is not None
+
+    def _cell(x: Any) -> str:
+        if x is None:
+            return ""
+        if isinstance(x, int):
+            return str(x)  # keep epoch and ints as ints
+        if isinstance(x, float):
+            return f"{x:.{SCI_DIGITS}e}"
+        return str(x)
+
+    if len(tail) > 1:
+        keys = list(rows[0].keys())  # preserves CSV header order
+
+        preferred = [
+            "epoch",
+            "train_loss",
+            "val_loss",
+            "train_log10_err",
+            "val_log10_err",
+            "train_z_mae",
+            "val_z_mae",
+            "train_loss_main",
+            "train_burn_loss",
+            "lr",
+        ]
+        cols = [k for k in preferred if k in keys and (k == "epoch" or any(_is_num(r.get(k)) for r in tail))]
+
+        extras = [k for k in keys if k not in cols and k != "epoch" and any(_is_num(r.get(k)) for r in tail)]
+
+        MAX_COLS = 12  # total columns including epoch
+        cols += extras[: max(0, MAX_COLS - len(cols))]
+
+        labels = {
+            "train_loss": "train",
+            "val_loss": "val",
+            "train_log10_err": "tr_log10",
+            "val_log10_err": "va_log10",
+            "train_z_mae": "tr_z_mae",
+            "val_z_mae": "va_z_mae",
+            "train_loss_main": "train_main",
+            "train_burn_loss": "burn",
+        }
+        headers = [labels.get(c, c) for c in cols]
+
+        table = [[_cell(r.get(c)) for c in cols] for r in tail]
+        widths = [max(len(headers[i]), max((len(row[i]) for row in table), default=0)) for i in range(len(cols))]
+
+        def _fmt_row(items: List[str]) -> str:
+            return " | ".join(items[i].rjust(widths[i]) for i in range(len(items)))
+
         print("\nRecent epochs:")
-        # Header
-        print("  " + "  ".join(f"{c:>14}" for c in cols))
-        for r in tail:
-            line = []
-            for c in cols:
-                v = r.get(c, None)
-                line.append(f"{_fmt(v):>14}" if v is not None else f"{'':>14}")
-            print("  " + "  ".join(line))
+        print("  " + _fmt_row(headers))
+        print("  " + "-+-".join("-" * w for w in widths))
+        for row in table:
+            print("  " + _fmt_row(row))
 
     print("=" * 72 + "\n")
     return 0

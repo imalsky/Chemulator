@@ -1,0 +1,43 @@
+#!/bin/bash
+#PBS -N MYGPUJOB
+#PBS -q gpu_long
+#PBS -W group_list=s2458
+#PBS -l select=1:ncpus=32:ngpus=1:mem=50gb:model=gh200
+#PBS -l walltime=05:00:00
+#PBS -j oe
+#PBS -m abe
+#PBS -M isaac.n.malsky@jpl.nasa.gov
+
+set -euo pipefail
+
+# PBS equivalent of SLURM_SUBMIT_DIR
+cd -P "${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
+
+# ---- Conda (match the working run.pbs approach) ----
+module purge
+module use -a /swbuild/analytix/tools/modulefiles
+module load miniconda3/gh2
+
+CONDA_BASE="$(conda info --base)"
+# shellcheck disable=SC1090
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+
+CONDA_ENV="${CONDA_ENV:-pyt2_7_gh}"   # default to the env your run.pbs uses
+set +e
+conda activate "${CONDA_ENV}"
+rc=$?
+set -e
+if [ $rc -ne 0 ]; then
+  echo "ERROR: failed to activate conda env: ${CONDA_ENV}"
+  echo "Available envs are:"
+  conda info --envs || true
+  exit 2
+fi
+
+# ---- Same runtime exports as your SLURM script ----
+export HDF5_USE_FILE_LOCKING=FALSE
+export PYTHONNOUSERSITE=1
+export PYTHONPATH="$(pwd)/src:$(pwd):${PYTHONPATH:-}"
+
+# PBS: no srun
+python -u src/main.py

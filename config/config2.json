@@ -1,0 +1,179 @@
+{
+  "normalization": {
+    "methods": {
+      "T": "min-max",
+      "P": "log-min-max"
+    },
+    "default_method": "log-standard",
+    "globals_default_method": "standard",
+    "epsilon": 1e-30,
+    "min_std": 1e-12
+  },
+  "data": {
+    "species_variables": [
+      "C2H2_evolution",
+      "CH4_evolution",
+      "CO2_evolution",
+      "CO_evolution",
+      "H2O_evolution",
+      "H2_evolution",
+      "HCN_evolution",
+      "H_evolution",
+      "N2_evolution",
+      "NH3_evolution",
+      "OH_evolution",
+      "O_evolution"
+    ],
+    "global_variables": [
+      "P",
+      "T"
+    ]
+  },
+  "dataset": {
+    "windows_per_trajectory": 10,
+    "preload_to_device": true,
+    "shard_cache_size": 2,
+    "use_mmap": false
+  },
+  "model": {
+    "type": "mlp",
+    "activation": "silu",
+    "dropout": 0.0,
+    "predict_delta": true,
+    "mlp": {
+      "hidden_dims": [
+        1024,
+        1024,
+        1024,
+        1024,
+        1024,
+        1024
+      ],
+      "residual": true
+    },
+    "autoencoder": {
+      "latent_dim": 256,
+      "encoder_hidden": [
+        512,
+        512
+      ],
+      "dynamics_hidden": [
+        512,
+        512
+      ],
+      "decoder_hidden": [
+        512,
+        512
+      ],
+      "residual": true,
+      "dynamics_residual": true
+    }
+  },
+  "training": {
+    "max_epochs": 500,
+    "batch_size": 4096,
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "rollout_steps": 50,
+    "_comment_rollout_steps": "Base rollout length used for most of training and for validation (unless apply_to_validation=true in long_rollout).",
+    "burn_in_steps": 5,
+    "_comment_burn_in_steps": "Stage 2: enable a short open-loop burn-in at the start of each rollout (no teacher forcing) to stabilize autoregressive unrolls.",
+    "val_burn_in_steps": 0,
+    "_comment_val_burn_in_steps": "Stage 2: keep validation burn-in off for clearer val_loss comparisons.",
+    "burn_in_noise_std": 0.0,
+    "burn_in_loss_weight": 0.5,
+    "grad_clip": 1.0,
+    "precision": "bf16-mixed",
+    "devices": "auto",
+    "accelerator": "auto",
+    "num_workers": 0,
+    "pin_memory": true,
+    "persistent_workers": false,
+    "prefetch_factor": 2,
+    "accumulate_grad_batches": 1,
+    "num_sanity_val_steps": 0,
+    "enable_progress_bar": true,
+    "enable_model_summary": true,
+    "resume": true,
+    "teacher_forcing": {
+      "start": 0.0,
+      "end": 0.0,
+      "decay_epochs": 1,
+      "mode": "linear",
+      "_comment__teacher_forcing": "Stage 2: pure autoregressive training (tf_prob=0.0) to tune rollout behavior.",
+      "decay": 1.0
+    },
+    "curriculum": {
+      "enabled": false,
+      "start_steps": 2,
+      "ramp_epochs": 250,
+      "_comment__curriculum": "Stage 2: curriculum disabled; rollout length controlled by long_rollout override."
+    },
+    "long_rollout": {
+      "enabled": true,
+      "long_rollout_steps": 200,
+      "long_ft_epochs": 200,
+      "apply_to_validation": false,
+      "apply_to_test": true,
+      "_comment__long_rollout": "Stage 2: use 200-step autoregressive rollouts for all stage-2 epochs (epochs 300-499) via long_rollout override (long_ft_epochs=200)."
+    },
+    "loss": {
+      "lambda_phys": 0.0,
+      "lambda_z": 1.0,
+      "_comment__loss": "Small physics penalty helps discourage runaway trajectories."
+    },
+    "scheduler": {
+      "name": "cosine_warmup",
+      "warmup_epochs": 10,
+      "min_lr_ratio": 0.05
+    },
+    "checkpointing": {
+      "enabled": true,
+      "save_top_k": 1,
+      "monitor": "val_loss",
+      "mode": "min",
+      "save_last": true,
+      "every_n_epochs": 1
+    },
+    "early_stopping": {
+      "enabled": false,
+      "monitor": "val_loss",
+      "patience": 20,
+      "mode": "min",
+      "min_delta": 0.0,
+      "verbose": true
+    },
+    "train_mode": "autoregressive",
+    "eval_mode": "autoregressive"
+  },
+  "preprocessing": {
+    "drop_below": 1e-30,
+    "output_trajectories_per_file": 500000,
+    "dt_sampling": "loguniform",
+    "dt_mode": "per_chunk",
+    "dt_min": 10,
+    "dt_max": 100,
+    "n_steps": 500,
+    "train_split": 0.8,
+    "val_split": 0.1,
+    "test_split": 0.1,
+    "shard_size": 16384,
+    "time_key": "time",
+    "species_group": "species",
+    "globals_group": "globals"
+  },
+  "paths": {
+    "raw_data_dir": "data/raw",
+    "processed_data_dir": "data/processed",
+    "model_dir": "models",
+    "work_dir": "models/config2"
+  },
+  "runtime": {
+    "mode": "train",
+    "checkpoint": "models/config1/last.ckpt"
+  },
+  "system": {
+    "seed": 1234,
+    "deterministic": false
+  }
+}

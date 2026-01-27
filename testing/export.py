@@ -24,11 +24,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from model import create_model
 
-
 # -----------------------------
 # CHOOSE YOUR RUN HERE (no args, no prompts)
 # -----------------------------
-RUN_DIR = (ROOT / "models" / "run").resolve()
+RUN_DIR = (ROOT / "models" / "v1").resolve()
 PREFERRED_CKPT = None  # set to "best.ckpt" or "last.ckpt" to force; otherwise auto-pick
 
 

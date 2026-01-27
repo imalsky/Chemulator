@@ -6,7 +6,7 @@ This module implements the training loop for flow-map models, including:
     - Autoregressive rollout with teacher forcing
     - Burn-in period for trajectory stabilization
     - Rollout length curriculum (optional)
-    - Physics-aware adaptive loss
+    - Two-term adaptive loss (z-MSE + log10-MAE)
     - Learning rate scheduling with warmup
 
 The core training paradigm is autoregressive: at each step, the model
@@ -17,7 +17,7 @@ Key Features:
     - TeacherForcingSchedule: Decays teacher forcing probability over epochs
     - RolloutCurriculum: Optionally ramps up rollout length during training
     - LateStageRolloutOverride: Use longer rollouts in final epochs
-    - AdaptiveLoss: Combines MSE with physics-informed penalties
+    - AdaptiveLoss: trainer_v1-style two-term loss (log10-MAE + z-MSE), with optional per-step weights
     - Burn-in: Optional warm-up period before loss computation
 
 Usage:
@@ -152,35 +152,42 @@ class CSVLoggerCallback(pl.Callback):
 # ==============================================================================
 
 
+# Loss numerics / defaults
+LOG_STD_CLAMP_MIN: float = 1e-10
+LOSS_DENOM_EPS: float = 1e-12
+DEF_LAMBDA_LOG10_MAE: float = 1.0
+DEF_LAMBDA_Z_MSE: float = 0.1
+
+
 class AdaptiveLoss(nn.Module):
     """
-    Physics-informed loss for chemical kinetics rollouts.
+    Two-term rollout loss matching the older `trainer_v1` objective.
 
     The model predicts z-space states, where each species concentration is
-    represented in a normalized log10 space:
+    represented in normalized log10 space:
+
         z = (log10(y) - mean_log10) / std_log10
 
-    This loss combines three components:
+    This implementation intentionally uses ONLY two differentiable terms:
 
-    1. Data fidelity in z-space:
-       - mse_z: mean squared error of (pred_z - true_z)
-       - z_mae: mean absolute error of (pred_z - true_z)
+        loss_total = (lambda_log10_mae * mean(|Δlog10(y)|)) + (lambda_z_mse * mean((Δz)^2))
 
-    2. Physics plausibility penalty in log10 space:
-       Penalizes predicted log10 values outside observed bounds.
+    Differences vs the previous codebase loss:
+      - No per-species weighting (uniform across species)
+      - No out-of-range physics penalty term
+      - Burn-in/step weighting (if provided) is applied consistently to BOTH terms
 
-    3. Logging-only metrics in log10 space:
-       For interpretability, reports errors after converting back to log10 space.
-
-    Total loss: loss_total = mse_z + lambda_z * z_mae + lambda_phys * phys_penalty
+    Notes:
+      - Reductions are promoted to float32 for numerical stability under AMP.
+      - `z_to_log10` must remain differentiable; do not wrap it in `no_grad`.
 
     Args:
-        log_means: Per-species log10 means [1, 1, S]
-        log_stds: Per-species log10 standard deviations [1, 1, S]
-        log_mins: Per-species log10 minimums [1, 1, S]
-        log_maxs: Per-species log10 maximums [1, 1, S]
-        lambda_phys: Weight for physics penalty term
-        lambda_z: Weight for z-space MAE term
+        log_means: Per-species log10 means, broadcastable to [B, K, S]
+        log_stds: Per-species log10 stds, broadcastable to [B, K, S]
+        log_mins: Retained for manifest compatibility and logging parity (unused in loss)
+        log_maxs: Retained for manifest compatibility and logging parity (unused in loss)
+        lambda_log10_mae: Weight for the log10-MAE term ("phys" term in trainer_v1)
+        lambda_z_mse: Weight for the z-space MSE term
     """
 
     def __init__(
@@ -190,17 +197,33 @@ class AdaptiveLoss(nn.Module):
         log_mins: torch.Tensor,
         log_maxs: torch.Tensor,
         *,
-        lambda_phys: float = 1.0,
-        lambda_z: float = 0.1,
+        lambda_log10_mae: float = DEF_LAMBDA_LOG10_MAE,
+        lambda_z_mse: float = DEF_LAMBDA_Z_MSE,
     ) -> None:
         super().__init__()
-        self.register_buffer("log_means", log_means)
-        self.register_buffer("log_stds", log_stds)
-        self.register_buffer("log_mins", log_mins)
-        self.register_buffer("log_maxs", log_maxs)
 
-        self.lambda_phys = float(lambda_phys)
-        self.lambda_z = float(lambda_z)
+        self.register_buffer("log_means", log_means.detach().clone())
+        self.register_buffer(
+            "log_stds",
+            torch.clamp(log_stds.detach().clone(), min=LOG_STD_CLAMP_MIN),
+        )
+
+        # Retained for backward compatibility with manifests/configs and for
+        # optional logging/diagnostics. These are not used in the loss.
+        self.register_buffer("log_mins", log_mins.detach().clone())
+        self.register_buffer("log_maxs", log_maxs.detach().clone())
+
+        self.lambda_log10_mae = float(lambda_log10_mae)
+        self.lambda_z_mse = float(lambda_z_mse)
+
+    def z_to_log10(self, z: torch.Tensor) -> torch.Tensor:
+        """Convert normalized z back to log10 space (DIFFERENTIABLE)."""
+        return z * self.log_stds + self.log_means
+
+    @torch.no_grad()
+    def z_to_log10_nograd(self, z: torch.Tensor) -> torch.Tensor:
+        """Metrics-only helper (explicitly no-grad)."""
+        return self.z_to_log10(z)
 
     def forward(
         self,
@@ -208,20 +231,6 @@ class AdaptiveLoss(nn.Module):
         true_z: torch.Tensor,
         weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Compute loss and metrics.
-
-        Args:
-            pred_z: Predicted states in z-space [B, K, S]
-            true_z: Ground truth states in z-space [B, K, S]
-            weights: Optional per-step weights [K] for burn-in weighting.
-                     If provided, losses are normalized by the sum of active weights
-                     (rather than the total number of elements), preventing gradient
-                     dilution when some steps are downweighted or masked.
-
-        Returns:
-            Dictionary containing loss_total and component metrics.
-        """
         if pred_z.shape != true_z.shape:
             raise ValueError(
                 f"Shape mismatch: pred_z={tuple(pred_z.shape)} true_z={tuple(true_z.shape)}"
@@ -229,50 +238,55 @@ class AdaptiveLoss(nn.Module):
 
         B, K, S = pred_z.shape
 
+        w_f32: Optional[torch.Tensor] = None
+        denom: Optional[torch.Tensor] = None
         if weights is not None:
             if weights.ndim != 1 or int(weights.shape[0]) != int(K):
                 raise ValueError(
                     f"weights must have shape [K] with K={K}; got {tuple(weights.shape)}"
                 )
-            weights = weights.to(device=pred_z.device, dtype=pred_z.dtype)
+            w_f32 = weights.to(device=pred_z.device, dtype=torch.float32).view(1, K, 1)
+            w_sum = w_f32.sum()
+            denom = (w_sum * float(B * S)).clamp_min(LOSS_DENOM_EPS)
 
-        delta_z = pred_z - true_z
-
-        # Weighted z-space errors (properly normalized by sum of active weights)
-        if weights is not None:
-            w = weights.view(1, K, 1)  # broadcast over batch/species
-            w_sum = weights.sum(dtype=torch.float32)
-            denom = (w_sum * float(B * S)).clamp_min(1e-12)
-
-            mse_z = (delta_z.pow(2).mul(w).sum(dtype=torch.float32)) / denom
-            z_mae = (delta_z.abs().mul(w).sum(dtype=torch.float32)) / denom
+        # ---- z-space MSE (stability term) ----
+        diff_z_f32 = (pred_z - true_z).to(torch.float32)
+        if w_f32 is not None and denom is not None:
+            mse_z = (diff_z_f32.square().mul(w_f32).sum(dtype=torch.float32)) / denom
+            z_mae = (diff_z_f32.abs().mul(w_f32).sum(dtype=torch.float32)) / denom
         else:
-            mse_z = delta_z.pow(2).mean()
-            z_mae = delta_z.abs().mean()
+            mse_z = diff_z_f32.square().mean()
+            z_mae = diff_z_f32.abs().mean()
 
-        pred_log = pred_z * self.log_stds + self.log_means
-        true_log = true_z * self.log_stds + self.log_means
-        delta_log = pred_log - true_log
-        mse_log = delta_log.pow(2).mean()
-        log_mae = delta_log.abs().mean()
+        # ---- log10-space MAE (data fidelity in physical log space) ----
+        pred_log = self.z_to_log10(pred_z)
+        true_log = self.z_to_log10(true_z)
+        abs_log_f32 = (pred_log - true_log).abs().to(torch.float32)
 
-        below = (self.log_mins - pred_log).clamp(min=0.0)
-        above = (pred_log - self.log_maxs).clamp(min=0.0)
-
-        # Weighted physics penalty (same normalization as z-space terms)
-        if weights is not None:
-            w = weights.view(1, K, 1)
-            w_sum = weights.sum(dtype=torch.float32)
-            denom = (w_sum * float(B * S)).clamp_min(1e-12)
-
-            phys_penalty = ((below + above).pow(2).mul(w).sum(dtype=torch.float32)) / denom
+        if w_f32 is not None and denom is not None:
+            log_mae = (abs_log_f32.mul(w_f32).sum(dtype=torch.float32)) / denom
         else:
-            phys_penalty = (below + above).pow(2).mean()
+            log_mae = abs_log_f32.mean()
 
-        loss_total = mse_z + (self.lambda_z * z_mae) + (self.lambda_phys * phys_penalty)
+        # Additional metrics (not part of the optimization objective)
+        mse_log = (pred_log - true_log).to(torch.float32).square().mean()
+
+        # Final loss (ONLY two terms).
+        z_term = self.lambda_z_mse * mse_z
+        log_term = self.lambda_log10_mae * log_mae
+        loss_total = z_term + log_term
+
+        # Backward-compatible metric keys.
+        phys_penalty = torch.zeros((), device=pred_z.device, dtype=torch.float32)
 
         return {
             "loss_total": loss_total,
+            # Components (trainer_v1-style)
+            "phys": log_term,
+            "z": z_term,
+            "mean_abs_log10": log_mae,
+            "weighted_mean_abs_log10": log_mae,
+            # Components/metrics (codebase-style)
             "mse_z": mse_z,
             "mse": mse_z,
             "z_mae": z_mae,
@@ -577,18 +591,45 @@ class FlowMapRolloutModule(pl.LightningModule):
             normalization_manifest, species_variables, torch.device("cpu")
         )
 
+        # Loss weights:
+        # - `lambda_log10_mae` is the weight on mean(|Δlog10(y)|) (trainer_v1's "phys" term).
+        # - `lambda_z_mse` is the weight on mean((Δz)^2) (trainer_v1's "z" term).
+        # For config compatibility, we accept several legacy aliases.
+        lambda_log10_mae = float(
+            lcfg.get(
+                "lambda_log10_mae",
+                lcfg.get("lambda_log_mae", lcfg.get("lambda_phys", DEF_LAMBDA_LOG10_MAE)),
+            )
+        )
+        lambda_z_mse = float(
+            lcfg.get(
+                "lambda_z_mse",
+                lcfg.get("lambda_z", DEF_LAMBDA_Z_MSE),
+            )
+        )
+
         self.criterion = AdaptiveLoss(
             log_means,
             log_stds,
             log_mins,
             log_maxs,
-            lambda_phys=float(lcfg.get("lambda_phys", 1.0)),
-            lambda_z=float(lcfg.get("lambda_z", 0.1)),
+            lambda_log10_mae=lambda_log10_mae,
+            lambda_z_mse=lambda_z_mse,
         )
 
         self.lr = float(tcfg.get("lr", 1e-3))
         self.weight_decay = float(tcfg.get("weight_decay", 1e-4))
         self.sched_cfg = dict(tcfg.get("scheduler", {}) or {})
+
+
+        # Training/evaluation execution mode.
+        # - "autoregressive": sequential unroll (true rollout)
+        # - "one_jump": vectorized one-step training over many transitions in parallel (train only by default)
+        self.train_mode = str(tcfg.get("train_mode", "autoregressive")).lower().strip()
+        self.eval_mode = str(tcfg.get("eval_mode", "autoregressive")).lower().strip()
+        # Optional cap on the number of one-step transitions used per window in "one_jump" mode.
+        # If 0, uses the same k_roll as the rollout schedule (curriculum/long-rollout).
+        self.one_jump_k_roll = int(tcfg.get("one_jump_k_roll", 0) or 0)
 
         self._train_dl = self._val_dl = self._test_dl = None
 
@@ -695,11 +736,21 @@ class FlowMapRolloutModule(pl.LightningModule):
             Tuple of:
                 - Predicted trajectory in z-space [B, k_roll, S]
                 - Burn-in weight mask [k_roll] for loss weighting
+
+        Notes on performance:
+            This function is intentionally written to minimize Python overhead and
+            avoid building Python lists of tensors. It preallocates the output
+            tensor and generates all stochastic teacher-forcing decisions in one
+            call to torch.rand, which reduces kernel-launch overhead when K is
+            large.
         """
         B, S = y0.shape
         K = int(k_roll)
 
-        if dt.ndim == 2 and dt.shape[1] >= K:
+        if K < 1:
+            raise ValueError(f"k_roll must be >= 1, got {K}")
+
+        if dt.ndim == 2 and int(dt.shape[1]) >= K:
             dt_sliced = dt[:, :K]
         else:
             dt_sliced = dt
@@ -707,6 +758,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         dt_bk = self._normalize_dt_for_unroll(dt_sliced, B=B, K=K)
 
         if g is None:
+            # Use an empty conditioning vector (models should handle G=0).
             g = torch.zeros(B, 0, device=y0.device, dtype=y0.dtype)
 
         if burn_in >= K:
@@ -718,32 +770,146 @@ class FlowMapRolloutModule(pl.LightningModule):
             )
             burn_in = K - 1
 
-        preds: List[torch.Tensor] = []
-        y_prev = y0
-
         burn_in_weights = torch.ones(K, device=y0.device, dtype=y0.dtype)
         if burn_in > 0:
             burn_in_weights[:burn_in] = self.burn_in_loss_weight
 
+        # Pre-generate burn-in noise and teacher-forcing decisions to reduce per-step overhead.
+        burn_noise: Optional[torch.Tensor] = None
+        if burn_in > 0 and self.burn_in_noise_std > 0.0:
+            burn_noise = torch.randn(
+                (B, burn_in, S), device=y0.device, dtype=y0.dtype
+            ).mul_(self.burn_in_noise_std)
+
+        use_tf = (tf_prob > 0.0) and (burn_in < K)
+        tf_mask: Optional[torch.Tensor] = None
+        if use_tf:
+            # Boolean mask of shape [B, K]; only steps t >= burn_in are consulted.
+            tf_mask = torch.rand((B, K), device=y0.device) < float(tf_prob)
+
+        y_prev = y0
+        y_pred: Optional[torch.Tensor] = None
+
         for t in range(K):
-            if t < burn_in and self.burn_in_noise_std > 0.0:
-                noise = torch.randn_like(y_prev) * self.burn_in_noise_std
-                y_input = y_prev + noise
-            else:
-                y_input = y_prev
+            y_input = y_prev
+            if burn_noise is not None and t < burn_in:
+                y_input = y_prev + burn_noise[:, t, :]
 
             dt_t = dt_bk[:, t]
             y_next = self.model.forward_step(y_input, dt_t, g)
 
-            preds.append(y_next.unsqueeze(1))
+            if y_pred is None:
+                # Allocate output using the model's output dtype/device (important under AMP).
+                y_pred = y_next.new_empty((B, K, S))
 
-            if t >= burn_in and tf_prob > 0.0:
-                use_truth = (torch.rand(B, device=y0.device) < tf_prob).view(B, 1)
+            y_pred[:, t, :] = y_next
+
+            if tf_mask is not None and t >= burn_in:
+                use_truth = tf_mask[:, t].view(B, 1)
                 y_prev = torch.where(use_truth, y_true[:, t, :], y_next)
             else:
                 y_prev = y_next
 
-        return torch.cat(preds, dim=1), burn_in_weights
+        if y_pred is None:
+            # Defensive: K >= 1 implies we must have produced at least one step.
+            raise RuntimeError("Autoregressive rollout produced no outputs.")
+
+        return y_pred, burn_in_weights
+
+    def _one_jump_predict(
+        self,
+        y_in: torch.Tensor,
+        dt: torch.Tensor,
+        g: Optional[torch.Tensor],
+        *,
+        k_roll: int,
+        burn_in: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Vectorized one-step prediction over K transitions (non-autoregressive).
+
+        This is intended for maximally efficient training when you want the model
+        to learn the single-step dynamics without sequential dependency across
+        rollout steps. It predicts y_{t+1} from y_t for all steps t in parallel
+        by flattening the time dimension into the batch dimension and performing
+        a single forward_step call.
+
+        Args:
+            y_in: Input states [B, K, S] (typically ground-truth y[:, :K, :])
+            dt: Timestep tensor (various shapes supported)
+            g: Global conditioning parameters [B, G] or None
+            k_roll: Number of one-step transitions K
+            burn_in: Optional number of initial steps to (a) inject noise into inputs and
+                     (b) downweight loss via burn_in_loss_weight, matching autoregressive behavior.
+
+        Returns:
+            Tuple of:
+                - Predicted next states [B, K, S]
+                - Burn-in weight mask [K] for loss weighting
+        """
+        if y_in.ndim != 3:
+            raise ValueError(f"y_in must have shape [B, K, S]; got {tuple(y_in.shape)}")
+
+        B, K, S = y_in.shape
+        if int(k_roll) != int(K):
+            raise ValueError(f"k_roll ({k_roll}) must match y_in K dimension ({K})")
+        if K < 1:
+            raise ValueError(f"k_roll must be >= 1, got {K}")
+
+        if dt.ndim == 2 and int(dt.shape[1]) >= K:
+            dt_sliced = dt[:, :K]
+        else:
+            dt_sliced = dt
+
+        dt_bk = self._normalize_dt_for_unroll(dt_sliced, B=B, K=K)
+
+        if g is None:
+            # Use an empty conditioning vector (models should handle G=0).
+            g = torch.zeros(B, 0, device=y_in.device, dtype=y_in.dtype)
+
+        if burn_in >= K:
+            warnings.warn(
+                f"burn_in_steps ({burn_in}) >= rollout length ({K}). "
+                f"Clamping burn_in to {K - 1} to leave at least one step for loss.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            burn_in = K - 1
+
+        burn_in_weights = torch.ones(K, device=y_in.device, dtype=y_in.dtype)
+        if burn_in > 0:
+            burn_in_weights[:burn_in] = self.burn_in_loss_weight
+
+        # Optional burn-in noise injection (kept vectorized).
+        y_eff = y_in
+        if burn_in > 0 and self.burn_in_noise_std > 0.0:
+            y_eff = y_in.clone()
+            y_eff[:, :burn_in, :].add_(
+                torch.randn((B, burn_in, S), device=y_in.device, dtype=y_in.dtype).mul_(
+                    self.burn_in_noise_std
+                )
+            )
+
+        # Flatten (B, K) into a single large batch dimension for one forward pass.
+        y_flat = y_eff.reshape(B * K, S)
+        dt_flat = dt_bk.reshape(B * K)
+
+        G = int(g.shape[1]) if g.ndim == 2 else 0
+        if G > 0:
+            g_flat = g.unsqueeze(1).expand(B, K, G).reshape(B * K, G)
+        else:
+            g_flat = g.new_zeros((B * K, 0))
+
+        y_next_flat = self.model.forward_step(y_flat, dt_flat, g_flat)
+        if y_next_flat.ndim != 2 or int(y_next_flat.shape[0]) != int(B * K) or int(y_next_flat.shape[1]) != int(S):
+            raise RuntimeError(
+                f"model.forward_step returned unexpected shape {tuple(y_next_flat.shape)}; expected [{B*K}, {S}]"
+            )
+
+        y_pred = y_next_flat.view(B, K, S)
+        return y_pred, burn_in_weights
+
+
 
     def _shared_step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         """
@@ -763,6 +929,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         B, K_full, S = y.shape
         epoch = int(self.current_epoch)
 
+        # K_full includes the initial state y0; there are (K_full - 1) transitions.
         K = int(max(1, K_full - 1))
 
         k_roll = int(min(self._effective_k_roll(epoch, stage=stage), K))
@@ -770,24 +937,53 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         burn_in = self._get_burn_in_steps(stage)
 
-        tf_prob = float(self._teacher_forcing_prob(epoch) if stage == "train" else 0.0)
+        # Mode selection:
+        # - Training can be run in "one_jump" for maximal throughput.
+        # - Validation/test default to "autoregressive" to measure true rollout performance.
+        mode = self.train_mode if stage == "train" else self.eval_mode
+        mode = str(mode or "autoregressive").lower().strip()
+        if mode not in ("autoregressive", "one_jump"):
+            raise ValueError(f"Unknown execution mode '{mode}'. Expected 'autoregressive' or 'one_jump'.")
 
-        y0 = y[:, 0, :]
-        y_true = y[:, 1 : 1 + k_roll, :]
+        is_one_jump = mode == "one_jump"
 
-        y_pred, burn_in_weights = self._autoregressive_unroll(
-            y0=y0,
-            y_true=y_true,
-            dt=dt,
-            g=g,
-            tf_prob=tf_prob,
-            k_roll=k_roll,
-            burn_in=burn_in, 
-        )
+        if is_one_jump:
+            # In one-jump mode we predict y_{t+1} from ground-truth y_t for all t in parallel.
+            k_eff = int(self.one_jump_k_roll) if (stage == "train" and int(self.one_jump_k_roll) > 0) else int(k_roll)
+            k_eff = int(max(1, min(k_eff, K)))
 
-        # Pass weights directly to criterion for consistent loss computation
-        # This ensures that both the loss used for backpropagation AND the logged metrics
-        # are computed with the same weighting scheme
+            y_in = y[:, :k_eff, :]
+            y_true = y[:, 1 : 1 + k_eff, :]
+
+            y_pred, burn_in_weights = self._one_jump_predict(
+                y_in=y_in,
+                dt=dt,
+                g=g,
+                k_roll=k_eff,
+                burn_in=burn_in,
+            )
+
+            # For logging only; conceptually teacher forcing is "always on" because inputs are ground truth.
+            tf_prob = 1.0 if stage == "train" else 0.0
+            k_roll_used = k_eff
+        else:
+            tf_prob = float(self._teacher_forcing_prob(epoch) if stage == "train" else 0.0)
+
+            y0 = y[:, 0, :]
+            y_true = y[:, 1 : 1 + k_roll, :]
+
+            y_pred, burn_in_weights = self._autoregressive_unroll(
+                y0=y0,
+                y_true=y_true,
+                dt=dt,
+                g=g,
+                tf_prob=tf_prob,
+                k_roll=k_roll,
+                burn_in=burn_in,
+            )
+            k_roll_used = k_roll
+
+        # Pass weights directly to criterion for consistent loss computation.
         use_weights = burn_in > 0 and self.burn_in_loss_weight < 1.0
         weights = burn_in_weights if use_weights else None
         loss_dict = self.criterion(y_pred, y_true, weights=weights)
@@ -803,20 +999,26 @@ class FlowMapRolloutModule(pl.LightningModule):
         if stage == "train":
             self.log(
                 "train_tf_prob",
-                torch.tensor(tf_prob, device=y.device),
+                torch.tensor(float(tf_prob), device=y.device),
                 on_step=False,
                 on_epoch=True,
             )
             self.log(
                 "train_k_roll",
-                torch.tensor(k_roll, device=y.device),
+                torch.tensor(int(k_roll_used), device=y.device),
+                on_step=False,
+                on_epoch=True,
+            )
+            self.log(
+                "train_is_one_jump",
+                torch.tensor(1 if is_one_jump else 0, device=y.device),
                 on_step=False,
                 on_epoch=True,
             )
             if burn_in > 0:
                 self.log(
                     "train_burn_in",
-                    torch.tensor(burn_in, device=y.device),
+                    torch.tensor(int(burn_in), device=y.device),
                     on_step=False,
                     on_epoch=True,
                 )
@@ -871,7 +1073,7 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         def lr_lambda(step: int) -> float:
             if max_steps <= 0:
-                return 1.0
+                raise ValueError(f"Warmup set up, but max steps not known")
 
             if warmup_steps > 0 and step < warmup_steps:
                 return float(step) / float(max(1, warmup_steps))

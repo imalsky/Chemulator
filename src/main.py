@@ -15,8 +15,6 @@ and testing. It orchestrates the full pipeline:
 
 Usage:
     python main.py                    # Uses config.json in repo root or config/
-    python main.py --config path.json # Specify custom config (if argparse added)
-
 Configuration Modes (runtime.mode in config.json):
     - "train": Train model, optionally run test after
     - "eval": Validate using saved checkpoint
