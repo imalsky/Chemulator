@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import logging
 import math
-import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
@@ -39,15 +38,7 @@ import torch.nn as nn
 
 ActivationFactory = Callable[[], nn.Module]
 
-# Small-output init for delta predictors: keeps early rollouts stable while still allowing
-# gradients to flow through the head into earlier layers (unlike strict zero init).
 _DELTA_OUT_INIT_STD = 1e-3
-
-
-# ==============================================================================
-# dt Shape Utilities
-# ==============================================================================
-
 
 def normalize_dt_shape(
     dt: torch.Tensor,
@@ -55,58 +46,43 @@ def normalize_dt_shape(
     seq_len: int,
     context: str = "forward",
 ) -> torch.Tensor:
+    """Canonicalize dt to shape [B, K].
+
+    Accepted shapes (strict):
+      - scalar: []  -> broadcast to [B, K]
+      - [B]         -> per-sample dt, broadcast over time
+      - [K]         -> per-step dt schedule, broadcast over batch
+      - [B, K]      -> canonical
+      - [B, K, 1]   -> squeezed to [B, K]
+
+    dt is assumed to be already normalized by preprocessing (typically to [0,1]).
     """
-    Normalize dt tensor to canonical shape [B, K] with explicit validation.
-
-    Supported input shapes:
-        - scalar: constant dt for all samples and steps
-        - [B]: constant dt per sample, broadcast across steps
-        - [K]: constant dt schedule, broadcast across batch
-        - [B, K]: per-sample per-step dt (canonical form)
-        - [B, K, 1]: same as [B, K], squeezed
-
-    Returns:
-        dt_seq: Tensor of shape [B, K]
-
-    Raises:
-        ValueError: If dt shape cannot be normalized to [B, K] unambiguously.
-    """
-    B, K = int(batch_size), int(seq_len)
+    B = int(batch_size)
+    K = int(seq_len)
 
     if dt.ndim == 0:
         return dt.reshape(1, 1).expand(B, K)
 
     if dt.ndim == 1:
-        if dt.shape[0] == B and B != K:
+        n = int(dt.shape[0])
+        if n == B:
             return dt.reshape(B, 1).expand(B, K)
-        if dt.shape[0] == K and B != K:
+        if n == K:
             return dt.reshape(1, K).expand(B, K)
-        if dt.shape[0] == B == K:
-            raise ValueError(f"[{context}] Ambiguous 1D dt of length {B} where B==K.")
-        raise ValueError(f"[{context}] Cannot normalize 1D dt with shape {tuple(dt.shape)}.")
+        raise ValueError(f"[{context}] dt must be scalar, [B], [K], or [B,K]. Got {tuple(dt.shape)} for B={B}, K={K}.")
 
     if dt.ndim == 2:
-        if dt.shape == (B, K):
-            if B == K:
-                warnings.warn(
-                    f"[{context}] Ambiguous 2D dt {tuple(dt.shape)} where B==K.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            return dt
-        if dt.shape == (K, B):
-            return dt.t()
-        raise ValueError(
-            f"[{context}] Cannot normalize 2D dt with shape {tuple(dt.shape)} to [B={B}, K={K}]."
-        )
+        if dt.shape != (B, K):
+            raise ValueError(f"[{context}] dt must have shape [B,K]=({B},{K}). Got {tuple(dt.shape)}.")
+        return dt
 
     if dt.ndim == 3 and dt.shape[-1] == 1:
-        squeezed = dt.squeeze(-1)
-        if squeezed.shape == (B, K):
-            return squeezed
-        raise ValueError(f"[{context}] Cannot normalize 3D dt with shape {tuple(dt.shape)}.")
+        dt2 = dt[..., 0]
+        if dt2.shape != (B, K):
+            raise ValueError(f"[{context}] dt must have shape [B,K,1]=({B},{K},1). Got {tuple(dt.shape)}.")
+        return dt2
 
-    raise ValueError(f"[{context}] Unsupported dt shape: {tuple(dt.shape)}.")
+    raise ValueError(f"[{context}] dt must be scalar, [B], [K], [B,K], or [B,K,1]. Got {tuple(dt.shape)}.")
 
 
 def normalize_dt_step(dt_norm: torch.Tensor, batch_size: int, *, context: str) -> torch.Tensor:
@@ -127,17 +103,12 @@ def normalize_dt_step(dt_norm: torch.Tensor, batch_size: int, *, context: str) -
     if dt_norm.ndim == 3 and dt_norm.shape == (B, 1, 1):
         return dt_norm.squeeze(-1)
 
-    raise ValueError(
-        f"[{context}] Unsupported dt_norm shape for single-step: {tuple(dt_norm.shape)}. "
-        "Expected scalar, [B], [B,1], or [B,1,1]."
-    )
+    raise ValueError(f"[{context}] Unsupported dt_norm shape for single-step: {tuple(dt_norm.shape)}. ")
 
 
 def _validate_g_shape(g: torch.Tensor, batch_size: int, global_dim: int, context: str) -> None:
     if g.ndim != 2 or g.shape[0] != batch_size or g.shape[1] != global_dim:
-        raise ValueError(
-            f"[{context}] Expected g shape [B={batch_size}, G={global_dim}], got {tuple(g.shape)}."
-        )
+        raise ValueError(f"[{context}] Expected g shape [B={batch_size}, G={global_dim}], got {tuple(g.shape)}.")
 
 
 def get_activation(name: str) -> ActivationFactory:
@@ -171,11 +142,6 @@ def _init_linear_xavier(linear: nn.Linear, *, scale: float = 1.0) -> None:
     if scale != 1.0:
         with torch.no_grad():
             linear.weight.mul_(float(scale))
-
-
-# ==============================================================================
-# MLP Blocks
-# ==============================================================================
 
 
 class MLP(nn.Module):
@@ -296,11 +262,6 @@ class ResidualMLP(nn.Module):
         return self.out(h)
 
 
-# ==============================================================================
-# Autoencoder Components
-# ==============================================================================
-
-
 class Encoder(nn.Module):
     """Encoder network: maps (state, globals) to latent representation."""
 
@@ -394,14 +355,8 @@ class LatentDynamics(nn.Module):
                 K = 1
             elif dt_norm.ndim == 1:
                 if dt_norm.shape[0] == B and B > 1:
-                    warnings.warn(
-                        "dt_norm has shape [B] and seq_len is None",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    K = 1
-                else:
-                    K = int(dt_norm.shape[0])
+                    raise ValueError(f"Ambiguous dt_norm shape {tuple(dt_norm.shape)}.")
+                K = int(dt_norm.shape[0])
             elif dt_norm.ndim == 2:
                 K = int(dt_norm.shape[1] if dt_norm.shape[0] == B else dt_norm.shape[0])
             elif dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
@@ -454,12 +409,6 @@ class Decoder(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.network(z)
-
-
-# ==============================================================================
-# Full Models
-# ==============================================================================
-
 
 class FlowMapAutoencoder(nn.Module):
     """Flow-map autoencoder: Encoder -> LatentDynamics -> Decoder."""
@@ -561,14 +510,8 @@ class FlowMapAutoencoder(nn.Module):
                 K = 1
             elif dt_norm.ndim == 1:
                 if dt_norm.shape[0] == B and B > 1:
-                    warnings.warn(
-                        "dt_norm has shape [B] and seq_len is None",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    K = 1
-                else:
-                    K = int(dt_norm.shape[0])
+                    raise ValueError(f"Ambiguous dt_norm shape {tuple(dt_norm.shape)}.")
+                K = int(dt_norm.shape[0])
             elif dt_norm.ndim == 2:
                 K = int(dt_norm.shape[1] if dt_norm.shape[0] == B else dt_norm.shape[0])
             elif dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
@@ -664,14 +607,8 @@ class FlowMapMLP(nn.Module):
                 K = 1
             elif dt_norm.ndim == 1:
                 if dt_norm.shape[0] == B and B > 1:
-                    warnings.warn(
-                        "dt_norm has shape [B] and seq_len is None",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    K = 1
-                else:
-                    K = int(dt_norm.shape[0])
+                    raise ValueError(f"Ambiguous dt_norm shape {tuple(dt_norm.shape)}.")
+                K = int(dt_norm.shape[0])
             elif dt_norm.ndim == 2:
                 K = int(dt_norm.shape[1] if dt_norm.shape[0] == B else dt_norm.shape[0])
             elif dt_norm.ndim == 3 and dt_norm.shape[-1] == 1:
@@ -690,12 +627,6 @@ class FlowMapMLP(nn.Module):
             y_pred[:, t, :] = state
         return y_pred
 
-
-# ==============================================================================
-# Model Factory
-# ==============================================================================
-
-
 def create_model(
     config: Dict[str, Any],
     *,
@@ -712,9 +643,7 @@ def create_model(
         global_vars = list(data_cfg.get("global_variables", []))
 
         if not species_vars:
-            raise KeyError(
-                "data.species_variables must be non-empty. This defines the state dimension S."
-            )
+            raise KeyError("data.species_variables must be non-empty. This defines the state dimension S.")
 
         state_dim = state_dim or len(species_vars)
         global_dim = global_dim if global_dim is not None else len(global_vars)
@@ -788,6 +717,4 @@ def create_model(
             layer_norm_eps=layer_norm_eps,
         )
 
-    raise ValueError(
-        f"Unknown model.type: '{model_type}'. Supported types: 'mlp', 'autoencoder'."
-    )
+    raise ValueError(f"Unknown model.type: '{model_type}'. Supported types: 'mlp', 'autoencoder'.")

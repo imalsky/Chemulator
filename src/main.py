@@ -1,188 +1,229 @@
 #!/usr/bin/env python3
 """
-main.py - Entry point for training and evaluation.
+main.py - Entrypoint for training / evaluation (strict training + manifest).
 
-Pipeline:
-  1) Load config.json
-  2) Resolve paths relative to repo root
-  3) Load normalization manifest and validate/sync config keys
-  4) Build datasets and dataloaders
-  5) Create (optionally torch.compile) model
-  6) Build Lightning trainer
-  7) Run train / eval / test based on runtime.mode
-
-Model compilation:
-  - Controlled by config key: model.compile (bool)
-  - Default: True
-  - If torch.compile is unavailable or compilation fails, training proceeds uncompiled.
+Goals:
+- Follow the strict training schema enforced by FlowMapRolloutModule (trainer.py).
+- Enforce consistency between config.json and normalization.json (species/global vars).
+- Remove redundant dataloader wiring (do NOT call lit_module.set_dataloaders; pass dataloaders to fit/test).
+- Keep path handling deterministic: resolve relative paths against config.json directory.
 """
 
 from __future__ import annotations
 
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-import gc
-import json
+import argparse
+import logging
 import sys
-import warnings
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-
-if hasattr(torch, "set_float32_matmul_precision"):
-    torch.set_float32_matmul_precision("high")
-
-try:
-    from lightning.pytorch import seed_everything
-except ImportError:
-    try:
-        from pytorch_lightning import seed_everything
-    except ImportError as e:
-        raise ImportError(
-            "Neither 'lightning' nor 'pytorch_lightning' is installed. "
-            "Install one of them to run this project."
-        ) from e
+from lightning import seed_everything
 
 from dataset import FlowMapRolloutDataset, create_dataloader
 from model import create_model
 from trainer import FlowMapRolloutModule, build_lightning_trainer
 from utils import atomic_write_json, ensure_dir, load_json_config
 
+log = logging.getLogger(__name__)
+
 
 # ==============================================================================
-# Configuration and Paths
+# Basic config / path helpers
 # ==============================================================================
 
 
-def _repo_root(config_path: Path) -> Path:
-    """
-    Infer repository root from config file location.
-
-    Assumes config is either at repo_root/config.json or repo_root/config/config.json.
-    """
-    config_path = Path(config_path).resolve()
-    if config_path.name == "config.json" and config_path.parent.name == "config":
-        return config_path.parent.parent
-    return config_path.parent
+def _repo_root(cfg_path: Path) -> Path:
+    return cfg_path.parent.resolve()
 
 
-def _resolve_path(root: Path, p: str) -> Path:
-    """Resolve a path relative to root, or return as-is if absolute."""
-    pp = Path(p)
-    return pp if pp.is_absolute() else (root / pp).resolve()
+def _resolve_path(root: Path, p: str) -> str:
+    pth = Path(p).expanduser()
+    if pth.is_absolute():
+        return str(pth)
+    return str((root / pth).resolve())
 
 
-def _config_path() -> Path:
-    """
-    Find configuration file location.
-
-    Searches in order:
-      1) repo_root/config/config.json
-      2) repo_root/config.json
-      3) Parent directories (for running from src/ subdirectory)
-    """
-    here = Path(__file__).resolve()
-    root = here.parent
-
-    candidates = [
-        root / "config" / "config.json",
-        root / "config.json",
-        root.parent / "config" / "config.json",
-        root.parent / "config.json",
-    ]
-
-    for p in candidates:
-        if p.exists():
-            return p
-
-    return candidates[0]
-
-
-def resolve_paths(cfg: Dict[str, Any], config_path: Path) -> Dict[str, Any]:
-    """
-    Resolve all path entries in config relative to repository root.
-
-    Converts relative paths in config["paths"] to absolute paths, applying defaults
-    for any missing entries.
-    """
+def resolve_paths(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, Any]:
+    root = _repo_root(cfg_path)
     cfg = dict(cfg)
-    pcfg = dict(cfg.get("paths", {}))
-    root = _repo_root(config_path)
 
-    defaults = {
-        "raw_data_dir": "data/raw",
-        "processed_data_dir": "data/processed",
-        "model_dir": "models",
-        "work_dir": "models/run",
-    }
+    paths = cfg.get("paths")
+    if not isinstance(paths, dict):
+        raise KeyError("config.json must contain a 'paths' dict.")
+    paths = dict(paths)
+    for k, v in list(paths.items()):
+        if isinstance(v, str) and v.strip():
+            paths[k] = _resolve_path(root, v)
+    cfg["paths"] = paths
 
-    for key, default in defaults.items():
-        pcfg[key] = str(_resolve_path(root, str(pcfg.get(key, default))))
+    runtime = cfg.get("runtime", {}) or {}
+    if not isinstance(runtime, dict):
+        raise TypeError("runtime must be a dict if provided.")
+    runtime = dict(runtime)
+    ckpt = runtime.get("checkpoint")
+    if isinstance(ckpt, str) and ckpt.strip():
+        runtime["checkpoint"] = _resolve_path(root, ckpt)
+    cfg["runtime"] = runtime
 
-    cfg["paths"] = pcfg
     return cfg
 
 
+def configure_logging(cfg: Dict[str, Any]) -> None:
+    sys_cfg = cfg.get("system", {}) or {}
+    if not isinstance(sys_cfg, dict):
+        raise TypeError("system must be a dict if provided.")
+
+    level_str = str(sys_cfg.get("log_level", "INFO")).upper().strip()
+    level = getattr(logging, level_str, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    logging.captureWarnings(True)
+
+
+def select_device(cfg: Dict[str, Any]) -> torch.device:
+    """
+    Used only for dataset preloading (preload_to_device=True) and any eager ops outside Lightning.
+    Lightning handles model/device placement.
+    """
+    sys_cfg = cfg.get("system", {}) or {}
+    pref = str(sys_cfg.get("device", "auto")).lower().strip()
+
+    if pref == "cpu":
+        return torch.device("cpu")
+
+    if pref.startswith("cuda"):
+        if torch.cuda.is_available():
+            return torch.device(pref)
+        log.warning("Requested device=%s but CUDA is unavailable; using CPU.", pref)
+        return torch.device("cpu")
+
+    if pref == "mps":
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        log.warning("Requested device=mps but MPS is unavailable; using CPU.")
+        return torch.device("cpu")
+
+    # auto
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 # ==============================================================================
-# Manifest Handling
+# Strict validation for training schema + normalization manifest consistency
 # ==============================================================================
 
 
-def load_manifest(processed_dir: Path) -> Dict[str, Any]:
-    """Load normalization manifest from processed data directory."""
-    path = processed_dir / "normalization.json"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Missing {path}. Run preprocessing first to generate "
-            "normalization manifest and data shards."
-        )
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _require_dict(cfg: Dict[str, Any], key: str, *, context: str) -> Dict[str, Any]:
+    if key not in cfg:
+        raise KeyError(f"Missing required key '{key}' in {context}.")
+    v = cfg[key]
+    if not isinstance(v, dict):
+        raise TypeError(f"Expected '{key}' in {context} to be a dict, got {type(v).__name__}.")
+    return v
 
 
-def _require_per_key_stats(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    stats = manifest.get("per_key_stats")
-    if not isinstance(stats, dict) or not stats:
-        raise KeyError(
-            "Normalization manifest must contain non-empty mapping 'per_key_stats'. "
-            "Regenerate normalization.json with the current preprocessing pipeline."
-        )
-    out: Dict[str, Dict[str, Any]] = {}
-    for k, v in stats.items():
+def _require_key(cfg: Dict[str, Any], key: str, *, context: str) -> Any:
+    if key not in cfg:
+        raise KeyError(f"Missing required key '{key}' in {context}.")
+    return cfg[key]
+
+
+def validate_training_schema(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enforce the strict training schema expected by trainer.FlowMapRolloutModule.
+
+    main.py should not 'setdefault' these; missing keys should fail fast.
+    This function intentionally mirrors the required key access patterns in trainer.FlowMapRolloutModule.__init__.
+    """
+    tcfg = _require_dict(cfg, "training", context="config")
+
+    # Required scalars (explicit keys; no aliases/defaults)
+    required_scalars = ["max_epochs", "rollout_steps", "batch_size"]
+    for k in required_scalars:
+        if k not in tcfg:
+            raise KeyError(f"Missing required training key: training.{k}")
+
+    # Deprecated: this codebase uses a single rollout horizon for train/val/test.
+    if "val_rollout_steps" in tcfg or "test_rollout_steps" in tcfg:
+        raise ValueError("cfg.training must not include val_rollout_steps/test_rollout_steps; use rollout_steps only.")
+
+    # Required nested dicts and keys
+    burn = _require_dict(tcfg, "burn_in", context="config.training")
+    for k in ("train", "val", "test"):
+        if k not in burn:
+            raise KeyError(f"Missing required training key: training.burn_in.{k}")
+
+    tf = _require_dict(tcfg, "teacher_forcing", context="config.training")
+    for k in ("mode", "p0", "p1", "ramp_epochs"):
+        if k not in tf:
+            raise KeyError(f"Missing required training key: training.teacher_forcing.{k}")
+
+    loss = _require_dict(tcfg, "loss", context="config.training")
+    for k in ("lambda_log10_mae", "lambda_z_mse"):
+        if k not in loss:
+            raise KeyError(f"Missing required training key: training.loss.{k}")
+
+    opt = _require_dict(tcfg, "optimizer", context="config.training")
+    for k in ("name", "lr"):
+        if k not in opt:
+            raise KeyError(f"Missing required training key: training.optimizer.{k}")
+
+    # Optional dicts (but if present must be dict)
+    for opt_key in ("scheduler", "curriculum", "long_rollout"):
+        if opt_key in tcfg and not isinstance(tcfg[opt_key], dict):
+            raise TypeError(f"training.{opt_key} must be a dict if provided.")
+
+    # Optional runtime torch_compile config (if present must be dicts)
+    runtime = cfg.get("runtime", {}) or {}
+    if "torch_compile" in runtime and not isinstance(runtime["torch_compile"], dict):
+        raise TypeError("runtime.torch_compile must be a dict if provided.")
+
+    return tcfg
+
+def _get_stats_dict(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    For strictness: accept known container keys, but require log_mean/log_std (no legacy-only).
+    """
+    for key in ("per_key_stats", "species_stats", "stats"):
+        v = manifest.get(key)
         if isinstance(v, dict):
-            out[str(k)] = v
-    if not out:
-        raise KeyError("Normalization manifest per_key_stats is empty or malformed.")
-    return out
+            return v
+    raise KeyError(
+        "normalization.json is missing a stats dict. Expected one of: per_key_stats, species_stats, stats."
+    )
 
 
-def _infer_species_from_methods(manifest: Dict[str, Any]) -> Optional[list]:
-    methods = manifest.get("normalization_methods") or manifest.get("methods") or {}
-    if not isinstance(methods, dict) or not methods:
-        return None
-    species = []
-    for k, m in methods.items():
-        mm = str(m).lower().strip()
-        if mm in ("log-standard", "log10-standard"):
-            species.append(str(k))
-    return species or None
-
-
-def sync_config_with_manifest(cfg: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]:
+def load_manifest_and_sync_data_cfg(
+    cfg: Dict[str, Any],
+    processed_dir: Path,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[str], List[str]]:
     """
-    Synchronize configuration with normalization manifest.
-
-    Strictness note:
-      - Trainer requires per_key_stats[species]["log_mean"/"log_std"].
-      - This function enforces that requirement and will error if the manifest uses
-        only legacy log10_mean/log10_std fields.
+    Strict policy:
+    - species_variables/global_variables must be declared in normalization.json OR config.data.
+    - If both declare them, they must match exactly.
+    - For every species variable, stats must contain log_mean and log_std (legacy-only is rejected).
     """
+    manifest_path = processed_dir / "normalization.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing normalization manifest: {manifest_path}")
+    manifest = load_json_config(manifest_path)
+
+    if not isinstance(manifest, dict):
+        raise TypeError("normalization.json must parse as a JSON object/dict.")
+
     cfg = dict(cfg)
-    data_cfg = dict(cfg.get("data", {}))
-
-    stats = _require_per_key_stats(manifest)
+    data_cfg = cfg.get("data", {}) or {}
+    if not isinstance(data_cfg, dict):
+        raise TypeError("config.data must be a dict if provided.")
+    data_cfg = dict(data_cfg)
 
     man_species = list(manifest.get("species_variables") or [])
     man_globals = list(manifest.get("global_variables") or [])
@@ -190,25 +231,32 @@ def sync_config_with_manifest(cfg: Dict[str, Any], manifest: Dict[str, Any]) -> 
     cfg_species = list(data_cfg.get("species_variables") or [])
     cfg_globals = list(data_cfg.get("global_variables") or [])
 
-    # Determine species_variables (manifest > config > infer from methods).
-    if not man_species:
-        if cfg_species:
-            man_species = list(cfg_species)
-        else:
-            inferred = _infer_species_from_methods(manifest)
-            if inferred:
-                man_species = inferred
+    # Decide authoritative lists (manifest > config), but enforce equality if both present.
+    species_vars = man_species or cfg_species
+    global_vars = man_globals or cfg_globals
 
-    if not man_species:
+    if not species_vars:
         raise ValueError(
-            "Could not determine species_variables. Provide data.species_variables in config.json "
-            "or include 'species_variables' in normalization.json."
+            "Species variables are missing. Provide data.species_variables in config.json or "
+            "include 'species_variables' in normalization.json."
         )
 
-    # Enforce strict stats keys required by trainer/build_loss_buffers.
-    missing = []
-    legacy_only = []
-    for s in man_species:
+    if man_species and cfg_species and cfg_species != man_species:
+        raise ValueError(
+            f"config.data.species_variables != normalization.json species_variables.\n"
+            f"config: {cfg_species}\nmanifest: {man_species}"
+        )
+    if man_globals and cfg_globals and cfg_globals != man_globals:
+        raise ValueError(
+            f"config.data.global_variables != normalization.json global_variables.\n"
+            f"config: {cfg_globals}\nmanifest: {man_globals}"
+        )
+
+    # Strict stats validation: require log_mean/log_std for all species.
+    stats = _get_stats_dict(manifest)
+    missing: List[str] = []
+    legacy_only: List[str] = []
+    for s in species_vars:
         entry = stats.get(s)
         if not isinstance(entry, dict):
             missing.append(s)
@@ -223,389 +271,334 @@ def sync_config_with_manifest(cfg: Dict[str, Any], manifest: Dict[str, Any]) -> 
 
     if legacy_only:
         raise KeyError(
-            "Normalization manifest uses legacy keys (log10_mean/log10_std) without "
-            "the required (log_mean/log_std) for these species: "
-            f"{legacy_only}. Regenerate normalization.json so species stats contain "
-            "'log_mean' and 'log_std'."
+            "normalization.json contains legacy-only keys (log10_mean/log10_std) without required "
+            f"log_mean/log_std for: {legacy_only}. Regenerate preprocessing outputs."
         )
     if missing:
         raise KeyError(
-            "Normalization manifest missing required stats (log_mean/log_std) for these species: "
-            f"{missing}."
+            f"normalization.json is missing required stats (log_mean/log_std) for: {missing}."
         )
 
-    # Infer globals if missing (keep behavior, but deterministic).
-    if not man_globals:
-        if cfg_globals:
-            man_globals = list(cfg_globals)
-        else:
-            methods = manifest.get("normalization_methods") or manifest.get("methods") or {}
-            if isinstance(methods, dict) and methods:
-                sp = set(man_species)
-                man_globals = [str(k) for k in methods.keys() if str(k) not in sp]
-
-    if cfg_species and cfg_species != man_species:
-        raise ValueError(
-            f"Config data.species_variables {cfg_species} doesn't match "
-            f"manifest/inferred species_variables {man_species}. "
-            "Either update config or re-run preprocessing."
-        )
-    if cfg_globals and man_globals and cfg_globals != man_globals:
-        raise ValueError(
-            f"Config data.global_variables {cfg_globals} doesn't match "
-            f"manifest/inferred global_variables {man_globals}. "
-            "Either update config or re-run preprocessing."
-        )
-
-    data_cfg["species_variables"] = list(man_species)
-    if man_globals:
-        data_cfg["global_variables"] = list(man_globals)
-
+    data_cfg["species_variables"] = list(species_vars)
+    data_cfg["global_variables"] = list(global_vars)
     cfg["data"] = data_cfg
-    return cfg
+    return cfg, manifest, list(species_vars), list(global_vars)
 
 
 # ==============================================================================
-# Data Loading
+# Dataloaders (non-redundant; sized for max rollout lengths actually used)
 # ==============================================================================
 
 
-def create_dataloaders(cfg: Dict[str, Any], device: torch.device) -> Tuple:
+def _max_rollout_steps_for_stage(tcfg: Dict[str, Any], *, stage: str) -> int:
+    """Compute maximum rollout length K used for a stage.
+
+    Single base horizon: training.rollout_steps.
+    Curriculum can increase K for training only; for sizing we take its max.
+    long_rollout can increase K for last N epochs (train always; validation/test via flags); for sizing we take the larger K.
     """
-    Create train/validation/test dataloaders from configuration.
+    base_k = int(_require_key(tcfg, "rollout_steps", context="cfg.training"))
 
-    Returns:
-        (train_dl, val_dl, test_dl, manifest)
-    """
-    paths = cfg.get("paths", {})
-    processed_dir = Path(paths.get("processed_data_dir", "data/processed"))
+    stage = str(stage).lower().strip()
+    if stage not in ("train", "validation", "test"):
+        raise ValueError(f"Unknown stage: {stage} (expected 'train'|'validation'|'test').")
 
-    manifest = load_manifest(processed_dir)
+    k = base_k
 
-    tcfg = cfg.get("training", {})
-    rollout_steps = int(tcfg.get("rollout_steps", 1))
-    burn_in_steps = int(tcfg.get("burn_in_steps", 0))
-    val_burn_in_steps = int(tcfg.get("val_burn_in_steps", burn_in_steps))
+    cur_cfg = tcfg.get("curriculum", None)
+    if stage == "train" and isinstance(cur_cfg, dict) and bool(cur_cfg.get("enabled", False)):
+        k = max(k, int(_require_key(cur_cfg, "max_k", context="cfg.training.curriculum")))
 
-    long_cfg = dict(tcfg.get("long_rollout", {}) or {})
-    long_enabled = bool(long_cfg.get("enabled", False))
-    long_rollout_steps = int(long_cfg.get("long_rollout_steps", 0) or 0)
-    apply_long_to_val = bool(long_cfg.get("apply_to_validation", True))
-    apply_long_to_test = bool(long_cfg.get("apply_to_test", True))
+    long_cfg = tcfg.get("long_rollout", None)
+    if isinstance(long_cfg, dict) and bool(long_cfg.get("enabled", False)):
+        long_k = int(_require_key(long_cfg, "long_rollout_steps", context="cfg.training.long_rollout"))
+        if stage == "train":
+            k = max(k, long_k)
+        elif stage == "validation":
+            if bool(_require_key(long_cfg, "apply_to_validation", context="cfg.training.long_rollout")):
+                k = max(k, long_k)
+        elif stage == "test":
+            if bool(_require_key(long_cfg, "apply_to_test", context="cfg.training.long_rollout")):
+                k = max(k, long_k)
 
-    candidates = [burn_in_steps + rollout_steps, val_burn_in_steps + rollout_steps]
-    if long_enabled and long_rollout_steps > 0:
-        candidates.append(burn_in_steps + long_rollout_steps)
-        if apply_long_to_val or apply_long_to_test:
-            candidates.append(val_burn_in_steps + long_rollout_steps)
+    return int(k)
 
-    total_steps = max(candidates)
 
-    dcfg = cfg.get("dataset", {})
+def create_dataloaders(
+    cfg: Dict[str, Any],
+    *,
+    tcfg: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[Any, Any, Optional[Any], Dict[str, Any]]:
+    paths = _require_dict(cfg, "paths", context="config")
+    processed_dir_raw = paths.get("processed_dir")
+    if not isinstance(processed_dir_raw, str) or not processed_dir_raw.strip():
+        raise KeyError("paths.processed_dir is required and must be a non-empty string.")
+    processed_dir = Path(processed_dir_raw).expanduser()
+    if not processed_dir.exists():
+        raise FileNotFoundError(f"Processed data dir not found: {processed_dir}")
+
+    # Per-stage required window sizes (K transitions => y length K+1).
+    k_train = _max_rollout_steps_for_stage(tcfg, stage="train")
+    k_val = _max_rollout_steps_for_stage(tcfg, stage="validation")
+    k_test = _max_rollout_steps_for_stage(tcfg, stage="test")
+
+    dcfg = cfg.get("dataset", {}) or {}
+    if not isinstance(dcfg, dict):
+        raise TypeError("dataset must be a dict if provided.")
+
     windows_per_traj = int(dcfg.get("windows_per_trajectory", 1))
-    seed = int(cfg.get("system", {}).get("seed", 1234))
     preload = bool(dcfg.get("preload_to_device", False))
     shard_cache_size = int(dcfg.get("shard_cache_size", 2))
+    use_mmap = bool(dcfg.get("use_mmap", False))
 
+    sys_cfg = cfg.get("system", {}) or {}
+    seed = int(sys_cfg.get("seed", 1234))
+
+    batch_size = int(tcfg["batch_size"])
+    num_workers = int(tcfg.get("num_workers", 0))
+    pin_memory = bool(tcfg.get("pin_memory", True))
+
+    # Validate preload + pin_memory combination
+    if preload and pin_memory:
+        raise ValueError("cfg.training.pin_memory must be false when dataset.preload_to_device=true.")
+
+    # Warn about data duplication risk with multi-GPU + preload_to_device.
     if preload:
-        devices_cfg = tcfg.get("devices", 1)
-        n_devices: Optional[int] = None
-        if isinstance(devices_cfg, int):
-            n_devices = devices_cfg
-        elif isinstance(devices_cfg, str) and devices_cfg.strip().isdigit():
-            n_devices = int(devices_cfg.strip())
+        runtime = cfg.get("runtime", {}) or {}
+        accel = str(runtime.get("accelerator", "auto")).lower().strip()
+        if accel == "cpu" and device.type != "cpu":
+            raise ValueError(
+                "dataset.preload_to_device=True would place batches on CUDA/MPS, but runtime.accelerator=cpu. "
+                "Set runtime.accelerator='auto'/'gpu' or disable dataset.preload_to_device."
+            )
+        if accel in ("gpu", "cuda") and device.type == "cpu":
+            raise ValueError(
+                "dataset.preload_to_device=True requires a GPU device, but runtime.accelerator requests GPU while system.device resolved to CPU. "
+                "Set system.device to a CUDA device or set dataset.preload_to_device=false."
+            )
+        devices_cfg = runtime.get("devices", "auto")
+        try:
+            n_devices = int(devices_cfg) if isinstance(devices_cfg, (int, str)) and str(devices_cfg).isdigit() else None
+        except Exception:
+            n_devices = None
         if n_devices is not None and n_devices > 1:
-            warnings.warn(
-                "preload_to_device=True may cause issues with multiple GPUs. "
-                "Each GPU would have duplicate data in memory.",
-                stacklevel=2,
+            raise RuntimeError(
+                "dataset.preload_to_device=True with multiple devices would duplicate data on each device. "
+                "Disable preload_to_device or use a single device."
             )
 
-    common_kwargs = dict(
-        total_steps=total_steps,
+    common_ds_kwargs = dict(
         windows_per_trajectory=windows_per_traj,
         preload_to_device=preload,
         device=device,
         storage_dtype=torch.float32,
         shard_cache_size=shard_cache_size,
-        use_mmap=bool(dcfg.get("use_mmap", False)),
+        use_mmap=use_mmap,
     )
 
-    train_ds = FlowMapRolloutDataset(processed_dir, "train", seed=seed, **common_kwargs)
-    val_ds = FlowMapRolloutDataset(processed_dir, "validation", seed=seed + 1, **common_kwargs)
+    train_ds = FlowMapRolloutDataset(processed_dir, "train", total_steps=k_train, seed=seed, **common_ds_kwargs)
+    val_ds = FlowMapRolloutDataset(processed_dir, "validation", total_steps=k_val, seed=seed + 1, **common_ds_kwargs)
 
     test_ds = None
     if (processed_dir / "test").exists():
-        test_ds = FlowMapRolloutDataset(processed_dir, "test", seed=seed + 2, **common_kwargs)
+        test_ds = FlowMapRolloutDataset(processed_dir, "test", total_steps=k_test, seed=seed + 2, **common_ds_kwargs)
 
-    batch_size = int(tcfg.get("batch_size", 256))
-    num_workers = int(tcfg.get("num_workers", 0))
-    pin_memory = bool(tcfg.get("pin_memory", device.type == "cuda"))
+    # DataLoader worker settings: be explicit and fail fast on invalid combinations.
+    persistent_raw = tcfg.get("persistent_workers", None)
+    prefetch_raw = tcfg.get("prefetch_factor", None)
 
-    if pin_memory and device.type == "mps":
-        warnings.warn("pin_memory not supported on MPS device, disabling", stacklevel=2)
-        pin_memory = False
-
-    if pin_memory and preload:
-        pin_memory = False
-
-    persistent = bool(tcfg.get("persistent_workers", num_workers > 0))
-    prefetch = int(tcfg.get("prefetch_factor", 2))
+    if num_workers == 0:
+        if persistent_raw not in (None, False):
+            raise ValueError("cfg.training.persistent_workers must be false when num_workers=0.")
+        if prefetch_raw not in (None,):
+            raise ValueError("cfg.training.prefetch_factor must be null/omitted when num_workers=0.")
+        persistent = False
+        prefetch = None
+    else:
+        if persistent_raw is None:
+            raise KeyError("cfg.training.persistent_workers is required when num_workers>0.")
+        if prefetch_raw is None:
+            raise KeyError("cfg.training.prefetch_factor is required when num_workers>0.")
+        persistent = bool(persistent_raw)
+        prefetch = int(prefetch_raw)
 
     dl_kwargs = dict(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent,
-        prefetch_factor=prefetch,
+        prefetch_factor=prefetch,  # DataLoader accepts None; avoids error when num_workers==0
     )
 
-    train_dl = create_dataloader(train_ds, shuffle=True, **dl_kwargs)
-    val_dl = create_dataloader(val_ds, shuffle=False, **dl_kwargs)
-    test_dl = create_dataloader(test_ds, shuffle=False, **dl_kwargs) if test_ds else None
+    train_dl = create_dataloader(train_ds, shuffle=True, drop_last=True, **dl_kwargs)
+    val_dl = create_dataloader(val_ds, shuffle=False, drop_last=False, **dl_kwargs)
+    test_dl = create_dataloader(test_ds, shuffle=False, drop_last=False, **dl_kwargs) if test_ds is not None else None
 
-    print("\n" + "=" * 60)
-    print("  DATASET CONFIGURATION")
-    print("=" * 60)
-    print(f"  Train samples:      {len(train_ds):,}")
-    print(f"  Validation samples: {len(val_ds):,}")
-    if test_ds:
-        print(f"  Test samples:       {len(test_ds):,}")
-    print(f"  Batch size:         {batch_size}")
-    print(f"  Train batches:      {len(train_dl):,}")
-    print(f"  Val batches:        {len(val_dl):,}")
-    print(f"  Burn-in steps (train): {burn_in_steps}")
-    print(f"  Burn-in steps (val):   {val_burn_in_steps}")
-    print(f"  Rollout steps (base):  {rollout_steps}")
-    print(f"  Window steps (y_seq):  {total_steps}")
-    if long_enabled and long_rollout_steps > 0:
-        long_ft_epochs = int(long_cfg.get("long_ft_epochs", long_cfg.get("final_epochs", 0)) or 0)
-        print(f"  Long rollout steps:    {long_rollout_steps} (final {long_ft_epochs} epochs)")
-        print(f"  Apply long to val/test: val={apply_long_to_val}, test={apply_long_to_test}")
-    print("=" * 60 + "\n")
+    log.info(
+        "Dataloaders: train=%d batches (K=%d), val=%d batches (K=%d), test=%s",
+        len(train_dl), k_train,
+        len(val_dl), k_val,
+        (f"{len(test_dl)} batches (K={k_test})" if test_dl is not None else "None"),
+    )
 
     if len(train_dl) == 0:
         raise ValueError(
-            "Train DataLoader has 0 batches. "
-            "Check batch_size and dataset size. "
-            f"Dataset has {len(train_ds)} samples, batch_size={batch_size}."
+            f"Train DataLoader has 0 batches. dataset_len={len(train_ds)} batch_size={batch_size}."
         )
 
+    # Return manifest too (loaded by dataset via normalization.json presence, but we want it in main anyway).
+    manifest = load_json_config(processed_dir / "normalization.json")
     return train_dl, val_dl, test_dl, manifest
 
 
 # ==============================================================================
-# Checkpoint Handling
+# Checkpoints
 # ==============================================================================
 
 
-def find_checkpoint(work_dir: Path) -> Optional[Path]:
-    """Find best available checkpoint in work directory."""
-    best = work_dir / "best.ckpt"
-    if best.exists():
-        return best
+def find_resume_checkpoint(work_dir: Path) -> Optional[Path]:
+    """
+    Look for checkpoints produced by trainer.build_lightning_trainer():
+      work_dir/checkpoints/last.ckpt
+      otherwise newest .ckpt under work_dir/checkpoints
+    """
+    ckpt_dir = work_dir / "checkpoints"
+    if not ckpt_dir.exists():
+        return None
 
-    last = work_dir / "last.ckpt"
+    last = ckpt_dir / "last.ckpt"
     if last.exists():
         return last
 
-    ckpts = sorted(work_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    ckpts = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
     return ckpts[0] if ckpts else None
 
 
 # ==============================================================================
-# Device Selection
+# CLI + main
 # ==============================================================================
 
 
-def select_device() -> torch.device:
-    """Select device: CUDA > MPS > CPU."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", type=str, default="config.json", help="Path to config.json")
+    return ap.parse_args()
 
 
-# ==============================================================================
-# Model compilation
-# ==============================================================================
+def main() -> None:
+    args = parse_args()
+    cfg_path = Path(args.config).expanduser().resolve()
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Config not found: {cfg_path}")
 
+    cfg = load_json_config(cfg_path)
+    cfg = resolve_paths(cfg, cfg_path)
+    configure_logging(cfg)
 
-def maybe_compile_model(model: torch.nn.Module, cfg: Dict[str, Any]) -> torch.nn.Module:
-    mcfg = dict(cfg.get("model", {}))
-    compile_enabled = bool(mcfg.get("compile", True))  # default ON
+    # Strict training schema validation (fail fast).
+    tcfg = validate_training_schema(cfg)
 
-    if not compile_enabled:
-        return model
+    # Seed (system-scoped; do not mutate training schema).
+    sys_cfg = cfg.get("system", {}) or {}
+    if not isinstance(sys_cfg, dict):
+        raise TypeError("system must be a dict if provided.")
+    seed = int(sys_cfg.get("seed", 1234))
+    seed_everything(seed, workers=True)
 
-    if not hasattr(torch, "compile"):
-        warnings.warn("model.compile=True but torch.compile is unavailable; continuing without compilation.", stacklevel=2)
-        return model
+    device = select_device(cfg)
+    log.info("Data device (for preloading only): %s", device)
 
-    try:
-        return torch.compile(model)  # default settings
-    except Exception as e:
-        warnings.warn(f"torch.compile failed; continuing without compilation: {e}", stacklevel=2)
-        return model
+    paths = _require_dict(cfg, "paths", context="config")
+    work_dir_raw = paths.get("work_dir")
+    if not isinstance(work_dir_raw, str) or not work_dir_raw.strip():
+        raise KeyError("paths.work_dir is required and must be a non-empty string.")
+    work_dir = ensure_dir(work_dir_raw)
 
+    processed_dir_raw = paths.get("processed_dir")
+    if not isinstance(processed_dir_raw, str) or not processed_dir_raw.strip():
+        raise KeyError("paths.processed_dir is required and must be a non-empty string.")
+    processed_dir = Path(processed_dir_raw).expanduser()
 
-# ==============================================================================
-# Cleanup
-# ==============================================================================
+    # Load manifest, enforce strict consistency, and sync cfg.data.{species,globals}.
+    cfg, manifest, species_vars, global_vars = load_manifest_and_sync_data_cfg(cfg, processed_dir)
 
+    # Persist the resolved config alongside the run artifacts.
+    atomic_write_json(work_dir / "config.resolved.json", cfg)
 
-def cleanup() -> None:
-    """Clean up PyTorch resources."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    gc.collect()
+    # Dataloaders (non-redundant; sized for max rollout lengths used by trainer).
+    train_dl, val_dl, test_dl, _ = create_dataloaders(cfg, tcfg=tcfg, device=device)
 
+    # Build model + module.
+    model = create_model(cfg)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(
+        "Model: type=%s | S=%d | G=%d | params=%d (trainable=%d)",
+        str(cfg.get("model", {}).get("type", "mlp")),
+        len(species_vars),
+        len(global_vars),
+        total_params,
+        trainable_params,
+    )
 
-# ==============================================================================
-# Main Entry Point
-# ==============================================================================
+    lit_module = FlowMapRolloutModule(
+        cfg=cfg,
+        model=model,
+        normalization_manifest=manifest,
+        species_variables=species_vars,
+    )
 
+    trainer = build_lightning_trainer(cfg, work_dir=work_dir)
 
-def main() -> int:
-    trainer = None
-    try:
-        cfg_path = _config_path()
-        if not cfg_path.exists():
-            print(f"Error: Config not found at {cfg_path}", file=sys.stderr)
-            return 1
+    runtime = cfg.get("runtime", {}) or {}
+    if not isinstance(runtime, dict):
+        raise TypeError("runtime must be a dict if provided.")
+    mode = str(runtime.get("mode", "train")).lower().strip()
+    if mode not in ("train", "test"):
+        raise ValueError("runtime.mode must be 'train' or 'test'.")
 
-        cfg = load_json_config(cfg_path)
-        cfg = resolve_paths(cfg, cfg_path)
+    # Resume logic (strict: explicit runtime.checkpoint wins; otherwise best-effort last/newest).
+    ckpt_path = runtime.get("checkpoint")
+    if isinstance(ckpt_path, str) and ckpt_path.strip():
+        ckpt_path = str(Path(ckpt_path).expanduser())
+    else:
+        ckpt = find_resume_checkpoint(work_dir)
+        ckpt_path = str(ckpt) if ckpt else None
 
-        # Ensure config has a place for model.compile (default True).
-        cfg.setdefault("model", {})
-        cfg["model"].setdefault("compile", True)
-
-        sys_cfg = cfg.get("system", {})
-        seed = int(sys_cfg.get("seed", 1234))
-        deterministic = bool(sys_cfg.get("deterministic", False))
-        seed_everything(seed, workers=True)
-
-        cfg.setdefault("training", {})
-        cfg["training"].setdefault("deterministic", deterministic)
-
-        device = select_device()
-        print(f"Using device: {device}")
-
-        paths = cfg.get("paths", {})
-        work_dir = ensure_dir(paths.get("work_dir", "models/run"))
-        ensure_dir(paths.get("model_dir", "models"))
-
-        train_dl, val_dl, test_dl, manifest = create_dataloaders(cfg, device)
-        cfg = sync_config_with_manifest(cfg, manifest)
-
-        atomic_write_json(work_dir / "config.json", cfg)
-
-        species_vars = list(cfg.get("data", {}).get("species_variables", []))
-
-        model = create_model(cfg)
-        model = maybe_compile_model(model, cfg)
-
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-        print("=" * 60)
-        print("  MODEL CONFIGURATION")
-        print("=" * 60)
-        print(f"  Type:               {cfg.get('model', {}).get('type', 'mlp')}")
-        print(f"  Species (S):        {len(species_vars)}")
-        print(f"  Globals (G):        {len(cfg.get('data', {}).get('global_variables', []))}")
-        print(f"  torch.compile:      {bool(cfg.get('model', {}).get('compile', True))}")
-        print(f"  Total params:       {total_params:,}")
-        print(f"  Trainable params:   {trainable_params:,}")
-        print("=" * 60 + "\n")
-
-        lit_module = FlowMapRolloutModule(
-            cfg=cfg,
-            model=model,
-            normalization_manifest=manifest,
-            species_variables=species_vars,
-            work_dir=work_dir,
+    if mode == "train":
+        resume = bool(tcfg.get("resume", True))
+        log.info(
+            "Training: max_epochs=%s lr=%s wd=%s batch_size=%s resume=%s ckpt=%s",
+            tcfg["max_epochs"],
+            tcfg["optimizer"]["lr"],
+            tcfg["optimizer"].get("weight_decay", 0.0),
+            tcfg["batch_size"],
+            resume,
+            (Path(ckpt_path).name if ckpt_path else "None"),
         )
-        lit_module.set_dataloaders(train_dl, val_dl, test_dl)
 
-        trainer = build_lightning_trainer(cfg, work_dir=work_dir)
+        trainer.fit(
+            lit_module,
+            train_dataloaders=train_dl,
+            val_dataloaders=val_dl,
+            ckpt_path=(ckpt_path if (resume and ckpt_path) else None),
+        )
 
-        runtime = cfg.get("runtime", {})
-        mode = str(runtime.get("mode", "train")).lower().strip()
+        # Optional post-fit test (only if test split exists).
+        if test_dl is not None:
+            trainer.test(lit_module, dataloaders=test_dl, ckpt_path="best")
 
-        ckpt_path = runtime.get("checkpoint")
-        if ckpt_path:
-            ckpt_path = _resolve_path(_repo_root(cfg_path), str(ckpt_path))
-        else:
-            ckpt_path = find_checkpoint(work_dir)
-
-        tcfg = cfg.get("training", {})
-        print("=" * 60)
-        print("  TRAINING CONFIGURATION")
-        print("=" * 60)
-        print(f"  Max epochs:         {tcfg.get('max_epochs', 100)}")
-        print(f"  Learning rate:      {tcfg.get('lr', 0.001)}")
-        print(f"  Weight decay:       {tcfg.get('weight_decay', 0.0001)}")
-        print(f"  Precision:          {tcfg.get('precision', 'bf16-mixed')}")
-        if ckpt_path and mode == "train":
-            print(f"  Resume from:        {Path(ckpt_path).name}")
-        print("=" * 60)
-        print("\nStarting...\n")
-
-        if mode == "train":
-            resume = bool(tcfg.get("resume", True))
-            trainer.fit(lit_module, ckpt_path=str(ckpt_path) if (resume and ckpt_path) else None)
-
-            if test_dl is not None:
-                print("\nRunning test evaluation...")
-                best_ckpt = work_dir / "best.ckpt"
-                trainer.test(
-                    lit_module,
-                    dataloaders=test_dl,
-                    ckpt_path=str(best_ckpt) if best_ckpt.exists() else None,
-                )
-
-        elif mode == "eval":
-            if ckpt_path is None:
-                print(f"Error: No checkpoint found in {work_dir}", file=sys.stderr)
-                return 1
-            trainer.validate(lit_module, ckpt_path=str(ckpt_path))
-
-        elif mode == "test":
-            if ckpt_path is None:
-                print(f"Error: No checkpoint found in {work_dir}", file=sys.stderr)
-                return 1
-            if test_dl is None:
-                print("Error: No test data available", file=sys.stderr)
-                return 1
-            trainer.test(lit_module, ckpt_path=str(ckpt_path), dataloaders=test_dl)
-
-        else:
-            print(f"Error: Unknown mode '{mode}'", file=sys.stderr)
-            return 1
-
-        return 0
-
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-        return 130
-
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
-        return 1
-
-    finally:
-        try:
-            cleanup()
-        except Exception:
-            pass
+    else:  # test
+        if test_dl is None:
+            raise ValueError("runtime.mode='test' but no test split found (processed_dir/test missing).")
+        log.info("Testing: ckpt=%s", (Path(ckpt_path).name if ckpt_path else "None"))
+        trainer.test(lit_module, dataloaders=test_dl, ckpt_path=ckpt_path)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        main()
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        raise SystemExit(1)

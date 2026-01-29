@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-export.py - Export FlowMap as a 1-step autoregressive module (K=1) via torch.export (.pt2).
+export.py - Export FlowMap as a 1-step autoregressive module via torch.export (.pt2).
+
+Intended location: <repo_root>/testing/export.py
+(where <repo_root>/src contains main.py, model.py, etc.)
 
 Edit RUN_DIR at the top to choose which trained run/checkpoint to export.
-Outputs written into RUN_DIR:
+Outputs are written into RUN_DIR:
   - export_cpu_1step.pt2
   - export_mps_1step.pt2   (if available)
   - export_cuda_1step.pt2  (if available)
@@ -22,54 +25,126 @@ import torch.nn as nn
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from model import create_model
+from model import create_model  # noqa: E402
 
 # -----------------------------
 # CHOOSE YOUR RUN HERE (no args, no prompts)
 # -----------------------------
-RUN_DIR = (ROOT / "models" / "v1").resolve()
-PREFERRED_CKPT = None  # set to "best.ckpt" or "last.ckpt" to force; otherwise auto-pick
+RUN_DIR = (ROOT / "models" / "v2_auto").resolve()
+PREFERRED_CKPT = None  # e.g. "last.ckpt" or "epoch005-val0.123456.ckpt"
 
 
-def load_config() -> dict:
-    cfg = json.loads((ROOT / "config" / "config.json").read_text())
-    paths = cfg.get("paths", {})
-    for key in ("processed_data_dir", "model_dir", "work_dir"):
-        if key in paths:
-            p = Path(paths[key])
-            paths[key] = str(p if p.is_absolute() else (ROOT / p).resolve())
-    cfg["paths"] = paths
+def _resolve_path(root: Path, p: str) -> str:
+    pth = Path(p).expanduser()
+    return str(pth if pth.is_absolute() else (root / pth).resolve())
+
+
+def load_config(run_dir: Path) -> dict:
+    """
+    Prefer the resolved config saved by training:
+      RUN_DIR/config.resolved.json
+    Fallbacks:
+      RUN_DIR/config.json
+      <repo_root>/config.json
+    """
+    candidates = [
+        run_dir / "config.resolved.json",
+        run_dir / "config.json",
+        ROOT / "config.json",
+    ]
+    cfg_path = next((p for p in candidates if p.exists()), None)
+    if cfg_path is None:
+        raise FileNotFoundError(
+            "Could not find a config. Looked for: " + ", ".join(str(p) for p in candidates)
+        )
+
+    cfg = json.loads(cfg_path.read_text())
+
+    # Resolve cfg["paths"] relative to the config file location.
+    cfg_root = cfg_path.parent.resolve()
+    paths = cfg.get("paths", {}) or {}
+    if isinstance(paths, dict):
+        paths = dict(paths)
+        for k, v in list(paths.items()):
+            if isinstance(v, str) and v.strip():
+                paths[k] = _resolve_path(cfg_root, v)
+        cfg["paths"] = paths
+
     return cfg
 
 
 def find_checkpoint(run_dir: Path) -> Path:
+    """
+    Training writes checkpoints under RUN_DIR/checkpoints/ (Lightning).
+    Prefer:
+      - PREFERRED_CKPT if set
+      - checkpoints/last.ckpt if present
+      - newest *.ckpt under checkpoints/
+    Also supports older layouts where ckpts were written directly into RUN_DIR.
+    """
+    ckpt_roots = [run_dir / "checkpoints", run_dir]
+
     if PREFERRED_CKPT:
-        p = run_dir / PREFERRED_CKPT
-        if p.exists():
-            return p
-        raise FileNotFoundError(f"Preferred checkpoint not found: {p}")
+        for r in ckpt_roots:
+            p = r / PREFERRED_CKPT
+            if p.exists():
+                return p
+        raise FileNotFoundError(
+            f"Preferred checkpoint not found: {PREFERRED_CKPT} (searched {ckpt_roots})"
+        )
 
-    for name in ("best.ckpt", "last.ckpt"):
-        p = run_dir / name
-        if p.exists():
-            return p
+    last = run_dir / "checkpoints" / "last.ckpt"
+    if last.exists():
+        return last
 
-    ckpts = sorted(run_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if ckpts:
-        return ckpts[0]
-    raise FileNotFoundError(f"No checkpoint in {run_dir}")
+    for r in ckpt_roots:
+        ckpts = sorted(r.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if ckpts:
+            return ckpts[0]
+
+    raise FileNotFoundError(f"No checkpoint found under {run_dir} (or {run_dir / 'checkpoints'}).")
+
+
+def _strip_prefixes(key: str) -> str:
+    # Repeatedly strip common Lightning / DDP / torch.compile prefixes.
+    prefixes = (
+        "state_dict.",
+        "model.",
+        "module.",
+        "_orig_mod.",
+        "model._orig_mod.",
+        "module.model.",
+        "module._orig_mod.",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for p in prefixes:
+            if key.startswith(p):
+                key = key[len(p) :]
+                changed = True
+    return key
 
 
 def load_weights(model: nn.Module, ckpt_path: Path) -> None:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = ckpt.get("state_dict", ckpt)
-    clean = {}
-    for k, v in state.items():
-        for prefix in ("model.", "module.", "_orig_mod."):
-            if k.startswith(prefix):
-                k = k[len(prefix):]
-        clean[k] = v
-    model.load_state_dict(clean, strict=False)
+
+    cleaned = {_strip_prefixes(k): v for k, v in state.items()}
+
+    # Drop anything not belonging to the bare model (e.g. criterion.*, optimizer.*, etc).
+    model_sd = model.state_dict()
+    filtered = {k: v for k, v in cleaned.items() if k in model_sd}
+
+    missing = [k for k in model_sd.keys() if k not in filtered]
+    if missing:
+        preview = "\n  ".join(missing[:20])
+        raise RuntimeError(
+            f"Checkpoint is missing {len(missing)} model keys (showing up to 20):\n  {preview}\n"
+            f"Checkpoint: {ckpt_path}"
+        )
+
+    model.load_state_dict(filtered, strict=True)
 
 
 def prepare_model(model: nn.Module) -> nn.Module:
@@ -82,63 +157,42 @@ def prepare_model(model: nn.Module) -> nn.Module:
     return model
 
 
-def infer_dt_rank(base: nn.Module, device: str, dtype: torch.dtype) -> int:
-    """
-    Infer whether base.forward expects dt shaped [B,K], [B,K,1], or [B] (for K=1).
-    Returns: 1, 2, or 3 (dt rank).
-    """
-    base = prepare_model(base.to(device))
-    S, G = int(getattr(base, "S")), int(getattr(base, "G"))
-    B = 2
-    y = torch.randn(B, S, device=device, dtype=dtype)
-    g = torch.randn(B, G, device=device, dtype=dtype) if G > 0 else torch.empty(B, 0, device=device, dtype=dtype)
-
-    # Try in order: [B,1], [B,1,1], [B]
-    candidates = [
-        (2, torch.randn(B, 1, device=device, dtype=dtype)),
-        (3, torch.randn(B, 1, 1, device=device, dtype=dtype)),
-        (1, torch.randn(B, device=device, dtype=dtype)),
-    ]
-    for rank, dt in candidates:
-        try:
-            _ = base(y, dt, g)
-            return rank
-        except Exception:
-            pass
-    raise RuntimeError("Could not infer dt shape for model forward (tried [B,1], [B,1,1], [B]).")
-
-
 class OneStepAR(nn.Module):
-    """1-step autoregressive wrapper that fixes K=1 for export (avoids dynamic range(K) issues)."""
+    """
+    1-step autoregressive wrapper for export.
 
-    def __init__(self, base: nn.Module, dt_rank: int):
+    Exports a pure single-step transition:
+        y_next = base.forward_step(y, dt, g)
+
+    Inputs:
+      y : [B, S]
+      dt: [B]   (normalized dt in [0,1])
+      g : [B, G]
+    Output:
+      y_next: [B, S]
+    """
+
+    def __init__(self, base: nn.Module):
         super().__init__()
         self.base = base
-        self.dt_rank = int(dt_rank)
         self.S = int(getattr(base, "S"))
         self.G = int(getattr(base, "G"))
 
-    def forward(self, y: torch.Tensor, dt: torch.Tensor, g: torch.Tensor):
-        # Export signature uses dt as [B]; reshape to what base expects for K=1.
-        if self.dt_rank == 3:
-            dt_in = dt.view(-1, 1, 1)     # [B,1,1]
-        elif self.dt_rank == 2:
-            dt_in = dt.view(-1, 1)        # [B,1]
-        else:
-            dt_in = dt.view(-1)           # [B]
-        return self.base(y, dt_in, g)
+    def forward(self, y: torch.Tensor, dt: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        return self.base.forward_step(y, dt, g)
 
 
 def export_pt2(step: nn.Module, out_path: Path, device: str, dtype: torch.dtype) -> None:
     step = prepare_model(step.to(device))
 
     S, G = step.S, step.G
-    B_ex = 2
+    B_ex = 2  # exported batch will be specialized to this unless model is made symint-safe
     y = torch.randn(B_ex, S, device=device, dtype=dtype)
-    dt = torch.randn(B_ex, device=device, dtype=dtype)  # [B] always for the wrapper
+    dt = torch.rand(B_ex, device=device, dtype=dtype)  # normalized dt in [0,1]
     g = torch.randn(B_ex, G, device=device, dtype=dtype) if G > 0 else torch.empty(B_ex, 0, device=device, dtype=dtype)
 
-    B_dim = torch.export.Dim("batch", min=1, max=4096)
+    # IMPORTANT: model currently specializes batch, so use AUTO (or omit dynamic_shapes).
+    B_dim = torch.export.Dim.AUTO
     dyn = ({0: B_dim}, {0: B_dim}, {0: B_dim})
 
     ep = torch.export.export(step, (y, dt, g), dynamic_shapes=dyn)
@@ -147,11 +201,11 @@ def export_pt2(step: nn.Module, out_path: Path, device: str, dtype: torch.dtype)
     print(f"Saved: {out_path}")
 
 
+
 def try_export(step: nn.Module, out_path: Path, device: str, preferred_dtype: torch.dtype) -> None:
     try:
         export_pt2(step, out_path, device, preferred_dtype)
     except Exception as e:
-        # MPS fp16 can be finicky; fall back to fp32.
         if device == "mps" and preferred_dtype != torch.float32:
             print(f"{device} export fp16 failed ({type(e).__name__}); retrying fp32...")
             export_pt2(step, out_path, device, torch.float32)
@@ -160,19 +214,26 @@ def try_export(step: nn.Module, out_path: Path, device: str, preferred_dtype: to
 
 
 def main() -> None:
-    cfg = load_config()
     run_dir = RUN_DIR
+    if not run_dir.exists():
+        raise FileNotFoundError(f"RUN_DIR does not exist: {run_dir}")
+
+    cfg = load_config(run_dir)
     ckpt = find_checkpoint(run_dir)
 
+    try:
+        ckpt_disp = str(ckpt.relative_to(run_dir))
+    except ValueError:
+        ckpt_disp = str(ckpt)
+
     print(f"Run dir: {run_dir}")
-    print(f"Checkpoint: {ckpt.name}")
+    print(f"Checkpoint: {ckpt_disp}")
 
     base = create_model(cfg)
     load_weights(base, ckpt)
 
-    dt_rank = infer_dt_rank(base, "cpu", torch.float32)
-    step = OneStepAR(base, dt_rank=dt_rank)
-    print(f"Exporting 1-step AR | S={step.S}, G={step.G}, base_dt_rank={dt_rank}")
+    step = OneStepAR(base)
+    print(f"Exporting 1-step AR | S={step.S}, G={step.G}")
 
     # CPU
     try_export(step, run_dir / "export_cpu_1step.pt2", "cpu", torch.float32)

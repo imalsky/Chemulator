@@ -36,11 +36,12 @@
     "use_mmap": true
   },
   "model": {
-    "compile": true,
     "type": "mlp",
     "activation": "silu",
     "dropout": 0.0,
     "predict_delta": true,
+    "layer_norm": true,
+    "layer_norm_eps": 1e-05,
     "mlp": {
       "hidden_dims": [
         1024,
@@ -71,32 +72,37 @@
     }
   },
   "training": {
-    "max_epochs": 300,
+    "max_epochs": 600,
     "batch_size": 2048,
-    "lr": 0.0003,
-    "weight_decay": 0.0001,
-
-    "rollout_steps": 50,
-
-    "burn_in_steps": 0,
-    "val_burn_in_steps": 0,
-    "burn_in_noise_std": 0.0,
-    "burn_in_loss_weight": 0.0,
-
-    "teacher_forcing": {
-      "start": 1.0,
-      "end": 1.0,
-      "decay_epochs": 1,
-      "mode": "linear"
+    "optimizer": {
+      "name": "adamw",
+      "lr": 1e-5,
+      "weight_decay": 0.0001,
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "eps": 1e-08
     },
-
+    "rollout_steps": 50,
+    "burn_in": {
+      "train": 3,
+      "val": 3,
+      "test": 3
+    },
+    "teacher_forcing": {
+      "mode": "constant",
+      "p0": 0.0,
+      "p1": 0.0,
+      "ramp_epochs": 0
+    },
     "curriculum": {
       "enabled": false,
-      "start_k": 2,
+      "mode": "linear",
+      "base_k": 2,
       "max_k": 50,
       "ramp_epochs": 250
     },
-
     "long_rollout": {
       "enabled": false,
       "long_rollout_steps": 300,
@@ -104,63 +110,71 @@
       "apply_to_validation": false,
       "apply_to_test": true
     },
-
     "loss": {
       "lambda_log10_mae": 1.0,
-      "lambda_z_mse": 0.1
+      "lambda_z_mse": 0.5
     },
-
     "scheduler": {
+      "enabled": true,
       "type": "cosine_with_warmup",
       "warmup_epochs": 10,
       "min_lr_ratio": 0.01
     },
-
-    "grad_clip": 1.0,
+    "num_workers": 0,
+    "pin_memory": false,
+    "persistent_workers": false,
+    "prefetch_factor": null,
+    "resume": true,
+    "autoregressive_training": {
+      "enabled": true,
+      "no_grad_steps": 10,
+      "backward_per_step": true,
+      "teacher_forcing_in_trained_steps": false
+    }
+  },
+  "runtime": {
+    "mode": "train",
+    "checkpoint": "models/v2/checkpoints/last.ckpt",
     "precision": "bf16-mixed",
     "devices": "auto",
     "accelerator": "auto",
+    "strategy": "auto",
+    "gradient_clip_val": 0.0,
     "accumulate_grad_batches": 1,
-
-    "num_workers": 0,
-    "pin_memory": true,
-    "persistent_workers": false,
-    "prefetch_factor": 2,
-
-    "num_sanity_val_steps": 0,
+    "log_every_n_steps": 50,
     "enable_progress_bar": true,
-    "enable_model_summary": true,
-    "resume": true,
-
-    "metrics_csv": "metrics.csv",
-
+    "deterministic": false,
     "checkpointing": {
       "enabled": true,
       "save_top_k": 1,
       "monitor": "val_loss",
-      "mode": "min",
-      "save_last": true,
       "every_n_epochs": 1
     },
-
-    "early_stopping": {
+    "torch_compile": {
       "enabled": false,
-      "monitor": "val_loss",
-      "patience": 20,
-      "mode": "min",
-      "min_delta": 0.0,
-      "verbose": true
+      "backend": "inductor",
+      "mode": "reduce-overhead",
+      "dynamic": false,
+      "fullgraph": false,
+      "compile_forward_step": true,
+      "compile_open_loop_unroll": false
     }
   },
   "preprocessing": {
     "drop_below": 1e-30,
-    "output_trajectories_per_file": 500000,
+    "dt": 100.0,
     "dt_sampling": "loguniform",
     "dt_mode": "per_chunk",
-    "dt_min": 10,
-    "dt_max": 100,
+    "dt_min": 10.0,
+    "dt_max": 100.0,
     "n_steps": 500,
-    "train_split": 0.8,
+    "t_min": 0.001,
+    "time_keys": [
+      "time",
+      "t_time",
+      "t"
+    ],
+    "output_trajectories_per_file": 1000,
     "val_split": 0.1,
     "test_split": 0.1,
     "shard_size": 16384,
@@ -170,16 +184,12 @@
   },
   "paths": {
     "raw_data_dir": "data/raw",
-    "processed_data_dir": "data/processed",
-    "model_dir": "models",
-    "work_dir": "models/v1"
-  },
-  "runtime": {
-    "mode": "train",
-    "checkpoint": null
+    "processed_dir": "data/processed",
+    "work_dir": "models/v2_auto"
   },
   "system": {
     "seed": 1234,
-    "deterministic": false
+    "log_level": "INFO",
+    "device": "auto"
   }
 }

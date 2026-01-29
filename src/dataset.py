@@ -45,21 +45,11 @@ forces Python to call `__getitem__` B times per step, producing thousands of
 tiny device indexing ops. To avoid that, `create_dataloader()` automatically
 switches to a vectorized, GPU-native IterableDataset that yields pre-batched
 tensors with a few large kernels per step.
-
-Change log vs the prior version of this repo:
-- Deterministic sampling (deterministic window positions and deterministic
-  GPU batch stream) has been removed. All sampling is stochastic.
-- `use_mmap=True` no longer re-opens the NPZ file per sample. Instead, each
-  worker keeps an LRU cache of open NPZ handles (mmap_mode="r"), eliminating
-  per-sample file-open overhead.
-- The dataset no longer constructs an unused NormalizationHelper instance.
 """
 
 from __future__ import annotations
 
 import json
-import warnings
-from bisect import bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +58,10 @@ from typing import Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
+
+
+_DT_PROBE_MAX = 1024
+_DT_RANGE_EPS = 1e-6
 
 
 @dataclass(frozen=True)
@@ -93,7 +87,6 @@ class FlowMapRolloutDataset(Dataset):
         total_steps: int,
         windows_per_trajectory: int = 1,
         seed: int = 1234,
-        random_windows: Optional[bool] = None,
         preload_to_device: bool = False,
         device: torch.device = torch.device("cpu"),
         storage_dtype: torch.dtype = torch.float32,
@@ -110,8 +103,6 @@ class FlowMapRolloutDataset(Dataset):
             windows_per_trajectory: Controls *epoch size* by repeating each trajectory this many times.
                                   Sampling is still random each time.
             seed: Base seed for per-worker RNG.
-            random_windows: Deprecated. Deterministic sampling was removed; windows are always random.
-                            If provided and False, a warning is emitted and random sampling is used.
             preload_to_device: If True, all shards are loaded to `device` and a GPU-native batch stream
                               can be used by create_dataloader().
             device: Target device for preload_to_device.
@@ -123,12 +114,19 @@ class FlowMapRolloutDataset(Dataset):
         """
         super().__init__()
 
+        processed_dir = Path(processed_dir).expanduser().resolve()
+        split_dir = processed_dir / split
+        if not split_dir.exists():
+            raise FileNotFoundError(f"Split dir not found: {split_dir}")
+
         if total_steps <= 0:
             raise ValueError(f"total_steps must be positive, got {total_steps}")
         if windows_per_trajectory <= 0:
             raise ValueError(f"windows_per_trajectory must be positive, got {windows_per_trajectory}")
+        if shard_cache_size <= 0:
+            raise ValueError(f"shard_cache_size must be positive, got {shard_cache_size}")
 
-        self.processed_dir = Path(processed_dir)
+        self.processed_dir = processed_dir
         self.split = str(split)
         self.total_steps = int(total_steps)
         self.windows_per_trajectory = int(windows_per_trajectory)
@@ -136,139 +134,69 @@ class FlowMapRolloutDataset(Dataset):
         self.preload_to_device = bool(preload_to_device)
         self.device = device
         self.storage_dtype = storage_dtype
-        self.shard_cache_size = max(1, int(shard_cache_size))
-        self.use_mmap = bool(use_mmap) and not self.preload_to_device
+        self.shard_cache_size = int(shard_cache_size)
+        self.use_mmap = bool(use_mmap)
 
-        # Deterministic windows were removed. Keep the parameter for backward compatibility only.
-        if random_windows is not None and not bool(random_windows):
-            warnings.warn(
-                "random_windows=False is no longer supported (deterministic sampling removed). "
-                "Proceeding with stochastic window sampling.",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        # Normalization manifest is required by the overall pipeline; dataset does not apply it.
-        self.manifest: Optional[Dict] = None
+        self.manifest: Optional[Dict[str, object]] = None
         if validate_manifest:
-            self._load_manifest()
+            mpath = processed_dir / "normalization.json"
+            if not mpath.exists():
+                raise FileNotFoundError(f"Missing normalization.json at {mpath}")
+            with open(mpath, "r", encoding="utf-8") as f:
+                self.manifest = json.load(f)
 
-        self._index_shards(validate_dt_range=validate_dt_range)
-
-        self._preloaded = False
-        self._shard_cache: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-
-        # CPU path caches:
-        # - _npz_cache_full caches fully-loaded shard arrays (y_all, g_all, dt_all)
-        # - _npz_handle_cache caches open NPZ handles when use_mmap=True (avoids per-sample np.load)
-        self._npz_cache_full: "OrderedDict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]]" = OrderedDict()
-        self._npz_handle_cache: "OrderedDict[int, np.lib.npyio.NpzFile]" = OrderedDict()
-
-        # Per-worker RNG cache (numpy Generator). Keyed by (worker_id, torch_seed).
-        self._rng_cache: Dict[object, np.random.Generator] = {}
-
-        if self.preload_to_device:
-            self._preload_all()
-
-    # -------------------------------------------------------------------------
-    # Initialization helpers
-    # -------------------------------------------------------------------------
-
-    def _load_manifest(self) -> None:
-        manifest_path = self.processed_dir / "normalization.json"
-        if not manifest_path.exists():
-            raise FileNotFoundError(
-                f"Missing {manifest_path}. Run preprocessing first to generate "
-                "normalized data and normalization manifest."
-            )
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            self.manifest = json.load(f)
-
-    def _index_shards(self, *, validate_dt_range: bool) -> None:
-        split_dir = self.processed_dir / self.split
-        if not split_dir.exists():
-            raise FileNotFoundError(
-                f"Missing split directory: {split_dir}. "
-                f"Available splits: {[d.name for d in self.processed_dir.iterdir() if d.is_dir()]}"
-            )
-
-        shard_paths = sorted(split_dir.glob("shard_*.npz"))
+        shard_paths = sorted(split_dir.glob("*.npz"))
         if not shard_paths:
-            raise FileNotFoundError(
-                f"No shard_*.npz files found in {split_dir}. "
-                "Run preprocessing to generate data shards."
-            )
+            raise FileNotFoundError(f"No shard NPZ files found in {split_dir}")
 
-        # Probe the first shard for shape/dtype checks.
-        with np.load(shard_paths[0]) as first:
-            y0 = first["y_mat"]
-            g0 = first["globals"]
-            dt0 = first["dt_norm_mat"]
+        # Peek first shard for basic schema + dimensions.
+        with np.load(shard_paths[0]) as z:
+            y0 = z["y_mat"]
+            g0 = z["globals"]
+            dt0 = z["dt_norm_mat"]
 
-        # Shape checks
         if y0.ndim != 3:
-            raise ValueError(f"y_mat must be 3D [N,T,S], got shape {y0.shape}")
+            raise ValueError(f"Expected y_mat to be 3D [N,T,S], got {y0.shape}")
         if g0.ndim != 2:
-            raise ValueError(f"globals must be 2D [N,G], got shape {g0.shape}")
+            raise ValueError(f"Expected globals to be 2D [N,G], got {g0.shape}")
         if dt0.ndim != 2:
-            raise ValueError(f"dt_norm_mat must be 2D [N,T-1], got shape {dt0.shape}")
+            raise ValueError(f"Expected dt_norm_mat to be 2D [N,T-1], got {dt0.shape}")
 
-        self.T = int(y0.shape[1])
-        self.S = int(y0.shape[2])
+        N0, T0, S0 = y0.shape
+        if dt0.shape[1] != T0 - 1:
+            raise ValueError(f"dt_norm_mat second dim must be T-1={T0-1}, got {dt0.shape[1]}")
+        if g0.shape[0] != N0:
+            raise ValueError(f"globals first dim must match y_mat N={N0}, got {g0.shape[0]}")
+
+        if T0 < self.total_steps + 1:
+            raise ValueError(f"Trajectories too short for total_steps={self.total_steps}.")
+
+        self.T = int(T0)
+        self.S = int(S0)
         self.G = int(g0.shape[1])
-
-        if int(dt0.shape[1]) != self.T - 1:
-            raise ValueError(
-                f"dt_norm_mat second dim must be T-1={self.T-1}, got {dt0.shape[1]}"
-            )
-
-        if self.total_steps + 1 > self.T:
-            raise ValueError(
-                f"total_steps={self.total_steps} requires window length K+1={self.total_steps+1} "
-                f"but trajectories have length T={self.T}."
-            )
 
         self.max_start = int(self.T - (self.total_steps + 1))
         if self.max_start < 0:
-            raise ValueError(
-                f"Invalid max_start {self.max_start}. Check total_steps and trajectory length."
-            )
-
-        # Dtype checks: strongly prefer float32 in preprocessing to avoid per-sample copies.
+            raise ValueError(f"max_start < 0; T={self.T} total_steps={self.total_steps}")
+        # Strict dtypes: avoid silent CPU copies / perf cliffs.
         if y0.dtype != np.float32:
-            warnings.warn(
-                f"y_mat dtype is {y0.dtype}; preprocessing should store float32 to avoid copies.",
-                UserWarning,
-                stacklevel=2,
-            )
+            raise ValueError(f"y_mat dtype must be float32, got {y0.dtype}. Regenerate preprocessing outputs.")
         if g0.dtype != np.float32:
-            warnings.warn(
-                f"globals dtype is {g0.dtype}; preprocessing should store float32 to avoid copies.",
-                UserWarning,
-                stacklevel=2,
-            )
+            raise ValueError(f"globals dtype must be float32, got {g0.dtype}. Regenerate preprocessing outputs.")
         if dt0.dtype != np.float32:
-            warnings.warn(
-                f"dt_norm_mat dtype is {dt0.dtype}; preprocessing should store float32 to avoid copies.",
-                UserWarning,
-                stacklevel=2,
-            )
+            raise ValueError(f"dt_norm_mat dtype must be float32, got {dt0.dtype}. Regenerate preprocessing outputs.")
 
         # Fast dt range sanity check on a small slice (avoids reading full array).
         if validate_dt_range:
-            # sample up to 1024 values from the first trajectory
-            dt_probe = np.asarray(dt0[0, : min(1024, dt0.shape[1])])
-            if np.any(dt_probe < -1e-6) or np.any(dt_probe > 1.0 + 1e-6):
-                warnings.warn(
-                    "dt_norm_mat appears to contain values outside [0,1]. "
-                    "The model expects dt normalized to [0,1] (log10 + min-max). "
-                    "Check preprocessing.",
-                    UserWarning,
-                    stacklevel=2,
+            dt_probe = np.asarray(dt0[0, : min(_DT_PROBE_MAX, dt0.shape[1])])
+            if np.any(dt_probe < -_DT_RANGE_EPS) or np.any(dt_probe > 1.0 + _DT_RANGE_EPS):
+                raise ValueError(
+                    "dt_norm_mat contains values outside [0,1]. The training code expects dt already normalized. "
+                    "Regenerate preprocessing outputs."
                 )
 
         # Build shard index (trajectory counts per shard)
-        self.shards = []
+        self.shards: List[ShardIndex] = []
         for p in shard_paths:
             with np.load(p) as z:
                 n = int(z["y_mat"].shape[0])
@@ -278,12 +206,36 @@ class FlowMapRolloutDataset(Dataset):
 
         self._total_traj = int(sum(si.n for si in self.shards))
 
-        # Prefix offsets in trajectory space (global trajectory id -> shard).
-        self._shard_offsets = [0]
-        running = 0
-        for si in self.shards:
-            running += int(si.n)
-            self._shard_offsets.append(running)
+        # Precompute O(1) global-trajectory → (shard, local) lookup tables.
+        # This avoids per-sample Python binary search in __getitem__.
+        self._traj_to_shard = np.empty(self._total_traj, dtype=np.int32)
+        self._traj_to_local = np.empty(self._total_traj, dtype=np.int32)
+        cursor = 0
+        for shard_i, si in enumerate(self.shards):
+            n = int(si.n)
+            self._traj_to_shard[cursor : cursor + n] = shard_i
+            self._traj_to_local[cursor : cursor + n] = np.arange(n, dtype=np.int32)
+            cursor += n
+
+        # GPU preload cache
+        self._preloaded = False
+        self._shard_cache: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+        # CPU caches
+        self._npz_cache_full: "OrderedDict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]]" = OrderedDict()
+        self._npz_handle_cache: "OrderedDict[int, np.lib.npyio.NpzFile]" = OrderedDict()
+
+        # RNG cache per worker/seed
+        self._rng_cache: Dict[Tuple[int, int], np.random.Generator] = {}
+
+        if self.preload_to_device:
+            if self.device.type == "cpu":
+                raise ValueError("preload_to_device=True requires a CUDA/MPS device (data should live on accelerator).")
+            self._preload_all()
+
+    # -------------------------------------------------------------------------
+    # Preload
+    # -------------------------------------------------------------------------
 
     def _preload_all(self) -> None:
         """Load all shards into device memory (requires num_workers=0)."""
@@ -311,8 +263,6 @@ class FlowMapRolloutDataset(Dataset):
 
         shard_path = self.shards[shard_i].path
         with np.load(shard_path) as z:
-            # np.asarray(dtype=np.float32) will copy if stored dtype mismatches;
-            # preprocessing should store float32 to keep this zero-copy.
             y_all = np.asarray(z["y_mat"], dtype=np.float32)
             g_all = np.asarray(z["globals"], dtype=np.float32)
             dt_all = np.asarray(z["dt_norm_mat"], dtype=np.float32)
@@ -322,14 +272,8 @@ class FlowMapRolloutDataset(Dataset):
             self._npz_cache_full.popitem(last=False)
         return y_all, g_all, dt_all
 
-    def _get_mmap_npz(self, shard_i: int) -> np.lib.npyio.NpzFile:
-        """
-        Get an open NPZ handle with mmap_mode="r" from an LRU cache.
-
-        This eliminates the per-sample np.load(...) overhead that the previous implementation had.
-        Note: true OS-level mmap depends on how the NPZ was produced; for best results, store
-        float32 arrays and avoid compression.
-        """
+    def _get_mmap_handle(self, shard_i: int) -> "np.lib.npyio.NpzFile":
+        """Get an mmap-mode handle for a shard, with LRU caching."""
         if shard_i in self._npz_handle_cache:
             h = self._npz_handle_cache.pop(shard_i)
             self._npz_handle_cache[shard_i] = h
@@ -338,7 +282,6 @@ class FlowMapRolloutDataset(Dataset):
         shard_path = self.shards[shard_i].path
         h = np.load(shard_path, mmap_mode="r")
         self._npz_handle_cache[shard_i] = h
-
         while len(self._npz_handle_cache) > self.shard_cache_size:
             _, old = self._npz_handle_cache.popitem(last=False)
             try:
@@ -348,16 +291,13 @@ class FlowMapRolloutDataset(Dataset):
         return h
 
     def _get_traj_arrays(self, shard_i: int, local_i: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Return numpy arrays for a single trajectory: (y_traj[T,S], g[G], dt_traj[T-1]).
-        """
+        """Load a single trajectory, using mmap handles or full-shard caching."""
         if self.use_mmap:
-            h = self._get_mmap_npz(shard_i)
-            y_traj = h["y_mat"][local_i]
-            g = h["globals"][local_i]
-            dt_traj = h["dt_norm_mat"][local_i]
+            h = self._get_mmap_handle(shard_i)
+            y_traj = np.asarray(h["y_mat"][local_i], dtype=np.float32)
+            g = np.asarray(h["globals"][local_i], dtype=np.float32)
+            dt_traj = np.asarray(h["dt_norm_mat"][local_i], dtype=np.float32)
 
-            # Avoid copies when possible; enforce float32 only if needed.
             if y_traj.dtype != np.float32:
                 y_traj = y_traj.astype(np.float32, copy=False)
             if g.dtype != np.float32:
@@ -379,11 +319,11 @@ class FlowMapRolloutDataset(Dataset):
                 pass
         self._npz_handle_cache.clear()
 
-    def __del__(self) -> None:  # pragma: no cover
-        try:
-            self.close()
-        except Exception:
-            pass
+    def __enter__(self) -> "FlowMapRolloutDataset":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     # -------------------------------------------------------------------------
     # RNG utilities
@@ -391,39 +331,31 @@ class FlowMapRolloutDataset(Dataset):
 
     def _get_worker_rng(self) -> np.random.Generator:
         """
-        Return a numpy RNG suitable for __getitem__.
+        Return a NumPy RNG suitable for __getitem__.
 
-        For multi-worker loaders, each worker gets its own independent stream.
-        We additionally incorporate torch.initial_seed() to avoid accidental
-        reuse when the outer training loop changes seeds.
+        - In the main process (num_workers=0), we key the RNG off torch.initial_seed().
+        - In DataLoader workers (num_workers>0), we prefer the per-worker seed provided
+          by PyTorch (get_worker_info().seed) so behavior is deterministic under
+          Lightning / seed_everything(workers=True).
         """
         info = get_worker_info()
 
         if info is None:
-            torch_seed = int(torch.initial_seed()) % (2**32)
-            cache_key = (0, torch_seed)
-            if cache_key not in self._rng_cache:
-                # Drop any stale entries for worker_id=0
-                for k in list(self._rng_cache.keys()):
-                    if isinstance(k, tuple) and len(k) == 2 and k[0] == 0:
-                        del self._rng_cache[k]
-                ss = np.random.SeedSequence(entropy=self.seed, spawn_key=(torch_seed,))
-                self._rng_cache[cache_key] = np.random.default_rng(ss)
-            return self._rng_cache[cache_key]
+            worker_id = 0
+            worker_seed = int(torch.initial_seed()) % (2**32)
+        else:
+            worker_id = int(info.id)
+            # PyTorch sets a unique seed per worker process; prefer that when available.
+            worker_seed = int(getattr(info, "seed", torch.initial_seed())) % (2**32)
 
-        torch_seed = int(torch.initial_seed()) % (2**32)
-        cache_key = (info.id, torch_seed)
-
+        cache_key = (worker_id, worker_seed)
         if cache_key not in self._rng_cache:
-            # Drop any stale entries for this worker id
-            keys_to_remove = [
-                k
-                for k in self._rng_cache.keys()
-                if isinstance(k, tuple) and len(k) == 2 and k[0] == info.id
-            ]
-            for k in keys_to_remove:
-                del self._rng_cache[k]
-            ss = np.random.SeedSequence(entropy=self.seed, spawn_key=(info.id, torch_seed))
+            # Drop any stale entries for this worker id.
+            for k in list(self._rng_cache.keys()):
+                if isinstance(k, tuple) and len(k) == 2 and k[0] == worker_id:
+                    del self._rng_cache[k]
+
+            ss = np.random.SeedSequence(entropy=self.seed, spawn_key=(worker_id, worker_seed))
             self._rng_cache[cache_key] = np.random.default_rng(ss)
 
         return self._rng_cache[cache_key]
@@ -443,8 +375,8 @@ class FlowMapRolloutDataset(Dataset):
         if traj_idx < 0 or traj_idx >= self._total_traj:
             raise IndexError(f"Index {idx} out of bounds for dataset with {len(self)} samples")
 
-        shard_i = bisect_right(self._shard_offsets, traj_idx) - 1
-        local_i = int(traj_idx - self._shard_offsets[shard_i])
+        shard_i = int(self._traj_to_shard[traj_idx])
+        local_i = int(self._traj_to_local[traj_idx])
 
         # Stochastic window start for every sample.
         start = int(rng.integers(0, self.max_start + 1))
@@ -484,8 +416,7 @@ class _GPUPreloadedStochasticBatchStream(IterableDataset):
     This addresses the utilization bottleneck of calling __getitem__ B times per step.
     The stream yields already-batched tensors directly on the target device.
 
-    Sampling is with replacement (SGD-style). This is used for both train and validation/test
-    after removing deterministic sampling from this repo.
+    Sampling is with replacement (SGD-style).
     """
 
     def __init__(
@@ -509,38 +440,36 @@ class _GPUPreloadedStochasticBatchStream(IterableDataset):
 
         self.device = base.device
         self.dtype = base.storage_dtype
+        
         self.K = int(base.total_steps)
         self.S = int(base.S)
+        self.T = int(base.T)
+        self.T_dt = int(base.T - 1)
 
         self._t_y = torch.arange(self.K + 1, device=self.device, dtype=torch.long)
         self._t_dt = torch.arange(self.K, device=self.device, dtype=torch.long)
 
-        counts = torch.tensor([si.n for si in base.shards], device=self.device, dtype=torch.float32)
-        if torch.any(counts <= 0):
+
+        counts = torch.tensor([si.n for si in base.shards], device="cpu", dtype=torch.float32)
+        if int((counts <= 0).sum().item()) != 0:
             raise ValueError("Encountered a shard with non-positive trajectory count.")
-        self._shard_weights = counts / counts.sum()
+        self._shard_weights_cpu = counts / counts.sum()
 
         self._seed = int(seed if seed is not None else base.seed)
+        # RNG: shard selection is done on CPU to avoid device→host sync from .item().
+        self._gen_cpu = torch.Generator()
+        self._gen_cpu.manual_seed(self._seed)
 
-        # RNG handling:
-        # Prefer a device generator so random index generation stays on-GPU.
-        self._use_cpu_rng = False
-        self._shard_weights_cpu: Optional[torch.Tensor] = None
+        # Trajectory/start indices are sampled on-device.
         try:
-            self._gen = torch.Generator(device=self.device)
-        except TypeError:
-            self._use_cpu_rng = True
-            self._gen = torch.Generator()
-            warnings.warn(
-                "torch.Generator(device=...) is not available; using a CPU generator and CPU-sampled indices. "
-                "Throughput may be slightly reduced.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            self._gen_dev = torch.Generator(device=self.device)
+        except TypeError as e:
+            raise RuntimeError(
+                "preload_to_device=True requires torch.Generator(device=...) support. "
+                "Upgrade PyTorch or set dataset.preload_to_device=false."
+            ) from e
+        self._gen_dev.manual_seed(self._seed + 1)
 
-        self._gen.manual_seed(self._seed)
-        if self._use_cpu_rng:
-            self._shard_weights_cpu = self._shard_weights.detach().to("cpu")
 
     def __len__(self) -> int:
         total = len(self.base)
@@ -557,50 +486,37 @@ class _GPUPreloadedStochasticBatchStream(IterableDataset):
             B = self.batch_size if (self.drop_last or remaining >= self.batch_size) else remaining
             if B <= 0:
                 break
-
-            # Select a shard and sample (trajectory, start) indices.
-            if self._use_cpu_rng:
-                assert self._shard_weights_cpu is not None
-                shard_i = int(torch.multinomial(self._shard_weights_cpu, 1, generator=self._gen).item())
-            else:
-                shard_i = int(torch.multinomial(self._shard_weights, 1, generator=self._gen).item())
+            # Select a shard (CPU) and sample (trajectory, start) indices.
+            shard_i = int(torch.multinomial(self._shard_weights_cpu, 1, generator=self._gen_cpu).item())
 
             y_mat, g_mat, dt_mat = self.base._shard_cache[shard_i]
             N = int(y_mat.shape[0])
+            traj = torch.randint(0, N, (B,), device=self.device, generator=self._gen_dev, dtype=torch.long)
+            start = torch.randint(
+                0,
+                self.base.max_start + 1,
+                (B,),
+                device=self.device,
+                generator=self._gen_dev,
+                dtype=torch.long,
+            )
 
-            if self._use_cpu_rng:
-                traj = torch.randint(0, N, (B,), device="cpu", generator=self._gen, dtype=torch.long).to(self.device)
-                start = torch.randint(
-                    0,
-                    self.base.max_start + 1,
-                    (B,),
-                    device="cpu",
-                    generator=self._gen,
-                    dtype=torch.long,
-                ).to(self.device)
-            else:
-                traj = torch.randint(0, N, (B,), device=self.device, generator=self._gen, dtype=torch.long)
-                start = torch.randint(
-                    0,
-                    self.base.max_start + 1,
-                    (B,),
-                    device=self.device,
-                    generator=self._gen,
-                    dtype=torch.long,
-                )
+            # Gather windows without materializing [B, T, S] intermediates.
+            # y_mat: [N, T, S]  dt_mat: [N, T-1]
+            t_y = start[:, None] + self._t_y[None, :]  # [B, K+1]
+            lin_y = (traj[:, None] * self.T + t_y).reshape(-1)
+            y_flat = y_mat.reshape(-1, self.S)  # [N*T, S]
+            y_win = y_flat.index_select(0, lin_y).reshape(B, self.K + 1, self.S)
 
-            # Gather windows
-            y_btS = y_mat.index_select(0, traj)
-            idx_y = (start[:, None] + self._t_y[None, :]).unsqueeze(-1).expand(-1, -1, self.S)
-            y_win = torch.gather(y_btS, dim=1, index=idx_y)
-
-            dt_bT = dt_mat.index_select(0, traj)
-            idx_dt = (start[:, None] + self._t_dt[None, :])
-            dt_win = torch.gather(dt_bT, dim=1, index=idx_dt)
+            t_dt = start[:, None] + self._t_dt[None, :]  # [B, K]
+            lin_dt = (traj[:, None] * self.T_dt + t_dt).reshape(-1)
+            dt_flat = dt_mat.reshape(-1)  # [N*(T-1)]
+            dt_win = dt_flat.index_select(0, lin_dt).reshape(B, self.K)
 
             g = g_mat.index_select(0, traj)
 
             yield {"y": y_win, "dt": dt_win, "g": g}
+
 
 
 def create_dataloader(
@@ -611,15 +527,14 @@ def create_dataloader(
     num_workers: int,
     pin_memory: bool,
     persistent_workers: bool,
-    prefetch_factor: int,
-    drop_last: Optional[bool] = None,
+    prefetch_factor: Optional[int],
+    drop_last: bool,
 ) -> DataLoader:
     """
     Create a DataLoader with safe defaults for this codebase.
 
     Notes for preload_to_device=True:
     - The loader will switch to a GPU-native stochastic batch stream (sampling with replacement).
-    - Deterministic/exhaustive sampling was removed from this repo per request.
     """
     preload = bool(getattr(dataset, "preload_to_device", False))
     if preload and num_workers != 0:
@@ -627,43 +542,28 @@ def create_dataloader(
             "preload_to_device=True requires num_workers=0. "
             "Preloaded data cannot be shared across worker processes."
         )
-
-    # Dataset size for drop_last logic
+    # Dataset size checks
     try:
         ds_len = len(dataset)
     except TypeError:
         ds_len = None
 
     if ds_len is not None and ds_len == 0:
+        raise ValueError("Dataset is empty - check preprocessing outputs.")
+
+    if drop_last and ds_len is not None and ds_len < batch_size:
         raise ValueError(
-            "Dataset is empty - cannot create DataLoader. "
-            "Check that preprocessing generated data for this split."
+            f"drop_last=True would yield 0 batches (dataset size {ds_len} < batch_size {batch_size})."
         )
 
-    # Auto-configure drop_last
-    if drop_last is None:
-        drop_last = bool(shuffle and ds_len is not None and ds_len >= batch_size)
-    elif drop_last and ds_len is not None and ds_len < batch_size:
-        warnings.warn(
-            f"drop_last=True with dataset size {ds_len} < batch_size {batch_size} "
-            "would yield 0 batches; forcing drop_last=False",
-            UserWarning,
-            stacklevel=2,
-        )
-        drop_last = False
-
-    # Preloaded data is already on device; pinning host memory is meaningless.
     if preload and pin_memory:
-        warnings.warn(
-            "pin_memory=True is incompatible with preload_to_device=True. "
-            "Data is already on device. Disabling pin_memory.",
-            UserWarning,
-            stacklevel=2,
-        )
-        pin_memory = False
+        raise ValueError("pin_memory=True is incompatible with preload_to_device=True (data is already on device).")
 
-    if num_workers == 0:
-        persistent_workers = False
+    if num_workers == 0 and persistent_workers:
+        raise ValueError("persistent_workers=True requires num_workers>0.")
+
+    if num_workers == 0 and prefetch_factor is not None:
+        raise ValueError("prefetch_factor requires num_workers>0.")
 
     # ---- Optimized GPU stream for preloaded FlowMapRolloutDataset ----
     if preload and isinstance(dataset, FlowMapRolloutDataset) and getattr(dataset, "_preloaded", False):
@@ -693,7 +593,10 @@ def create_dataloader(
         persistent_workers=persistent_workers,
         drop_last=bool(drop_last),
     )
-    if num_workers > 0:
+
+    # prefetch_factor is only meaningful when using worker processes. Some PyTorch versions
+    # error if it is passed when num_workers==0, so only forward it when applicable.
+    if num_workers > 0 and prefetch_factor is not None:
         dl_kwargs["prefetch_factor"] = int(prefetch_factor)
 
     return DataLoader(**dl_kwargs)

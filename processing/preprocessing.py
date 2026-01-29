@@ -60,7 +60,7 @@ def _default_repo_root() -> Path:
     """
     here = Path(__file__).resolve().parent
     for p in (here, here.parent, here.parent.parent):
-        if (p / "config" / "config.json").exists() or (p / "config.json").exists():
+        if (p / "config.json").exists() or (p / "config.json").exists():
             return p
     return here
 
@@ -757,6 +757,7 @@ def sample_trajectories_from_file(
     with h5py.File(file_path, "r") as fin:
         # Reservoir sample trajectory groups from the file to avoid loading all keys.
         pool = reservoir_sample(fin.keys(), int(cfg.pool_size), rng)
+        rng.shuffle(pool)
 
         for traj_name in pool:
             if written >= target:
