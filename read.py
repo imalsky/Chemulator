@@ -128,6 +128,13 @@ def _pipes(items: Sequence[str]) -> str:
     return " | ".join([s for s in items if s])
 
 
+def _first_existing(header_set: set, keys: Sequence[str]) -> Optional[str]:
+    for k in keys:
+        if k in header_set:
+            return k
+    return None
+
+
 # ----------------------------
 # summaries (concise)
 # ----------------------------
@@ -186,28 +193,78 @@ def _train_summary(cfg: Dict[str, Any]) -> str:
         parts.append(f"{k}={v}")
 
     add("batch", t.get("batch_size"))
-    lr = t.get("lr")
-    wd = t.get("weight_decay")
-    add("lr", _fmt(float(lr)) if isinstance(lr, (int, float)) else lr)
-    add("wd", _fmt(float(wd)) if isinstance(wd, (int, float)) else wd)
     add("max_epochs", t.get("max_epochs"))
     add("rollout", t.get("rollout_steps"))
 
-    tf = t.get("teacher_forcing", {}) or {}
-    if isinstance(tf, dict) and ("start" in tf or "end" in tf):
-        tf_start = tf.get("start", None)
-        tf_end = tf.get("end", None)
-        tf_mode = tf.get("mode", None)
-        if tf_start is not None and tf_end is not None:
-            parts.append(f"tf={tf_start}->{tf_end}{'' if tf_mode is None else f'({tf_mode})'}")
+    # Optimizer schema (new): training.optimizer.{name,lr,weight_decay,...}
+    opt = t.get("optimizer", {}) or {}
+    if isinstance(opt, dict):
+        add("opt", opt.get("name"))
+        lr = opt.get("lr")
+        wd = opt.get("weight_decay")
+        add("lr", _fmt(float(lr)) if isinstance(lr, (int, float)) else lr)
+        add("wd", _fmt(float(wd)) if isinstance(wd, (int, float)) else wd)
+    else:
+        # Legacy fallback: training.lr / training.weight_decay
+        lr = t.get("lr")
+        wd = t.get("weight_decay")
+        add("lr", _fmt(float(lr)) if isinstance(lr, (int, float)) else lr)
+        add("wd", _fmt(float(wd)) if isinstance(wd, (int, float)) else wd)
 
+    # Teacher forcing schema (new): {mode, p0, p1, ramp_epochs}
+    tf = t.get("teacher_forcing", {}) or {}
+    if isinstance(tf, dict):
+        if "p0" in tf or "p1" in tf:
+            p0 = tf.get("p0", None)
+            p1 = tf.get("p1", None)
+            mode = tf.get("mode", None)
+            ramp = tf.get("ramp_epochs", None)
+            if p0 is not None and p1 is not None:
+                extra = []
+                if mode is not None:
+                    extra.append(str(mode))
+                if ramp is not None:
+                    extra.append(f"{ramp}e")
+                parts.append(f"tf={p0}->{p1}{'' if not extra else '(' + ','.join(extra) + ')'}")
+        # Legacy fallback: {start,end,mode}
+        elif "start" in tf or "end" in tf:
+            tf_start = tf.get("start", None)
+            tf_end = tf.get("end", None)
+            tf_mode = tf.get("mode", None)
+            if tf_start is not None and tf_end is not None:
+                parts.append(f"tf={tf_start}->{tf_end}{'' if tf_mode is None else f'({tf_mode})'}")
+
+    # Curriculum schema (new): {enabled, mode, base_k, max_k, ramp_epochs}
     cur = t.get("curriculum", {}) or {}
     if isinstance(cur, dict) and bool(cur.get("enabled", False)):
-        parts.append(f"cur={cur.get('start_k')}->{cur.get('max_k')}@{cur.get('ramp_epochs')}e")
+        base_k = cur.get("base_k", cur.get("start_k", None))
+        max_k = cur.get("max_k", None)
+        ramp = cur.get("ramp_epochs", None)
+        if base_k is not None and max_k is not None and ramp is not None:
+            parts.append(f"cur={base_k}->{max_k}@{ramp}e")
 
+    # Long rollout schema: {enabled, long_rollout_steps, final_epochs, ...}
     longr = t.get("long_rollout", {}) or {}
     if isinstance(longr, dict) and bool(longr.get("enabled", False)):
-        parts.append(f"long={longr.get('long_rollout_steps')}@last{longr.get('final_epochs')}e")
+        steps = longr.get("long_rollout_steps", None)
+        fin = longr.get("final_epochs", None)
+        if steps is not None and fin is not None:
+            parts.append(f"long={steps}@last{fin}e")
+
+    # Loss weights (useful when comparing across runs)
+    loss = t.get("loss", {}) or {}
+    if isinstance(loss, dict):
+        lam1 = loss.get("lambda_log10_mae", None)
+        lam2 = loss.get("lambda_z_mse", None)
+        if lam1 is not None or lam2 is not None:
+            parts.append(f"loss=log10_mae*{lam1}+z_mse*{lam2}")
+
+    # Autoregressive training flag
+    ar = t.get("autoregressive_training", {}) or {}
+    if isinstance(ar, dict) and bool(ar.get("enabled", False)):
+        ng = ar.get("no_grad_steps", None)
+        bps = ar.get("backward_per_step", None)
+        parts.append(f"AR=on(ng={ng},bps={bps})")
 
     return " | ".join([p for p in parts if p]) if parts else ""
 
@@ -220,34 +277,61 @@ def _train_summary(cfg: Dict[str, Any]) -> str:
 def _select_table_cols(header: Sequence[str], max_cols: int = 8) -> List[str]:
     header_set = set(header)
 
-    # New trainer default CSV schema (fixed fields).
+    # Prefer metric-first aliases when present.
     priority = [
         "epoch",
         "train_loss",
+        "train_log10_mae",
         "val_loss",
+        "val_log10_mae",
         "val_loss_log10_mae",
         "val_loss_z_mse",
-        "lr",
         "epoch_time_sec",
-        "train_tf_prob",
-        "train_rollout_steps",
+        "lr",
+        "test_loss",
+        "test_log10_mae",
     ]
 
     cols = [c for c in priority if c in header_set]
-    return cols[:max_cols]
+
+    # If alias keys aren't present, fall back to component keys.
+    if "train_log10_mae" not in header_set and "train_loss_log10_mae" in header_set and "train_loss_log10_mae" not in cols:
+        cols.insert(2, "train_loss_log10_mae")
+    if "val_log10_mae" not in header_set and "val_loss_log10_mae" in header_set and "val_loss_log10_mae" not in cols:
+        # keep val_loss_log10_mae near val_loss
+        try:
+            i = cols.index("val_loss") + 1
+        except ValueError:
+            i = len(cols)
+        cols.insert(i, "val_loss_log10_mae")
+
+    # Dedup while preserving order.
+    seen = set()
+    out: List[str] = []
+    for c in cols:
+        if c not in seen and c in header_set:
+            seen.add(c)
+            out.append(c)
+
+    return out[:max_cols]
 
 
 def _best_lines(rows: List[Dict[str, Any]], header: Sequence[str]) -> List[str]:
     header_set = set(header)
-    candidates = [
-        ("best_val_loss", "val_loss", "min"),
-        ("best_val_log10_mae", "val_loss_log10_mae", "min"),
-        ("best_val_z_mse", "val_loss_z_mse", "min"),
+
+    key_val_loss = _first_existing(header_set, ["val_loss"])
+    key_val_log10 = _first_existing(header_set, ["val_log10_mae", "val_loss_log10_mae"])
+    key_val_z = _first_existing(header_set, ["val_z_mse", "val_loss_z_mse"])
+
+    candidates: List[Tuple[str, Optional[str], str]] = [
+        ("best_val_loss", key_val_loss, "min"),
+        ("best_val_log10_mae", key_val_log10, "min"),
+        ("best_val_z_mse", key_val_z, "min"),
     ]
 
     out: List[str] = []
     for label, key, mode in candidates:
-        if key not in header_set:
+        if not key:
             continue
         b = _best(rows, key, mode=mode)
         if b:

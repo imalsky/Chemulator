@@ -1067,7 +1067,6 @@ def compute_train_stats_from_physical(
     for g in cfg.global_variables:
         methods[g] = _canonical_method(cfg.methods.get(g, cfg.globals_default_method))
 
-    # Prefer train; fallback to validation if train empty
     shards = iter_shards(out_tmp, "train", "_physical")
     if not shards:
         raise RuntimeError("No physical shards found (train/validation) to compute normalization.")

@@ -39,24 +39,24 @@ except Exception:
 
 @dataclass
 class Config:
-    run_dir: Path = ROOT / "models" / "v2_auto"
+    run_dir: Path = ROOT / "models" / "v3"
     processed_dir: Path = ROOT / "data" / "processed"
     export_name: str = "export_cpu_1step.pt2"
 
     sample_idx: int = 1
-    start_index: int = 1
-    n_steps: int = 200
+    start_index: int = 0
+    n_steps: int = 500
 
     plot_species: list | None = None  # None/[] => all
     y_range: tuple = (1e-30, 3)
 
     true_lw: float = 3.0
-    true_alpha: float = 1.0
+    true_alpha: float = 0.5
     pred_lw: float = 2.0
     pred_alpha: float = 1.0
     pred_ls: tuple = (8, 3)
-    pred_marker: str = "o"
-    pred_ms: float = 3
+    pred_marker: str = "s"
+    pred_ms: float = 0.0
 
 
 CFG = Config()

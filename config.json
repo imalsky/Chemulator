@@ -24,7 +24,7 @@
       "OH_evolution",
       "O_evolution"
     ],
-    "global_variables": ["T", "P"]
+    "global_variables": ["P", "T"]
   },
   "dataset": {
     "windows_per_trajectory": 10,
@@ -40,76 +40,29 @@
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "mlp": {
-      "hidden_dims": [
-        1024,
-        1024,
-        1024,
-        1024,
-        1024,
-        1024
-      ],
+      "hidden_dims": [1024, 1024, 1024, 1024, 1024, 1024],
       "residual": true
-    },
-    "autoencoder": {
-      "latent_dim": 256,
-      "encoder_hidden": [
-        512,
-        512
-      ],
-      "dynamics_hidden": [
-        512,
-        512
-      ],
-      "decoder_hidden": [
-        512,
-        512
-      ],
-      "residual": true,
-      "dynamics_residual": true
     }
   },
   "training": {
     "max_epochs": 300,
-    "batch_size": 2048,
-    "optimizer": {
-      "name": "adamw",
-      "lr": 0.0003,
-      "weight_decay": 0.0001,
-      "betas": [
-        0.9,
-        0.999
-      ],
-      "eps": 1e-08
-    },
+    "batch_size": 8192,
     "rollout_steps": 1,
     "burn_in": {
       "train": 0,
       "val": 0,
       "test": 0
     },
-    "teacher_forcing": {
-      "mode": "linear",
-      "p0": 1.0,
-      "p1": 1.0,
-      "ramp_epochs": 1
-    },
-    "curriculum": {
-      "enabled": false,
-      "mode": "linear",
-      "base_k": 2,
-      "max_k": 50,
-      "ramp_epochs": 250
-    },
-    "long_rollout": {
-      "enabled": false,
-      "long_rollout_steps": 300,
-      "final_epochs": 40,
-      "apply_to_validation": false,
-      "apply_to_test": true
-    },
     "loss": {
       "lambda_log10_mae": 1.0,
       "lambda_z_mse": 0.5
+    },
+    "optimizer": {
+      "name": "adamw",
+      "lr": 0.0003,
+      "weight_decay": 0.0001,
+      "betas": [0.9, 0.999],
+      "eps": 1e-08
     },
     "scheduler": {
       "enabled": true,
@@ -117,17 +70,17 @@
       "warmup_epochs": 10,
       "min_lr_ratio": 0.01
     },
+    "curriculum": {
+      "enabled": false
+    },
+    "autoregressive_training": {
+      "enabled": false
+    },
     "num_workers": 0,
     "pin_memory": false,
     "persistent_workers": false,
     "prefetch_factor": null,
-    "resume": true,
-    "autoregressive_training": {
-      "enabled": false,
-      "no_grad_steps": 0,
-      "backward_per_step": true,
-      "teacher_forcing_in_trained_steps": false
-    }
+    "resume": true
   },
   "runtime": {
     "mode": "train",
@@ -150,7 +103,7 @@
     "torch_compile": {
       "enabled": true,
       "backend": "inductor",
-      "mode": "reduce-overhead",
+      "mode": "default",
       "dynamic": false,
       "fullgraph": false,
       "compile_forward_step": true,
@@ -166,11 +119,7 @@
     "dt_max": 100.0,
     "n_steps": 500,
     "t_min": 0.001,
-    "time_keys": [
-      "time",
-      "t_time",
-      "t"
-    ],
+    "time_keys": ["time", "t_time", "t"],
     "output_trajectories_per_file": 1000,
     "val_split": 0.1,
     "test_split": 0.1,
@@ -182,7 +131,7 @@
   "paths": {
     "raw_data_dir": "data/raw",
     "processed_dir": "data/processed",
-    "work_dir": "models/v2"
+    "work_dir": "models/v3"
   },
   "system": {
     "seed": 1234,

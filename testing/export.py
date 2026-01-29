@@ -30,7 +30,7 @@ from model import create_model  # noqa: E402
 # -----------------------------
 # CHOOSE YOUR RUN HERE (no args, no prompts)
 # -----------------------------
-RUN_DIR = (ROOT / "models" / "v2_auto").resolve()
+RUN_DIR = (ROOT / "models" / "v3").resolve()
 PREFERRED_CKPT = None  # e.g. "last.ckpt" or "epoch005-val0.123456.ckpt"
 
 
