@@ -30,7 +30,7 @@ from model import create_model  # noqa: E402
 # -----------------------------
 # CHOOSE YOUR RUN HERE (no args, no prompts)
 # -----------------------------
-RUN_DIR = (ROOT / "models" / "v3").resolve()
+RUN_DIR = (ROOT / "models" / "v4").resolve()
 PREFERRED_CKPT = None  # e.g. "last.ckpt" or "epoch005-val0.123456.ckpt"
 
 
@@ -183,7 +183,7 @@ class OneStepAR(nn.Module):
 
 
 def export_pt2(step: nn.Module, out_path: Path, device: str, dtype: torch.dtype) -> None:
-    step = prepare_model(step.to(device))
+    step = prepare_model(step.to(device=device, dtype=dtype))
 
     S, G = step.S, step.G
     B_ex = 2  # exported batch will be specialized to this unless model is made symint-safe

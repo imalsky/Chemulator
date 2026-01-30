@@ -40,26 +40,26 @@
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "mlp": {
-      "hidden_dims": [1024, 1024, 1024, 1024, 1024, 1024],
+      "hidden_dims": [2048, 2048, 2048, 2048, 2048, 2048],
       "residual": true
     }
   },
   "training": {
-    "max_epochs": 600,
-    "batch_size": 512,
-    "rollout_steps": 100,
+    "max_epochs": 700,
+    "batch_size": 4096,
+    "rollout_steps": 3,
     "burn_in": {
-      "train": 3,
-      "val": 3,
-      "test": 3
+      "train": 1,
+      "val": 1,
+      "test": 1
     },
     "loss": {
       "lambda_log10_mae": 1.0,
-      "lambda_z_mse": 0.5
+      "lambda_z_mse": 0.25
     },
     "optimizer": {
       "name": "adamw",
-      "lr": 0.0003,
+      "lr": 1e-4,
       "weight_decay": 0.0001,
       "betas": [0.9, 0.999],
       "eps": 1e-08,
@@ -68,16 +68,20 @@
     },
     "scheduler": {
       "enabled": true,
-      "type": "cosine_with_warmup",
-      "warmup_epochs": 10,
-      "min_lr_ratio": 0.01
+      "type": "plateau",
+      "monitor": "val_loss",
+      "mode": "min",
+      "factor": 0.5,
+      "patience": 5,
+      "threshold": 1e-10,
+      "min_lr": 1e-8
     },
     "curriculum": {
       "enabled": false
     },
     "autoregressive_training": {
       "enabled": true,
-      "no_grad_steps": 3,
+      "no_grad_steps": 1,
       "backward_per_step": true
     },
     "num_workers": 0,
@@ -105,7 +109,7 @@
       "every_n_epochs": 1
     },
     "torch_compile": {
-      "enabled": true,
+      "enabled": false,
       "backend": "inductor",
       "mode": "reduce-overhead",
       "dynamic": false,
@@ -135,7 +139,7 @@
   "paths": {
     "raw_data_dir": "data/raw",
     "processed_dir": "data/processed",
-    "work_dir": "models/v3"
+    "work_dir": "models/v4"
   },
   "system": {
     "seed": 1234,

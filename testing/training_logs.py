@@ -154,10 +154,8 @@ def plot_losses(m, out_path: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(7, 7))
 
-    if np.isfinite(train).any():
-        ax.plot(epoch, train, label="train_loss")
-    if np.isfinite(val).any():
-        ax.plot(epoch, val, label="val_loss")
+    ax.plot(epoch, train, label="train_loss", color='black', linestyle="solid", linewidth=3, alpha=0.5)
+    ax.plot(epoch, val, label="val_loss", color='black', linestyle="dashed", linewidth=3)
 
     if CFG.plot_components:
         tlm = _sanitize_for_log(m["train_loss_log10_mae"])
@@ -165,14 +163,11 @@ def plot_losses(m, out_path: Path) -> None:
         tzm = _sanitize_for_log(m["train_loss_z_mse"])
         vzm = _sanitize_for_log(m["val_loss_z_mse"])
 
-        if np.isfinite(tlm).any():
-            ax.plot(epoch, tlm, linestyle="solid", label="train_log10_mae")
-        if np.isfinite(vlm).any():
-            ax.plot(epoch, vlm, linestyle="dashed", label="val_log10_mae")
-        if np.isfinite(tzm).any():
-            ax.plot(epoch, tzm, linestyle=":", label="train_z_mse")
-        if np.isfinite(vzm).any():
-            ax.plot(epoch, vzm, linestyle=":", label="val_z_mse")
+        #ax.plot(epoch, tlm, linestyle="solid", label="train_log10_mae", color='red', linewidth=5, alpha=0.8)
+        #ax.plot(epoch, vlm, linestyle="dashed", label="val_log10_mae", color='red')
+
+        #ax.plot(epoch, tzm, linestyle="solid", label="train_z_mse", color='blue', linewidth=5, alpha=0.8)
+        #ax.plot(epoch, vzm, linestyle="dashed", label="val_z_mse", color='blue')
 
     ax.set_yscale("log")
     ax.set_xlabel("Epoch")

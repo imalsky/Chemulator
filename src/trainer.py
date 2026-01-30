@@ -664,18 +664,8 @@ class FlowMapRolloutModule(pl.LightningModule):
     # ------------------------
     # Train/val/test steps
     # ------------------------
-
     def _training_step_autoregressive_detached(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """Detached autoregressive training regime (pushforward + stop-grad).
-
-        Contract:
-          - Roll out for N steps (N = effective train rollout horizon for this epoch).
-          - The first `skip_steps` steps are rolled out under torch.no_grad() and do not contribute gradients.
-            skip_steps := max(cfg.training.burn_in.train, cfg.training.autoregressive_training.no_grad_steps)
-          - For the remaining steps, train on each 1-step prediction, but detach the state after every step so
-            gradients never backpropagate through time.
-
-        """
+        """Detached autoregressive training regime (pushforward + stop-grad)."""
         y = batch["y"]
         dt = batch["dt"]
         g = batch.get("g", None)
@@ -684,14 +674,15 @@ class FlowMapRolloutModule(pl.LightningModule):
         transitions = max(1, int(K_full) - 1)
         epoch = int(self.current_epoch)
 
-        dt_full = normalize_dt_shape(dt, batch_size=B, seq_len=transitions, context="train/_training_step_autoregressive_detached")
+        dt_full = normalize_dt_shape(
+            dt, batch_size=B, seq_len=transitions, context="train/_training_step_autoregressive_detached"
+        )
 
         k_train = int(max(1, min(self._effective_k_roll(epoch, stage="train"), transitions)))
-        dt_train = dt_full[:, :k_train]                 # [B, k_train]
-        y_true = y[:, 1: 1 + k_train, :]                # [B, k_train, S]
-        y0 = y[:, 0, :]                                 # [B, S]
+        dt_train = dt_full[:, :k_train]                  # [B, k_train]
+        y_true = y[:, 1 : 1 + k_train, :]                # [B, k_train, S]
+        y0 = y[:, 0, :]                                  # [B, S]
 
-        # Steps to exclude from gradient updates.
         burn_in_train = int(self._get_burn_in_steps("train"))
         skip_steps = int(max(0, max(burn_in_train, int(getattr(self, "ar_no_grad_steps", 0)))))
         if skip_steps >= k_train:
@@ -708,14 +699,13 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         acc = getattr(self.trainer, "accumulate_grad_batches", 1)
         if isinstance(acc, Mapping):
-            # Rare Lightning case: per-epoch dict. Best-effort: pick epoch 0 / first value.
-            acc = int(acc.get(0, list(acc.values())[0]))  # type: ignore[index]
+            acc = int(acc.get(0, list(acc.values())[0]))  # best-effort
         acc = int(max(1, int(acc)))
 
         if (batch_idx % acc) == 0:
             opt.zero_grad(set_to_none=True)
 
-        # Pushforward / warmup: roll out without gradients to move the state distribution.
+        # Pushforward / warmup: roll out without gradients.
         y_prev = y0
         if skip_steps > 0:
             with torch.no_grad():
@@ -728,7 +718,6 @@ class FlowMapRolloutModule(pl.LightningModule):
         z_mse_sum = y_prev.new_zeros(())
         total_sum = y_prev.new_zeros(())
 
-        # Train on the remaining steps, detaching after every step.
         for k in range(skip_steps, k_train):
             y_prev = y_prev.detach()
             y_next = self._forward_step(y_prev, dt_train[:, k], g_t)
@@ -738,7 +727,6 @@ class FlowMapRolloutModule(pl.LightningModule):
             loss_step = losses["loss_total"]
 
             if bool(getattr(self, "ar_backward_per_step", True)):
-                # Scale so the accumulated gradient matches the mean loss over trained steps.
                 self.manual_backward(loss_step / float(num_train_steps))
             else:
                 total_sum = total_sum + loss_step
@@ -766,13 +754,15 @@ class FlowMapRolloutModule(pl.LightningModule):
 
             sch = self.lr_schedulers()
             if sch is not None:
-                if isinstance(sch, (list, tuple)):
-                    for s in sch:
-                        s.step()
-                else:
-                    sch.step()
+                # Manual optimization: step metric-free schedulers here (cosine/Lambda/etc).
+                # Plateau is stepped in on_validation_epoch_end() using the configured monitor (e.g. val_loss).
+                sch_list = list(sch) if isinstance(sch, (list, tuple)) else [sch]
+                for s in sch_list:
+                    if isinstance(s, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        continue
+                    s.step()
 
-        # Log an epoch-averaged loss consistent with the default criterion weighting.
+        # Epoch-averaged loss for logging.
         loss_log10_mae = log10_mae_sum / float(num_train_steps)
         loss_z_mse = z_mse_sum / float(num_train_steps)
         loss_total = self.criterion.lambda_log10_mae * loss_log10_mae + self.criterion.lambda_z_mse * loss_z_mse
@@ -787,6 +777,29 @@ class FlowMapRolloutModule(pl.LightningModule):
         self.log("train_skip_steps", float(skip_steps), on_step=False, on_epoch=True)
 
         return loss_total
+
+    def on_validation_epoch_end(self) -> None:
+        # Only needed for manual optimization (autoregressive_training=True)
+        if not getattr(self, "autoregressive_training", False):
+            return
+
+        monitor = str(self.sched_cfg.get("monitor", "val_loss"))
+        metrics = getattr(self.trainer, "callback_metrics", {}) or {}
+        metric = metrics.get(monitor, None)
+        if metric is None:
+            return
+
+        metric_val = float(metric.detach().cpu().item()) if isinstance(metric, torch.Tensor) else float(metric)
+
+        sch = self.lr_schedulers()
+        if sch is None:
+            return
+
+        sch_list = list(sch) if isinstance(sch, (list, tuple)) else [sch]
+        for s in sch_list:
+            if isinstance(s, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                s.step(metric_val)
+
 
     def _training_step_one_jump(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """Single-step supervised training ("one-jump").
@@ -847,7 +860,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         return loss_total
 
     def _eval_step(self, batch: Mapping[str, torch.Tensor], stage: str) -> torch.Tensor:
-        """Shared validation/test step: open-loop autoregressive rollout (no teacher forcing)."""
+        """Shared validation/test step: open-loop autoregressive rollout."""
         if stage not in ("val", "test"):
             raise ValueError(f"_eval_step stage must be 'val' or 'test', got {stage}")
         y = batch["y"]

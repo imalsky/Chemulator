@@ -40,12 +40,12 @@
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "mlp": {
-      "hidden_dims": [1024, 1024, 1024, 1024, 1024, 1024],
+      "hidden_dims": [2048, 2048, 2048, 2048, 2048, 2048],
       "residual": true
     }
   },
   "training": {
-    "max_epochs": 300,
+    "max_epochs": 500,
     "batch_size": 8192,
     "rollout_steps": 1,
     "burn_in": {
@@ -55,7 +55,7 @@
     },
     "loss": {
       "lambda_log10_mae": 1.0,
-      "lambda_z_mse": 0.5
+      "lambda_z_mse": 0.25
     },
     "optimizer": {
       "name": "adamw",
@@ -133,7 +133,7 @@
   "paths": {
     "raw_data_dir": "data/raw",
     "processed_dir": "data/processed",
-    "work_dir": "models/v3"
+    "work_dir": "models/v4"
   },
   "system": {
     "seed": 1234,
