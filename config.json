@@ -82,7 +82,8 @@
     "pin_memory": false,
     "persistent_workers": false,
     "prefetch_factor": null,
-    "resume": true
+    "resume": false,
+    "checkpoint_mode": "none"
   },
   "runtime": {
     "mode": "train",

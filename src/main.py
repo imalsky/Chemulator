@@ -11,15 +11,19 @@ Notes:
 from __future__ import annotations
 
 import os
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import argparse
 import logging
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+
 torch.set_float32_matmul_precision("high")
 
 from lightning import seed_everything
@@ -245,8 +249,10 @@ def create_dataloaders(
 
     log.info(
         "Dataloaders: train=%d batches (K=%d), val=%d batches (K=%d), test=%s",
-        len(train_dl), k_train,
-        len(val_dl), k_val,
+        len(train_dl),
+        k_train,
+        len(val_dl),
+        k_val,
         (f"{len(test_dl)} batches (K={k_test})" if test_dl is not None else "None"),
     )
 
@@ -271,6 +277,135 @@ def find_resume_checkpoint(work_dir: Path) -> Optional[Path]:
 
     ckpts = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
     return ckpts[0] if ckpts else None
+
+
+# ==============================================================================
+# Checkpoint loading modes
+# ==============================================================================
+
+
+def _parse_checkpoint_mode(tcfg: Dict[str, Any]) -> str:
+    """Return the checkpoint loading mode for training.
+
+    Supported modes:
+      - "none": start fresh (ignore any checkpoint)
+      - "resume": Lightning resume (restore model + optimizer/scheduler + trainer state)
+      - "weights_only": load module weights from checkpoint, but start a new optimizer/scheduler
+
+    Backward compatible:
+      - If training.checkpoint_mode is missing, falls back to training.resume (bool).
+    """
+    mode_raw = tcfg.get("checkpoint_mode", None)
+    if mode_raw is None:
+        resume = bool(tcfg.get("resume", True))
+        return "resume" if resume else "none"
+
+    if not isinstance(mode_raw, str):
+        raise TypeError("training.checkpoint_mode must be a string: one of {'none','resume','weights_only'}.")
+
+    mode = mode_raw.strip().lower().replace("-", "_")
+    aliases = {
+        "none": "none",
+        "fresh": "none",
+        "scratch": "none",
+        "new": "none",
+        "resume": "resume",
+        "full": "resume",
+        "weights_only": "weights_only",
+        "weights": "weights_only",
+        "load_weights": "weights_only",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            f"Unsupported training.checkpoint_mode={mode_raw!r}. "
+            "Supported: 'none', 'resume', 'weights_only'."
+        )
+    return aliases[mode]
+
+
+def _load_module_weights_from_ckpt(
+    module: torch.nn.Module,
+    ckpt_path: str,
+    *,
+    strict: bool = True,
+) -> None:
+    """Load checkpoint weights into an existing module without restoring optimizer state.
+
+    Supports standard Lightning checkpoints (dict containing "state_dict") and raw state_dict checkpoints.
+    """
+    p = Path(ckpt_path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {p}")
+
+    ckpt_obj = torch.load(str(p), map_location="cpu")
+    if not isinstance(ckpt_obj, dict):
+        raise TypeError(f"Unexpected checkpoint type at {p}: {type(ckpt_obj)}")
+
+    state_dict = ckpt_obj.get("state_dict", None)
+    if state_dict is None:
+        state_dict = ckpt_obj  # allow raw state_dict checkpoints
+
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Checkpoint at {p} does not contain a state_dict mapping.")
+
+    missing, unexpected = module.load_state_dict(state_dict, strict=strict)
+    if strict and (missing or unexpected):
+        raise RuntimeError(
+            f"Strict weight load failed for {p}. missing_keys={missing} unexpected_keys={unexpected}"
+        )
+
+    if missing or unexpected:
+        log.warning(
+            "Non-strict weight load from %s. missing_keys=%s unexpected_keys=%s",
+            p.name,
+            missing,
+            unexpected,
+        )
+
+
+def _is_rank_zero() -> bool:
+    """Best-effort guard so multi-process training doesn't attempt multiple backups."""
+    for env in ("RANK", "SLURM_PROCID"):
+        if env in os.environ:
+            try:
+                return int(os.environ[env]) == 0
+            except ValueError:
+                return True
+    if "LOCAL_RANK" in os.environ:
+        try:
+            return int(os.environ["LOCAL_RANK"]) == 0
+        except ValueError:
+            return True
+    return True
+
+
+def _backup_work_dir_on_resume(
+    work_dir: Path,
+    *,
+    suffix: str = "stage_1_done",
+) -> Optional[Path]:
+    """Create a safety copy of the entire work_dir before resuming training.
+
+    Example: models/v4 -> models/v4_stage_1_done (or with timestamp if already exists).
+
+    Returns the destination directory if a backup was created, otherwise None.
+    """
+    if not _is_rank_zero():
+        log.info("Skipping resume backup on non-zero rank.")
+        return None
+
+    work_dir = work_dir.resolve()
+    parent = work_dir.parent
+    base_name = f"{work_dir.name}_{suffix}"
+    dst = parent / base_name
+
+    if dst.exists():
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dst = parent / f"{base_name}_{ts}"
+
+    log.info("Creating safety copy before resume: %s -> %s", work_dir, dst)
+    shutil.copytree(work_dir, dst)
+    return dst
 
 
 # ==============================================================================
@@ -346,14 +481,39 @@ def main() -> None:
         ckpt_path = str(ckpt) if ckpt else None
 
     if mode == "train":
-        resume = bool(tcfg.get("resume", True))
+        ckpt_mode = _parse_checkpoint_mode(tcfg)
+        strict = bool(runtime.get("load_weights_strict", True))
+
+        fit_ckpt_path: Optional[str] = None
+
+        if ckpt_mode == "resume":
+            if ckpt_path:
+                _backup_work_dir_on_resume(work_dir, suffix="stage_1_done")
+            fit_ckpt_path = ckpt_path if ckpt_path else None
+
+        elif ckpt_mode == "weights_only":
+            if not ckpt_path:
+                raise ValueError(
+                    "training.checkpoint_mode='weights_only' but no checkpoint was provided "
+                    "(runtime.checkpoint) and none was found under work_dir/checkpoints."
+                )
+            log.info("Loading weights only from checkpoint: %s (strict=%s)", Path(ckpt_path).name, strict)
+            _load_module_weights_from_ckpt(lit_module, ckpt_path, strict=strict)
+            fit_ckpt_path = None  # start a new optimizer/scheduler
+
+        elif ckpt_mode == "none":
+            fit_ckpt_path = None
+
+        else:
+            raise RuntimeError(f"Unhandled checkpoint mode: {ckpt_mode}")
+
         log.info(
-            "Training: max_epochs=%s lr=%s wd=%s batch_size=%s resume=%s ckpt=%s",
+            "Training: max_epochs=%s lr=%s wd=%s batch_size=%s checkpoint_mode=%s ckpt=%s",
             tcfg["max_epochs"],
             tcfg["optimizer"]["lr"],
             tcfg["optimizer"].get("weight_decay", 0.0),
             tcfg["batch_size"],
-            resume,
+            ckpt_mode,
             (Path(ckpt_path).name if ckpt_path else "None"),
         )
 
@@ -361,7 +521,7 @@ def main() -> None:
             lit_module,
             train_dataloaders=train_dl,
             val_dataloaders=val_dl,
-            ckpt_path=(ckpt_path if (resume and ckpt_path) else None),
+            ckpt_path=fit_ckpt_path,
         )
 
         if test_dl is not None:
