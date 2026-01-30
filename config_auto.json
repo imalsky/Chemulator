@@ -68,20 +68,16 @@
     },
     "scheduler": {
       "enabled": true,
-      "type": "plateau",
-      "factor": 0.5,
-      "patience": 10,
-      "threshold": 1e-10,
-      "min_lr": 1e-7,
-      "mode": "min",
-      "monitor": "val_loss"
+      "type": "cosine_with_warmup",
+      "warmup_epochs": 10,
+      "min_lr_ratio": 0.01
     },
     "curriculum": {
       "enabled": false
     },
     "autoregressive_training": {
       "enabled": true,
-      "no_grad_steps": 10,
+      "no_grad_steps": 3,
       "backward_per_step": true
     },
     "num_workers": 0,
