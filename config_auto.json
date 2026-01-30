@@ -46,7 +46,7 @@
   },
   "training": {
     "max_epochs": 600,
-    "batch_size": 256,
+    "batch_size": 512,
     "rollout_steps": 100,
     "burn_in": {
       "train": 3,
@@ -59,10 +59,12 @@
     },
     "optimizer": {
       "name": "adamw",
-      "lr": 1e-4,
+      "lr": 0.0003,
       "weight_decay": 0.0001,
       "betas": [0.9, 0.999],
-      "eps": 1e-08
+      "eps": 1e-08,
+      "fused": true,
+      "foreach": true
     },
     "scheduler": {
       "enabled": true,
@@ -97,7 +99,7 @@
     "strategy": "auto",
     "gradient_clip_val": 0.0,
     "accumulate_grad_batches": 1,
-    "log_every_n_steps": 50,
+    "log_every_n_steps": 1000000,
     "enable_progress_bar": true,
     "deterministic": false,
     "checkpointing": {
@@ -107,11 +109,11 @@
       "every_n_epochs": 1
     },
     "torch_compile": {
-      "enabled": false,
+      "enabled": true,
       "backend": "inductor",
       "mode": "reduce-overhead",
       "dynamic": false,
-      "fullgraph": false,
+      "fullgraph": true,
       "compile_forward_step": true,
       "compile_open_loop_unroll": false
     }

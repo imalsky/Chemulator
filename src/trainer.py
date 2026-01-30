@@ -941,16 +941,34 @@ class FlowMapRolloutModule(pl.LightningModule):
             betas = opt_cfg.get("betas", (0.9, 0.999))
             b0, b1 = betas
             eps = float(opt_cfg.get("eps", 1e-8))
+
+            # These are optional config knobs (defaults are chosen for throughput on CUDA).
+            use_fused = bool(opt_cfg.get("fused", True))
+            use_foreach = bool(opt_cfg.get("foreach", True))
+
             if name == "adam":
-                opt = torch.optim.Adam(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay)
-            else:
-                opt = torch.optim.AdamW(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay)
+                if use_fused:
+                    try:
+                        opt = torch.optim.Adam(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, fused=True)
+                    except TypeError:
+                        opt = torch.optim.Adam(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, foreach=use_foreach)
+                else:
+                    opt = torch.optim.Adam(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, foreach=use_foreach)
+            else:  # adamw
+                if use_fused:
+                    try:
+                        opt = torch.optim.AdamW(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, fused=True)
+                    except TypeError:
+                        opt = torch.optim.AdamW(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, foreach=use_foreach)
+                else:
+                    opt = torch.optim.AdamW(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, foreach=use_foreach)
         else:
             raise ValueError(f"Unsupported optimizer name: {name} (supported: adam, adamw)")
 
 
+
         if not self.sched_cfg or not bool(self.sched_cfg.get("enabled", False)):
-                return opt
+            return opt
 
         sched_type = str(self.sched_cfg.get("type", "cosine_with_warmup")).lower().strip()
 
@@ -1086,10 +1104,17 @@ def build_lightning_trainer(cfg: Mapping[str, Any], *, work_dir: Path) -> pl.Tra
         precision=precision,
         log_every_n_steps=log_every_n_steps,
         callbacks=callbacks,
-        enable_progress_bar=bool(runtime.get("enable_progress_bar", True)),
+
+        # Throughput: remove per-step logger/progress overhead (CSVLoggerCallback remains).
+        logger=False,
+        enable_progress_bar=bool(runtime.get("enable_progress_bar", False)),
+        enable_model_summary=False,
+        num_sanity_val_steps=0,
+
         enable_checkpointing=bool(enable_ckpt),
         gradient_clip_val=gradient_clip_val,
         accumulate_grad_batches=accumulate_grad_batches,
         deterministic=bool(runtime.get("deterministic", False)),
     )
+
     return trainer

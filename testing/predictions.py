@@ -43,7 +43,7 @@ class Config:
     processed_dir: Path = ROOT / "data" / "processed"
     export_name: str = "export_cpu_1step.pt2"
 
-    sample_idx: int = 1
+    sample_idx: int = 5
     start_index: int = 0
     n_steps: int = 500
 

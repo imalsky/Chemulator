@@ -3,7 +3,7 @@
 #PBS -q gpu_long
 #PBS -W group_list=s2458
 #PBS -l select=1:ncpus=32:ngpus=1:mem=50gb:model=gh200
-#PBS -l walltime=05:00:00
+#PBS -l walltime=12:00:00
 #PBS -j oe
 #PBS -m abe
 #PBS -M isaac.n.malsky@jpl.nasa.gov

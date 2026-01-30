@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+torch.set_float32_matmul_precision("high")
+
 from lightning import seed_everything
 
 from dataset import FlowMapRolloutDataset, create_dataloader
