@@ -24,142 +24,154 @@
       "OH_evolution",
       "O_evolution"
     ],
-    "global_variables": ["P", "T"]
+    "global_variables": [
+      "P",
+      "T"
+    ]
   },
   "dataset": {
-    "windows_per_trajectory": 100,
+    "windows_per_trajectory": 50,
     "preload_to_device": true,
     "shard_cache_size": 2,
     "use_mmap": true
   },
   "model": {
     "type": "mlp",
+    "mlp_only": false,
+    "predict_delta": true,
     "activation": "silu",
     "dropout": 0.0,
-    "predict_delta": true,
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "mlp": {
-      "hidden_dims": [2048, 2048, 2048, 2048, 2048, 2048],
+      "hidden_dims": [
+        2048,
+        2048,
+        2048,
+        2048,
+        2048,
+        2048
+      ],
       "residual": true
     },
-    "mlp_only": false,
     "autoencoder": {
       "latent_dim": 256,
       "encoder_hidden": 512,
-      "dynamics_hidden": 512,
       "decoder_hidden": 512,
+      "dynamics_hidden": 512,
       "residual": true,
       "dynamics_residual": true
     }
   },
   "training": {
-    "max_epochs": 1500,
+    "autoregressive_training": {
+      "enabled": true,
+      "skip_steps": 1,
+      "detach_between_steps": true,
+      "backward_per_step": true
+    },
     "batch_size": 4096,
-    "rollout_steps": 5,
-    "burn_in": {
-      "train": 0,
-      "val": 0,
-      "test": 0
+    "checkpoint_mode": "weights_only",
+    "curriculum": {
+      "base_k": 2,
+      "enabled": false,
+      "max_k": 2,
+      "mode": "linear",
+      "ramp_epochs": 0
     },
     "loss": {
       "lambda_log10_mae": 1.0,
       "lambda_z_mse": 0.25
     },
+    "max_epochs": 1500,
+    "num_workers": 0,
     "optimizer": {
-      "name": "adamw",
-      "lr": 1e-5,
-      "weight_decay": 0.0001,
-      "betas": [0.9, 0.999],
+      "betas": [
+        0.9,
+        0.999
+      ],
       "eps": 1e-08,
-      "fused": true,
+      "exclude_norm_and_bias_from_weight_decay": true,
       "foreach": true,
-      "exclude_norm_and_bias_from_weight_decay": true
+      "fused": true,
+      "lr": 1e-05,
+      "name": "adamw",
+      "weight_decay": 0.0001
     },
+    "persistent_workers": false,
+    "pin_memory": false,
+    "prefetch_factor": null,
+    "rollout_steps": 2,
     "scheduler": {
       "enabled": true,
-      "type": "plateau",
-      "monitor": "val_loss",
-      "mode": "min",
       "factor": 0.5,
+      "min_lr": 1e-08,
+      "mode": "min",
+      "monitor": "val_loss",
       "patience": 5,
       "threshold": 1e-10,
-      "min_lr": 1e-8
-    },
-    "curriculum": {
-      "enabled": true,
-      "mode": "cosine",
-      "base_k": 1,
-      "max_k": 5,
-      "ramp_epochs": 50
-    },
-    "autoregressive_training": {
-      "enabled": true,
-      "no_grad_steps": 0,
-      "backward_per_step": true
-    },
-    "num_workers": 0,
-    "pin_memory": false,
-    "persistent_workers": false,
-    "prefetch_factor": null,
-    "resume": false,
-    "checkpoint_mode": "weights_only"
+      "type": "plateau"
+    }
   },
   "runtime": {
-    "mode": "train",
-    "checkpoint": null,
-    "load_weights_strict": true,
-    "precision": "bf16-mixed",
-    "devices": "auto",
     "accelerator": "auto",
-    "strategy": "auto",
-    "gradient_clip_val": 0.0,
     "accumulate_grad_batches": 1,
-    "log_every_n_steps": 1000000,
-    "enable_progress_bar": true,
-    "deterministic": false,
+    "checkpoint": "models/one_jump/checkpoints/last.ckpt",
     "checkpointing": {
       "enabled": true,
-      "save_top_k": 1,
+      "every_n_epochs": 1,
       "monitor": "val_loss",
-      "every_n_epochs": 1
+      "save_top_k": 1
     },
+    "deterministic": false,
+    "devices": "auto",
+    "enable_progress_bar": true,
+    "gradient_clip_val": 0.0,
+    "load_weights_strict": true,
+    "log_every_n_steps": 1000000,
+    "mode": "train",
+    "precision": "bf16-mixed",
+    "strategy": "auto",
     "torch_compile": {
-      "enabled": false,
       "backend": "inductor",
-      "mode": "reduce-overhead",
-      "dynamic": false,
-      "fullgraph": true,
       "compile_forward_step": true,
-      "compile_open_loop_unroll": false
+      "compile_open_loop_unroll": false,
+      "dynamic": false,
+      "enabled": false,
+      "fullgraph": true,
+      "mode": "reduce-overhead"
     }
   },
   "preprocessing": {
-    "drop_below": 1e-30,
     "dt": 100.0,
-    "dt_sampling": "loguniform",
-    "dt_mode": "per_chunk",
     "dt_min": 10.0,
     "dt_max": 100.0,
+    "dt_mode": "per_chunk",
+    "dt_sampling": "loguniform",
     "n_steps": 500,
     "t_min": 0.001,
-    "time_keys": ["time", "t_time", "t"],
-    "output_trajectories_per_file": 1000,
-    "val_split": 0.1,
-    "test_split": 0.1,
-    "shard_size": 16384,
     "time_key": "time",
+    "time_keys": [
+      "time",
+      "t_time",
+      "t"
+    ],
     "species_group": "species",
-    "globals_group": "globals"
+    "globals_group": "globals",
+    "drop_below": 1e-30,
+    "shard_size": 16384,
+    "output_trajectories_per_file": 10000000,
+    "val_split": 0.1,
+    "test_split": 0.1
   },
   "paths": {
     "raw_data_dir": "data/raw",
     "processed_dir": "data/processed",
-    "work_dir": "models/v5"
+    "work_dir": "models/autoregressive"
   },
   "system": {
-    "seed": 1234,
+    "device": "auto",
     "log_level": "INFO",
-    "device": "auto"
+    "seed": 1234
   }
 }
