@@ -27,7 +27,7 @@
     "global_variables": ["P", "T"]
   },
   "dataset": {
-    "windows_per_trajectory": 10,
+    "windows_per_trajectory": 100,
     "preload_to_device": true,
     "shard_cache_size": 2,
     "use_mmap": true
@@ -42,16 +42,25 @@
     "mlp": {
       "hidden_dims": [2048, 2048, 2048, 2048, 2048, 2048],
       "residual": true
+    },
+    "mlp_only": false,
+    "autoencoder": {
+      "latent_dim": 256,
+      "encoder_hidden": 512,
+      "dynamics_hidden": 512,
+      "decoder_hidden": 512,
+      "residual": true,
+      "dynamics_residual": true
     }
   },
   "training": {
-    "max_epochs": 700,
+    "max_epochs": 1500,
     "batch_size": 4096,
-    "rollout_steps": 3,
+    "rollout_steps": 5,
     "burn_in": {
-      "train": 1,
-      "val": 1,
-      "test": 1
+      "train": 0,
+      "val": 0,
+      "test": 0
     },
     "loss": {
       "lambda_log10_mae": 1.0,
@@ -59,12 +68,13 @@
     },
     "optimizer": {
       "name": "adamw",
-      "lr": 1e-4,
+      "lr": 1e-5,
       "weight_decay": 0.0001,
       "betas": [0.9, 0.999],
       "eps": 1e-08,
       "fused": true,
-      "foreach": true
+      "foreach": true,
+      "exclude_norm_and_bias_from_weight_decay": true
     },
     "scheduler": {
       "enabled": true,
@@ -77,11 +87,15 @@
       "min_lr": 1e-8
     },
     "curriculum": {
-      "enabled": false
+      "enabled": true,
+      "mode": "cosine",
+      "base_k": 1,
+      "max_k": 5,
+      "ramp_epochs": 50
     },
     "autoregressive_training": {
       "enabled": true,
-      "no_grad_steps": 1,
+      "no_grad_steps": 0,
       "backward_per_step": true
     },
     "num_workers": 0,
@@ -94,6 +108,7 @@
   "runtime": {
     "mode": "train",
     "checkpoint": null,
+    "load_weights_strict": true,
     "precision": "bf16-mixed",
     "devices": "auto",
     "accelerator": "auto",
@@ -140,7 +155,7 @@
   "paths": {
     "raw_data_dir": "data/raw",
     "processed_dir": "data/processed",
-    "work_dir": "models/v4"
+    "work_dir": "models/v5"
   },
   "system": {
     "seed": 1234,

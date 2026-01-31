@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 from lightning import seed_everything
 
@@ -384,14 +386,14 @@ def _backup_work_dir_on_resume(
     *,
     suffix: str = "stage_1_done",
 ) -> Optional[Path]:
-    """Create a safety copy of the entire work_dir before resuming training.
+    """Create a safety copy of the entire work_dir before continuing training.
 
     Example: models/v4 -> models/v4_stage_1_done (or with timestamp if already exists).
 
     Returns the destination directory if a backup was created, otherwise None.
     """
     if not _is_rank_zero():
-        log.info("Skipping resume backup on non-zero rank.")
+        log.info("Skipping work_dir backup on non-zero rank.")
         return None
 
     work_dir = work_dir.resolve()
@@ -403,7 +405,7 @@ def _backup_work_dir_on_resume(
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         dst = parent / f"{base_name}_{ts}"
 
-    log.info("Creating safety copy before resume: %s -> %s", work_dir, dst)
+    log.info("Creating safety copy before training: %s -> %s", work_dir, dst)
     shutil.copytree(work_dir, dst)
     return dst
 
@@ -431,6 +433,12 @@ def main() -> None:
 
     tcfg = validate_training_schema(cfg)
 
+    # Determine mode early so we can protect work_dir before writing into it.
+    runtime = cfg.get("runtime", {}) or {}
+    mode = str(runtime.get("mode", "train")).lower().strip()
+    if mode not in ("train", "test"):
+        raise ValueError("runtime.mode must be 'train' or 'test'.")
+
     sys_cfg = cfg.get("system", {}) or {}
     seed = int(sys_cfg.get("seed", 1234))
     seed_everything(seed, workers=True)
@@ -438,11 +446,27 @@ def main() -> None:
     device = select_device(cfg)
     log.info("Data device (for preloading only): %s", device)
 
-    work_dir = ensure_dir(cfg["paths"]["work_dir"])
+    # ---- work_dir safety copy (ALWAYS before we write anything into work_dir) ----
+    work_dir_path = Path(cfg["paths"]["work_dir"]).expanduser()
+    work_dir_has_contents = False
+    try:
+        work_dir_has_contents = work_dir_path.exists() and any(work_dir_path.iterdir())
+    except OSError:
+        # If we can't iterate, don't guess; leave it to fail later.
+        work_dir_has_contents = False
+
+    work_dir = ensure_dir(work_dir_path)
+
+    # If we're going to train and the folder already has content, always back it up.
+    # This protects stage-1 artifacts from being overwritten by stage-2 (or any rerun).
+    if mode == "train" and work_dir_has_contents:
+        _backup_work_dir_on_resume(work_dir, suffix="stage_1_done")
+
     processed_dir = Path(cfg["paths"]["processed_dir"]).expanduser()
 
     cfg, manifest, species_vars, global_vars = load_manifest_and_sync_data_cfg(cfg, processed_dir)
 
+    # Now it is safe to write into work_dir (backup already taken if needed).
     atomic_write_json(work_dir / "config.resolved.json", cfg)
 
     train_dl, val_dl, test_dl, _ = create_dataloaders(cfg, tcfg=tcfg, device=device)
@@ -468,11 +492,6 @@ def main() -> None:
 
     trainer = build_lightning_trainer(cfg, work_dir=work_dir)
 
-    runtime = cfg.get("runtime", {}) or {}
-    mode = str(runtime.get("mode", "train")).lower().strip()
-    if mode not in ("train", "test"):
-        raise ValueError("runtime.mode must be 'train' or 'test'.")
-
     ckpt_path = runtime.get("checkpoint")
     if isinstance(ckpt_path, str) and ckpt_path.strip():
         ckpt_path = str(Path(ckpt_path).expanduser())
@@ -487,8 +506,6 @@ def main() -> None:
         fit_ckpt_path: Optional[str] = None
 
         if ckpt_mode == "resume":
-            if ckpt_path:
-                _backup_work_dir_on_resume(work_dir, suffix="stage_1_done")
             fit_ckpt_path = ckpt_path if ckpt_path else None
 
         elif ckpt_mode == "weights_only":
@@ -535,6 +552,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # IMPORTANT: without this guard, `python src/main.py` exits immediately with status 0.
     try:
         main()
     except Exception as e:

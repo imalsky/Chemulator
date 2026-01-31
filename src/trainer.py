@@ -78,8 +78,71 @@ except Exception:  # pragma: no cover
         def rank_zero_warn(msg: str, *args: Any, **kwargs: Any) -> None:  # type: ignore
             logging.getLogger(__name__).warning(msg)
 
-
 _LOSS_DENOM_EPS = 1e-3
+
+# ==============================================================================
+# Optimizer parameter groups
+# ==============================================================================
+# If True, biases and normalization parameters (LayerNorm/BatchNorm/GroupNorm/InstanceNorm)
+# will have weight_decay=0.0 by default.
+EXCLUDE_NORM_AND_BIAS_FROM_WEIGHT_DECAY_BY_DEFAULT = True
+
+_NORM_MODULE_TYPES = (
+    nn.LayerNorm,
+    nn.BatchNorm1d,
+    nn.BatchNorm2d,
+    nn.BatchNorm3d,
+    nn.GroupNorm,
+    nn.InstanceNorm1d,
+    nn.InstanceNorm2d,
+    nn.InstanceNorm3d,
+)
+if hasattr(nn, "SyncBatchNorm"):
+    _NORM_MODULE_TYPES = _NORM_MODULE_TYPES + (nn.SyncBatchNorm,)
+
+
+def _build_optimizer_param_groups(
+    module: nn.Module,
+    *,
+    weight_decay: float,
+    exclude_norm_and_bias: bool,
+) -> List[Dict[str, Any]]:
+    """Return optimizer param groups.
+
+    When exclude_norm_and_bias=True, parameters that are either:
+      - biases, or
+      - owned by a normalization module (LayerNorm/BatchNorm/GroupNorm/InstanceNorm)
+    are placed into a separate param group with weight_decay=0.0.
+    """
+    wd = float(weight_decay)
+    named = [(n, p) for n, p in module.named_parameters() if p.requires_grad]
+
+    if (not exclude_norm_and_bias) or wd == 0.0:
+        return [{"params": [p for _, p in named], "weight_decay": wd}]
+
+    norm_param_names: set[str] = set()
+    for mod_name, mod in module.named_modules():
+        if isinstance(mod, _NORM_MODULE_TYPES):
+            for pn, _ in mod.named_parameters(recurse=False):
+                full = f"{mod_name}.{pn}" if mod_name else pn
+                norm_param_names.add(full)
+
+    decay: List[torch.nn.Parameter] = []
+    no_decay: List[torch.nn.Parameter] = []
+
+    for name, p in named:
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf == "bias" or name in norm_param_names:
+            no_decay.append(p)
+        else:
+            decay.append(p)
+
+    groups: List[Dict[str, Any]] = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": wd})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
 
 # ==============================================================================
 # CSV epoch logger callback
@@ -504,8 +567,6 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         # Autoregressive training (pushforward + stop-grad) - optional.
         # When enabled, training uses a detached autoregressive rollout:
-        #   - first `skip_steps` are rolled out under torch.no_grad() (no training)
-        #   - remaining steps train per-step, detaching the state after every step
         ar_cfg = dict(tcfg.get("autoregressive_training", {}) or {})
         self.autoregressive_training = bool(ar_cfg.get("enabled", False))
         self.ar_no_grad_steps = int(ar_cfg.get("no_grad_steps", 0))
@@ -876,22 +937,42 @@ class FlowMapRolloutModule(pl.LightningModule):
         k_roll_sched = self._effective_k_roll(epoch, stage=stage)
         k_roll = int(max(1, min(int(k_roll_sched), transitions)))
 
-        burn_in = int(self._get_burn_in_steps(stage))
-        if burn_in >= k_roll:
-            raise ValueError(f"{stage}: burn_in ({burn_in}) must be < rollout steps ({k_roll}).")
+        burn_in_cfg = int(self._get_burn_in_steps(stage))
 
         dt_roll = dt_full[:, :k_roll]
         y_true = y[:, 1 : 1 + k_roll, :]
         y0 = y[:, 0, :]
 
         fn_unroll = self._compiled_open_loop_unroll if self._compiled_open_loop_unroll is not None else self._open_loop_unroll
-        y_pred, step_weights = fn_unroll(
-            y0=y0,
-            y_true=y_true,
-            dt_bk=dt_roll,
-            g=g,
-            burn_in=burn_in,
-        )
+
+        if getattr(self, "autoregressive_training", False):
+            # Match AR training: no teacher forcing, but ignore the same initial skip_steps in loss.
+            skip_steps = int(max(
+                self._get_burn_in_steps("train"),
+                int(getattr(self, "ar_no_grad_steps", 0)),
+            ))
+            if skip_steps >= k_roll:
+                raise ValueError(f"{stage}: skip_steps ({skip_steps}) must be < rollout steps ({k_roll}).")
+
+            y_pred, _ = fn_unroll(
+                y0=y0, y_true=y_true, dt_bk=dt_roll, g=g, burn_in=0
+            )
+            if skip_steps > 0:
+                step_weights = torch.ones((k_roll,), device=y_pred.device, dtype=torch.float32)
+                step_weights[:skip_steps] = 0.0
+            else:
+                step_weights = None
+        else:
+            # Keep the old eval semantics for one-step training or non-AR runs.
+            if burn_in_cfg >= k_roll:
+                raise ValueError(f"{stage}: burn_in ({burn_in_cfg}) must be < rollout steps ({k_roll}).")
+            y_pred, step_weights = fn_unroll(
+                y0=y0, y_true=y_true, dt_bk=dt_roll, g=g, burn_in=burn_in_cfg
+            )
+
+
+
+        
 
         losses = self.criterion(y_pred, y_true, step_weights=step_weights)
         loss_total = losses["loss_total"]
@@ -948,7 +1029,13 @@ class FlowMapRolloutModule(pl.LightningModule):
         lr = float(opt_cfg["lr"])
         weight_decay = float(opt_cfg.get("weight_decay", 0.0))
 
-        params = [p for p in self.parameters() if p.requires_grad]
+        exclude_nd = bool(
+            opt_cfg.get(
+                "exclude_norm_and_bias_from_weight_decay",
+                EXCLUDE_NORM_AND_BIAS_FROM_WEIGHT_DECAY_BY_DEFAULT,
+            )
+        )
+        param_groups = _build_optimizer_param_groups(self, weight_decay=weight_decay, exclude_norm_and_bias=exclude_nd)
 
         if name in ("adam", "adamw"):
             betas = opt_cfg.get("betas", (0.9, 0.999))
@@ -959,24 +1046,28 @@ class FlowMapRolloutModule(pl.LightningModule):
             use_fused = bool(opt_cfg.get("fused", True))
             use_foreach = bool(opt_cfg.get("foreach", True))
 
+            # Weight decay is set per parameter-group (see _build_optimizer_param_groups()).
+            opt_wd_default = 0.0
+
             if name == "adam":
                 if use_fused:
                     try:
-                        opt = torch.optim.Adam(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, fused=True)
+                        opt = torch.optim.Adam(param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, fused=True)
                     except TypeError:
-                        opt = torch.optim.Adam(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, foreach=use_foreach)
+                        opt = torch.optim.Adam(param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, foreach=use_foreach)
                 else:
-                    opt = torch.optim.Adam(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, foreach=use_foreach)
+                    opt = torch.optim.Adam(param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, foreach=use_foreach)
             else:  # adamw
                 if use_fused:
                     try:
-                        opt = torch.optim.AdamW(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, fused=True)
+                        opt = torch.optim.AdamW(param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, fused=True)
                     except TypeError:
-                        opt = torch.optim.AdamW(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, foreach=use_foreach)
+                        opt = torch.optim.AdamW(param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, foreach=use_foreach)
                 else:
-                    opt = torch.optim.AdamW(params, lr=lr, betas=(b0, b1), eps=eps, weight_decay=weight_decay, foreach=use_foreach)
+                    opt = torch.optim.AdamW(param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, foreach=use_foreach)
         else:
             raise ValueError(f"Unsupported optimizer name: {name} (supported: adam, adamw)")
+
 
 
 

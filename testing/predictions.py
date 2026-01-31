@@ -40,8 +40,8 @@ class Config:
 
     # Which test trajectory to load and how much of it to roll out.
     sample_idx: int = 3
-    start_index: int = 0
-    n_steps: int = 499
+    start_index: int = 5
+    n_steps: int = 490
 
     # Plot settings.
     y_range: tuple = (1e-30, 3)

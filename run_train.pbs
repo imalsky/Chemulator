@@ -6,7 +6,6 @@
 #PBS -l walltime=12:00:00
 #PBS -j oe
 #PBS -m abe
-#PBS -M isaac.n.malsky@jpl.nasa.gov
 
 set -euo pipefail
 

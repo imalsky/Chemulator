@@ -31,7 +31,7 @@ from model import create_model  # noqa: E402
 # CHOOSE YOUR RUN HERE (no args, no prompts)
 # -----------------------------
 RUN_DIR = (ROOT / "models" / "v4").resolve()
-PREFERRED_CKPT = None  # e.g. "last.ckpt" or "epoch005-val0.123456.ckpt"
+PREFERRED_CKPT = 'epochepoch=054-valval_loss=0.000476.ckpt'  # e.g. "last.ckpt" or "epoch005-val0.123456.ckpt"
 
 
 def _resolve_path(root: Path, p: str) -> str:

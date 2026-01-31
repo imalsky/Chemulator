@@ -33,7 +33,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 @dataclass
 class Config:
-    run_dir: Path = ROOT / "models" / "v3"
+    run_dir: Path = ROOT / "models" / "v4"
     metrics_name: str = "metrics.csv"
 
     out_name: str = "loss_curves.png"

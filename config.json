@@ -27,7 +27,7 @@
     "global_variables": ["P", "T"]
   },
   "dataset": {
-    "windows_per_trajectory": 10,
+    "windows_per_trajectory": 50,
     "preload_to_device": true,
     "shard_cache_size": 2,
     "use_mmap": true
@@ -42,10 +42,19 @@
     "mlp": {
       "hidden_dims": [2048, 2048, 2048, 2048, 2048, 2048],
       "residual": true
+    },
+    "mlp_only": false,
+    "autoencoder": {
+      "latent_dim": 256,
+      "encoder_hidden": 512,
+      "dynamics_hidden": 512,
+      "decoder_hidden": 512,
+      "residual": true,
+      "dynamics_residual": true
     }
   },
   "training": {
-    "max_epochs": 500,
+    "max_epochs": 1000,
     "batch_size": 8192,
     "rollout_steps": 1,
     "burn_in": {
@@ -64,19 +73,26 @@
       "betas": [0.9, 0.999],
       "eps": 1e-08,
       "fused": true,
-      "foreach": true
+      "foreach": true,
+      "exclude_norm_and_bias_from_weight_decay": true
     },
     "scheduler": {
       "enabled": true,
       "type": "cosine_with_warmup",
-      "warmup_epochs": 10,
+      "warmup_epochs": 50,
       "min_lr_ratio": 0.01
     },
     "curriculum": {
-      "enabled": false
+      "enabled": false,
+      "mode": "linear",
+      "base_k": 1,
+      "max_k": 1,
+      "ramp_epochs": 0
     },
     "autoregressive_training": {
-      "enabled": false
+      "enabled": false,
+      "no_grad_steps": 0,
+      "backward_per_step": true
     },
     "num_workers": 0,
     "pin_memory": false,
@@ -88,6 +104,7 @@
   "runtime": {
     "mode": "train",
     "checkpoint": null,
+    "load_weights_strict": true,
     "precision": "bf16-mixed",
     "devices": "auto",
     "accelerator": "auto",
@@ -123,7 +140,7 @@
     "n_steps": 500,
     "t_min": 0.001,
     "time_keys": ["time", "t_time", "t"],
-    "output_trajectories_per_file": 1000,
+    "output_trajectories_per_file": 10000000,
     "val_split": 0.1,
     "test_split": 0.1,
     "shard_size": 16384,
@@ -134,7 +151,7 @@
   "paths": {
     "raw_data_dir": "data/raw",
     "processed_dir": "data/processed",
-    "work_dir": "models/v4"
+    "work_dir": "models/v5"
   },
   "system": {
     "seed": 1234,
