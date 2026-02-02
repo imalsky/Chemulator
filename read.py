@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -11,13 +12,13 @@ SCI_DIGITS = 3  # digits after decimal in scientific notation (e.g., 2.975e-02)
 
 
 # ----------------------------
-# path resolution (robust to where you run it)
+# path resolution
 # ----------------------------
 
 
 def _infer_models_dir() -> Path:
     """
-    Locate the models/ directory without searching/globbing.
+    Locate the models/ directory without deep searching.
 
     Works for either:
       - running from repo root (./models exists)
@@ -41,8 +42,20 @@ def _infer_models_dir() -> Path:
 
 
 def _resolve_run_dir(models_dir: Path, name: str) -> Path:
-    # Allow passing "v1" (preferred) or "models/v1" (tolerated).
-    p = Path(name)
+    """
+    Accept:
+      - absolute/relative path to a run dir (if it exists)
+      - "v1" under models/
+      - "models/v1" (tolerated)
+    """
+    raw = Path(name).expanduser()
+
+    # If the user passed a real directory path, honor it (no confinement).
+    if raw.is_dir():
+        return raw.resolve()
+
+    # Otherwise interpret under models/.
+    p = raw
     if len(p.parts) >= 2 and p.parts[0] == "models":
         p = Path(*p.parts[1:])
 
@@ -53,9 +66,49 @@ def _resolve_run_dir(models_dir: Path, name: str) -> Path:
         raise SystemExit(f"Run dir must be under models/: {name}")
 
     if not candidate.is_dir():
-        raise SystemExit(f"Run dir not found under models/: {p.as_posix()}")
+        raise SystemExit(f"Run dir not found: {candidate.as_posix()}")
 
     return candidate
+
+
+def _resolve_metrics_path(run_dir: Path) -> Path:
+    """
+    Prefer run_dir/metrics.csv.
+    If missing, try common Lightning CSVLogger layouts:
+      - run_dir/lightning_logs/version_*/metrics.csv
+      - run_dir/version_*/metrics.csv
+    """
+    direct = run_dir / "metrics.csv"
+    if direct.exists():
+        return direct
+
+    # Common Lightning default layout
+    ll = run_dir / "lightning_logs"
+    if ll.is_dir():
+        candidates = sorted(ll.glob("version_*/metrics.csv"))
+        if candidates:
+            return candidates[-1].resolve()
+
+    # Sometimes versioned dirs are created directly under run_dir
+    candidates2 = sorted(run_dir.glob("version_*/metrics.csv"))
+    if candidates2:
+        return candidates2[-1].resolve()
+
+    raise SystemExit(f"Missing metrics.csv under: {run_dir.as_posix()}")
+
+
+def _resolve_config_path(run_dir: Path) -> Optional[Path]:
+    """
+    Prefer config.resolved.json (this repo writes that).
+    Fall back to config.json if present.
+    """
+    p1 = run_dir / "config.resolved.json"
+    if p1.exists():
+        return p1
+    p2 = run_dir / "config.json"
+    if p2.exists():
+        return p2
+    return None
 
 
 # ----------------------------
@@ -63,11 +116,12 @@ def _resolve_run_dir(models_dir: Path, name: str) -> Path:
 # ----------------------------
 
 
-def _read_json(path: Path) -> Dict[str, Any]:
-    if not path.exists():
+def _read_json(path: Optional[Path]) -> Dict[str, Any]:
+    if path is None or not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        obj = json.load(f)
+    return obj if isinstance(obj, dict) else {}
 
 
 def _read_metrics_csv(path: Path) -> List[Dict[str, Any]]:
@@ -84,13 +138,42 @@ def _read_metrics_csv(path: Path) -> List[Dict[str, Any]]:
                 if not s:
                     rr[k] = None
                     continue
-                # epoch is always int; everything else is float-ish
+                # epoch is always int-ish; everything else is float-ish
                 try:
                     rr[k] = int(float(s)) if k == "epoch" else float(s)
                 except Exception:
                     rr[k] = s
             rows.append(rr)
     return rows
+
+
+def _coalesce_by_epoch(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Lightning CSVLogger can write multiple rows per epoch (train-phase vs val-phase).
+    Coalesce rows by epoch by taking the last non-null value per key.
+    Output: one row per epoch (in epoch order of first appearance).
+    """
+    merged: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
+
+    for r in rows:
+        ep = r.get("epoch")
+        if isinstance(ep, float):
+            ep = int(ep)
+        if not isinstance(ep, int):
+            continue
+
+        if ep not in merged:
+            merged[ep] = {"epoch": ep}
+
+        dst = merged[ep]
+        for k, v in r.items():
+            if k == "epoch":
+                continue
+            if v is None:
+                continue
+            dst[k] = v
+
+    return list(merged.values())
 
 
 def _get(cfg: Dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -196,7 +279,6 @@ def _train_summary(cfg: Dict[str, Any]) -> str:
     add("max_epochs", t.get("max_epochs"))
     add("rollout", t.get("rollout_steps"))
 
-    # Optimizer schema (new): training.optimizer.{name,lr,weight_decay,...}
     opt = t.get("optimizer", {}) or {}
     if isinstance(opt, dict):
         add("opt", opt.get("name"))
@@ -205,53 +287,37 @@ def _train_summary(cfg: Dict[str, Any]) -> str:
         add("lr", _fmt(float(lr)) if isinstance(lr, (int, float)) else lr)
         add("wd", _fmt(float(wd)) if isinstance(wd, (int, float)) else wd)
     else:
-        # Legacy fallback: training.lr / training.weight_decay
         lr = t.get("lr")
         wd = t.get("weight_decay")
         add("lr", _fmt(float(lr)) if isinstance(lr, (int, float)) else lr)
         add("wd", _fmt(float(wd)) if isinstance(wd, (int, float)) else wd)
 
-    # Teacher forcing schema (new): {mode, p0, p1, ramp_epochs}
-    tf = t.get("teacher_forcing", {}) or {}
-    if isinstance(tf, dict):
-        if "p0" in tf or "p1" in tf:
-            p0 = tf.get("p0", None)
-            p1 = tf.get("p1", None)
-            mode = tf.get("mode", None)
-            ramp = tf.get("ramp_epochs", None)
-            if p0 is not None and p1 is not None:
-                extra = []
-                if mode is not None:
-                    extra.append(str(mode))
-                if ramp is not None:
-                    extra.append(f"{ramp}e")
-                parts.append(f"tf={p0}->{p1}{'' if not extra else '(' + ','.join(extra) + ')'}")
-        # Legacy fallback: {start,end,mode}
-        elif "start" in tf or "end" in tf:
-            tf_start = tf.get("start", None)
-            tf_end = tf.get("end", None)
-            tf_mode = tf.get("mode", None)
-            if tf_start is not None and tf_end is not None:
-                parts.append(f"tf={tf_start}->{tf_end}{'' if tf_mode is None else f'({tf_mode})'}")
-
-    # Curriculum schema (new): {enabled, mode, base_k, max_k, ramp_epochs}
     cur = t.get("curriculum", {}) or {}
     if isinstance(cur, dict) and bool(cur.get("enabled", False)):
-        base_k = cur.get("base_k", cur.get("start_k", None))
-        max_k = cur.get("max_k", None)
+        # Support both schemas:
+        # - old: base_k/max_k/ramp_epochs
+        # - new: start_steps/end_steps/ramp_epochs
+        start = cur.get("base_k", cur.get("start_steps", None))
+        end = cur.get("max_k", cur.get("end_steps", None))
         ramp = cur.get("ramp_epochs", None)
-        if base_k is not None and max_k is not None and ramp is not None:
-            parts.append(f"cur={base_k}->{max_k}@{ramp}e")
+        if start is not None and end is not None and ramp is not None:
+            parts.append(f"cur={start}->{end}@{ramp}e")
 
-    # Long rollout schema: {enabled, long_rollout_steps, final_epochs, ...}
-    longr = t.get("long_rollout", {}) or {}
-    if isinstance(longr, dict) and bool(longr.get("enabled", False)):
-        steps = longr.get("long_rollout_steps", None)
-        fin = longr.get("final_epochs", None)
-        if steps is not None and fin is not None:
-            parts.append(f"long={steps}@last{fin}e")
+    ar = t.get("autoregressive_training", {}) or {}
+    if isinstance(ar, dict) and bool(ar.get("enabled", False)):
+        # Support both key names seen in this repo’s history.
+        ng = ar.get("no_grad_steps", ar.get("skip_steps", None))
+        bps = ar.get("backward_per_step", None)
+        detach = ar.get("detach_between_steps", None)
+        extras = []
+        if ng is not None:
+            extras.append(f"ng={ng}")
+        if bps is not None:
+            extras.append(f"bps={bps}")
+        if detach is not None:
+            extras.append(f"detach={detach}")
+        parts.append(f"AR=on({','.join(extras)})" if extras else "AR=on")
 
-    # Loss weights (useful when comparing across runs)
     loss = t.get("loss", {}) or {}
     if isinstance(loss, dict):
         lam1 = loss.get("lambda_log10_mae", None)
@@ -259,51 +325,36 @@ def _train_summary(cfg: Dict[str, Any]) -> str:
         if lam1 is not None or lam2 is not None:
             parts.append(f"loss=log10_mae*{lam1}+z_mse*{lam2}")
 
-    # Autoregressive training flag
-    ar = t.get("autoregressive_training", {}) or {}
-    if isinstance(ar, dict) and bool(ar.get("enabled", False)):
-        ng = ar.get("no_grad_steps", None)
-        bps = ar.get("backward_per_step", None)
-        parts.append(f"AR=on(ng={ng},bps={bps})")
-
     return " | ".join([p for p in parts if p]) if parts else ""
 
 
 # ----------------------------
-# column selection (new trainer schema)
+# column selection
 # ----------------------------
 
 
 def _select_table_cols(header: Sequence[str], max_cols: int = 8) -> List[str]:
     header_set = set(header)
 
-    # Prefer metric-first aliases when present.
+    # Prefer metric-first aliases when present (covers both old and new schemas).
     priority = [
         "epoch",
         "train_loss",
-        "train_log10_mae",
+        "train_loss_log10_mae",
+        "train_log10_mae",          # legacy
         "val_loss",
-        "val_log10_mae",
         "val_loss_log10_mae",
+        "val_log10_mae",            # legacy
         "val_loss_z_mse",
+        "val_z_mse",                # legacy
         "epoch_time_sec",
         "lr",
         "test_loss",
-        "test_log10_mae",
+        "test_loss_log10_mae",
+        "test_log10_mae",           # legacy
     ]
 
     cols = [c for c in priority if c in header_set]
-
-    # If alias keys aren't present, fall back to component keys.
-    if "train_log10_mae" not in header_set and "train_loss_log10_mae" in header_set and "train_loss_log10_mae" not in cols:
-        cols.insert(2, "train_loss_log10_mae")
-    if "val_log10_mae" not in header_set and "val_loss_log10_mae" in header_set and "val_loss_log10_mae" not in cols:
-        # keep val_loss_log10_mae near val_loss
-        try:
-            i = cols.index("val_loss") + 1
-        except ValueError:
-            i = len(cols)
-        cols.insert(i, "val_loss_log10_mae")
 
     # Dedup while preserving order.
     seen = set()
@@ -313,6 +364,10 @@ def _select_table_cols(header: Sequence[str], max_cols: int = 8) -> List[str]:
             seen.add(c)
             out.append(c)
 
+    # Always include epoch if present.
+    if "epoch" in header_set and (not out or out[0] != "epoch"):
+        out = ["epoch"] + [c for c in out if c != "epoch"]
+
     return out[:max_cols]
 
 
@@ -320,8 +375,8 @@ def _best_lines(rows: List[Dict[str, Any]], header: Sequence[str]) -> List[str]:
     header_set = set(header)
 
     key_val_loss = _first_existing(header_set, ["val_loss"])
-    key_val_log10 = _first_existing(header_set, ["val_log10_mae", "val_loss_log10_mae"])
-    key_val_z = _first_existing(header_set, ["val_z_mse", "val_loss_z_mse"])
+    key_val_log10 = _first_existing(header_set, ["val_loss_log10_mae", "val_log10_mae"])
+    key_val_z = _first_existing(header_set, ["val_loss_z_mse", "val_z_mse"])
 
     candidates: List[Tuple[str, Optional[str], str]] = [
         ("best_val_loss", key_val_loss, "min"),
@@ -341,6 +396,19 @@ def _best_lines(rows: List[Dict[str, Any]], header: Sequence[str]) -> List[str]:
     return out
 
 
+def _union_header(rows: Sequence[Dict[str, Any]]) -> List[str]:
+    # Keep epoch first if present, then deterministic order by first appearance.
+    seen: OrderedDict[str, None] = OrderedDict()
+    for r in rows:
+        for k in r.keys():
+            if k not in seen:
+                seen[k] = None
+    keys = list(seen.keys())
+    if "epoch" in keys:
+        keys = ["epoch"] + [k for k in keys if k != "epoch"]
+    return keys
+
+
 # ----------------------------
 # main
 # ----------------------------
@@ -349,11 +417,11 @@ def _best_lines(rows: List[Dict[str, Any]], header: Sequence[str]) -> List[str]:
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="read.py",
-        description="Concise training run summary from ./models/<name>/metrics.csv",
+        description="Concise training run summary from metrics.csv (handles multi-row-per-epoch CSVLogger outputs).",
     )
     ap.add_argument(
         "name",
-        help="Run directory name under ./models (e.g., 'v1'). You may also pass 'models/v1'.",
+        help="Run directory (path) OR name under ./models (e.g., 'v4' or 'models/v4').",
     )
     ap.add_argument(
         "--tail",
@@ -361,28 +429,38 @@ def main() -> int:
         default=10,
         help="Print last N epochs as a table. Default: 10 (0 disables).",
     )
+    ap.add_argument(
+        "--raw",
+        action="store_true",
+        help="Do not coalesce; show raw CSV rows (Lightning CSVLogger may produce multiple rows per epoch).",
+    )
     args = ap.parse_args()
 
     models_dir = _infer_models_dir()
     run_dir = _resolve_run_dir(models_dir, args.name)
 
-    metrics_path = run_dir / "metrics.csv"
-    cfg_path = run_dir / "config.json"
+    metrics_path = _resolve_metrics_path(run_dir)
+    cfg_path = _resolve_config_path(run_dir)
 
-    if not metrics_path.exists():
-        raise SystemExit(f"Missing: {run_dir.name}/metrics.csv")
+    rows_raw = _read_metrics_csv(metrics_path)
+    if not rows_raw:
+        raise SystemExit(f"No rows found in: {metrics_path.as_posix()}")
+
+    rows = rows_raw if args.raw else _coalesce_by_epoch(rows_raw)
+    if not rows:
+        raise SystemExit(f"No usable epoch rows found in: {metrics_path.as_posix()}")
 
     cfg = _read_json(cfg_path)
-    rows = _read_metrics_csv(metrics_path)
-    if not rows:
-        raise SystemExit(f"No rows found in: {run_dir.name}/metrics.csv")
 
-    header = list(rows[0].keys())
+    header = _union_header(rows)
     cols = _select_table_cols(header, max_cols=8)
 
     last = rows[-1]
 
-    print(_pipes([f"run={run_dir.name}"]))
+    print(_pipes([f"run={run_dir.name}", f"metrics={metrics_path.parent.name}/{metrics_path.name}"]))
+
+    if cfg_path is not None:
+        print(_pipes([f"config={cfg_path.name}"]))
 
     model_line = _model_summary(cfg, run_dir.name)
     if model_line:

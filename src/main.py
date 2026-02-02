@@ -1,34 +1,45 @@
 #!/usr/bin/env python3
 """
-main.py - Entrypoint for training / evaluation.
+main.py - Strict entrypoint for training / evaluation.
+
+Principles (by design):
+- No alias keys. Config must use the canonical schema.
+- No silent fallbacks (no “search for a checkpoint”, no “use CPU if CUDA missing”, etc.).
+- Errors are concise and deterministic.
+
+This script:
+1) Loads config JSON.
+2) Resolves relative paths relative to the config file directory.
+3) Loads normalization manifest (processed_dir/normalization.json) and checks config consistency.
+4) Builds datasets/dataloaders sized for the rollouts actually used.
+5) Builds model strictly from model.type.
+6) Runs Lightning training or test, using explicit checkpoint behavior.
 
 Notes:
-- This code assumes configuration and preprocessing outputs are internally consistent.
-- Paths are resolved deterministically against the config.json directory.
-- Dataloaders are sized for the maximum rollout length actually used (base horizon + optional curriculum for train).
+- Device selection here is ONLY for dataset preloading (dataset.preload_to_device).
+  Lightning decides training device(s) based on cfg.runtime.
 """
 
 from __future__ import annotations
 
-import os
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 import argparse
 import logging
-import shutil
+import os
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
+# Avoid MKL/OpenMP duplicate symbol aborts in some environments.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# Prefer fast matmul where supported.
 torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-from lightning import seed_everything
+from lightning.pytorch import seed_everything
 
 from dataset import FlowMapRolloutDataset, create_dataloader
 from model import create_model
@@ -39,8 +50,45 @@ log = logging.getLogger(__name__)
 
 
 # ==============================================================================
-# Basic config / path helpers
+# Small strict helpers
 # ==============================================================================
+
+
+def _require(mapping: Mapping[str, Any], key: str) -> Any:
+    if key not in mapping:
+        raise KeyError(f"missing: {key}")
+    return mapping[key]
+
+
+def _require_dict(mapping: Mapping[str, Any], key: str) -> Dict[str, Any]:
+    val = _require(mapping, key)
+    if not isinstance(val, dict):
+        raise TypeError(f"bad type: {key}")
+    return val
+
+
+def _as_int(val: Any, key: str) -> int:
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise TypeError(f"bad type: {key}")
+    return int(val)
+
+
+def _as_bool(val: Any, key: str) -> bool:
+    if not isinstance(val, bool):
+        raise TypeError(f"bad type: {key}")
+    return bool(val)
+
+
+def _as_str(val: Any, key: str) -> str:
+    if not isinstance(val, str) or not val.strip():
+        raise TypeError(f"bad type: {key}")
+    return val.strip()
+
+
+def _as_opt_int(val: Any, key: str) -> Optional[int]:
+    if val is None:
+        return None
+    return _as_int(val, key)
 
 
 def _repo_root(cfg_path: Path) -> Path:
@@ -55,363 +103,251 @@ def _resolve_path(root: Path, p: str) -> str:
 
 
 def resolve_paths(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, Any]:
+    """Resolve cfg.paths[*] relative to the config file directory."""
     root = _repo_root(cfg_path)
-    cfg = dict(cfg)
 
-    paths = dict(cfg["paths"])
-    for k, v in list(paths.items()):
+    out = dict(cfg)
+    paths = _require_dict(out, "paths")
+    resolved: Dict[str, Any] = dict(paths)
+
+    for k, v in paths.items():
         if isinstance(v, str) and v.strip():
-            paths[k] = _resolve_path(root, v)
-    cfg["paths"] = paths
+            resolved[k] = _resolve_path(root, v)
 
-    runtime = dict(cfg.get("runtime", {}) or {})
-    ckpt = runtime.get("checkpoint")
-    if isinstance(ckpt, str) and ckpt.strip():
-        runtime["checkpoint"] = _resolve_path(root, ckpt)
-    cfg["runtime"] = runtime
-
-    return cfg
+    out["paths"] = resolved
+    return out
 
 
-def configure_logging(cfg: Dict[str, Any]) -> None:
-    sys_cfg = cfg.get("system", {}) or {}
-    level_str = str(sys_cfg.get("log_level", "INFO")).upper().strip()
-    level = getattr(logging, level_str, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+def configure_logging(cfg: Mapping[str, Any]) -> None:
+    sys_cfg = _require_dict(cfg, "system")
+    level_str = str(_require(sys_cfg, "log_level")).upper().strip()
+    level = getattr(logging, level_str, None)
+    if level is None:
+        raise ValueError("bad log_level")
+    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     logging.captureWarnings(True)
 
 
-def select_device(cfg: Dict[str, Any]) -> torch.device:
-    """Used only for dataset preloading (dataset.preload_to_device=True) and any eager ops outside Lightning."""
-    sys_cfg = cfg.get("system", {}) or {}
-    pref = str(sys_cfg.get("device", "auto")).lower().strip()
+def select_preload_device(cfg: Mapping[str, Any]) -> torch.device:
+    """Select device ONLY for dataset preloading (dataset.preload_to_device=True)."""
+    sys_cfg = _require_dict(cfg, "system")
+    pref = str(_require(sys_cfg, "device")).lower().strip()
 
     if pref == "cpu":
         return torch.device("cpu")
 
-    if pref.startswith("cuda"):
+    if pref == "auto":
         if torch.cuda.is_available():
-            return torch.device(pref)
-        log.warning("Requested device=%s but CUDA is unavailable; using CPU.", pref)
-        return torch.device("cpu")
-
-    if pref == "mps":
+            return torch.device("cuda")
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
-        log.warning("Requested device=mps but MPS is unavailable; using CPU.")
         return torch.device("cpu")
 
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    if pref.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("cuda unavailable")
+        return torch.device(pref)
+
+    if pref == "mps":
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            raise RuntimeError("mps unavailable")
         return torch.device("mps")
-    return torch.device("cpu")
+
+    raise ValueError("bad system.device")
 
 
 # ==============================================================================
-# Minimal schema accessors (scientific code; rely on KeyError/TypeError from Python)
+# Manifest consistency
 # ==============================================================================
 
 
-def _require_dict(cfg: Dict[str, Any], key: str, *, context: str) -> Dict[str, Any]:
-    _ = context
-    return cfg[key]
-
-
-def _require_key(cfg: Dict[str, Any], key: str, *, context: str) -> Any:
-    _ = context
-    return cfg[key]
-
-
-def validate_training_schema(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Return cfg['training'] (no extra validation; trainer is the source of truth)."""
-    return cfg["training"]
-
-
-def load_manifest_and_sync_data_cfg(
-    cfg: Dict[str, Any],
+def load_manifest_and_validate_config(
+    cfg: Mapping[str, Any],
     processed_dir: Path,
-) -> Tuple[Dict[str, Any], Dict[str, Any], List[str], List[str]]:
-    """
-    Load normalization.json and ensure cfg.data.{species_variables,global_variables} are populated.
+) -> Tuple[Dict[str, Any], List[str], List[str]]:
+    """Load normalization.json and require config.data matches it (if present in manifest)."""
+    mpath = processed_dir / "normalization.json"
+    if not mpath.exists():
+        raise FileNotFoundError("missing normalization.json")
 
-    Authoritative precedence:
-      manifest values (if present) > config.data values.
+    manifest = load_json_config(mpath)
+    if not isinstance(manifest, dict):
+        raise TypeError("bad normalization.json")
 
-    This function intentionally avoids strict consistency checks; incorrect inputs should fail naturally
-    when the dataset/model/trainer consume them.
-    """
-    manifest_path = processed_dir / "normalization.json"
-    manifest = load_json_config(manifest_path)
+    data_cfg = _require_dict(cfg, "data")
+    cfg_species = _require(data_cfg, "species_variables")
+    cfg_globals = _require(data_cfg, "global_variables")
 
-    cfg = dict(cfg)
-    data_cfg = dict(cfg.get("data", {}) or {})
+    if not isinstance(cfg_species, list) or not all(isinstance(x, str) for x in cfg_species) or not cfg_species:
+        raise TypeError("bad data.species_variables")
+    if not isinstance(cfg_globals, list) or not all(isinstance(x, str) for x in cfg_globals):
+        raise TypeError("bad data.global_variables")
 
-    man_species = list((manifest or {}).get("species_variables") or [])
-    man_globals = list((manifest or {}).get("global_variables") or [])
+    man_species = manifest.get("species_variables", None)
+    man_globals = manifest.get("global_variables", None)
 
-    cfg_species = list(data_cfg.get("species_variables") or [])
-    cfg_globals = list(data_cfg.get("global_variables") or [])
+    if man_species is not None:
+        if not isinstance(man_species, list) or not all(isinstance(x, str) for x in man_species) or not man_species:
+            raise TypeError("bad manifest.species_variables")
+        if list(cfg_species) != list(man_species):
+            raise ValueError("species_variables mismatch")
 
-    species_vars = man_species or cfg_species
-    global_vars = man_globals or cfg_globals
+    if man_globals is not None:
+        if not isinstance(man_globals, list) or not all(isinstance(x, str) for x in man_globals):
+            raise TypeError("bad manifest.global_variables")
+        if list(cfg_globals) != list(man_globals):
+            raise ValueError("global_variables mismatch")
 
-    data_cfg["species_variables"] = list(species_vars)
-    data_cfg["global_variables"] = list(global_vars)
-    cfg["data"] = data_cfg
-
-    return cfg, manifest, list(species_vars), list(global_vars)
+    return manifest, list(cfg_species), list(cfg_globals)
 
 
 # ==============================================================================
-# Dataloaders (sized for rollout lengths actually used)
+# Rollout sizing
 # ==============================================================================
 
 
-def _max_rollout_steps_for_stage(tcfg: Dict[str, Any], *, stage: str) -> int:
-    """
-    Base horizon: training.rollout_steps.
+def max_rollout_steps_for_training(tcfg: Mapping[str, Any]) -> int:
+    """Dataset sizing K for training split."""
+    base_k = _as_int(_require(tcfg, "rollout_steps"), "training.rollout_steps")
+    if base_k < 1:
+        raise ValueError("bad rollout_steps")
 
-    Curriculum (if enabled) can increase K for training only; for sizing we take its max_k.
-    long_rollout is intentionally ignored (trainer no longer uses it).
-    """
-    base_k = int(tcfg["rollout_steps"])
-    if str(stage).lower().strip() != "train":
+    cur = tcfg.get("curriculum", None)
+    if cur is None:
+        return base_k
+    if not isinstance(cur, dict):
+        raise TypeError("bad training.curriculum")
+
+    enabled = cur.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise TypeError("bad curriculum.enabled")
+    if not enabled:
         return base_k
 
-    cur_cfg = tcfg.get("curriculum")
-    if isinstance(cur_cfg, dict) and bool(cur_cfg.get("enabled", False)):
-        return int(max(base_k, int(cur_cfg["max_k"])))
+    # Canonical keys only (no aliases).
+    start_steps = _as_int(_require(cur, "start_steps"), "training.curriculum.start_steps")
+    end_steps = _as_int(_require(cur, "end_steps"), "training.curriculum.end_steps")
+
+    if start_steps < 1 or end_steps < 1:
+        raise ValueError("bad curriculum steps")
+
+    return int(max(base_k, end_steps))
+
+
+def max_rollout_steps_for_eval(tcfg: Mapping[str, Any]) -> int:
+    """Dataset sizing K for val/test split (fixed horizon)."""
+    base_k = _as_int(_require(tcfg, "rollout_steps"), "training.rollout_steps")
+    if base_k < 1:
+        raise ValueError("bad rollout_steps")
     return base_k
 
 
+# ==============================================================================
+# Dataloaders
+# ==============================================================================
+
+
 def create_dataloaders(
-    cfg: Dict[str, Any],
+    cfg: Mapping[str, Any],
     *,
-    tcfg: Dict[str, Any],
-    device: torch.device,
-) -> Tuple[Any, Any, Optional[Any], Dict[str, Any]]:
-    paths = cfg["paths"]
-    processed_dir = Path(paths["processed_dir"]).expanduser()
+    tcfg: Mapping[str, Any],
+    preload_device: torch.device,
+    seed: int,
+) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Optional[torch.utils.data.DataLoader]]:
+    """Build train/val/test dataloaders (strict)."""
+    paths = _require_dict(cfg, "paths")
+    processed_dir = Path(_as_str(_require(paths, "processed_dir"), "paths.processed_dir")).expanduser().resolve()
 
-    k_train = _max_rollout_steps_for_stage(tcfg, stage="train")
-    k_val = _max_rollout_steps_for_stage(tcfg, stage="validation")
-    k_test = _max_rollout_steps_for_stage(tcfg, stage="test")
+    ds_cfg = _require_dict(cfg, "dataset")
+    windows_per_traj = _as_int(_require(ds_cfg, "windows_per_trajectory"), "dataset.windows_per_trajectory")
+    preload_to_device = _as_bool(_require(ds_cfg, "preload_to_device"), "dataset.preload_to_device")
+    shard_cache_size = _as_int(_require(ds_cfg, "shard_cache_size"), "dataset.shard_cache_size")
+    use_mmap = _as_bool(_require(ds_cfg, "use_mmap"), "dataset.use_mmap")
 
-    dcfg = cfg.get("dataset", {}) or {}
-    windows_per_traj = int(dcfg.get("windows_per_trajectory", 1))
-    preload = bool(dcfg.get("preload_to_device", False))
-    shard_cache_size = int(dcfg.get("shard_cache_size", 2))
-    use_mmap = bool(dcfg.get("use_mmap", False))
+    batch_size = _as_int(_require(tcfg, "batch_size"), "training.batch_size")
+    num_workers = _as_int(_require(tcfg, "num_workers"), "training.num_workers")
+    pin_memory = _as_bool(_require(tcfg, "pin_memory"), "training.pin_memory")
+    persistent_workers = _as_bool(_require(tcfg, "persistent_workers"), "training.persistent_workers")
+    prefetch_factor = _as_opt_int(_require(tcfg, "prefetch_factor"), "training.prefetch_factor")
 
-    sys_cfg = cfg.get("system", {}) or {}
-    seed = int(sys_cfg.get("seed", 1234))
+    if num_workers < 0:
+        raise ValueError("bad num_workers")
+    if batch_size <= 0:
+        raise ValueError("bad batch_size")
 
-    batch_size = int(tcfg["batch_size"])
-    num_workers = int(tcfg.get("num_workers", 0))
-    pin_memory = bool(tcfg.get("pin_memory", True))
+    # Strict DataLoader semantics.
+    if num_workers == 0:
+        if persistent_workers:
+            raise ValueError("persistent_workers requires num_workers>0")
+        if prefetch_factor is not None:
+            raise ValueError("prefetch_factor requires num_workers>0")
+    else:
+        # prefetch_factor=None means "use torch default" (2) by not passing it through.
+        if prefetch_factor is not None and prefetch_factor <= 0:
+            raise ValueError("bad prefetch_factor")
+
+    k_train = max_rollout_steps_for_training(tcfg)
+    k_eval = max_rollout_steps_for_eval(tcfg)
 
     common_ds_kwargs = dict(
         windows_per_trajectory=windows_per_traj,
-        preload_to_device=preload,
-        device=device,
+        preload_to_device=preload_to_device,
+        device=preload_device,
         storage_dtype=torch.float32,
         shard_cache_size=shard_cache_size,
         use_mmap=use_mmap,
     )
 
     train_ds = FlowMapRolloutDataset(processed_dir, "train", total_steps=k_train, seed=seed, **common_ds_kwargs)
-    val_ds = FlowMapRolloutDataset(processed_dir, "validation", total_steps=k_val, seed=seed + 1, **common_ds_kwargs)
+    val_ds = FlowMapRolloutDataset(processed_dir, "validation", total_steps=k_eval, seed=seed + 1, **common_ds_kwargs)
 
     test_ds = None
     if (processed_dir / "test").exists():
-        test_ds = FlowMapRolloutDataset(processed_dir, "test", total_steps=k_test, seed=seed + 2, **common_ds_kwargs)
-
-    if num_workers == 0:
-        persistent = False
-        prefetch = None
-    else:
-        persistent = bool(tcfg["persistent_workers"])
-        prefetch = int(tcfg["prefetch_factor"])
+        test_ds = FlowMapRolloutDataset(processed_dir, "test", total_steps=k_eval, seed=seed + 2, **common_ds_kwargs)
 
     dl_kwargs = dict(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=persistent,
-        prefetch_factor=prefetch,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
 
     train_dl = create_dataloader(train_ds, shuffle=True, drop_last=True, **dl_kwargs)
     val_dl = create_dataloader(val_ds, shuffle=False, drop_last=False, **dl_kwargs)
     test_dl = create_dataloader(test_ds, shuffle=False, drop_last=False, **dl_kwargs) if test_ds is not None else None
 
-    log.info(
-        "Dataloaders: train=%d batches (K=%d), val=%d batches (K=%d), test=%s",
-        len(train_dl),
-        k_train,
-        len(val_dl),
-        k_val,
-        (f"{len(test_dl)} batches (K={k_test})" if test_dl is not None else "None"),
-    )
-
-    manifest = load_json_config(processed_dir / "normalization.json")
-    return train_dl, val_dl, test_dl, manifest
+    log.info("Dataloaders: train(K=%d) val(K=%d) test=%s", k_train, k_eval, ("yes" if test_dl else "no"))
+    return train_dl, val_dl, test_dl
 
 
 # ==============================================================================
-# Checkpoints
+# Checkpoints (strict)
 # ==============================================================================
 
 
-def find_resume_checkpoint(work_dir: Path) -> Optional[Path]:
-    """Find a resume checkpoint under work_dir/checkpoints."""
-    ckpt_dir = work_dir / "checkpoints"
-    if not ckpt_dir.exists():
-        return None
+def _load_weights_only(module: torch.nn.Module, ckpt_path: Path, *, strict: bool) -> None:
+    """Load Lightning checkpoint weights only (no optimizer/scheduler state)."""
+    if not ckpt_path.exists():
+        raise FileNotFoundError("ckpt not found")
 
-    last = ckpt_dir / "last.ckpt"
-    if last.exists():
-        return last
+    obj = torch.load(str(ckpt_path), map_location="cpu")
+    if not isinstance(obj, dict):
+        raise TypeError("bad ckpt")
+    if "state_dict" not in obj:
+        raise KeyError("missing state_dict")
 
-    ckpts = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return ckpts[0] if ckpts else None
-
-
-# ==============================================================================
-# Checkpoint loading modes
-# ==============================================================================
-
-
-def _parse_checkpoint_mode(tcfg: Dict[str, Any]) -> str:
-    """Return the checkpoint loading mode for training.
-
-    Supported modes:
-      - "none": start fresh (ignore any checkpoint)
-      - "resume": Lightning resume (restore model + optimizer/scheduler + trainer state)
-      - "weights_only": load module weights from checkpoint, but start a new optimizer/scheduler
-
-    Backward compatible:
-      - If training.checkpoint_mode is missing, falls back to training.resume (bool).
-    """
-    mode_raw = tcfg.get("checkpoint_mode", None)
-    if mode_raw is None:
-        resume = bool(tcfg.get("resume", True))
-        return "resume" if resume else "none"
-
-    if not isinstance(mode_raw, str):
-        raise TypeError("training.checkpoint_mode must be a string: one of {'none','resume','weights_only'}.")
-
-    mode = mode_raw.strip().lower().replace("-", "_")
-    aliases = {
-        "none": "none",
-        "fresh": "none",
-        "scratch": "none",
-        "new": "none",
-        "resume": "resume",
-        "full": "resume",
-        "weights_only": "weights_only",
-        "weights": "weights_only",
-        "load_weights": "weights_only",
-    }
-    if mode not in aliases:
-        raise ValueError(
-            f"Unsupported training.checkpoint_mode={mode_raw!r}. "
-            "Supported: 'none', 'resume', 'weights_only'."
-        )
-    return aliases[mode]
-
-
-def _load_module_weights_from_ckpt(
-    module: torch.nn.Module,
-    ckpt_path: str,
-    *,
-    strict: bool = True,
-) -> None:
-    """Load checkpoint weights into an existing module without restoring optimizer state.
-
-    Supports standard Lightning checkpoints (dict containing "state_dict") and raw state_dict checkpoints.
-    """
-    p = Path(ckpt_path).expanduser()
-    if not p.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {p}")
-
-    ckpt_obj = torch.load(str(p), map_location="cpu")
-    if not isinstance(ckpt_obj, dict):
-        raise TypeError(f"Unexpected checkpoint type at {p}: {type(ckpt_obj)}")
-
-    state_dict = ckpt_obj.get("state_dict", None)
-    if state_dict is None:
-        state_dict = ckpt_obj  # allow raw state_dict checkpoints
-
+    state_dict = obj["state_dict"]
     if not isinstance(state_dict, dict):
-        raise TypeError(f"Checkpoint at {p} does not contain a state_dict mapping.")
+        raise TypeError("bad state_dict")
 
     missing, unexpected = module.load_state_dict(state_dict, strict=strict)
     if strict and (missing or unexpected):
-        raise RuntimeError(
-            f"Strict weight load failed for {p}. missing_keys={missing} unexpected_keys={unexpected}"
-        )
-
-    if missing or unexpected:
-        log.warning(
-            "Non-strict weight load from %s. missing_keys=%s unexpected_keys=%s",
-            p.name,
-            missing,
-            unexpected,
-        )
-
-
-def _is_rank_zero() -> bool:
-    """Best-effort guard so multi-process training doesn't attempt multiple backups."""
-    for env in ("RANK", "SLURM_PROCID"):
-        if env in os.environ:
-            try:
-                return int(os.environ[env]) == 0
-            except ValueError:
-                return True
-    if "LOCAL_RANK" in os.environ:
-        try:
-            return int(os.environ["LOCAL_RANK"]) == 0
-        except ValueError:
-            return True
-    return True
-
-
-def _backup_work_dir_on_resume(
-    work_dir: Path,
-    *,
-    suffix: str = "stage_1_done",
-) -> Optional[Path]:
-    """Create a safety copy of the entire work_dir before continuing training.
-
-    Example: models/v4 -> models/v4_stage_1_done (or with timestamp if already exists).
-
-    Returns the destination directory if a backup was created, otherwise None.
-    """
-    if not _is_rank_zero():
-        log.info("Skipping work_dir backup on non-zero rank.")
-        return None
-
-    work_dir = work_dir.resolve()
-    parent = work_dir.parent
-    base_name = f"{work_dir.name}_{suffix}"
-    dst = parent / base_name
-
-    if dst.exists():
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dst = parent / f"{base_name}_{ts}"
-
-    log.info("Creating safety copy before training: %s -> %s", work_dir, dst)
-    shutil.copytree(work_dir, dst)
-    return dst
+        raise RuntimeError("state mismatch")
 
 
 # ==============================================================================
-# CLI + main
+# CLI
 # ==============================================================================
 
 
@@ -423,65 +359,63 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
     cfg_path = Path(args.config).expanduser().resolve()
     if not cfg_path.exists():
-        raise FileNotFoundError(f"Config not found: {cfg_path}")
+        raise FileNotFoundError("config not found")
 
     cfg = load_json_config(cfg_path)
+    if not isinstance(cfg, dict):
+        raise TypeError("bad config")
+
     cfg = resolve_paths(cfg, cfg_path)
     configure_logging(cfg)
 
-    tcfg = validate_training_schema(cfg)
+    # Required top-level sections (strict).
+    tcfg = _require_dict(cfg, "training")
+    runtime = _require_dict(cfg, "runtime")
+    sys_cfg = _require_dict(cfg, "system")
+    paths = _require_dict(cfg, "paths")
 
-    # Determine mode early so we can protect work_dir before writing into it.
-    runtime = cfg.get("runtime", {}) or {}
-    mode = str(runtime.get("mode", "train")).lower().strip()
+    mode = _as_str(_require(runtime, "mode"), "runtime.mode").lower()
     if mode not in ("train", "test"):
-        raise ValueError("runtime.mode must be 'train' or 'test'.")
+        raise ValueError("bad runtime.mode")
 
-    sys_cfg = cfg.get("system", {}) or {}
-    seed = int(sys_cfg.get("seed", 1234))
+    seed = _as_int(_require(sys_cfg, "seed"), "system.seed")
     seed_everything(seed, workers=True)
 
-    device = select_device(cfg)
-    log.info("Data device (for preloading only): %s", device)
+    work_dir = Path(_as_str(_require(paths, "work_dir"), "paths.work_dir")).expanduser().resolve()
 
-    # ---- work_dir safety copy (ALWAYS before we write anything into work_dir) ----
-    work_dir_path = Path(cfg["paths"]["work_dir"]).expanduser()
-    work_dir_has_contents = False
-    try:
-        work_dir_has_contents = work_dir_path.exists() and any(work_dir_path.iterdir())
-    except OSError:
-        # If we can't iterate, don't guess; leave it to fail later.
-        work_dir_has_contents = False
+    # Check checkpoint_mode early to decide if work_dir must be empty.
+    ckpt_mode = _as_str(_require(tcfg, "checkpoint_mode"), "training.checkpoint_mode").lower()
+    if ckpt_mode not in ("none", "resume", "weights_only"):
+        raise ValueError("bad checkpoint_mode")
 
-    work_dir = ensure_dir(work_dir_path)
+    # No automatic backups. Fresh training requires an empty work_dir.
+    # Resume mode allows non-empty work_dir (continuing in same directory).
+    if mode == "train" and ckpt_mode != "resume":
+        if work_dir.exists() and any(work_dir.iterdir()):
+            raise RuntimeError("work_dir not empty")
+    ensure_dir(work_dir)
 
-    # If we're going to train and the folder already has content, always back it up.
-    # This protects stage-1 artifacts from being overwritten by stage-2 (or any rerun).
-    if mode == "train" and work_dir_has_contents:
-        _backup_work_dir_on_resume(work_dir, suffix="stage_1_done")
+    processed_dir = Path(_as_str(_require(paths, "processed_dir"), "paths.processed_dir")).expanduser().resolve()
 
-    processed_dir = Path(cfg["paths"]["processed_dir"]).expanduser()
+    # Manifest must exist; config.data must match it if manifest provides variable lists.
+    manifest, species_vars, global_vars = load_manifest_and_validate_config(cfg, processed_dir)
 
-    cfg, manifest, species_vars, global_vars = load_manifest_and_sync_data_cfg(cfg, processed_dir)
+    atomic_write_json(work_dir / "config.resolved.json", dict(cfg))
 
-    # Now it is safe to write into work_dir (backup already taken if needed).
-    atomic_write_json(work_dir / "config.resolved.json", cfg)
+    preload_device = select_preload_device(cfg)
+    log.info("preload device: %s", preload_device)
 
-    train_dl, val_dl, test_dl, _ = create_dataloaders(cfg, tcfg=tcfg, device=device)
+    train_dl, val_dl, test_dl = create_dataloaders(cfg, tcfg=tcfg, preload_device=preload_device, seed=seed)
 
-    model = create_model(cfg)
+    model = create_model(dict(cfg))
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info(
-        "Model: type=%s | S=%d | G=%d | params=%d (trainable=%d)",
-        str(cfg.get("model", {}).get("type", "mlp")),
-        len(species_vars),
-        len(global_vars),
-        total_params,
-        trainable_params,
-    )
+    log.info("model: type=%s S=%d G=%d params=%d trainable=%d",
+             str(_require_dict(cfg, "model").get("type", "")),
+             len(species_vars), len(global_vars), total_params, trainable_params)
 
     lit_module = FlowMapRolloutModule(
         cfg=cfg,
@@ -490,71 +424,63 @@ def main() -> None:
         species_variables=species_vars,
     )
 
+    # On resume/weights-only runs, preserve any existing metrics.csv before Lightning touches it.
+    if mode == "train" and ckpt_mode in ("resume", "weights_only") and os.environ.get("LOCAL_RANK", "0") == "0":
+        m = work_dir / "metrics.csv"
+        if m.exists():
+            dst = work_dir / "metrics.pre_restart.csv"
+            i = 1
+            while dst.exists():
+                dst = work_dir / f"metrics.pre_restart.{i}.csv"
+                i += 1
+            m.replace(dst)
+
     trainer = build_lightning_trainer(cfg, work_dir=work_dir)
 
-    ckpt_path = runtime.get("checkpoint")
-    if isinstance(ckpt_path, str) and ckpt_path.strip():
-        ckpt_path = str(Path(ckpt_path).expanduser())
-    else:
-        ckpt = find_resume_checkpoint(work_dir)
-        ckpt_path = str(ckpt) if ckpt else None
+    ckpt_mode = _as_str(_require(tcfg, "checkpoint_mode"), "training.checkpoint_mode").lower()
+    ckpt_val = runtime.get("checkpoint", None)
+    ckpt_path: Optional[Path] = None
+
+    if ckpt_val is not None:
+        ckpt_path = Path(_as_str(ckpt_val, "runtime.checkpoint")).expanduser().resolve()
 
     if mode == "train":
-        ckpt_mode = _parse_checkpoint_mode(tcfg)
-        strict = bool(runtime.get("load_weights_strict", True))
+        strict_load = bool(_require(runtime, "load_weights_strict"))
 
-        fit_ckpt_path: Optional[str] = None
+        if ckpt_mode == "none":
+            if ckpt_path is not None:
+                raise ValueError("checkpoint_mode=none with checkpoint set")
+            trainer.fit(lit_module, train_dataloaders=train_dl, val_dataloaders=val_dl, ckpt_path=None)
 
-        if ckpt_mode == "resume":
-            fit_ckpt_path = ckpt_path if ckpt_path else None
+        elif ckpt_mode == "resume":
+            if ckpt_path is None:
+                raise ValueError("resume requires checkpoint")
+            trainer.fit(lit_module, train_dataloaders=train_dl, val_dataloaders=val_dl, ckpt_path=str(ckpt_path))
 
         elif ckpt_mode == "weights_only":
-            if not ckpt_path:
-                raise ValueError(
-                    "training.checkpoint_mode='weights_only' but no checkpoint was provided "
-                    "(runtime.checkpoint) and none was found under work_dir/checkpoints."
-                )
-            log.info("Loading weights only from checkpoint: %s (strict=%s)", Path(ckpt_path).name, strict)
-            _load_module_weights_from_ckpt(lit_module, ckpt_path, strict=strict)
-            fit_ckpt_path = None  # start a new optimizer/scheduler
-
-        elif ckpt_mode == "none":
-            fit_ckpt_path = None
+            if ckpt_path is None:
+                raise ValueError("weights_only requires checkpoint")
+            _load_weights_only(lit_module, ckpt_path, strict=strict_load)
+            trainer.fit(lit_module, train_dataloaders=train_dl, val_dataloaders=val_dl, ckpt_path=None)
 
         else:
-            raise RuntimeError(f"Unhandled checkpoint mode: {ckpt_mode}")
-
-        log.info(
-            "Training: max_epochs=%s lr=%s wd=%s batch_size=%s checkpoint_mode=%s ckpt=%s",
-            tcfg["max_epochs"],
-            tcfg["optimizer"]["lr"],
-            tcfg["optimizer"].get("weight_decay", 0.0),
-            tcfg["batch_size"],
-            ckpt_mode,
-            (Path(ckpt_path).name if ckpt_path else "None"),
-        )
-
-        trainer.fit(
-            lit_module,
-            train_dataloaders=train_dl,
-            val_dataloaders=val_dl,
-            ckpt_path=fit_ckpt_path,
-        )
+            raise ValueError("bad checkpoint_mode")
 
         if test_dl is not None:
             trainer.test(lit_module, dataloaders=test_dl, ckpt_path="best")
 
     else:  # test
         if test_dl is None:
-            raise ValueError("runtime.mode='test' but no test split found (processed_dir/test missing).")
-        log.info("Testing: ckpt=%s", (Path(ckpt_path).name if ckpt_path else "None"))
-        trainer.test(lit_module, dataloaders=test_dl, ckpt_path=ckpt_path)
+            raise RuntimeError("no test split")
+        if ckpt_path is None:
+            raise ValueError("test requires checkpoint")
+        trainer.test(lit_module, dataloaders=test_dl, ckpt_path=str(ckpt_path))
 
 
 if __name__ == "__main__":
-    # IMPORTANT: without this guard, `python src/main.py` exits immediately with status 0.
     try:
         main()
     except Exception as e:
+        # Concise top-level error. No traceback by default.
         print(str(e), file=sys.stderr)
         raise SystemExit(1)

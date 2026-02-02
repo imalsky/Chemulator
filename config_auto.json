@@ -30,17 +30,16 @@
     ]
   },
   "dataset": {
-    "windows_per_trajectory": 50,
+    "windows_per_trajectory": 100,
     "preload_to_device": true,
     "shard_cache_size": 2,
     "use_mmap": true
   },
   "model": {
     "type": "mlp",
-    "mlp_only": false,
     "predict_delta": true,
     "activation": "silu",
-    "dropout": 0.0,
+    "dropout": 0.01,
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "mlp": {
@@ -64,26 +63,51 @@
     }
   },
   "training": {
+    "_comment_autoregressive": [
+      "false: one-jump mode, single step only",
+      "true: unroll model for rollout_steps"
+    ],
     "autoregressive_training": {
       "enabled": true,
+      "_comment_skip_steps": [
+        "0: no warmup",
+        "N: run N steps without gradient first"
+      ],
       "skip_steps": 1,
+      "_comment_detach": [
+        "true: no BPTT, independent step gradients",
+        "false: full BPTT through sequence"
+      ],
       "detach_between_steps": true,
+      "_comment_backward_per_step": [
+        "true: backward each step, saves memory",
+        "false: accumulate graph, faster, more VRAM"
+      ],
       "backward_per_step": true
     },
     "batch_size": 4096,
+    "_comment_checkpoint_mode": [
+      "none: fresh training, work_dir must be empty",
+      "resume: restore model + optimizer + epoch",
+      "weights_only: load weights, reset training state"
+    ],
     "checkpoint_mode": "weights_only",
+    "_comment_curriculum": [
+      "true: ramp rollout_steps over training",
+      "mode: linear or cosine interpolation"
+    ],
     "curriculum": {
-      "base_k": 2,
       "enabled": false,
-      "max_k": 2,
       "mode": "linear",
-      "ramp_epochs": 0
+      "ramp_epochs": 0,
+      "start_steps": 2,
+      "end_steps": 2
     },
     "loss": {
       "lambda_log10_mae": 1.0,
-      "lambda_z_mse": 0.25
+      "lambda_z_mse": 0.1
     },
-    "max_epochs": 1500,
+    "max_epochs": 200,
     "num_workers": 0,
     "optimizer": {
       "betas": [
@@ -101,7 +125,15 @@
     "persistent_workers": false,
     "pin_memory": false,
     "prefetch_factor": null,
+    "_comment_rollout_steps": [
+      "1: required for one-jump mode",
+      ">1: needs autoregressive_training.enabled=true"
+    ],
     "rollout_steps": 2,
+    "_comment_scheduler": [
+      "plateau: reduce LR when metric stalls",
+      "cosine_with_warmup: warmup then cosine decay"
+    ],
     "scheduler": {
       "enabled": true,
       "factor": 0.5,
@@ -116,17 +148,30 @@
   "runtime": {
     "accelerator": "auto",
     "accumulate_grad_batches": 1,
-    "checkpoint": "models/one_jump/checkpoints/last.ckpt",
+    "_comment_checkpoint": [
+      "null: no checkpoint (fresh training)",
+      "path: checkpoint file to load"
+    ],
+    "checkpoint": "models/v1/checkpoints/last.ckpt",
+    "_comment_checkpointing": [
+      "save_top_k: keep N best by monitor metric",
+      "save_last: always keep last.ckpt"
+    ],
     "checkpointing": {
       "enabled": true,
       "every_n_epochs": 1,
       "monitor": "val_loss",
-      "save_top_k": 1
+      "save_top_k": 1,
+      "save_last": true
     },
     "deterministic": false,
     "devices": "auto",
     "enable_progress_bar": true,
     "gradient_clip_val": 0.0,
+    "_comment_load_weights_strict": [
+      "true: state_dict must match exactly",
+      "false: allow missing/extra keys"
+    ],
     "load_weights_strict": true,
     "log_every_n_steps": 1000000,
     "mode": "train",
@@ -143,31 +188,18 @@
     }
   },
   "preprocessing": {
-    "dt": 100.0,
-    "dt_min": 10.0,
-    "dt_max": 100.0,
-    "dt_mode": "per_chunk",
-    "dt_sampling": "loguniform",
-    "n_steps": 500,
-    "t_min": 0.001,
-    "time_key": "time",
-    "time_keys": [
-      "time",
-      "t_time",
-      "t"
-    ],
-    "species_group": "species",
-    "globals_group": "globals",
-    "drop_below": 1e-30,
-    "shard_size": 16384,
-    "output_trajectories_per_file": 10000000,
-    "val_split": 0.1,
-    "test_split": 0.1
+    "train_frac": 0.8,
+    "val_frac": 0.1,
+    "test_frac": 0.1,
+    "random_seed": 1234,
+    "chunk_size": 1000,
+    "epsilon": 1e-30,
+    "min_positive": 1e-30
   },
   "paths": {
-    "raw_data_dir": "data/raw",
+    "raw_dir": "data/raw",
     "processed_dir": "data/processed",
-    "work_dir": "models/autoregressive"
+    "work_dir": "models/auto"
   },
   "system": {
     "device": "auto",

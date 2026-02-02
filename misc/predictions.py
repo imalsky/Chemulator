@@ -32,16 +32,16 @@ plt.style.use("science.mplstyle")
 @dataclass
 class Config:
     # Where the exported model and plots live.
-    run_dir: Path = ROOT / "models" / "v4"
+    run_dir: Path = ROOT / "models" / "v1"
     export_name: str = "export_cpu_1step.pt2"
 
     # Where processed test shards + normalization live.
     processed_dir: Path = ROOT / "data" / "processed"
 
     # Which test trajectory to load and how much of it to roll out.
-    sample_idx: int = 3
-    start_index: int = 5
-    n_steps: int = 490
+    sample_idx: int = 2
+    start_index: int = 1
+    n_steps: int = 498
 
     # Plot settings.
     y_range: tuple = (1e-30, 3)

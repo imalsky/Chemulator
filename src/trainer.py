@@ -10,7 +10,7 @@ Training styles (burn-in removed):
 
 2) Autoregressive rollout
    - Total rollout steps K := training.rollout_steps
-   - Skip/warmup steps M := training.autoregressive_training.skip_steps (alias: no_grad_steps)
+   - Skip/warmup steps M := training.autoregressive_training.skip_steps
        * warmup is run under torch.no_grad(), then detached (pushforward trick input generation)
        * warmup steps are excluded from the loss via masking (and/or by construction in detached-per-step mode)
    - Gradients:
@@ -28,8 +28,8 @@ Logging:
 
 Batch contract (from dataset.py):
 - y:  [B, K_full, S]   (states in z-space)
-- dt: scalar | [K_full-1] | [B, K_full-1] (canonicalized to [B, transitions])
-- g:  optional [G] | [B, G] (broadcasted)
+- dt: [B, K_full-1]    (per-transition normalized dt)
+- g:  [B, G]           (G may be 0)
 
 Note on “pushforward trick”:
 - skip_steps warmup runs A(u) forward without grad, and training loss is computed on later steps.
@@ -267,9 +267,6 @@ def _try_torch_compile(fn: Any, *, cfg: Mapping[str, Any], context: str) -> Any:
 class RolloutCurriculum:
     """Ramps training rollout steps from start_steps -> end_steps over ramp_epochs.
 
-    Backwards-compatible aliases:
-    - base_k -> start_steps
-    - max_k  -> end_steps
     """
 
     enabled: bool
@@ -333,8 +330,16 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         ar_cfg = dict(tcfg.get("autoregressive_training", {}) or {})
         self.autoregressive_training = bool(ar_cfg.get("enabled", False))
-        self.ar_skip_steps = int(ar_cfg.get("skip_steps", ar_cfg.get("no_grad_steps", 0)))
-        self.ar_detach_between_steps = bool(ar_cfg.get("detach_between_steps", ar_cfg.get("detach", True)))
+        if self.autoregressive_training:
+            if "skip_steps" not in ar_cfg:
+                raise KeyError("missing: training.autoregressive_training.skip_steps")
+            if "detach_between_steps" not in ar_cfg:
+                raise KeyError("missing: training.autoregressive_training.detach_between_steps")
+            self.ar_skip_steps = int(ar_cfg["skip_steps"])
+            self.ar_detach_between_steps = bool(ar_cfg["detach_between_steps"])
+        else:
+            self.ar_skip_steps = 0
+            self.ar_detach_between_steps = True
         self.ar_backward_per_step = bool(ar_cfg.get("backward_per_step", True))
 
         if not self.autoregressive_training and self.rollout_steps != 1:
@@ -346,11 +351,19 @@ class FlowMapRolloutModule(pl.LightningModule):
         if self.autoregressive_training:
             self.automatic_optimization = False
 
-        # Curriculum (training only); accept base_k/max_k as aliases for readability.
+        # Curriculum (training only).
         cur_cfg = dict(tcfg.get("curriculum", {}) or {})
         cur_enabled = bool(cur_cfg.get("enabled", False))
-        start_steps = int(cur_cfg.get("start_steps", cur_cfg.get("base_k", 1)))
-        end_steps = int(cur_cfg.get("end_steps", cur_cfg.get("max_k", self.rollout_steps)))
+        if cur_enabled:
+            if "start_steps" not in cur_cfg:
+                raise KeyError("missing: training.curriculum.start_steps")
+            if "end_steps" not in cur_cfg:
+                raise KeyError("missing: training.curriculum.end_steps")
+            start_steps = int(cur_cfg["start_steps"])
+            end_steps = int(cur_cfg["end_steps"])
+        else:
+            start_steps = int(cur_cfg.get("start_steps", 1))
+            end_steps = int(cur_cfg.get("end_steps", self.rollout_steps))
         self.curriculum = RolloutCurriculum(
             enabled=cur_enabled,
             mode=str(cur_cfg.get("mode", "linear")),
