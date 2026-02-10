@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
-xi_again.py — VULCAN → PHYSICAL inputs/globals → constant-dt autoregressive rollout → plot (PHYSICAL-space model).
+vulcan.py — VULCAN → PHYSICAL inputs/globals → constant-dt autoregressive rollout → plot (PHYSICAL-space model).
 
-This version uses the baked physical-space export:
-  - Inputs: y_phys (species), g_phys (P,T), dt_sec (seconds)
-  - Output: y_phys next-step
-
-We still read normalization.json ONLY to get the canonical ordering of:
-  - species_variables (model input/output channel order)
-  - global_variables   (model globals channel order)
-
-Plot behavior matches your current two-panel layout:
-  - Left: after-anchor (relative time) with VULCAN solid interpolated line + raw dots + ML markers
-  - Right: full VULCAN on log-x with anchor line
+Hard requirements:
+- Uses exactly ONE exported artifact:
+    export_cpu_dynB_1step_phys.pt2
+- Runs on CPU only.
+- Canonical channel order comes from data/processed/normalization.json:
+    species_variables (model channels)
+    global_variables  (globals channels)
 """
 
 from __future__ import annotations
@@ -28,17 +24,23 @@ import torch
 
 # ----------------------------- GLOBALS -----------------------------
 ROOT = Path(__file__).resolve().parents[1]
-PROCESSED_DIR = ROOT / "data" / "processed"
-RUN_DIR = ROOT / "models" / "v1"
-OUT_DIR = RUN_DIR / "plots"
+PROCESSED_DIR = (ROOT / "data" / "processed").resolve()
+
+RUN_DIR = (ROOT / "models" / "v1_done_1000_epochs").resolve()
+OUT_DIR = (RUN_DIR / "plots").resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+EXPORT_PATH = (RUN_DIR / "export_cpu_dynB_1step_phys.pt2").resolve()
+
+DEVICE = "cpu"
+DTYPE = torch.float32
 
 VULCAN_DIR = Path("/Users/imalsky/Desktop/Chemistry_Project/Vulcan/0D_full_NCHO/solar")
 PROFILE = "2000K_1bar"
 
-START_T_SEC = 1e0   # requested anchor (snapped to nearest VULCAN sample)
-DT_SEC = 1e2         # constant dt (seconds)
-N_STEPS = 1000       # ML steps (rollout length)
+START_T_SEC = 1e-2  # requested anchor (snapped to nearest VULCAN sample)
+DT_SEC = 1e-3        # constant dt (seconds)
+N_STEPS = 1000      # ML steps (rollout length)
 
 # Plot control: cap number of ML markers plotted (uniformly downsampled)
 MAX_ML_PLOT_POINTS = 10
@@ -51,9 +53,6 @@ PLOT_VULCAN_RAW_DOTS_LEFT = True
 
 # Minimum number of raw VULCAN samples after anchor to include on the left (for the dots overlay)
 N_FUTURE_PTS = 5
-
-# IMPORTANT: on Apple MPS, prefer the CPU-exported phys model (fp32 graph) and run it on MPS.
-EXPORT_NAME = "export_cpu_dynB_1step_phys.pt2"
 
 PLOT_SPECIES = ["H2O", "CH4", "CO", "CO2", "NH3", "HCN", "N2", "C2H2"]
 YMIN, YMAX = 1e-30, 2.0
@@ -92,13 +91,13 @@ def _step(model, y: torch.Tensor, dt: torch.Tensor, g: torch.Tensor) -> torch.Te
 
 
 @torch.inference_mode()
-def rollout_phys(model, y0_phys: np.ndarray, g_phys: np.ndarray, dt_sec: float, n: int, device: str) -> np.ndarray:
+def rollout_phys(model, y0_phys: np.ndarray, g_phys: np.ndarray, dt_sec: float, n: int) -> np.ndarray:
     """
     Physical-space rollout. Inputs/outputs are physical abundances.
     """
-    y = torch.from_numpy(y0_phys.astype(np.float32)).to(device=device).unsqueeze(0)  # [1,S]
-    g = torch.from_numpy(g_phys.astype(np.float32)).to(device=device).unsqueeze(0)   # [1,G]
-    dt = torch.tensor([float(dt_sec)], device=device, dtype=torch.float32)           # [1]
+    y = torch.from_numpy(y0_phys.astype(np.float32)).to(device=DEVICE, dtype=DTYPE).unsqueeze(0)  # [1,S]
+    g = torch.from_numpy(g_phys.astype(np.float32)).to(device=DEVICE, dtype=DTYPE).unsqueeze(0)  # [1,G]
+    dt = torch.tensor([float(dt_sec)], device=DEVICE, dtype=DTYPE)  # [1]
 
     ys = []
     for _ in range(int(n)):
@@ -147,21 +146,18 @@ def _interp_vulcan_logtime(t_abs: np.ndarray, y: np.ndarray, tq_abs: np.ndarray)
 def main():
     plt.style.use("science.mplstyle")
 
+    if not EXPORT_PATH.exists():
+        raise FileNotFoundError(f"Missing export: {EXPORT_PATH}")
+
     # Canonical channel order comes from the manifest used during training/export.
     manifest = json.loads((PROCESSED_DIR / "normalization.json").read_text())
     species_keys = list(manifest["species_variables"])
     bases = [k[:-10] if k.endswith("_evolution") else k for k in species_keys]
     gvars = list(manifest.get("global_variables") or manifest.get("meta", {}).get("global_variables") or [])
 
-    pt2 = (RUN_DIR / EXPORT_NAME).resolve()
-
-    # Choose runtime device (run on best available).
-    device = "mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-
-    model = torch.export.load(pt2).module().to(device=device)
-    print(f"[model] {pt2.name}  device={device} dtype=torch.float32")
+    model = torch.export.load(EXPORT_PATH).module().to(device=DEVICE)
+    #model.eval()
+    print(f"[model] {EXPORT_PATH.name}  device={DEVICE} dtype=torch.float32")
 
     t_all, MR_all, vidx, T_K, barye = load_vulcan(PROFILE)
 
@@ -175,7 +171,7 @@ def main():
     # Build y0 in canonical model order (species_keys / bases).
     y0 = np.array([MR_all[idx0, vidx[b]] for b in bases], float)
     y0 = np.clip(y0, 1e-30, None)
-    y0 = y0 / y0.sum()
+    y0 = y0 / np.maximum(y0.sum(), 1e-30)
     y0_phys = y0.astype(np.float64)
 
     # Build g in canonical order (gvars).
@@ -184,9 +180,9 @@ def main():
         g_phys[i] = barye if nm.strip().lower().startswith("p") else T_K
 
     # Roll out in physical space.
-    y_pred = rollout_phys(model, y0_phys, g_phys, float(DT_SEC), int(N_STEPS), device=device)
+    y_pred = rollout_phys(model, y0_phys, g_phys, float(DT_SEC), int(N_STEPS))
 
-    # Optional: keep predictions normalized as mixing ratios.
+    # Keep predictions normalized as mixing ratios.
     y_pred = np.clip(y_pred, 1e-30, None)
     y_pred = y_pred / np.maximum(y_pred.sum(1, keepdims=True), 1e-30)
 
@@ -221,11 +217,10 @@ def main():
         MR_dots = MR_minseg
     t_rel_dots = t_abs_dots - t0
 
-    # ----------------------------- COLORS (shared map) -----------------------------
+    # Shared colors: species -> color
     color_arr = plt.cm.tab20(np.linspace(0, 0.95, len(PLOT_SPECIES)))
     sp_color = {sp: color_arr[i] for i, sp in enumerate(PLOT_SPECIES)}
 
-    # ----------------------------- PLOT (2 columns) -----------------------------
     fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
 
     for ax in (ax0, ax1):
@@ -247,11 +242,24 @@ def main():
 
     fig.suptitle(f"{PROFILE}  snapped t0={t0:.3e}s (idx {idx0})", y=1.02)
 
-    # Map species name -> model channel index via bases list.
     for sp in PLOT_SPECIES:
         c = sp_color[sp]
         jv = vidx[sp]
         jm = bases.index(sp)
+
+        # LEFT: explicit start marker at the anchor (t_rel = 0), one per species (unlabeled)
+        ax0.plot(
+            [0.0],
+            [float(np.clip(MR_all[idx0, jv], YMIN, None))],
+            marker="o",
+            ms=6.0,
+            mfc=c,
+            mec=c,
+            mew=0.0,
+            linestyle="None",
+            alpha=0.95,
+            zorder=6,
+        )
 
         # LEFT: VULCAN SOLID line (interpolated; labeled)
         y_line = _interp_vulcan_logtime(t_all, MR_all[:, jv], t_abs_line_for_interp)
@@ -295,7 +303,7 @@ def main():
     ax0.legend(loc="best", fontsize=9)
     ax1.legend(loc="best", fontsize=9)
 
-    out = OUT_DIR / f"xi_again_2col_logx_phys_{PROFILE}_t0_{t0:.3e}_dt_{DT_SEC:.0e}_N{int(N_STEPS)}_after_anchor.png"
+    out = OUT_DIR / f"vulcan_2col_logx_phys_cpuexport_{PROFILE}_t0_{t0:.3e}_dt_{DT_SEC:.0e}_N{int(N_STEPS)}.png"
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)

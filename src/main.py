@@ -289,11 +289,15 @@ def create_dataloaders(
     k_train = max_rollout_steps_for_training(tcfg)
     k_eval = max_rollout_steps_for_eval(tcfg)
 
+    # If preloading to an accelerator, store tensors in bf16 to reduce HBM usage.
+    # This is safe when training/eval is running with bf16 AMP.
+    storage_dtype = torch.bfloat16 if preload_to_device else torch.float32
+
     common_ds_kwargs = dict(
         windows_per_trajectory=windows_per_traj,
         preload_to_device=preload_to_device,
         device=preload_device,
-        storage_dtype=torch.float32,
+        storage_dtype=storage_dtype,
         shard_cache_size=shard_cache_size,
         use_mmap=use_mmap,
     )

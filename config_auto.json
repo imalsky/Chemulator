@@ -39,7 +39,7 @@
     "type": "mlp",
     "predict_delta": true,
     "activation": "silu",
-    "dropout": 0.01,
+    "dropout": 0.0,
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "mlp": {
@@ -105,9 +105,9 @@
     },
     "loss": {
       "lambda_log10_mae": 1.0,
-      "lambda_z_mse": 0.1
+      "lambda_z_mse": 0.25
     },
-    "max_epochs": 200,
+    "max_epochs": 1500,
     "num_workers": 0,
     "optimizer": {
       "betas": [
@@ -152,7 +152,7 @@
       "null: no checkpoint (fresh training)",
       "path: checkpoint file to load"
     ],
-    "checkpoint": "models/v1/checkpoints/last.ckpt",
+    "checkpoint": "models/one_jump/checkpoints/last.ckpt",
     "_comment_checkpointing": [
       "save_top_k: keep N best by monitor metric",
       "save_last: always keep last.ckpt"

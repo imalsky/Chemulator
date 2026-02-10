@@ -115,7 +115,7 @@ def load_weights(model: nn.Module, ckpt_path: Path) -> None:
 
 
 def prepare_model(model: nn.Module) -> nn.Module:
-    model.eval()
+    #model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
     return model
@@ -432,7 +432,7 @@ def verify_dynB(ep: torch.export.ExportedProgram, step_ref: OneStepARPhysical) -
     Fail hard unless the exported program runs with multiple batch sizes (proof of dynamic B).
     """
     m = ep.module()
-    m.eval()
+    #m.eval()
 
     for B in (1, 7):
         y, dt, g = make_example_inputs(step_ref, B, DEVICE, DTYPE)

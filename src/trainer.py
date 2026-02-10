@@ -555,7 +555,31 @@ class FlowMapRolloutModule(pl.LightningModule):
         if not should_step:
             return
 
+        # Use the underlying torch optimizer for inspection/unscale when available.
+        torch_opt = opt.optimizer if hasattr(opt, "optimizer") else opt
+
+        self.log("lr", float(torch_opt.param_groups[0]["lr"]), on_step=False, on_epoch=True)
+
+        # If using fp16 mixed precision, log the *unscaled* grad norm.
+        try:
+            self.trainer.strategy.precision_plugin.unscale_gradients(torch_opt)
+        except Exception:
+            try:
+                self.trainer.precision_plugin.unscale_gradients(torch_opt)
+            except Exception:
+                pass
+
+        gn2 = sum(
+            (p.grad.detach().float().norm(2) ** 2)
+            for pg in torch_opt.param_groups
+            for p in pg["params"]
+            if p.grad is not None
+        )
+        self.log("grad_norm", torch.sqrt(gn2 + torch.zeros((), device=self.device)), on_step=False, on_epoch=True)
+
         clip_val = getattr(self.trainer, "gradient_clip_val", None)
+
+
         if clip_val is not None and float(clip_val) > 0:
             self.clip_gradients(
                 opt,
@@ -572,9 +596,11 @@ class FlowMapRolloutModule(pl.LightningModule):
             return
         sched_list = list(sched) if isinstance(sched, (list, tuple)) else [sched]
         for s in sched_list:
-            if isinstance(s, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            sch = s.scheduler if hasattr(s, "scheduler") else s
+            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 continue
-            s.step()
+            sch.step()
+
 
     # ------------------------
     # Training / eval
@@ -603,11 +629,19 @@ class FlowMapRolloutModule(pl.LightningModule):
         self.log("train_loss", losses["loss_total"].detach(), on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_loss_log10_mae", losses["loss_log10_mae"], on_step=False, on_epoch=True)
         self.log("train_loss_z_mse", losses["loss_z_mse"], on_step=False, on_epoch=True)
+
+        # I was having trouble getting pylighting lr
+        opt0 = self.trainer.optimizers[0]
+        torch_opt0 = opt0.optimizer if hasattr(opt0, "optimizer") else opt0
+        self.log("lr", float(torch_opt0.param_groups[0]["lr"]), on_step=False, on_epoch=True)
+
         self.log("train_rollout_steps", float(1.0), on_step=False, on_epoch=True)
+
         self.log("train_skip_steps", float(0.0), on_step=False, on_epoch=True)
         self.log("train_detach_between_steps", float(1.0), on_step=False, on_epoch=True)
 
         return losses["loss_total"]
+
 
     def _training_step_autoregressive(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         y = batch["y"]
@@ -657,7 +691,7 @@ class FlowMapRolloutModule(pl.LightningModule):
                 step_losses = self.criterion(y_next.unsqueeze(1), y_tgt.unsqueeze(1), step_weights=None)
 
                 if self.ar_backward_per_step:
-                    self.manual_backward(step_losses["loss_total"] / float(num_steps))
+                    self.manual_backward(step_losses["loss_total"] / float(num_steps * acc))
                 else:
                     loss_total_sum = loss_total_sum + step_losses["loss_total"]
 
@@ -667,7 +701,7 @@ class FlowMapRolloutModule(pl.LightningModule):
                 y_prev = y_next.detach()
 
             if not self.ar_backward_per_step:
-                self.manual_backward(loss_total_sum / float(num_steps))
+                self.manual_backward(loss_total_sum / float(num_steps * acc))
 
             self._maybe_step_optimizer(opt, batch_idx)
 
@@ -690,7 +724,7 @@ class FlowMapRolloutModule(pl.LightningModule):
             loss_log10_mae = losses["loss_log10_mae"].detach()
             loss_z_mse = losses["loss_z_mse"].detach()
 
-            self.manual_backward(loss_total)
+            self.manual_backward(loss_total / float(acc))
             self._maybe_step_optimizer(opt, batch_idx)
 
         self.log("train_loss", loss_total.detach(), on_step=False, on_epoch=True, prog_bar=True)
@@ -773,8 +807,10 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         sched_list = list(sched) if isinstance(sched, (list, tuple)) else [sched]
         for s in sched_list:
-            if isinstance(s, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                s.step(metric_val)
+            sch = s.scheduler if hasattr(s, "scheduler") else s
+            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                sch.step(metric_val)
+
 
     # ------------------------
     # Optimizer / scheduler
@@ -973,7 +1009,7 @@ def build_lightning_trainer(cfg: Mapping[str, Any], *, work_dir: Path) -> pl.Tra
     strategy = runtime.get("strategy", "auto")
     accumulate_grad_batches = int(runtime.get("accumulate_grad_batches", 1))
 
-    return pl.Trainer(
+    trainer_kwargs = dict(
         default_root_dir=str(work_dir),
         max_epochs=max_epochs,
         accelerator=accelerator,
@@ -991,3 +1027,7 @@ def build_lightning_trainer(cfg: Mapping[str, Any], *, work_dir: Path) -> pl.Tra
         accumulate_grad_batches=accumulate_grad_batches,
         deterministic=bool(runtime.get("deterministic", False)),
     )
+
+    sig = inspect.signature(pl.Trainer)
+    trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if k in sig.parameters}
+    return pl.Trainer(**trainer_kwargs)

@@ -2,19 +2,19 @@
 """
 predictions.py - Autoregressive 1-step evaluation on test data (constant dt), PHYSICAL-space model.
 
-This version assumes the exported module already bakes:
-  - species normalization (log-standard)
-  - globals normalization (e.g., P log-min-max, T min-max)
-  - dt normalization (log-min-max over dt seconds)
-
-So: the model takes PHYSICAL inputs:
-  y_phys : [B, S]   (species abundances / mixing ratios, positive)
-  dt_sec : [B]      (seconds)
-  g_phys : [B, G]   (e.g., P in barye, T in K, in the same units used during preprocessing)
-
-We still load normalization.json ONLY to invert the processed test shard back to physical
-for (1) producing physical inputs for the baked model and (2) plotting/metrics vs GT.
+Hard requirements:
+- Uses exactly ONE exported artifact:
+    export_cpu_dynB_1step_phys.pt2
+- Runs on CPU only (simple + deterministic).
+- Model expects PHYSICAL inputs:
+    y_phys : [B, S]   (positive)
+    dt_sec : [B]      (seconds)
+    g_phys : [B, G]   (same units as preprocessing)
+- We load normalization.json only to invert processed test shard (z-space -> physical)
+  for inputs/GT + dt_seconds inversion for constant dt.
 """
+
+from __future__ import annotations
 
 import json
 import sys
@@ -33,23 +33,23 @@ sys.path.insert(0, str(ROOT / "src"))
 
 plt.style.use("science.mplstyle")
 
+# =============================================================================
+# Globals (single export, CPU only)
+# =============================================================================
+RUN_DIR = (ROOT / "models" / "v1_done_1000_epochs").resolve()
+EXPORT_PATH = (RUN_DIR / "export_cpu_dynB_1step_phys.pt2").resolve()
+
+PROCESSED_DIR = (ROOT / "data" / "processed").resolve()
+
+DEVICE = "cpu"
+DTYPE = torch.float32
+
 
 # =============================================================================
 # Config
 # =============================================================================
-
 @dataclass
 class Config:
-    # Where exported model(s) and plots live.
-    run_dir: Path = ROOT / "models" / "v1"
-
-    # If None, we auto-pick a *physical* export with sane dtype behavior on your device.
-    # Recommended: leave None.
-    export_name: str | None = None
-
-    # Processed test shards + normalization.json live here.
-    processed_dir: Path = ROOT / "data" / "processed"
-
     # Which test trajectory to load and how much of it to roll out.
     sample_idx: int = 2
     start_index: int = 1
@@ -78,7 +78,6 @@ CFG = Config()
 # =============================================================================
 # Data loading
 # =============================================================================
-
 def load_test_trajectory(processed_dir: Path, idx: int):
     """
     Loads a single test trajectory from the first test shard.
@@ -93,9 +92,9 @@ def load_test_trajectory(processed_dir: Path, idx: int):
     """
     shard_path = sorted((processed_dir / "test").glob("shard_*.npz"))[0]
     with np.load(shard_path) as f:
-        y_all = f["y_mat"].astype(np.float32)        # [N, T, S]
-        g_all = f["globals"].astype(np.float32)      # [N, G]
-        dt_all = f["dt_norm_mat"].astype(np.float32) # [N, T-1]
+        y_all = f["y_mat"].astype(np.float32)  # [N, T, S]
+        g_all = f["globals"].astype(np.float32)  # [N, G]
+        dt_all = f["dt_norm_mat"].astype(np.float32)  # [N, T-1]
 
     manifest = json.loads((processed_dir / "normalization.json").read_text())
     species_keys = list(manifest["species_variables"])
@@ -107,11 +106,7 @@ def load_test_trajectory(processed_dir: Path, idx: int):
 # =============================================================================
 # Normalization inversion (z -> physical) for processed shards
 # =============================================================================
-
 def dt_to_seconds(dt_norm: float, manifest: dict) -> float:
-    """
-    Inverts dt normalization back to seconds.
-    """
     a = float(manifest["dt"]["log_min"])
     b = float(manifest["dt"]["log_max"])
     log_dt = float(dt_norm) * (b - a) + a
@@ -126,7 +121,7 @@ def _method_for_key(key: str, manifest: dict) -> str:
 
 def denormalize_species(y_z: np.ndarray, species_keys: list[str], manifest: dict) -> np.ndarray:
     """
-    Inverts species z-space -> physical. Your manifest uses log-standard for species.
+    Inverts species z-space -> physical. Assumes species are log-standard in manifest.
     """
     stats = manifest["per_key_stats"]
     mu = np.array([stats[k]["log_mean"] for k in species_keys], dtype=np.float64)
@@ -169,48 +164,26 @@ def denormalize_globals(g_z: np.ndarray, gvars: list[str], manifest: dict) -> np
 # =============================================================================
 # Model + inference
 # =============================================================================
-
-def _pick_physical_export(run_dir: Path, device: str) -> Path:
-    """
-    Important detail:
-    - On Apple MPS, using an export produced on MPS (often fp16) can embed mixed-dtype graph constants
-      that crash when you try bf16/fp32. The most robust approach is: use the CPU-exported phys model
-      (fp32 graph), then run it on MPS.
-    """
-    if device == "cuda":
-        cands = [
-            run_dir / "export_cuda_dynB_1step_phys.pt2",
-            run_dir / "export_cuda_b1_1step_phys.pt2",
-        ]
-    else:
-        # For both mps and cpu: prefer CPU-exported phys.
-        cands = [
-            run_dir / "export_cpu_dynB_1step_phys.pt2",
-            run_dir / "export_cpu_b1_1step_phys.pt2",
-        ]
-
-    for p in cands:
-        if p.exists():
-            return p.resolve()
-    return cands[0].resolve()  # will error naturally if it's truly missing
-
-
 def _step_model(model, y: torch.Tensor, dt: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
     out = model(y, dt, g)
     return out[:, 0, :] if out.ndim == 3 else out
 
 
 @torch.inference_mode()
-def rollout_phys(model, y0_phys: np.ndarray, g_phys: np.ndarray, dt_sec: float, n_steps: int,
-                 device: str) -> np.ndarray:
+def rollout_phys(
+    model,
+    y0_phys: np.ndarray,
+    g_phys: np.ndarray,
+    dt_sec: float,
+    n_steps: int,
+) -> np.ndarray:
     """
     Autoregressive rollout with constant dt (seconds).
     Returns [n_steps, S] in physical space.
     """
-    # Exported graphs are dtype-specialized; your phys CPU export is fp32, so feed fp32.
-    y = torch.from_numpy(y0_phys.astype(np.float32)).to(device=device).unsqueeze(0)  # [1,S]
-    g = torch.from_numpy(g_phys.astype(np.float32)).to(device=device).unsqueeze(0)   # [1,G]
-    dt = torch.tensor([float(dt_sec)], device=device, dtype=torch.float32)           # [1]
+    y = torch.from_numpy(y0_phys.astype(np.float32)).to(device=DEVICE, dtype=DTYPE).unsqueeze(0)  # [1,S]
+    g = torch.from_numpy(g_phys.astype(np.float32)).to(device=DEVICE, dtype=DTYPE).unsqueeze(0)  # [1,G]
+    dt = torch.tensor([float(dt_sec)], device=DEVICE, dtype=DTYPE)  # [1]
 
     ys = []
     for _ in range(int(n_steps)):
@@ -222,7 +195,6 @@ def rollout_phys(model, y0_phys: np.ndarray, g_phys: np.ndarray, dt_sec: float, 
 # =============================================================================
 # Plotting / metrics
 # =============================================================================
-
 def _distinct_colors(n: int):
     cmaps = ["tab20", "tab20b", "tab20c", "Set3", "Dark2", "Paired", "Accent"]
     cols = []
@@ -267,7 +239,7 @@ def plot_results(t: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, species_
         ylim=CFG.y_range,
         xlabel="Time (s)",
         ylabel="Relative Abundance",
-        title=f"Autoregressive (constant dt): {len(t)} steps (PHYS model)",
+        title=f"Autoregressive (constant dt): {len(t)} steps (PHYS model, CPU export)",
     )
     ax.set_box_aspect(1)
 
@@ -306,7 +278,6 @@ def plot_results(t: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, species_
 
 
 def print_errors(y_true: np.ndarray, y_pred: np.ndarray) -> None:
-    # Keep metrics numerically sane in log-space.
     eps = 1e-30
     yt = np.clip(y_true, eps, None)
     yp = np.clip(y_pred, eps, None)
@@ -322,42 +293,33 @@ def print_errors(y_true: np.ndarray, y_pred: np.ndarray) -> None:
 # =============================================================================
 # Main
 # =============================================================================
-
 def main() -> None:
-    processed_dir = CFG.processed_dir
+    if not EXPORT_PATH.exists():
+        raise FileNotFoundError(f"Missing export: {EXPORT_PATH}")
 
-    # Pick device (no cleverness: run where you are).
-    device = "mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
+    export_path = EXPORT_PATH
+    model = torch.export.load(export_path).module().to(device=DEVICE)
+    #model.eval()
+    print(f"[model] {export_path.name}  device={DEVICE} dtype=torch.float32")
 
-    export_path = (CFG.run_dir / CFG.export_name).resolve() if CFG.export_name else _pick_physical_export(CFG.run_dir, device)
-    model = torch.export.load(export_path).module().to(device=device)
+    y_z, g_z, dt_vec, species_keys, gvars, manifest = load_test_trajectory(PROCESSED_DIR, CFG.sample_idx)
 
-    # Print what we actually loaded (important when running MPS via CPU-exported phys graph).
-    print(f"[model] {export_path.name}  device={device} dtype=torch.float32")
-
-    y_z, g_z, dt_vec, species_keys, gvars, manifest = load_test_trajectory(processed_dir, CFG.sample_idx)
-
-    # Constant dt picked from the processed trajectory (normalized -> seconds).
     dt0_norm = float(dt_vec[CFG.start_index])
     dt_sec = dt_to_seconds(dt0_norm, manifest)
 
-    # Build PHYSICAL inputs/GT from processed shard.
     y0_z = y_z[CFG.start_index]
-    y_true_z = y_z[CFG.start_index + 1: CFG.start_index + 1 + CFG.n_steps]
+    y_true_z = y_z[CFG.start_index + 1 : CFG.start_index + 1 + CFG.n_steps]
 
     y0_phys = denormalize_species(y0_z, species_keys, manifest)
     y_true_phys = denormalize_species(y_true_z, species_keys, manifest)
 
     g_phys = denormalize_globals(g_z, gvars, manifest)
 
-    # Run PHYSICAL model.
-    y_pred_phys = rollout_phys(model, y0_phys, g_phys, dt_sec, CFG.n_steps, device=device)
+    y_pred_phys = rollout_phys(model, y0_phys, g_phys, dt_sec, CFG.n_steps)
 
     t_eval = dt_sec * np.arange(1, CFG.n_steps + 1, dtype=float)
 
-    out_path = CFG.run_dir / "plots" / f"autoregressive_constdt_phys_{CFG.sample_idx}_t{CFG.start_index}.png"
+    out_path = RUN_DIR / "plots" / f"autoregressive_constdt_phys_cpuexport_{CFG.sample_idx}_t{CFG.start_index}.png"
     plot_results(t_eval, y_true_phys, y_pred_phys, species_keys, out_path)
     print_errors(y_true_phys, y_pred_phys)
 

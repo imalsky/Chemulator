@@ -1,33 +1,88 @@
 {
-  "normalization": {
-    "methods": {
-      "T": "min-max",
-      "P": "log-min-max"
-    },
-    "default_method": "log-standard",
-    "globals_default_method": "standard",
-    "epsilon": 1e-30,
-    "min_std": 1e-12
+  "paths": {
+    "raw_data_dir": "data/raw",
+    "processed_data_dir": "data/processed",
+    "processed_dir": "data/processed",
+    "work_dir": "models/v2"
+  },
+  "system": {
+    "seed": 1234,
+    "log_level": "INFO",
+    "device": "auto"
   },
   "data": {
     "species_variables": [
-      "C2H2_evolution",
-      "CH4_evolution",
-      "CO2_evolution",
-      "CO_evolution",
-      "H2O_evolution",
-      "H2_evolution",
-      "HCN_evolution",
       "H_evolution",
-      "N2_evolution",
-      "NH3_evolution",
+      "H2_evolution",
       "OH_evolution",
-      "O_evolution"
-    ],
-    "global_variables": [
-      "P",
-      "T"
-    ]
+      "H2O_evolution",
+      "CO_evolution",
+      "CO2_evolution",
+      "O_evolution",
+      "CH4_evolution",
+      "C2H2_evolution",
+      "NH3_evolution",
+      "N2_evolution",
+      "HCN_evolution"],
+    "global_variables": ["P", "T"]
+  },
+  "normalization": {
+    "epsilon": 1e-30,
+    "min_std": 1e-12,
+    "methods": {
+      "P": "log-min-max",
+      "T": "min-max"
+    },
+    "default_method": "log-standard",
+    "globals_default_method": "standard"
+  },
+  "preprocessing": {
+    "dt": 100.0,
+    "dt_mode": "per_chunk",
+    "dt_min": 5e-2,
+    "dt_max": 5e3,
+    "dt_sampling": "loguniform",
+    "n_steps": 500,
+    "t_min": 0.0,
+    "drop_below": 1e-30,
+    "output_trajectories_per_file": 10000,
+    "shard_size": 8192,
+    "overwrite": true,
+    "time_keys": ["t_time", "time", "t"],
+    "time_key": null,
+    "species_group": null,
+    "globals_group": null,
+    "val_fraction": 0.1,
+    "test_fraction": 0.1,
+    "seed": 1234,
+    "pool_size": 1000000,
+    "samples_per_source_trajectory": 100,
+    "max_chunk_attempts_per_source": 200,
+    "raw_file_patterns": ["*.h5", "*.hdf5"],
+    "_comment": {
+      "dt": "Nominal timestep (seconds). Used directly when dt_mode='fixed'.",
+      "dt_mode": "How dt is chosen: 'fixed' => always dt; 'per_chunk' => sample one dt per chunk.",
+      "dt_min": "Minimum dt (seconds) when dt_mode='per_chunk'; ignored/overwritten in 'fixed'.",
+      "dt_max": "Maximum dt (seconds) when dt_mode='per_chunk'; ignored/overwritten in 'fixed'.",
+      "dt_sampling": "Distribution for per-chunk dt: 'uniform' (linear) or 'loguniform' (log10-uniform).",
+      "n_steps": "Steps per sampled chunk; chunk duration ~ n_steps * dt (after any regridding).",
+      "t_min": "Avoid/discard times < t_min when building chunks (skips very-early tiny times).",
+      "drop_below": "Reject values below this",
+      "output_trajectories_per_file": "Target # output trajectories per produced file (controls file splitting).",
+      "shard_size": "Samples per output shard on disk (affects dataset IO and caching).",
+      "overwrite": "If true, replace existing processed outputs instead of erroring.",
+      "time_keys": "Candidate dataset names to find the time array if time_key is not set.",
+      "time_key": "If set, force this exact time dataset name (bypasses time_keys search).",
+      "species_group": "If set, HDF5 group path containing species datasets; null => infer/use root.",
+      "globals_group": "If set, HDF5 group path containing globals datasets; null => infer/use root.",
+      "val_fraction": "Fraction of processed chunks assigned to validation split.",
+      "test_fraction": "Fraction of processed chunks assigned to test split (train is remainder).",
+      "seed": "RNG seed for preprocessing sampling/splitting (defaults to system.seed if omitted).",
+      "pool_size": "Size of candidate sampling pool used when drawing chunks from source trajectories.",
+      "samples_per_source_trajectory": "How many chunks to sample from each source trajectory.",
+      "max_chunk_attempts_per_source": "Max resampling tries per source to find a valid chunk.",
+      "raw_file_patterns": "Glob patterns used to find raw input files under paths.raw_data_dir."
+    }
   },
   "dataset": {
     "windows_per_trajectory": 100,
@@ -37,165 +92,100 @@
   },
   "model": {
     "type": "mlp",
-    "predict_delta": true,
     "activation": "silu",
-    "dropout": 0.01,
+    "dropout": 0.00,
+    "predict_delta": true,
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "mlp": {
-      "hidden_dims": [
-        2048,
-        2048,
-        2048,
-        2048,
-        2048,
-        2048
-      ],
+      "hidden_dims": [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048],
       "residual": true
     },
     "autoencoder": {
       "latent_dim": 256,
-      "encoder_hidden": 512,
-      "decoder_hidden": 512,
-      "dynamics_hidden": 512,
+      "encoder_hidden": [512, 512],
+      "dynamics_hidden": [512, 512],
+      "decoder_hidden": [512, 512],
       "residual": true,
       "dynamics_residual": true
     }
   },
   "training": {
-    "_comment_autoregressive": [
-      "false: one-jump mode",
-      "true: unroll for rollout_steps"
-    ],
+    "max_epochs": 1000,
+    "rollout_steps": 1,
+    "batch_size": 8192,
+    "num_workers": 0,
+    "pin_memory": false,
+    "persistent_workers": false,
+    "prefetch_factor": null,
+    "checkpoint_mode": "none",
+    "loss": {
+      "lambda_log10_mae": 1.0,
+      "lambda_z_mse": 0.1
+    },
+    "optimizer": {
+      "name": "adamw",
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "betas": [0.9, 0.999],
+      "eps": 1e-08,
+      "exclude_norm_and_bias_from_weight_decay": true,
+      "fused": true,
+      "foreach": false
+    },
+    "scheduler": {
+      "enabled": true,
+      "type": "cosine_with_warmup",
+      "warmup_epochs": 50,
+      "min_lr_ratio": 0.01,
+      "factor": 0.5,
+      "patience": 10,
+      "threshold": 0.0001,
+      "min_lr": 1e-07,
+      "mode": "min",
+      "monitor": "val_loss"
+    },
     "autoregressive_training": {
       "enabled": false,
-      "_comment_skip_steps": [
-        "0: no warmup",
-        "N: run N steps without gradient"
-      ],
       "skip_steps": 0,
-      "_comment_detach": [
-        "true: no BPTT, independent gradients",
-        "false: full BPTT through sequence"
-      ],
       "detach_between_steps": true,
-      "_comment_backward_per_step": [
-        "true: backward each step, saves memory",
-        "false: accumulate graph, faster"
-      ],
       "backward_per_step": true
     },
-    "batch_size": 8192,
-    "_comment_checkpoint_mode": [
-      "none: fresh training, empty work_dir",
-      "resume: restore model+optimizer+epoch",
-      "weights_only: load weights, reset state"
-    ],
-    "checkpoint_mode": "resume",
-    "_comment_curriculum": [
-      "true: ramp rollout_steps over training",
-      "mode: linear or cosine"
-    ],
     "curriculum": {
       "enabled": false,
       "mode": "linear",
       "ramp_epochs": 0,
       "start_steps": 1,
       "end_steps": 1
-    },
-    "loss": {
-      "lambda_log10_mae": 1.0,
-      "lambda_z_mse": 0.1
-    },
-    "max_epochs": 1000,
-    "num_workers": 0,
-    "optimizer": {
-      "betas": [
-        0.9,
-        0.999
-      ],
-      "eps": 1e-08,
-      "exclude_norm_and_bias_from_weight_decay": true,
-      "foreach": true,
-      "fused": true,
-      "lr": 1e-4,
-      "name": "adamw",
-      "weight_decay": 1e-4
-    },
-    "persistent_workers": false,
-    "pin_memory": false,
-    "prefetch_factor": null,
-    "_comment_rollout_steps": [
-      "1: required for one-jump mode",
-      ">1: needs autoregressive enabled"
-    ],
-    "rollout_steps": 1,
-    "scheduler": {
-      "enabled": true,
-      "min_lr_ratio": 0.01,
-      "type": "cosine_with_warmup",
-      "warmup_epochs": 50
     }
   },
   "runtime": {
+    "mode": "train",
+    "checkpoint": null,
+    "load_weights_strict": true,
+    "devices": "auto",
     "accelerator": "auto",
+    "strategy": "auto",
+    "precision": "bf16-mixed",
+    "log_every_n_steps": 50,
+    "enable_progress_bar": false,
+    "gradient_clip_val": null,
     "accumulate_grad_batches": 1,
-    "_comment_checkpoint": [
-      "null: no checkpoint (fresh)",
-      "path: checkpoint file to load"
-    ],
-    "checkpoint": "models/v1/checkpoints/last.ckpt",
-    "_comment_checkpointing": [
-      "save_top_k: keep N best",
-      "save_last: always keep last.ckpt"
-    ],
+    "deterministic": false,
     "checkpointing": {
       "enabled": true,
       "every_n_epochs": 1,
-      "monitor": "val_loss",
       "save_top_k": 1,
-      "save_last": true
+      "monitor": "val_loss"
     },
-    "deterministic": false,
-    "devices": "auto",
-    "enable_progress_bar": false,
-    "gradient_clip_val": 0.0,
-    "_comment_load_weights_strict": [
-      "true: state_dict must match",
-      "false: allow missing/extra keys"
-    ],
-    "load_weights_strict": true,
-    "log_every_n_steps": 1000000,
-    "mode": "train",
-    "precision": "bf16-mixed",
-    "strategy": "auto",
     "torch_compile": {
-      "backend": "inductor",
-      "compile_forward_step": true,
-      "compile_open_loop_unroll": false,
-      "dynamic": false,
       "enabled": true,
+      "backend": "inductor",
+      "mode": "reduce-overhead",
+      "dynamic": false,
       "fullgraph": true,
-      "mode": "reduce-overhead"
+      "compile_forward_step": true,
+      "compile_open_loop_unroll": false
     }
-  },
-  "preprocessing": {
-    "train_frac": 0.8,
-    "val_frac": 0.1,
-    "test_frac": 0.1,
-    "random_seed": 1234,
-    "chunk_size": 1000,
-    "epsilon": 1e-30,
-    "min_positive": 1e-30
-  },
-  "paths": {
-    "raw_dir": "data/raw",
-    "processed_dir": "data/processed",
-    "work_dir": "models/v1"
-  },
-  "system": {
-    "device": "auto",
-    "log_level": "INFO",
-    "seed": 1234
   }
 }

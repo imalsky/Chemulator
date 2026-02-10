@@ -33,10 +33,17 @@ if [ $rc -ne 0 ]; then
   exit 2
 fi
 
+# Remove the incompatible x86 version
+pip uninstall -y h5py || true
+
+# Install the correct ARM version for GH200 (force no cache to avoid picking up the old file)
+pip install h5py --no-cache-dir
+
 # ---- Same runtime exports as your SLURM script ----
 export HDF5_USE_FILE_LOCKING=FALSE
-export PYTHONNOUSERSITE=1
+#export PYTHONNOUSERSITE=1
 export PYTHONPATH="$(pwd)/src:$(pwd):${PYTHONPATH:-}"
 
 # PBS: no srun
-python -u src/main.py
+python -u processing/preprocessing.py
+#python -u src/main.py
