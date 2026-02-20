@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -26,7 +27,7 @@ import torch
 import torch.nn as nn
 from torch.export import Dim
 
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -37,7 +38,7 @@ from model import create_model  # noqa: E402
 # -----------------------------
 # GLOBALS
 # -----------------------------
-RUN_DIR = (ROOT / "models" / "v1_done_1000_epochs").resolve()
+RUN_DIR = (ROOT / "models" / "fixed").resolve()
 OUT_PATH = (RUN_DIR / "export_cpu_dynB_1step_phys.pt2").resolve()
 
 # Example batch used for tracing (B will be dynamic in the exported program).

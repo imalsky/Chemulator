@@ -25,14 +25,15 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+
+# Avoid MKL/OpenMP duplicate symbol aborts in some environments.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
-
-# Avoid MKL/OpenMP duplicate symbol aborts in some environments.
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 # Prefer fast matmul where supported.
 torch.set_float32_matmul_precision("high")
@@ -291,7 +292,9 @@ def create_dataloaders(
 
     # If preloading to an accelerator, store tensors in bf16 to reduce HBM usage.
     # This is safe when training/eval is running with bf16 AMP.
-    storage_dtype = torch.bfloat16 if preload_to_device else torch.float32
+    #storage_dtype = torch.bfloat16 if preload_to_device else torch.float32
+    storage_dtype = torch.float32
+
 
     common_ds_kwargs = dict(
         windows_per_trajectory=windows_per_traj,

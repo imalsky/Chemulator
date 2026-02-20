@@ -56,7 +56,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 # Training run directory containing the exported artifact and where plots are saved.
-RUN_DIR: Path = (ROOT / "models" / "v1").resolve()
+RUN_DIR: Path = (ROOT / "models" / "hmm").resolve()
 
 # Export artifact produced by testing/new_export.py
 EXPORT_NAME: str = "export_cpu_dynB_1step_phys.pt2"

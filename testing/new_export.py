@@ -44,6 +44,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+
+
+# Some MKL/OpenMP builds abort on duplicate symbols; this is a pragmatic default.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -51,9 +56,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 from torch.export import Dim
-
-# Some MKL/OpenMP builds abort on duplicate symbols; this is a pragmatic default.
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -654,7 +656,7 @@ def parse_args() -> argparse.Namespace:
         "--run-dir",
         type=Path,
         required=False,
-        default=(REPO_ROOT / "models" / "v1_done_1000_epochs"),
+        default=(REPO_ROOT / "models" / "hmm"),
         help="Training run directory containing checkpoint(s) and config.",
     )
 

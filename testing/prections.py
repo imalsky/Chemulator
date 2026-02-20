@@ -36,7 +36,7 @@ plt.style.use("science.mplstyle")
 # =============================================================================
 # Globals (single export, CPU only)
 # =============================================================================
-RUN_DIR = (ROOT / "models" / "v1_done_1000_epochs").resolve()
+RUN_DIR = (ROOT / "models" / "fixed").resolve()
 EXPORT_PATH = (RUN_DIR / "export_cpu_dynB_1step_phys.pt2").resolve()
 
 PROCESSED_DIR = (ROOT / "data" / "processed").resolve()

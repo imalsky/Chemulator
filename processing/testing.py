@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 # =============================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
+CONFIG_PATH = PROJECT_ROOT / "config.json"
 
 # If None, uses first *.h5/*.hdf5 under config.paths.raw_data_dir
 RAW_FILE: Optional[Path] = None
