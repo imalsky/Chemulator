@@ -4,7 +4,7 @@ main.py - Strict entrypoint for training / evaluation.
 
 Principles (by design):
 - No alias keys. Config must use the canonical schema.
-- No silent fallbacks (no “search for a checkpoint”, no “use CPU if CUDA missing”, etc.).
+- No silent fallbacks (no "search for a checkpoint", no "use CPU if CUDA missing", etc.).
 - Errors are concise and deterministic.
 
 This script:
@@ -45,8 +45,7 @@ from lightning.pytorch import seed_everything
 from dataset import FlowMapRolloutDataset, create_dataloader
 from model import create_model
 from trainer import FlowMapRolloutModule, build_lightning_trainer
-from utils import atomic_write_json, ensure_dir, load_json_config
-
+from utils import PrecisionConfig, atomic_write_json, ensure_dir, load_json_config, parse_precision_config
 log = logging.getLogger(__name__)
 
 
@@ -252,6 +251,7 @@ def create_dataloaders(
     cfg: Mapping[str, Any],
     *,
     tcfg: Mapping[str, Any],
+    precision: PrecisionConfig,
     preload_device: torch.device,
     seed: int,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Optional[torch.utils.data.DataLoader]]:
@@ -263,7 +263,6 @@ def create_dataloaders(
     windows_per_traj = _as_int(_require(ds_cfg, "windows_per_trajectory"), "dataset.windows_per_trajectory")
     preload_to_device = _as_bool(_require(ds_cfg, "preload_to_device"), "dataset.preload_to_device")
     shard_cache_size = _as_int(_require(ds_cfg, "shard_cache_size"), "dataset.shard_cache_size")
-    use_mmap = _as_bool(_require(ds_cfg, "use_mmap"), "dataset.use_mmap")
 
     batch_size = _as_int(_require(tcfg, "batch_size"), "training.batch_size")
     num_workers = _as_int(_require(tcfg, "num_workers"), "training.num_workers")
@@ -290,11 +289,10 @@ def create_dataloaders(
     k_train = max_rollout_steps_for_training(tcfg)
     k_eval = max_rollout_steps_for_eval(tcfg)
 
-    # If preloading to an accelerator, store tensors in bf16 to reduce HBM usage.
-    # This is safe when training/eval is running with bf16 AMP.
-    #storage_dtype = torch.bfloat16 if preload_to_device else torch.float32
-    storage_dtype = torch.float32
-
+    # Dataset dtype policy (centralized in cfg.precision):
+    # - If preloading to an accelerator, store tensors using precision.preload_dtype (often bf16 to save HBM).
+    # - Otherwise, emit precision.dataset_dtype.
+    storage_dtype = precision.preload_dtype if preload_to_device else precision.dataset_dtype
 
     common_ds_kwargs = dict(
         windows_per_trajectory=windows_per_traj,
@@ -302,7 +300,6 @@ def create_dataloaders(
         device=preload_device,
         storage_dtype=storage_dtype,
         shard_cache_size=shard_cache_size,
-        use_mmap=use_mmap,
     )
 
     train_ds = FlowMapRolloutDataset(processed_dir, "train", total_steps=k_train, seed=seed, **common_ds_kwargs)
@@ -360,7 +357,10 @@ def _load_weights_only(module: torch.nn.Module, ckpt_path: Path, *, strict: bool
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, default="config.json", help="Path to config.json")
+
+    # Repository layout: <repo_root>/config.json and <repo_root>/src/main.py
+    default_cfg = Path(__file__).resolve().parents[1] / "config.json"
+    ap.add_argument("--config", type=str, default=str(default_cfg), help="Path to config.json")
     return ap.parse_args()
 
 
@@ -415,9 +415,29 @@ def main() -> None:
     preload_device = select_preload_device(cfg)
     log.info("preload device: %s", preload_device)
 
-    train_dl, val_dl, test_dl = create_dataloaders(cfg, tcfg=tcfg, preload_device=preload_device, seed=seed)
+    prec = parse_precision_config(cfg)
+    log.info(
+        "precision: compute=%s amp=%s model=%s input=%s dataset=%s preload=%s loss=%s lightning=%s",
+        str(prec.compute_dtype),
+        prec.amp_mode,
+        str(prec.model_dtype),
+        str(prec.input_dtype),
+        str(prec.dataset_dtype),
+        str(prec.preload_dtype),
+        str(prec.loss_dtype),
+        prec.lightning_precision,
+    )
+
+    train_dl, val_dl, test_dl = create_dataloaders(
+        cfg,
+        tcfg=tcfg,
+        precision=prec,
+        preload_device=preload_device,
+        seed=seed,
+    )
 
     model = create_model(dict(cfg))
+    model = model.to(dtype=prec.model_dtype)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("model: type=%s S=%d G=%d params=%d trainable=%d",
@@ -429,6 +449,7 @@ def main() -> None:
         model=model,
         normalization_manifest=manifest,
         species_variables=species_vars,
+        precision=prec,
     )
 
     # On resume/weights-only runs, preserve any existing metrics.csv before Lightning touches it.
@@ -442,7 +463,7 @@ def main() -> None:
                 i += 1
             m.replace(dst)
 
-    trainer = build_lightning_trainer(cfg, work_dir=work_dir)
+    trainer = build_lightning_trainer(cfg, work_dir=work_dir, precision_config=prec)
 
     ckpt_mode = _as_str(_require(tcfg, "checkpoint_mode"), "training.checkpoint_mode").lower()
     ckpt_val = runtime.get("checkpoint", None)

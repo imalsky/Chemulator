@@ -73,7 +73,7 @@
       "dynamic": false,
       "fullgraph": true,
       "compile_forward_step": true,
-      "compile_open_loop_unroll": true
+      "compile_open_loop_unroll": false
     }
   },
   "data": {
@@ -139,6 +139,7 @@
       "  6. Normalize all splits and write final shards + normalization.json.",
       "  7. Write preprocessing_summary.json with counts and rejection breakdown."
     ],
+
     "_comment_raw_file_patterns": [
       "Glob patterns for discovering HDF5 files under paths.raw_dir.",
       "Can be a list of patterns or a single string.",
@@ -148,6 +149,7 @@
       "*.h5",
       "*.hdf5"
     ],
+
     "_comment_dt": [
       "dt: base timestep (seconds). Used directly when dt_mode='fixed'.",
       "  When dt_mode='per_chunk', dt serves as the default for dt_min and dt_max if they are omitted.",
@@ -165,15 +167,17 @@
     ],
     "dt": 100.0,
     "dt_mode": "per_chunk",
-    "dt_min": 5e-2,
-    "dt_max": 5e3,
+    "dt_min": 10.0,
+    "dt_max": 100.0,
     "dt_sampling": "loguniform",
+
     "_comment_n_steps": [
       "Number of uniformly-spaced time points per resampled chunk.",
       "Each chunk has shape [n_steps, n_species] for y and [n_steps-1] for dt.",
       "Larger n_steps captures longer trajectories but requires more memory per sample."
     ],
     "n_steps": 300,
+
     "_comment_t_min": [
       "Minimum start time for chunk placement (seconds).",
       "The actual start is max(t_min, first_positive_time_in_trajectory).",
@@ -181,25 +185,29 @@
       "t_start is sampled log-uniformly in [t_lo, t_hi] where t_hi = t_end - chunk_duration.",
       "Set very small to capture early-time chemistry; set larger to skip stiff transients."
     ],
-    "t_min": 0.0,
+    "t_min": 0.000,
+
     "_comment_output_trajectories_per_file": [
       "Target number of resampled chunks to extract per raw HDF5 file.",
       "Sampling stops once this many chunks have been successfully written.",
       "If the file has fewer viable trajectories, fewer chunks are produced."
     ],
     "output_trajectories_per_file": 5000,
+
     "_comment_shard_size": [
       "Maximum number of samples (resampled chunks) per NPZ shard file.",
       "Buffers are flushed to disk when this count is reached.",
       "Smaller shards improve random access and memory; larger shards reduce file count."
     ],
     "shard_size": 4096,
+
     "_comment_overwrite": [
       "If true, remove existing _tmp_physical/ and split directories before starting.",
       "If false, raise an error if output directories already exist (prevents accidental mixing)."
     ],
     "overwrite": true,
     "time_key": "t_time",
+
     "_comment_splits": [
       "val_fraction: fraction of trajectories assigned to the validation split.",
       "test_fraction: fraction of trajectories assigned to the test split.",
@@ -209,6 +217,7 @@
     ],
     "val_fraction": 0.1,
     "test_fraction": 0.1,
+
     "_comment_seed": [
       "RNG seed for all stochastic operations in preprocessing:",
       "  - reservoir sampling of trajectory groups from each HDF5 file",
@@ -219,12 +228,14 @@
       "Falls back to system.seed if not specified here."
     ],
     "seed": 1234,
+
     "_comment_pool_size": [
       "Maximum number of trajectory group keys to reservoir-sample per HDF5 file.",
       "Reservoir sampling avoids loading all keys into memory for very large files.",
       "Set >= total trajectories per file to sample exhaustively."
     ],
     "pool_size": 1000000,
+
     "_comment_samples_per_source_trajectory": [
       "Number of resampled chunks to attempt from each source trajectory.",
       "Each attempt independently samples a new dt (if per_chunk) and t_start.",
@@ -233,6 +244,7 @@
       "Minimum value is 1 (clamped internally)."
     ],
     "samples_per_source_trajectory": 1,
+
     "_comment_max_chunk_attempts_per_source": [
       "Maximum random t_start candidates to try when placing a chunk within a trajectory.",
       "If no valid placement is found after this many attempts, the chunk is rejected",
@@ -241,6 +253,7 @@
       "but increase per-trajectory processing time."
     ],
     "max_chunk_attempts_per_source": 200,
+
     "_comment_drop_below": [
       "Floor threshold for species mass fractions in raw (physical) space.",
       "If ANY value in y_raw falls below this, the entire trajectory is rejected",
@@ -258,19 +271,12 @@
   "model": {
     "type": "mlp",
     "activation": "silu",
-    "dropout": 0.0,
+    "dropout": 0.00,
     "layer_norm": true,
     "layer_norm_eps": 1e-05,
     "predict_delta": true,
     "mlp": {
-      "hidden_dims": [
-        2048,
-        2048,
-        2048,
-        2048,
-        2048,
-        2048
-      ],
+      "hidden_dims": [1024, 1024, 1024, 1024, 1024, 1024],
       "residual": true
     },
     "autoencoder": {
@@ -301,7 +307,7 @@
       ">1: needs autoregressive enabled"
     ],
     "batch_size": 8192,
-    "max_epochs": 500,
+    "max_epochs": 200,
     "checkpoint_mode": "none",
     "num_workers": 0,
     "pin_memory": false,
@@ -314,7 +320,7 @@
     },
     "optimizer": {
       "name": "adamw",
-      "lr": 0.0003,
+      "lr": 0.0001,
       "weight_decay": 0.0001,
       "exclude_norm_and_bias_from_weight_decay": true,
       "betas": [

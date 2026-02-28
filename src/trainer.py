@@ -31,7 +31,7 @@ Batch contract (from dataset.py):
 - dt: [B, K_full-1]    (per-transition normalized dt)
 - g:  [B, G]           (G may be 0)
 
-Note on “pushforward trick”:
+Note on "pushforward trick":
 - skip_steps warmup runs A(u) forward without grad, and training loss is computed on later steps.
 """
 
@@ -50,6 +50,7 @@ import torch.nn as nn
 
 from model import normalize_dt_shape
 
+from utils import PrecisionConfig, parse_precision_config
 # Lightning imports with compatibility (lightning.pytorch vs pytorch_lightning)
 try:
     import lightning.pytorch as pl
@@ -149,10 +150,12 @@ class HybridLoss(nn.Module):
         *,
         lambda_log10_mae: float,
         lambda_z_mse: float,
+        loss_dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
-        self.register_buffer("log_means", log_means.clone().detach())
-        self.register_buffer("log_stds", log_stds.clone().detach())
+        self.loss_dtype = loss_dtype
+        self.register_buffer("log_means", log_means.clone().detach().to(dtype=loss_dtype))
+        self.register_buffer("log_stds", log_stds.clone().detach().to(dtype=loss_dtype))
         self.lambda_log10_mae = float(lambda_log10_mae)
         self.lambda_z_mse = float(lambda_z_mse)
 
@@ -178,23 +181,23 @@ class HybridLoss(nn.Module):
         if step_weights is not None:
             if step_weights.ndim != 1 or int(step_weights.shape[0]) != int(K):
                 raise ValueError(f"step_weights must have shape [K={K}], got {tuple(step_weights.shape)}")
-            w = step_weights.to(device=pred_z.device, dtype=torch.float32).view(1, K, 1)
+            w = step_weights.to(device=pred_z.device, dtype=self.loss_dtype).view(1, K, 1)
             denom = (w.sum() * float(B * S)).clamp_min(_LOSS_DENOM_EPS)
 
-        diff_z = (pred_z - true_z).to(torch.float32)
+        diff_z = (pred_z - true_z).to(self.loss_dtype)
         if w is None:
             z_mse = diff_z.square().mean()
         else:
-            z_mse = diff_z.square().mul(w).sum(dtype=torch.float32) / denom  # type: ignore[arg-type]
+            z_mse = diff_z.square().mul(w).sum(dtype=self.loss_dtype) / denom  # type: ignore[arg-type]
 
-        pred_log10 = self._denormalize_log10(pred_z.to(torch.float32))
-        true_log10 = self._denormalize_log10(true_z.to(torch.float32))
-        diff_log10 = (pred_log10 - true_log10).abs()
+        # log10(y_phys) = z * log_std + log_mean, so the log-mean cancels in differences:
+        #   |pred_log10 - true_log10| = |(pred_z - true_z) * log_std|
+        diff_log10 = diff_z.abs().mul(self.log_stds)
 
         if w is None:
             log10_mae = diff_log10.mean()
         else:
-            log10_mae = diff_log10.mul(w).sum(dtype=torch.float32) / denom  # type: ignore[arg-type]
+            log10_mae = diff_log10.mul(w).sum(dtype=self.loss_dtype) / denom  # type: ignore[arg-type]
 
         loss_total = self.lambda_log10_mae * log10_mae + self.lambda_z_mse * z_mse
         return {"loss_total": loss_total, "loss_log10_mae": log10_mae, "loss_z_mse": z_mse}
@@ -204,20 +207,20 @@ def build_loss_buffers(
     normalization_manifest: Mapping[str, Any],
     species_variables: Sequence[str],
     device: torch.device,
+    *,
+    dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Create [1,1,S] log10_mean/log10_std tensors matching species_variables order."""
-    stats = (
-        normalization_manifest.get("per_key_stats")
-        or normalization_manifest.get("species_stats")
-        or normalization_manifest.get("stats")
-    )
+    if "per_key_stats" not in normalization_manifest:
+        raise KeyError("Normalization manifest missing 'per_key_stats'.")
+    stats = normalization_manifest["per_key_stats"]
     if not isinstance(stats, Mapping):
-        raise KeyError("Normalization manifest missing stats mapping (per_key_stats/species_stats/stats).")
+        raise TypeError("normalization manifest 'per_key_stats' must be a mapping.")
 
     means = [float(stats[name]["log_mean"]) for name in species_variables]
     stds = [float(stats[name]["log_std"]) for name in species_variables]
-    log_means = torch.tensor(means, device=device, dtype=torch.float32).view(1, 1, -1)
-    log_stds = torch.tensor(stds, device=device, dtype=torch.float32).view(1, 1, -1)
+    log_means = torch.tensor(means, device=device, dtype=dtype).view(1, 1, -1)
+    log_stds = torch.tensor(stds, device=device, dtype=dtype).view(1, 1, -1)
     return log_means, log_stds
 
 
@@ -314,11 +317,18 @@ class FlowMapRolloutModule(pl.LightningModule):
         cfg: Mapping[str, Any],
         normalization_manifest: Mapping[str, Any],
         species_variables: Sequence[str],
+        precision: Optional[PrecisionConfig] = None,
     ) -> None:
         super().__init__()
         self.model = model
         self.normalization_manifest = dict(normalization_manifest)
         self.species_variables = list(species_variables)
+
+        # Precision (centralized): controls dataset/model/loss dtypes and Lightning AMP settings.
+        self.precision_config = precision if precision is not None else parse_precision_config(cfg)
+        self.model_dtype = self.precision_config.model_dtype
+        self.input_dtype = self.precision_config.input_dtype
+        self.loss_dtype = self.precision_config.loss_dtype
 
         tcfg = dict(cfg["training"])
         mcfg = dict(cfg.get("model", {}) or {})
@@ -375,13 +385,17 @@ class FlowMapRolloutModule(pl.LightningModule):
         # Loss
         loss_cfg = dict(tcfg["loss"])
         log_means, log_stds = build_loss_buffers(
-            self.normalization_manifest, self.species_variables, device=torch.device("cpu")
+            self.normalization_manifest,
+            self.species_variables,
+            device=torch.device("cpu"),
+            dtype=self.loss_dtype,
         )
         self.criterion = HybridLoss(
             log_means,
             log_stds,
             lambda_log10_mae=float(loss_cfg["lambda_log10_mae"]),
             lambda_z_mse=float(loss_cfg["lambda_z_mse"]),
+            loss_dtype=self.loss_dtype,
         )
 
         self.sched_cfg = dict(tcfg.get("scheduler", {}) or {})
@@ -400,7 +414,7 @@ class FlowMapRolloutModule(pl.LightningModule):
                 )
             if bool(tc.get("compile_open_loop_unroll", False)):
                 self._compiled_open_loop_unroll = _try_torch_compile(
-                    self._open_loop_unroll, cfg=cfg, context="FlowMapRolloutModule._open_loop_unroll"
+                    self._open_loop_unroll_raw_step, cfg=cfg, context="FlowMapRolloutModule._open_loop_unroll_raw_step"
                 )
 
         # Dataloader wiring (kept for compatibility; main.py can also pass dataloaders directly)
@@ -503,6 +517,25 @@ class FlowMapRolloutModule(pl.LightningModule):
     def _eval_rollout_steps(self, *, transitions: int) -> int:
         return int(max(1, min(self.rollout_steps, transitions)))
 
+    def _cast_batch_tensors(
+        self,
+        y: torch.Tensor,
+        dt: torch.Tensor,
+        g: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Cast batch tensors to the configured input dtype.
+
+        Lightning moves tensors to the target device; this function only adjusts dtype.
+        """
+        target = self.input_dtype
+        if y.dtype != target:
+            y = y.to(dtype=target)
+        if dt.dtype != target:
+            dt = dt.to(dtype=target)
+        if g is not None and g.numel() > 0 and g.dtype != target:
+            g = g.to(dtype=target)
+        return y, dt, g
+
     @staticmethod
     def _step_weights(k: int, skip_steps: int, *, device: torch.device) -> Optional[torch.Tensor]:
         skip = int(max(0, skip_steps))
@@ -523,10 +556,40 @@ class FlowMapRolloutModule(pl.LightningModule):
         B, K = int(dt_bk.shape[0]), int(dt_bk.shape[1])
         g_t = self._coerce_g(g, B, y0)
 
+        if not hasattr(self.model, "forward_step"):
+            raise AttributeError("Model must implement forward_step(y_t, dt, g) -> y_{t+1}.")
+        step_fn = self._compiled_forward_step if self._compiled_forward_step is not None else self.model.forward_step  # type: ignore[attr-defined]
+
         y_pred = torch.empty((B, K, y0.shape[-1]), device=y0.device, dtype=y0.dtype)
         y_prev = y0
         for k in range(K):
-            y_prev = self._forward_step(y_prev, dt_bk[:, k], g_t)
+            y_prev = step_fn(y_prev, dt_bk[:, k], g_t)  # type: ignore[misc]
+            y_pred[:, k, :] = y_prev
+        return y_pred
+
+    def _open_loop_unroll_raw_step(
+        self,
+        *,
+        y0: torch.Tensor,     # [B,S]
+        dt_bk: torch.Tensor,  # [B,K]
+        g: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Open-loop rollout using the raw (uncompiled) model step.
+
+        This is used when compiling the unroll itself (compile_open_loop_unroll=True) so the
+        compiler can see the full step-to-step dependency chain and fuse across steps.
+        """
+        B, K = int(dt_bk.shape[0]), int(dt_bk.shape[1])
+        g_t = self._coerce_g(g, B, y0)
+
+        if not hasattr(self.model, "forward_step"):
+            raise AttributeError("Model must implement forward_step(y_t, dt, g) -> y_{t+1}.")
+        step_fn = self.model.forward_step  # type: ignore[attr-defined]
+
+        y_pred = torch.empty((B, K, y0.shape[-1]), device=y0.device, dtype=y0.dtype)
+        y_prev = y0
+        for k in range(K):
+            y_prev = step_fn(y_prev, dt_bk[:, k], g_t)  # type: ignore[misc]
             y_pred[:, k, :] = y_prev
         return y_pred
 
@@ -560,22 +623,21 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         self.log("lr", float(torch_opt.param_groups[0]["lr"]), on_step=False, on_epoch=True)
 
-        # If using fp16 mixed precision, log the *unscaled* grad norm.
-        try:
-            self.trainer.strategy.precision_plugin.unscale_gradients(torch_opt)
-        except Exception:
-            try:
-                self.trainer.precision_plugin.unscale_gradients(torch_opt)
-            except Exception:
-                pass
+        # Unscale gradients so logged grad_norm is in true scale.
+        # Only needed when a GradScaler is active (fp16 AMP); bf16/fp32 do not use one.
+        _plugin = getattr(self.trainer.strategy, "precision_plugin", None) or getattr(self.trainer, "precision_plugin", None)
+        if _plugin is not None and hasattr(_plugin, "unscale_gradients"):
+            _plugin.unscale_gradients(torch_opt)
 
-        gn2 = sum(
-            (p.grad.detach().float().norm(2) ** 2)
-            for pg in torch_opt.param_groups
-            for p in pg["params"]
-            if p.grad is not None
-        )
-        self.log("grad_norm", torch.sqrt(gn2 + torch.zeros((), device=self.device)), on_step=False, on_epoch=True)
+        gn2 = torch.zeros((), device=self.device, dtype=torch.float32)
+        for pg in torch_opt.param_groups:
+            for p in pg["params"]:
+                if p.grad is None:
+                    continue
+                # Cast only the scalar norm to fp32 to avoid allocating a full fp32 gradient copy.
+                n = p.grad.detach().norm(2).float()
+                gn2 = gn2 + n * n
+        self.log("grad_norm", torch.sqrt(gn2), on_step=False, on_epoch=True)
 
         clip_val = getattr(self.trainer, "gradient_clip_val", None)
 
@@ -610,6 +672,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         y = batch["y"]
         dt = batch["dt"]
         g = batch.get("g", None)
+        y, dt, g = self._cast_batch_tensors(y, dt, g)
 
         B, K_full, _ = y.shape
         transitions = max(1, int(K_full) - 1)
@@ -630,7 +693,6 @@ class FlowMapRolloutModule(pl.LightningModule):
         self.log("train_loss_log10_mae", losses["loss_log10_mae"], on_step=False, on_epoch=True)
         self.log("train_loss_z_mse", losses["loss_z_mse"], on_step=False, on_epoch=True)
 
-        # I was having trouble getting pylighting lr
         opt0 = self.trainer.optimizers[0]
         torch_opt0 = opt0.optimizer if hasattr(opt0, "optimizer") else opt0
         self.log("lr", float(torch_opt0.param_groups[0]["lr"]), on_step=False, on_epoch=True)
@@ -647,6 +709,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         y = batch["y"]
         dt = batch["dt"]
         g = batch.get("g", None)
+        y, dt, g = self._cast_batch_tensors(y, dt, g)
 
         B, K_full, S = y.shape
         transitions = max(1, int(K_full) - 1)
@@ -740,6 +803,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         y = batch["y"]
         dt = batch["dt"]
         g = batch.get("g", None)
+        y, dt, g = self._cast_batch_tensors(y, dt, g)
 
         B, K_full, _ = y.shape
         transitions = max(1, int(K_full) - 1)
@@ -907,20 +971,22 @@ class FlowMapRolloutModule(pl.LightningModule):
             raise ValueError(f"Unsupported scheduler type '{sched_type}' (supported: plateau, cosine_with_warmup)")
 
         # Cosine schedule with optional warmup (step-based).
-        max_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0)) if self.trainer else 0
+        if self.trainer is None:
+            raise RuntimeError("Trainer must be attached before configure_optimizers for cosine scheduler.")
+        max_steps = int(self.trainer.estimated_stepping_batches)
         if max_steps <= 0:
-            max_steps = int(self.max_epochs)
+            raise RuntimeError(f"estimated_stepping_batches={max_steps}; cannot build cosine schedule.")
 
         warmup_epochs = int(sched_cfg.get("warmup_epochs", 0))
         min_lr_ratio = float(sched_cfg.get("min_lr_ratio", 0.0))
 
         warmup_steps = 0
-        if warmup_epochs > 0 and self.trainer is not None:
-            try:
-                steps_per_epoch = int(self.trainer.estimated_stepping_batches) // max(1, int(self.max_epochs))
-                warmup_steps = int(warmup_epochs) * max(1, steps_per_epoch)
-            except Exception:
-                warmup_steps = 0
+        if warmup_epochs > 0:
+            if self.trainer is None:
+                raise RuntimeError("Trainer must be attached before configure_optimizers when warmup_epochs > 0.")
+            steps_per_epoch = int(self.trainer.estimated_stepping_batches) // max(1, int(self.max_epochs))
+            warmup_steps = int(warmup_epochs) * max(1, steps_per_epoch)
+
 
         warmup_steps = int(max(0, min(warmup_steps, max_steps)))
 
@@ -955,20 +1021,27 @@ class FlowMapRolloutModule(pl.LightningModule):
 # ==============================================================================
 
 
-def build_lightning_trainer(cfg: Mapping[str, Any], *, work_dir: Path) -> pl.Trainer:
+def build_lightning_trainer(
+    cfg: Mapping[str, Any],
+    *,
+    work_dir: Path,
+    precision_config: Optional[PrecisionConfig] = None,
+) -> pl.Trainer:
     tcfg = cfg["training"]
     runtime = dict(cfg.get("runtime", {}) or {})
 
     max_epochs = int(tcfg["max_epochs"])
     devices = runtime.get("devices", "auto")
     accelerator = runtime.get("accelerator", "auto")
-    precision = runtime.get("precision", "16-mixed")
+    prec = precision_config if precision_config is not None else parse_precision_config(cfg)
+    lightning_precision = prec.lightning_precision
     log_every_n_steps = int(runtime.get("log_every_n_steps", 50))
 
     ckpt_cfg = dict(runtime.get("checkpointing", {}) or {})
     enable_ckpt = bool(ckpt_cfg.get("enabled", True))
     ckpt_every_n_epochs = int(ckpt_cfg.get("every_n_epochs", 1))
     save_top_k = int(ckpt_cfg.get("save_top_k", 1))
+    save_last = bool(ckpt_cfg.get("save_last", True))
     monitor = str(ckpt_cfg.get("monitor", "val_loss"))
 
     work_dir = Path(work_dir)
@@ -999,7 +1072,7 @@ def build_lightning_trainer(cfg: Mapping[str, Any], *, work_dir: Path) -> pl.Tra
                 save_top_k=save_top_k,
                 mode="min",
                 every_n_epochs=ckpt_every_n_epochs,
-                save_last=True,
+                save_last=save_last,
             )
         )
 
@@ -1015,7 +1088,7 @@ def build_lightning_trainer(cfg: Mapping[str, Any], *, work_dir: Path) -> pl.Tra
         accelerator=accelerator,
         devices=devices,
         strategy=strategy,
-        precision=precision,
+        precision=lightning_precision,
         log_every_n_steps=log_every_n_steps,
         callbacks=callbacks,
         logger=csv_logger,
