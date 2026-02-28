@@ -28,7 +28,7 @@ plt.style.use("science.mplstyle")
 # ---------------- Paths & settings ----------------
 REPO = Path(__file__).parent.parent
 #MODEL_DIR = REPO / "models" / "big_big_big"
-MODEL_DIR = REPO / "models" / "big_mlp"
+MODEL_DIR = REPO / "models" / "final_model"
 EP_FILENAME = "export_k1_cpu.pt2"
 
 sys.path.insert(0, str(REPO / "src"))

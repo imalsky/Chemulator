@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-FlowMap Model Export Script (minimal)
-- CPU:  K=1, dynamic batch
-- CUDA: dynamic B,K
-- MPS:  dynamic B,K
+export.py
+
+FlowMap Model Export Script (dtype-consistent, B up to 8192)
+
+- CPU:  K=1, dynamic batch B in [1,8192], FP32
+- CUDA: dynamic B,K with B in [1,8192], K in [1,1024]
+  - BF16 export (primary)
+  - FP32 export (fallback for benchmarking / debug)
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import pathlib
@@ -17,28 +22,23 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-# --------------------------------------------------------------------------------------
-# Paths / basic config
-# --------------------------------------------------------------------------------------
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-#WORK_DIR = ROOT / "models" / "big_big_big"
-WORK_DIR = ROOT / "models" / "big_mlp"
+WORK_DIR = ROOT / "models" / "final_model"
 
 CONFIG_PATH = WORK_DIR / "config.json"
 
 CPU_OUT = WORK_DIR / "export_k1_cpu.pt2"
-GPU_OUT = WORK_DIR / "export_bk_gpu.pt2"
-MPS_OUT = WORK_DIR / "export_bk_mps.pt2"
+GPU_OUT_BF16 = WORK_DIR / "export_bk_gpu.pt2"
+GPU_OUT_FP32 = WORK_DIR / "export_bk_gpu_fp32.pt2"
 
-MIN_BATCH, MAX_BATCH = 1, 4096
+MIN_BATCH, MAX_BATCH = 1, 8192
 MIN_K, MAX_K = 1, 1024
 
 os.chdir(ROOT)
 sys.path.insert(0, str(SRC))
 
-from model import create_model  # type: ignore
+from model import create_model  # type: ignore  # noqa: E402
 
 try:
     torch.serialization.add_safe_globals([pathlib.PosixPath, pathlib.WindowsPath])
@@ -46,15 +46,16 @@ except Exception:
     pass
 
 
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
-
 def parse_dtype(dtype_str: str) -> torch.dtype:
     m = {
-        "float32": torch.float32, "float": torch.float32, "fp32": torch.float32,
-        "float16": torch.float16, "half": torch.float16, "fp16": torch.float16,
-        "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "float": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
     }
     return m.get(dtype_str.lower(), torch.float32)
 
@@ -86,13 +87,15 @@ def load_weights(model: nn.Module, ckpt_path: Path) -> None:
         )
     else:
         state = payload
-    clean = {}
+
+    clean: dict[str, torch.Tensor] = {}
     for k, v in state.items():
         kk = k
         for prefix in ("model.", "module.", "_orig_mod."):
             if kk.startswith(prefix):
-                kk = kk[len(prefix):]
+                kk = kk[len(prefix) :]
         clean[kk] = v
+
     model.load_state_dict(clean, strict=False)
 
 
@@ -106,18 +109,16 @@ def optimize_inference(model: nn.Module) -> nn.Module:
     return model
 
 
-# --------------------------------------------------------------------------------------
-# Export routines
-# --------------------------------------------------------------------------------------
-
 def export_cpu_k1(base: nn.Module) -> None:
     print("\n" + "=" * 80)
     print("Exporting CPU (K=1, dynamic B)")
     print("=" * 80)
 
-    device = "cpu"
-    dtype = parse_dtype("float32")
-    model = optimize_inference(base.to(device))
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    model = copy.deepcopy(base)
+    model = optimize_inference(model.to(device=device, dtype=dtype))
 
     S_in = int(getattr(model, "S_in"))
     G = int(getattr(model, "G", getattr(model, "global_dim", 0)) or 0)
@@ -126,16 +127,16 @@ def export_cpu_k1(base: nn.Module) -> None:
 
     B = 2
     y = torch.zeros(B, S_in, dtype=dtype, device=device)  # [B,S]
-    dt = torch.zeros(B, 1, dtype=dtype, device=device)    # [B,1] (K=1)
+    dt = torch.zeros(B, 1, dtype=dtype, device=device)    # [B,1]
     g = torch.zeros(B, G, dtype=dtype, device=device) if G > 0 else torch.empty(B, 0, dtype=dtype, device=device)
 
     ep = torch.export.export(
         model,
         (y, dt, g),
         dynamic_shapes=(
-            {0: Bdim},   # y: [B,S]
-            {0: Bdim},   # dt: [B,1]
-            {0: Bdim},   # g: [B,G]
+            {0: Bdim},
+            {0: Bdim},
+            {0: Bdim},
         ),
     )
 
@@ -144,14 +145,16 @@ def export_cpu_k1(base: nn.Module) -> None:
     print(f"  wrote {CPU_OUT}")
 
 
-def export_device_dynBK(base: nn.Module, device: str, out_path: Path, dtype_str: str) -> None:
-    pretty = "GPU (CUDA)" if device == "cuda" else "MPS (Apple Silicon)"
+def export_cuda_dynBK(base: nn.Module, out_path: Path, dtype_str: str) -> None:
     print("\n" + "=" * 80)
-    print(f"Exporting {pretty} (dynamic B,K)")
+    print(f"Exporting GPU (CUDA) (dynamic B,K) dtype={dtype_str}")
     print("=" * 80)
 
     dtype = parse_dtype(dtype_str)
-    model = optimize_inference(base.to(device))
+    dev = torch.device("cuda")
+
+    model = copy.deepcopy(base)
+    model = optimize_inference(model.to(device=dev, dtype=dtype))
 
     S_in = int(getattr(model, "S_in"))
     G = int(getattr(model, "G", getattr(model, "global_dim", 0)) or 0)
@@ -160,17 +163,17 @@ def export_device_dynBK(base: nn.Module, device: str, out_path: Path, dtype_str:
     Kdim = torch.export.Dim("K", min=MIN_K, max=MAX_K)
 
     B, K = 2, 2
-    y = torch.randn(B, S_in, dtype=dtype, device=device)  # [B,S]
-    dt = torch.randn(B, K, 1, dtype=dtype, device=device) # [B,K,1]
-    g = torch.randn(B, G, dtype=dtype, device=device) if G > 0 else torch.empty(B, 0, dtype=dtype, device=device)
+    y = torch.randn(B, S_in, dtype=dtype, device=dev)       # [B,S]
+    dt = torch.randn(B, K, 1, dtype=dtype, device=dev)      # [B,K,1]
+    g = torch.randn(B, G, dtype=dtype, device=dev) if G > 0 else torch.empty(B, 0, dtype=dtype, device=dev)
 
     ep = torch.export.export(
         model,
         (y, dt, g),
         dynamic_shapes=(
-            {0: Bdim},         # y: [B,S]
-            {0: Bdim, 1: Kdim},# dt: [B,K,1]
-            {0: Bdim},         # g: [B,G]
+            {0: Bdim},
+            {0: Bdim, 1: Kdim},
+            {0: Bdim},
         ),
     )
 
@@ -179,13 +182,9 @@ def export_device_dynBK(base: nn.Module, device: str, out_path: Path, dtype_str:
     print(f"  wrote {out_path}")
 
 
-# --------------------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------------------
-
 def main() -> None:
     print("=" * 80)
-    print("FlowMap Export: CPU K=1 + GPU/MPS dynamic-K")
+    print("FlowMap Export: CPU K=1 + GPU dynamic-K (B up to 8192)")
     print("=" * 80)
     print(f"Config path: {CONFIG_PATH}")
 
@@ -199,18 +198,13 @@ def main() -> None:
     export_cpu_k1(base)
 
     if torch.cuda.is_available():
-        export_device_dynBK(base, "cuda", GPU_OUT, "bfloat16")
+        export_cuda_dynBK(base, GPU_OUT_BF16, "bfloat16")
+        export_cuda_dynBK(base, GPU_OUT_FP32, "float32")
     else:
         print("[note] CUDA not available; skipping GPU export")
-
-    if torch.backends.mps.is_available():
-        export_device_dynBK(base, "mps", MPS_OUT, "float32")
-    else:
-        print("[note] MPS not available; skipping MPS export")
 
     print("\nDone.")
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     main()

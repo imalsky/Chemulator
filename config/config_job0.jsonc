@@ -5,7 +5,7 @@
     // List of raw HDF5 files (optional; auto-detect if empty)
     "raw_data_files": [],
     // Directory for logs/checkpoints/exports
-    "work_dir": "models/3",
+    "work_dir": "models/final_version",
     // Delete existing work_dir before start
     "overwrite": false
   },
@@ -78,7 +78,7 @@
 
   "dataset": {
     // Global training batch size
-    "batch_size_train": 1024,
+    "batch_size_train": 4096,
 
     // Optional: override dataset tensor dtype (null = use AMP dtype on CUDA; float32 forced on CPU/MPS)
     // Allowed strings: "float32", "float16", "bf16"/"bfloat16"
@@ -96,7 +96,7 @@
     // Return K targets per anchor (K=times_per_anchor)
     "multi_time_per_anchor": true,
     // K: number of target steps per anchor when multi_time_per_anchor
-    "times_per_anchor": 4,
+    "times_per_anchor": 2,
     // Use same offsets for entire batch
     "share_times_across_batch": false,
     // Sample offsets uniformly then fit anchors
@@ -122,7 +122,7 @@
   "model": {
     "mlp_only": false,
     // Latent channel count for autoencoder
-    "latent_dim": 1024,
+    "latent_dim": 512,
     // Encoder MLP hidden sizes
     "encoder_hidden": [1024, 1024, 1024, 1024],
     // Dynamics MLP hidden sizes
@@ -136,7 +136,7 @@
     // Use VAE-style stochastic encoder (if supported by your model.py)
     "vae_mode": false,
     // Predict Δz and add to z (residual dynamics)
-    "dynamics_residual": true,
+    "dynamics_residual": false,
     // Decoder predicts Δy in z-space
     "predict_delta": true,
     // Decoder predicts Δlog10(y) in physical space
@@ -149,7 +149,7 @@
 
   "training": {
     // Total epochs to train
-    "epochs": 100,
+    "epochs": 500,
     // Clip grad-norm at this value (0 = disabled)
     "gradient_clip": 0.0,
     // Gradient accumulation steps
@@ -165,7 +165,7 @@
     "compile_fullgraph": true,
 
     // Initial learning rate
-    "lr": 1e-4,
+    "lr": 3e-4,
     // Cosine schedule minimum learning rate
     "min_lr": 5e-7,
     // Linear warmup epochs before cosine
@@ -203,7 +203,7 @@
 
     "adaptive_stiff_loss": {
       "lambda_phys": 1.0,
-      "lambda_z": 0.5,
+      "lambda_z": 0.25,
       "use_weighting": false, // Set to false for equal 1.0 weights
       "weight_power": 0.5,   // Change to 1.0 for linear weighting
       "w_min": 0.5,          // The lowest weight a species can have

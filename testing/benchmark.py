@@ -1,142 +1,75 @@
 #!/usr/bin/env python3
 """
-Benchmark exported models across powers-of-two batch sizes for a fixed K.
+benchmark.py
 
-- Scans REPO/models/full_big (matches export.py outputs).
-- Infers S_in and G from data/processed/normalization.json.
-- Uses AOTI/PT2 depending on device and available artifacts, with fallback.
-- Detects BK (dynamic B,K) vs K1 (dynamic B only) from filename.
-- Throughput = (iters * B * K_eff) / elapsed; saves plots/bench_throughput_k{K}.png.
+CPU + GPU benchmark (B up to 8192), with VULCAN baseline.
+
+- Uses REPO/models/final_model.
+- CPU: export_k1_cpu.pt2 (K1, FP32)
+- GPU: tries export_bk_gpu.pt2 (BF16); if warmup dtype mismatch, falls back to
+       export_bk_gpu_fp32.pt2 (FP32).
+- Adds gray baseline line at y=100 labeled "VULCAN, CPU".
+- X limits autoset from curve data.
+- Y limits fixed to [1, 1e7].
 """
 
 from __future__ import annotations
+
+import json
+import math
 import os
 import time
-import json
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple
 
-import torch
 import matplotlib.pyplot as plt
+import torch
 
-# ====== GLOBALS ======
-MODEL_SUBDIR = "models/big_mlp"   # exporter target dir
-BENCH_K: int = 1                   # for BK exports; ignored by K1 exports
+MODEL_SUBDIR = "models/final_model"
+BENCH_K: int = 1
 
 WARMUP_STEPS: int = 10
 MEASURE_STEPS: int = 200
 
-# Caps for power-of-two batches
-MAX_POW2_BATCH_BY_TAG: Dict[str, Optional[int]] = {
-    "CPU": 1024,
-    "MPS": 4096,
-    "GPU": 8192,
-}
+MAX_BATCH_CPU = 8192
+MAX_BATCH_GPU = 8192
 
-# Whether to try AOTI first on each device
-PREFER_AOTI: Dict[str, bool] = {"CPU": False, "GPU": True, "MPS": True}
+VULCAN_BASELINE_Y = 100.0
+YMIN, YMAX = 10.0, 1.0e7
 
-# Match export.py filenames
-RAW_EXPORT = {
-    "CPU": "export_k1_cpu.pt2",   # K1
-    "GPU": "export_bk_gpu.pt2",   # BK
-    "MPS": "export_bk_mps.pt2",   # BK
-}
-AOTI_EXPORT = {
-    "GPU": "export_bk_gpu.aoti",  # BK
-    "MPS": "export_bk_mps.aoti",  # BK
-}
+CPU_PT2 = "export_k1_cpu.pt2"
+GPU_BF16_PT2 = "export_bk_gpu.pt2"
+GPU_FP32_PT2 = "export_bk_gpu_fp32.pt2"
 
-# MPS safety
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-os.environ.setdefault("AOTI_RUNTIME_CHECK_INPUTS", "1")
 
-# ====== PATHS ======
 ROOT = Path(__file__).resolve().parents[1]
 WORK_DIR = ROOT / MODEL_SUBDIR
-PROCESSED_DIR = ROOT / "data" / "processed"
-NORM_PATH = PROCESSED_DIR / "normalization.json"
-
-
-# ====== Helpers ======
-def _device_ok(tag: str) -> bool:
-    if tag == "CPU":
-        return True
-    if tag == "GPU":
-        return torch.cuda.is_available()
-    return torch.backends.mps.is_available()
-
-
-def _device_str(tag: str) -> str:
-    if tag == "CPU":
-        return "cpu"
-    if tag == "GPU":
-        return "cuda"
-    return "mps"
+NORM_PATH = ROOT / "data" / "processed" / "normalization.json"
 
 
 def _sync(dev: str) -> None:
     if dev.startswith("cuda"):
         torch.cuda.synchronize()
-    elif dev == "mps" and hasattr(torch, "mps"):
-        torch.mps.synchronize()
 
 
-def _dtype_for(tag: str) -> torch.dtype:
-    # Mirrors export defaults
-    return torch.bfloat16 if tag == "GPU" else torch.float32
+def _amp_ctx(dev: str, dtype: torch.dtype):
+    if dev.startswith("cuda") and dtype in (torch.float16, torch.bfloat16):
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    return nullcontext()
 
 
-def _p2_batches(max_cap: int, min_b: int = 1) -> List[int]:
-    """Return powers-of-two in [min_b, max_cap]."""
-    b = 1
-    while b < min_b:
-        b <<= 1
+def _p2_batches(max_cap: int) -> List[int]:
     out: List[int] = []
+    b = 1
     while b <= max_cap:
         out.append(b)
         b <<= 1
-    return out or [min_b]
-
-
-def _artifact_candidates(tag: str) -> List[Path]:
-    """Ordered list of candidate artifacts for a device tag."""
-    prefer_aoti = PREFER_AOTI.get(tag, False)
-    names: List[str] = []
-    if prefer_aoti and tag in AOTI_EXPORT:
-        names.append(AOTI_EXPORT[tag])
-    names.append(RAW_EXPORT[tag])
-    if not prefer_aoti and tag in AOTI_EXPORT:
-        names.append(AOTI_EXPORT[tag])  # fallback
-    return [WORK_DIR / n for n in names if (WORK_DIR / n).exists()]
-
-
-def _is_aoti(p: Path) -> bool:
-    return p.suffix == ".aoti" or (p.is_dir() and p.name.endswith(".aoti"))
-
-
-def _load_callable(p: Path):
-    """Load PT2 or AOTI artifact, returning (module, is_aoti)."""
-    if p.suffix == ".pt2":
-        from torch.export import load as torch_export_load
-        ep = torch_export_load(str(p))
-        return ep.module(), False
-    else:
-        # AOTI: file or directory
-        try:
-            from torch._inductor import aot_load_package
-        except Exception as e:
-            raise RuntimeError(f"AOTI loader unavailable: {e}")
-        return aot_load_package(str(p)), True
-
-
-def _signature_from_name(p: Path) -> str:
-    nm = p.name.lower()
-    return "K1" if "k1" in nm else "BK"
+    return out
 
 
 def _dims_from_normalization(norm_path: Path) -> Tuple[int, int]:
-    """Infer S_in and G from normalization.json."""
     if not norm_path.exists():
         raise FileNotFoundError(f"Missing {norm_path}")
     j = json.loads(norm_path.read_text())
@@ -145,45 +78,62 @@ def _dims_from_normalization(norm_path: Path) -> Tuple[int, int]:
     gvars = meta.get("global_variables") or j.get("global_variables") or []
     if not species:
         raise RuntimeError("species_variables missing in normalization.json")
-    S_in = len(species)
-    G = len(gvars or [])
-    return S_in, G
+    return len(species), len(gvars or [])
 
 
-def _make_inputs(
-    sig: str,
-    B: int,
-    K: int,
-    S_in: int,
-    G: int,
-    dtype: torch.dtype,
-    device: str,
-):
-    """
-    Inputs must match export signature:
-
-    - K1: y[B,S], dt[B,1],   g[B,G]
-    - BK: y[B,S], dt[B,K,1], g[B,G]
-    """
-    y = torch.randn(B, S_in, dtype=dtype, device=device).contiguous()  # [B,S]
-    if G > 0:
-        g = torch.randn(B, G, dtype=dtype, device=device).contiguous()  # [B,G]
-    else:
-        g = torch.empty(B, 0, dtype=dtype, device=device)
-
-    if sig == "K1":
-        dt = torch.randn(B, 1, dtype=dtype, device=device).contiguous()  # [B,1]
-    else:
-        dt = torch.randn(B, K, 1, dtype=dtype, device=device).contiguous()  # [B,K,1]
-
+def _make_inputs_k1(B: int, S_in: int, G: int, dtype: torch.dtype, device: str):
+    y = torch.randn(B, S_in, dtype=dtype, device=device).contiguous()
+    dt = torch.randn(B, 1, dtype=dtype, device=device).contiguous()
+    g = (
+        torch.randn(B, G, dtype=dtype, device=device).contiguous()
+        if G > 0
+        else torch.empty(B, 0, dtype=dtype, device=device)
+    )
     return y, dt, g
 
 
-# ====== Main ======
+def _make_inputs_bk(B: int, K: int, S_in: int, G: int, dtype: torch.dtype, device: str):
+    y = torch.randn(B, S_in, dtype=dtype, device=device).contiguous()
+    dt = torch.randn(B, K, 1, dtype=dtype, device=device).contiguous()
+    g = (
+        torch.randn(B, G, dtype=dtype, device=device).contiguous()
+        if G > 0
+        else torch.empty(B, 0, dtype=dtype, device=device)
+    )
+    return y, dt, g
+
+
+def _load_pt2(path: Path):
+    from torch.export import load as torch_export_load
+
+    ep = torch_export_load(str(path))
+    return ep.module()
+
+
+def _is_dtype_mismatch_err(e: Exception) -> bool:
+    msg = str(e)
+    return (
+        "must have the same dtype" in msg
+        or ("Float" in msg and "BFloat16" in msg)
+        or ("Tensor dtype mismatch" in msg)
+    )
+
+
+def _autoset_log_xlim(ax, curves: List[Tuple[str, List[int], List[float]]]) -> None:
+    xs: List[float] = []
+    for _, bs, _ in curves:
+        xs.extend([float(b) for b in bs if b > 0])
+    if not xs:
+        return
+    pad = 1.25
+    ax.set_xlim(max(min(xs) / pad, 1e-6), max(xs) * pad)
+
+
 def main() -> None:
     print("=" * 80)
     print(f"Benchmarking exported models in: {WORK_DIR}")
     print("=" * 80)
+    print(f"__file__={Path(__file__).resolve()}")
 
     if not WORK_DIR.exists():
         print(f"Model directory does not exist: {WORK_DIR}")
@@ -195,128 +145,173 @@ def main() -> None:
         print(f"Failed to read dims from {NORM_PATH}: {e}")
         return
 
-    tags = ["CPU", "GPU", "MPS"]
     curves: List[Tuple[str, List[int], List[float]]] = []
     png_out = WORK_DIR / f"plots/bench_throughput_k{BENCH_K}.png"
 
-    for tag in tags:
-        if not _device_ok(tag):
-            print(f"- {tag}: device not available, skipping")
-            continue
-
-        cands = _artifact_candidates(tag)
-        if not cands:
-            print(f"- {tag}: no artifacts found in {WORK_DIR}, skipping")
-            continue
-
-        dev = _device_str(tag)
-        dtype = _dtype_for(tag)
-
-        model = None
-        is_aoti = False
-        sig = "BK"
-        art: Optional[Path] = None
-
-        # Try preferred artifact, then fallbacks
-        for candidate in cands:
-            try:
-                m, is_a = _load_callable(candidate)
-                model, is_aoti, art = m, is_a, candidate
-                sig = _signature_from_name(candidate)
-                break
-            except Exception as e:
-                print(f"- {tag}: failed to load {candidate.name}: {e}")
-
-        if model is None or art is None:
-            print(f"- {tag}: cannot load any artifact, skipping")
-            continue
-
-        # Batch schedule
-        max_cap = MAX_POW2_BATCH_BY_TAG.get(tag) or 16384
-        batches = _p2_batches(max_cap=max_cap, min_b=1)
+    # ---------------- CPU ----------------
+    cpu_path = WORK_DIR / CPU_PT2
+    if not cpu_path.exists():
+        print(f"- CPU: missing {cpu_path}")
+    else:
+        model_cpu = _load_pt2(cpu_path)
+        dev = "cpu"
+        dtype = torch.float32
+        batches = _p2_batches(MAX_BATCH_CPU)
 
         print(
-            f"- {tag}: using {art.name} "
-            f"({'AOTI' if is_aoti else 'PT2'}), sig={sig}, device={dev}, dtype={dtype}, "
-            f"S_in={S_in}, G={G}, K={BENCH_K}, B∈{batches}"
+            f"- CPU: using {cpu_path.name} (PT2), sig=K1, device={dev}, dtype={dtype}, "
+            f"S_in={S_in}, G={G}, K=1, B∈{batches}"
         )
 
-        def run_once(B: int):
-            inp = _make_inputs(sig, B, BENCH_K, S_in, G, dtype, dev)
-            with torch.inference_mode():
-                return model(*inp)
-
-        # Validate at B=1; if AOTI fails, fall back to PT2 where possible
         try:
-            run_once(1)
-            _sync(dev)
+            inp = _make_inputs_k1(1, S_in, G, dtype, dev)
+            with torch.inference_mode():
+                _ = model_cpu(*inp)
         except Exception as e:
-            if is_aoti:
-                print(f"  AOTI warmup failed: {e}\n  -> Falling back to PT2 for {tag}")
-                pt2 = WORK_DIR / RAW_EXPORT[tag]
-                if not pt2.exists():
-                    print("  PT2 export not available; skipping this tag")
-                    continue
+            print(f"  CPU warmup failed: {e}")
+        else:
+            thr: List[float] = []
+            ok_batches: List[int] = []
+            for B in batches:
                 try:
-                    model, is_aoti = _load_callable(pt2)
-                    sig = _signature_from_name(pt2)
-                    run_once(1)
-                    _sync(dev)
-                except Exception as e2:
-                    print(f"  PT2 warmup also failed: {e2}; skipping this tag")
-                    continue
-            else:
-                print(f"  Warmup failed: {e}; skipping this tag")
-                continue
+                    inp = _make_inputs_k1(B, S_in, G, dtype, dev)
 
-        # Measure throughput
-        thr: List[float] = []
-        for B in batches:
-            try:
-                inp = _make_inputs(sig, B, BENCH_K, S_in, G, dtype, dev)
+                    for _ in range(WARMUP_STEPS):
+                        with torch.inference_mode():
+                            _ = model_cpu(*inp)
 
-                # Warmup
-                for _ in range(WARMUP_STEPS):
+                    t0 = time.perf_counter()
                     with torch.inference_mode():
-                        _ = model(*inp)
-                _sync(dev)
+                        for _ in range(MEASURE_STEPS):
+                            _ = model_cpu(*inp)
+                    elapsed = time.perf_counter() - t0
 
-                # Timed region
-                t0 = time.perf_counter()
-                with torch.inference_mode():
-                    for _ in range(MEASURE_STEPS):
-                        _ = model(*inp)
-                _sync(dev)
-                elapsed = time.perf_counter() - t0
+                    sps = (MEASURE_STEPS * B) / max(elapsed, 1e-12)
+                    thr.append(float(sps))
+                    ok_batches.append(B)
+                    print(f"    B={B:>5d} -> {sps:,.1f} samples/s")
+                except Exception as e:
+                    print(f"    B={B:>5d} failed: {e}")
+                    break
 
-                K_eff = BENCH_K if sig == "BK" else 1
-                sps = (MEASURE_STEPS * B * K_eff) / max(elapsed, 1e-12)
-                thr.append(sps)
-                print(f"    B={B:>5d} → {sps:,.1f} samples/s")
+            if thr:
+                curves.append(("CPU", ok_batches, thr))
+
+    # ---------------- GPU ----------------
+    if not torch.cuda.is_available():
+        print("- GPU: CUDA not available, skipping")
+    else:
+        dev = "cuda"
+        batches = _p2_batches(MAX_BATCH_GPU)
+
+        gpu_path_bf16 = WORK_DIR / GPU_BF16_PT2
+        gpu_path_fp32 = WORK_DIR / GPU_FP32_PT2
+
+        chosen_path: Path | None = None
+        chosen_dtype: torch.dtype | None = None
+        model_gpu = None
+
+        # Try BF16 export first
+        if gpu_path_bf16.exists():
+            try:
+                model_gpu = _load_pt2(gpu_path_bf16)
+                chosen_path = gpu_path_bf16
+                chosen_dtype = torch.bfloat16
+                inp = _make_inputs_bk(1, BENCH_K, S_in, G, chosen_dtype, dev)
+                with torch.inference_mode(), _amp_ctx(dev, chosen_dtype):
+                    _ = model_gpu(*inp)
+                _sync(dev)
             except Exception as e:
-                print(f"    B={B:>5d} failed: {e}")
-                break
+                if _is_dtype_mismatch_err(e) and gpu_path_fp32.exists():
+                    print(f"- GPU: BF16 warmup failed ({e}) -> using {gpu_path_fp32.name} for GPU benchmark")
+                    model_gpu = None
+                    chosen_path = None
+                    chosen_dtype = None
+                else:
+                    print(f"- GPU: warmup failed: {e}")
+                    model_gpu = None
 
-        if thr:
-            curves.append((tag, batches[: len(thr)], thr))
+        # Fall back to FP32 export
+        if model_gpu is None and gpu_path_fp32.exists():
+            try:
+                model_gpu = _load_pt2(gpu_path_fp32)
+                chosen_path = gpu_path_fp32
+                chosen_dtype = torch.float32
+                inp = _make_inputs_bk(1, BENCH_K, S_in, G, chosen_dtype, dev)
+                with torch.inference_mode(), _amp_ctx(dev, chosen_dtype):
+                    _ = model_gpu(*inp)
+                _sync(dev)
+            except Exception as e:
+                print(f"- GPU: FP32 warmup failed: {e}")
+                model_gpu = None
+
+        if model_gpu is None or chosen_path is None or chosen_dtype is None:
+            print("- GPU: no usable artifact, skipping")
+        else:
+            print(
+                f"- GPU: using {chosen_path.name} (PT2), sig=BK, device={dev}, dtype={chosen_dtype}, "
+                f"S_in={S_in}, G={G}, K={BENCH_K}, B∈{batches}"
+            )
+
+            thr: List[float] = []
+            ok_batches: List[int] = []
+            amp_ctx = _amp_ctx(dev, chosen_dtype)
+
+            for B in batches:
+                try:
+                    inp = _make_inputs_bk(B, BENCH_K, S_in, G, chosen_dtype, dev)
+
+                    for _ in range(WARMUP_STEPS):
+                        with torch.inference_mode(), amp_ctx:
+                            _ = model_gpu(*inp)
+                    _sync(dev)
+
+                    t0 = time.perf_counter()
+                    with torch.inference_mode(), amp_ctx:
+                        for _ in range(MEASURE_STEPS):
+                            _ = model_gpu(*inp)
+                    _sync(dev)
+
+                    elapsed = time.perf_counter() - t0
+                    sps = (MEASURE_STEPS * B * BENCH_K) / max(elapsed, 1e-12)
+                    thr.append(float(sps))
+                    ok_batches.append(B)
+                    print(f"    B={B:>5d} -> {sps:,.1f} samples/s")
+                except Exception as e:
+                    print(f"    B={B:>5d} failed: {e}")
+                    break
+
+            if thr:
+                curves.append(("GPU", ok_batches, thr))
 
     if not curves:
-        print("No curves to plot. Nothing was benchmarked.")
+        print("No curves to plot.")
         return
 
-    # ====== Plot (square axes, ax-based API) ======
-    plt.style.use("science.mplstyle")
-    fig, ax = plt.subplots(figsize=(6, 6))
+    try:
+        plt.style.use("science.mplstyle")
+    except OSError:
+        pass
 
+    fig, ax = plt.subplots(figsize=(6, 6))
     for label, bs, th in curves:
         ax.plot(bs, th, marker="o", label=label)
+
+    ax.axhline(y=VULCAN_BASELINE_Y, linewidth=2, color="gray", linestyle="--", label="VULCAN, CPU")
 
     ax.set_xlabel("Batch size (B)")
     ax.set_ylabel("Throughput (samples/second)")
     ax.set_xscale("log")
     ax.set_yscale("log")
+
+    # Fixed y-limits per request
+    ax.set_ylim(YMIN, YMAX)
+
+    # X-limits from data
+    _autoset_log_xlim(ax, curves)
+
     ax.legend(loc="best")
-    ax.set_box_aspect(1)  # square axes region
+    ax.set_box_aspect(1)
 
     fig.tight_layout()
     png_out.parent.mkdir(parents=True, exist_ok=True)
