@@ -29,7 +29,7 @@ Logging:
 Batch contract (from dataset.py):
 - y:  [B, K_full, S]   (states in z-space)
 - dt: [B, K_full-1]    (per-transition normalized dt)
-- g:  [B, G]           (G may be 0)
+- g:  [B, G]           (G = 2 mandatory: P, T)
 
 Note on "pushforward trick":
 - skip_steps warmup runs A(u) forward without grad, and training loss is computed on later steps.
@@ -51,28 +51,15 @@ import torch.nn as nn
 from model import normalize_dt_shape
 
 from utils import PrecisionConfig, parse_precision_config
-# Lightning imports with compatibility (lightning.pytorch vs pytorch_lightning)
-try:
-    import lightning.pytorch as pl
-    from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-    from lightning.pytorch.loggers import CSVLogger
-except ImportError:  # pragma: no cover
-    import pytorch_lightning as pl  # type: ignore
-    from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint  # type: ignore
-    from pytorch_lightning.loggers import CSVLogger  # type: ignore
-
-# Rank-zero warn helper (varies across versions)
-try:
-    from lightning_utilities.core.rank_zero import rank_zero_warn  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from pytorch_lightning.utilities.rank_zero import rank_zero_warn  # type: ignore
-    except Exception:  # pragma: no cover
-        def rank_zero_warn(msg: str, *args: Any, **kwargs: Any) -> None:  # type: ignore
-            logging.getLogger(__name__).warning(msg)
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger
+from lightning_utilities.core.rank_zero import rank_zero_warn
 
 
 _LOSS_DENOM_EPS = 1e-3
+_LOG_GRAD_NORM_DEFAULT = False
+log = logging.getLogger(__name__)
 
 # ==============================================================================
 # Optimizer parameter groups
@@ -159,9 +146,6 @@ class HybridLoss(nn.Module):
         self.lambda_log10_mae = float(lambda_log10_mae)
         self.lambda_z_mse = float(lambda_z_mse)
 
-    def _denormalize_log10(self, z: torch.Tensor) -> torch.Tensor:
-        return z * self.log_stds + self.log_means
-
     def forward(
         self,
         pred_z: torch.Tensor,  # [B,K,S]
@@ -233,16 +217,23 @@ def _try_torch_compile(fn: Any, *, cfg: Mapping[str, Any], context: str) -> Any:
     """Optionally wrap a callable with torch.compile (strict)."""
     runtime = dict(cfg.get("runtime", {}) or {})
     tc = dict(runtime.get("torch_compile", {}) or {})
-    if not bool(tc.get("enabled", False)):
+    if not bool(tc.get("enabled", True)):
         return fn
 
     if not hasattr(torch, "compile"):
         raise RuntimeError(f"runtime.torch_compile.enabled=True but torch.compile is unavailable ({context}).")
 
     backend = str(tc.get("backend", "inductor"))
-    mode = str(tc.get("mode", "reduce-overhead"))
+    mode = str(tc.get("mode", "default"))
     dynamic = bool(tc.get("dynamic", False))
     fullgraph = bool(tc.get("fullgraph", False))
+    accelerator = str(runtime.get("accelerator", "auto")).lower().strip()
+
+    mps_available = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+    targeting_mps = accelerator == "mps" or (accelerator == "auto" and mps_available and not torch.cuda.is_available())
+    if backend == "inductor" and targeting_mps:
+        log.info("Skipping torch.compile for %s (inductor backend on MPS).", context)
+        return fn
 
     sig = inspect.signature(torch.compile)
     kwargs: Dict[str, Any] = {}
@@ -268,9 +259,7 @@ def _try_torch_compile(fn: Any, *, cfg: Mapping[str, Any], context: str) -> Any:
 
 @dataclass(frozen=True)
 class RolloutCurriculum:
-    """Ramps training rollout steps from start_steps -> end_steps over ramp_epochs.
-
-    """
+    """Ramps training rollout steps from start_steps -> end_steps over ramp_epochs."""
 
     enabled: bool
     mode: str
@@ -279,11 +268,11 @@ class RolloutCurriculum:
     ramp_epochs: int
 
     def steps(self, epoch: int) -> int:
-        end_k = int(max(1, self.end_steps))
+        end_k = int(self.end_steps)
         if not self.enabled:
             return end_k
 
-        start_k = int(max(1, self.start_steps))
+        start_k = int(self.start_steps)
         if self.ramp_epochs <= 0 or start_k >= end_k:
             return start_k
 
@@ -299,7 +288,7 @@ class RolloutCurriculum:
             raise ValueError(f"Unknown curriculum.mode '{self.mode}' (expected: linear|cosine)")
 
         k = start_k + int((end_k - start_k) * f)
-        return int(max(1, min(end_k, k)))
+        return int(min(end_k, k))
 
 
 # ==============================================================================
@@ -346,6 +335,8 @@ class FlowMapRolloutModule(pl.LightningModule):
             if "detach_between_steps" not in ar_cfg:
                 raise KeyError("missing: training.autoregressive_training.detach_between_steps")
             self.ar_skip_steps = int(ar_cfg["skip_steps"])
+            if self.ar_skip_steps < 0:
+                raise ValueError(f"training.autoregressive_training.skip_steps must be >= 0, got {self.ar_skip_steps}")
             self.ar_detach_between_steps = bool(ar_cfg["detach_between_steps"])
         else:
             self.ar_skip_steps = 0
@@ -400,19 +391,22 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         self.sched_cfg = dict(tcfg.get("scheduler", {}) or {})
 
+        # Validate model interface once at init (both FlowMapMLP and FlowMapAutoencoder provide this).
+        if not hasattr(self.model, "forward_step"):
+            raise RuntimeError("Model must implement forward_step(y_t, dt, g) -> y_{t+1}.")
+
         # Optional compilation
         runtime = dict(cfg.get("runtime", {}) or {})
         tc = dict(runtime.get("torch_compile", {}) or {})
+        self.log_grad_norm = bool(runtime.get("log_grad_norm", _LOG_GRAD_NORM_DEFAULT))
         self._compiled_forward_step: Optional[Any] = None
         self._compiled_open_loop_unroll: Optional[Any] = None
-        if bool(tc.get("enabled", False)):
-            if bool(tc.get("compile_forward_step", False)):
-                if not hasattr(self.model, "forward_step"):
-                    raise RuntimeError("compile_forward_step=True but model has no forward_step method.")
+        if bool(tc.get("enabled", True)):
+            if bool(tc.get("compile_forward_step", True)):
                 self._compiled_forward_step = _try_torch_compile(
                     self.model.forward_step, cfg=cfg, context="FlowMapRolloutModule.model.forward_step"  # type: ignore[attr-defined]
                 )
-            if bool(tc.get("compile_open_loop_unroll", False)):
+            if bool(tc.get("compile_open_loop_unroll", True)):
                 self._compiled_open_loop_unroll = _try_torch_compile(
                     self._open_loop_unroll_raw_step, cfg=cfg, context="FlowMapRolloutModule._open_loop_unroll_raw_step"
                 )
@@ -432,15 +426,12 @@ class FlowMapRolloutModule(pl.LightningModule):
         self.save_hyperparameters({"training": dict(tcfg), "model": dict(mcfg)})
 
     # ------------------------
-    # Dataloader wiring (optional)
+    # Dataloader wiring
     # ------------------------
-
-    def set_dataloaders(self, train_dl: Any, val_dl: Any = None, test_dl: Any = None) -> None:
-        self._train_dl, self._val_dl, self._test_dl = train_dl, val_dl, test_dl
 
     def train_dataloader(self) -> Any:
         if self._train_dl is None:
-            raise RuntimeError("train_dataloader not set. Pass dataloaders to Trainer.fit(...) or call set_dataloaders().")
+            raise RuntimeError("train_dataloader not set. Pass dataloaders to Trainer.fit(...).")
         return self._train_dl
 
     def val_dataloader(self) -> Any:
@@ -469,7 +460,7 @@ class FlowMapRolloutModule(pl.LightningModule):
                 "train_loss (one-jump training) is not directly comparable to val_loss/test_loss (open-loop rollout evaluation). "
                 "Compare within the same rollout procedure."
             )
-        rank_zero_warn(msg)
+        log.info(msg)
 
     # ------------------------
     # Epoch timing
@@ -487,15 +478,10 @@ class FlowMapRolloutModule(pl.LightningModule):
     # ------------------------
 
     def _forward_step(self, y_t: torch.Tensor, dt: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        if not hasattr(self.model, "forward_step"):
-            raise AttributeError("Model must implement forward_step(y_t, dt, g) -> y_{t+1}.")
         fn = self._compiled_forward_step if self._compiled_forward_step is not None else self.model.forward_step  # type: ignore[attr-defined]
         return fn(y_t, dt, g)  # type: ignore[misc]
 
-    def _coerce_g(self, g: Optional[torch.Tensor], batch_size: int, like: torch.Tensor) -> torch.Tensor:
-        if g is None or g.numel() == 0:
-            return like.new_zeros((batch_size, 0))
-
+    def _coerce_g(self, g: torch.Tensor, batch_size: int, like: torch.Tensor) -> torch.Tensor:
         if g.ndim == 1:
             g = g.view(1, -1).expand(batch_size, -1)
         elif g.ndim == 2:
@@ -510,19 +496,19 @@ class FlowMapRolloutModule(pl.LightningModule):
 
     def _train_rollout_steps(self, epoch: int, *, transitions: int) -> int:
         if not self.curriculum.enabled:
-            return int(max(1, min(self.rollout_steps, transitions)))
+            return int(min(self.rollout_steps, transitions))
         k = int(self.curriculum.steps(epoch))
-        return int(max(1, min(self.rollout_steps, transitions, k)))
+        return int(min(self.rollout_steps, transitions, k))
 
     def _eval_rollout_steps(self, *, transitions: int) -> int:
-        return int(max(1, min(self.rollout_steps, transitions)))
+        return int(min(self.rollout_steps, transitions))
 
     def _cast_batch_tensors(
         self,
         y: torch.Tensor,
         dt: torch.Tensor,
-        g: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        g: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Cast batch tensors to the configured input dtype.
 
         Lightning moves tensors to the target device; this function only adjusts dtype.
@@ -532,13 +518,13 @@ class FlowMapRolloutModule(pl.LightningModule):
             y = y.to(dtype=target)
         if dt.dtype != target:
             dt = dt.to(dtype=target)
-        if g is not None and g.numel() > 0 and g.dtype != target:
+        if g.dtype != target:
             g = g.to(dtype=target)
         return y, dt, g
 
     @staticmethod
     def _step_weights(k: int, skip_steps: int, *, device: torch.device) -> Optional[torch.Tensor]:
-        skip = int(max(0, skip_steps))
+        skip = int(skip_steps)
         if skip <= 0:
             return None
         w = torch.ones((int(k),), device=device, dtype=torch.float32)
@@ -550,14 +536,12 @@ class FlowMapRolloutModule(pl.LightningModule):
         *,
         y0: torch.Tensor,     # [B,S]
         dt_bk: torch.Tensor,  # [B,K]
-        g: Optional[torch.Tensor],
+        g: torch.Tensor,      # [B,G]
     ) -> torch.Tensor:
         """Open-loop rollout: feed predictions back in (no teacher forcing)."""
         B, K = int(dt_bk.shape[0]), int(dt_bk.shape[1])
         g_t = self._coerce_g(g, B, y0)
 
-        if not hasattr(self.model, "forward_step"):
-            raise AttributeError("Model must implement forward_step(y_t, dt, g) -> y_{t+1}.")
         step_fn = self._compiled_forward_step if self._compiled_forward_step is not None else self.model.forward_step  # type: ignore[attr-defined]
 
         y_pred = torch.empty((B, K, y0.shape[-1]), device=y0.device, dtype=y0.dtype)
@@ -572,7 +556,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         *,
         y0: torch.Tensor,     # [B,S]
         dt_bk: torch.Tensor,  # [B,K]
-        g: Optional[torch.Tensor],
+        g: torch.Tensor,      # [B,G]
     ) -> torch.Tensor:
         """Open-loop rollout using the raw (uncompiled) model step.
 
@@ -582,8 +566,6 @@ class FlowMapRolloutModule(pl.LightningModule):
         B, K = int(dt_bk.shape[0]), int(dt_bk.shape[1])
         g_t = self._coerce_g(g, B, y0)
 
-        if not hasattr(self.model, "forward_step"):
-            raise AttributeError("Model must implement forward_step(y_t, dt, g) -> y_{t+1}.")
         step_fn = self.model.forward_step  # type: ignore[attr-defined]
 
         y_pred = torch.empty((B, K, y0.shape[-1]), device=y0.device, dtype=y0.dtype)
@@ -629,19 +611,18 @@ class FlowMapRolloutModule(pl.LightningModule):
         if _plugin is not None and hasattr(_plugin, "unscale_gradients"):
             _plugin.unscale_gradients(torch_opt)
 
-        gn2 = torch.zeros((), device=self.device, dtype=torch.float32)
-        for pg in torch_opt.param_groups:
-            for p in pg["params"]:
-                if p.grad is None:
-                    continue
-                # Cast only the scalar norm to fp32 to avoid allocating a full fp32 gradient copy.
-                n = p.grad.detach().norm(2).float()
-                gn2 = gn2 + n * n
-        self.log("grad_norm", torch.sqrt(gn2), on_step=False, on_epoch=True)
+        if self.log_grad_norm:
+            gn2 = torch.zeros((), device=self.device, dtype=torch.float32)
+            for pg in torch_opt.param_groups:
+                for p in pg["params"]:
+                    if p.grad is None:
+                        continue
+                    # Cast only the scalar norm to fp32 to avoid allocating a full fp32 gradient copy.
+                    n = p.grad.detach().norm(2).float()
+                    gn2 = gn2 + n * n
+            self.log("grad_norm", torch.sqrt(gn2), on_step=False, on_epoch=True)
 
         clip_val = getattr(self.trainer, "gradient_clip_val", None)
-
-
         if clip_val is not None and float(clip_val) > 0:
             self.clip_gradients(
                 opt,
@@ -671,11 +652,11 @@ class FlowMapRolloutModule(pl.LightningModule):
     def _training_step_one_jump(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         y = batch["y"]
         dt = batch["dt"]
-        g = batch.get("g", None)
+        g = batch["g"]
         y, dt, g = self._cast_batch_tensors(y, dt, g)
 
         B, K_full, _ = y.shape
-        transitions = max(1, int(K_full) - 1)
+        transitions = int(K_full) - 1
         dt_full = normalize_dt_shape(dt, batch_size=B, seq_len=transitions, context="train/one_jump")
 
         if K_full < 2:
@@ -708,11 +689,11 @@ class FlowMapRolloutModule(pl.LightningModule):
     def _training_step_autoregressive(self, batch: Mapping[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         y = batch["y"]
         dt = batch["dt"]
-        g = batch.get("g", None)
+        g = batch["g"]
         y, dt, g = self._cast_batch_tensors(y, dt, g)
 
         B, K_full, S = y.shape
-        transitions = max(1, int(K_full) - 1)
+        transitions = int(K_full) - 1
 
         dt_full = normalize_dt_shape(dt, batch_size=B, seq_len=transitions, context="train/autoregressive")
         k_train = self._train_rollout_steps(int(self.current_epoch), transitions=transitions)
@@ -722,7 +703,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         y0 = y[:, 0, :]
         g_t = self._coerce_g(g, B, y0)
 
-        skip = int(max(0, self.ar_skip_steps))
+        skip = int(self.ar_skip_steps)
         if skip >= k_train:
             raise ValueError(f"skip_steps ({skip}) must be < rollout_steps ({k_train}).")
 
@@ -802,11 +783,11 @@ class FlowMapRolloutModule(pl.LightningModule):
     def _eval_step(self, batch: Mapping[str, torch.Tensor], stage: str) -> torch.Tensor:
         y = batch["y"]
         dt = batch["dt"]
-        g = batch.get("g", None)
+        g = batch["g"]
         y, dt, g = self._cast_batch_tensors(y, dt, g)
 
         B, K_full, _ = y.shape
-        transitions = max(1, int(K_full) - 1)
+        transitions = int(K_full) - 1
         k_eval = self._eval_rollout_steps(transitions=transitions)
 
         dt_full = normalize_dt_shape(dt, batch_size=B, seq_len=transitions, context=f"{stage}/eval")
@@ -896,8 +877,8 @@ class FlowMapRolloutModule(pl.LightningModule):
         )
         param_groups = _build_optimizer_param_groups(self, weight_decay=weight_decay, exclude_norm_and_bias=exclude_nd)
 
-        if name not in ("adam", "adamw"):
-            raise ValueError(f"Unsupported optimizer '{name}' (supported: adam, adamw)")
+        if name != "adamw":
+            raise ValueError("Unsupported optimizer; only 'adamw' is allowed")
 
         betas = opt_cfg.get("betas", (0.9, 0.999))
         b0, b1 = float(betas[0]), float(betas[1])
@@ -905,52 +886,41 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         use_fused = bool(opt_cfg.get("fused", True))
         use_foreach = bool(opt_cfg.get("foreach", True))
+        if use_fused and use_foreach:
+            raise ValueError("optimizer config invalid: fused and foreach cannot both be true")
 
         # Weight decay is handled by param groups, so pass 0 here.
         opt_wd_default = 0.0
 
-        if name == "adam":
-            if use_fused:
-                try:
-                    opt = torch.optim.Adam(
-                        param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, fused=True
-                    )
-                except TypeError:
-                    opt = torch.optim.Adam(
-                        param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, foreach=use_foreach
-                    )
-            else:
-                opt = torch.optim.Adam(
-                    param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, foreach=use_foreach
-                )
-        else:  # adamw
-            if use_fused:
-                try:
-                    opt = torch.optim.AdamW(
-                        param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, fused=True
-                    )
-                except TypeError:
-                    opt = torch.optim.AdamW(
-                        param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, foreach=use_foreach
-                    )
-            else:
-                opt = torch.optim.AdamW(
-                    param_groups, lr=lr, betas=(b0, b1), eps=eps, weight_decay=opt_wd_default, foreach=use_foreach
-                )
+        opt_kwargs: Dict[str, Any] = {
+            "params": param_groups,
+            "lr": lr,
+            "betas": (b0, b1),
+            "eps": eps,
+            "weight_decay": opt_wd_default,
+        }
+        if use_fused:
+            opt_kwargs["fused"] = True
+        else:
+            opt_kwargs["foreach"] = use_foreach
+        opt = torch.optim.AdamW(**opt_kwargs)
 
         sched_cfg = dict(tcfg.get("scheduler", {}) or {})
         if not bool(sched_cfg.get("enabled", False)):
             return opt
 
-        sched_type = str(sched_cfg.get("type", "plateau")).lower().strip()
+        sched_type_raw = str(sched_cfg.get("type", "ReduceLROnPlateau")).strip()
+        sched_type = sched_type_raw.lower()
 
-        if sched_type in ("plateau", "reduce_on_plateau", "reduceonplateau"):
+        if sched_type == "reducelronplateau":
             factor = float(sched_cfg.get("factor", 0.5))
             patience = int(sched_cfg.get("patience", 10))
             threshold = float(sched_cfg.get("threshold", 1e-4))
             min_lr = float(sched_cfg.get("min_lr", 1e-7))
             mode = str(sched_cfg.get("mode", "min"))
             monitor = str(sched_cfg.get("monitor", "val_loss"))
+            if monitor != "val_loss":
+                raise ValueError("scheduler.monitor must be 'val_loss'")
 
             sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 opt, mode=mode, factor=factor, patience=patience, threshold=threshold, min_lr=min_lr
@@ -967,8 +937,11 @@ class FlowMapRolloutModule(pl.LightningModule):
                 },
             }
 
-        if sched_type not in ("cosine_with_warmup", "cosine-warmup", "cosine"):
-            raise ValueError(f"Unsupported scheduler type '{sched_type}' (supported: plateau, cosine_with_warmup)")
+        if sched_type != "cosine_with_warmup":
+            raise ValueError(
+                f"Unsupported scheduler type '{sched_type_raw}' "
+                "(supported: ReduceLROnPlateau, cosine_with_warmup)"
+            )
 
         # Cosine schedule with optional warmup (step-based).
         if self.trainer is None:
@@ -982,11 +955,8 @@ class FlowMapRolloutModule(pl.LightningModule):
 
         warmup_steps = 0
         if warmup_epochs > 0:
-            if self.trainer is None:
-                raise RuntimeError("Trainer must be attached before configure_optimizers when warmup_epochs > 0.")
             steps_per_epoch = int(self.trainer.estimated_stepping_batches) // max(1, int(self.max_epochs))
             warmup_steps = int(warmup_epochs) * max(1, steps_per_epoch)
-
 
         warmup_steps = int(max(0, min(warmup_steps, max_steps)))
 
@@ -1026,6 +996,7 @@ def build_lightning_trainer(
     *,
     work_dir: Path,
     precision_config: Optional[PrecisionConfig] = None,
+    train_batches_per_epoch: Optional[int] = None,
 ) -> pl.Trainer:
     tcfg = cfg["training"]
     runtime = dict(cfg.get("runtime", {}) or {})
@@ -1036,6 +1007,12 @@ def build_lightning_trainer(
     prec = precision_config if precision_config is not None else parse_precision_config(cfg)
     lightning_precision = prec.lightning_precision
     log_every_n_steps = int(runtime.get("log_every_n_steps", 50))
+    if log_every_n_steps <= 0:
+        raise ValueError("runtime.log_every_n_steps must be > 0")
+    if train_batches_per_epoch is not None:
+        if int(train_batches_per_epoch) <= 0:
+            raise ValueError("train_batches_per_epoch must be > 0 when provided")
+        log_every_n_steps = min(log_every_n_steps, int(train_batches_per_epoch))
 
     ckpt_cfg = dict(runtime.get("checkpointing", {}) or {})
     enable_ckpt = bool(ckpt_cfg.get("enabled", True))
@@ -1043,6 +1020,8 @@ def build_lightning_trainer(
     save_top_k = int(ckpt_cfg.get("save_top_k", 1))
     save_last = bool(ckpt_cfg.get("save_last", True))
     monitor = str(ckpt_cfg.get("monitor", "val_loss"))
+    if monitor != "val_loss":
+        raise ValueError("runtime.checkpointing.monitor must be 'val_loss'")
 
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)

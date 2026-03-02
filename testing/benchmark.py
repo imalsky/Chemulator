@@ -5,25 +5,43 @@ Measures a single autoregressive jump y_next = model(y, dt, g) for different bat
 Prints amortized latency per sample (microseconds/sample) and saves a log-log plot.
 
 Expected artifacts in CFG.run_dir (produced by testing/export.py):
-  - export_cpu_1step.pt2
-  - export_mps_1step.pt2 (optional)
+  - export_cpu_dynB_1step_phys.pt2
+  - export_mps_dynB_1step_phys.pt2 (optional)
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import torch
-
+# Set before importing torch to avoid duplicate OpenMP aborts in some environments.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+import torch
+
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+
+
+def _default_run_dir() -> Path:
+    cfg_path = (ROOT / "config.json").resolve()
+    if cfg_path.exists():
+        try:
+            import json
+
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            paths = cfg.get("paths", {}) or {}
+            work_dir = paths.get("work_dir")
+            if isinstance(work_dir, str) and work_dir.strip():
+                p = Path(work_dir).expanduser()
+                if not p.is_absolute():
+                    p = (cfg_path.parent / p).resolve()
+                return p.resolve()
+        except Exception:
+            pass
+    return (ROOT / "models" / "v1_test").resolve()
 
 # -------------------------
 # User-tunable global knobs
@@ -32,6 +50,7 @@ sys.path.insert(0, str(ROOT / "src"))
 #   - "auto"     (recommended): infer from the loaded exported module
 #   - "float32"  (fp32)
 #   - "float16"  (fp16)
+#   - "bfloat16" (bf16)
 # NOTE: For torch.export artifacts, dtype is typically baked into the graph.
 DTYPE: str = "auto"
 
@@ -42,11 +61,11 @@ ALLOW_UNSAFE_DTYPE_MISMATCH_ON_MPS: bool = False
 
 @dataclass
 class Config:
-    run_dir: Path = ROOT / "models" / "v4"
+    run_dir: Path = _default_run_dir()
     processed_dir: Path = ROOT / "data" / "processed"
 
-    export_cpu: str = "export_cpu_1step.pt2"
-    export_mps: str = "export_mps_1step.pt2"
+    export_cpu: str = "export_cpu_dynB_1step_phys.pt2"
+    export_mps: str = "export_mps_dynB_1step_phys.pt2"
 
     warmup: int = 50
     iters: int = 200
@@ -58,11 +77,11 @@ CFG = Config()
 
 
 def _resolve_processed_dir() -> Path:
-    fallback = CFG.processed_dir.resolve()
-    if (fallback / "normalization.json").exists():
-        return fallback
+    explicit = CFG.processed_dir.resolve()
+    if (explicit / "normalization.json").exists():
+        return explicit
 
-    for cfg_path in (CFG.run_dir / "config.resolved.json", CFG.run_dir / "config.json", ROOT / "config.json"):
+    for cfg_path in (CFG.run_dir / "config.resolved.json", CFG.run_dir / "config.json"):
         if not cfg_path.exists():
             continue
         try:
@@ -72,7 +91,7 @@ def _resolve_processed_dir() -> Path:
         except Exception:
             continue
         paths = cfg.get("paths", {}) or {}
-        p = paths.get("processed_dir") or paths.get("processed_data_dir")
+        p = paths.get("processed_dir")
         if not isinstance(p, str) or not p.strip():
             continue
         cand = Path(p).expanduser()
@@ -81,7 +100,10 @@ def _resolve_processed_dir() -> Path:
         if (cand / "normalization.json").exists():
             return cand
 
-    return fallback
+    raise FileNotFoundError(
+        "Could not resolve processed_dir containing normalization.json. "
+        "Set CFG.processed_dir or ensure run config has paths.processed_dir."
+    )
 
 
 def _infer_dims(processed_dir: Path) -> tuple[int, int]:
@@ -112,11 +134,13 @@ def _load_export(export_path: Path, device: str) -> torch.nn.Module:
     # torch.export.load(...) returns ExportedProgram; call .module() to get nn.Module.
     m = torch.export.load(export_path).module()
 
-    # Some CPU exports may reject .to('mps'); keep best effort.
     try:
         m = m.to(device)
-    except Exception:
-        m = m.to("cpu")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to move export '{export_path.name}' to device '{device}'. "
+            "Fix the export/backend mismatch instead of falling back silently."
+        ) from e
     return m
 
 
@@ -139,7 +163,7 @@ def _parse_dtype(s: str) -> torch.dtype:
         return torch.float16
     if s in {"bf16", "bfloat16"}:
         return torch.bfloat16
-    raise ValueError(f"Unsupported DTYPE='{s}'. Use auto|float32|float16 (or fp32|fp16).")
+    raise ValueError(f"Unsupported DTYPE='{s}'. Use auto|float32|float16|bfloat16 (or fp32|fp16|bf16).")
 
 
 def _select_input_dtype(model: torch.nn.Module, *, backend: str) -> torch.dtype:
@@ -239,19 +263,13 @@ def _print_table(rows: list[dict]) -> None:
 def _try_science_style(plt) -> None:
     # Try repo style sheet.
     try:
-        plt.style.use("science.mplystyle")
-        return
-    except Exception:
-        pass
-
-    try:
         plt.style.use("science.mplstyle")
         return
     except Exception:
         pass
 
     # Best-effort fallbacks.
-    for rel in ("science.mplstyle", "misc/science.mplstyle", "science.mplystyle", "misc/science.mplystyle"):
+    for rel in ("science.mplstyle", "misc/science.mplstyle"):
         p = (ROOT / rel).resolve()
         if p.exists():
             try:
@@ -300,7 +318,6 @@ def _save_plot(rows: list[dict], run_dir: Path) -> Path | None:
         plt.xscale("log", basex=2)
     plt.yscale("log")
 
-    #plt.grid(True, which="both")
     plt.legend()
     plt.tight_layout()
 

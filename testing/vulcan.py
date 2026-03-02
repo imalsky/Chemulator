@@ -6,7 +6,7 @@ Hard requirements:
 - Uses exactly ONE exported artifact:
     export_cpu_dynB_1step_phys.pt2
 - Runs on CPU only.
-- Canonical channel order comes from data/processed/normalization.json:
+- Canonical channel order comes from normalization metadata embedded in the export:
     species_variables (model channels)
     global_variables  (globals channels)
 """
@@ -24,9 +24,25 @@ import torch
 
 # ----------------------------- GLOBALS -----------------------------
 ROOT = Path(__file__).resolve().parents[1]
-PROCESSED_DIR = (ROOT / "data" / "processed").resolve()
 
-RUN_DIR = (ROOT / "models" / "v1_done_1000_epochs").resolve()
+def _default_run_dir() -> Path:
+    cfg_path = (ROOT / "config.json").resolve()
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            paths = cfg.get("paths", {}) or {}
+            work_dir = paths.get("work_dir")
+            if isinstance(work_dir, str) and work_dir.strip():
+                p = Path(work_dir).expanduser()
+                if not p.is_absolute():
+                    p = (cfg_path.parent / p).resolve()
+                return p.resolve()
+        except Exception:
+            pass
+    return (ROOT / "models" / "v1_test").resolve()
+
+
+RUN_DIR = _default_run_dir()
 OUT_DIR = (RUN_DIR / "plots").resolve()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -34,6 +50,7 @@ EXPORT_PATH = (RUN_DIR / "export_cpu_dynB_1step_phys.pt2").resolve()
 
 DEVICE = "cpu"
 DTYPE = torch.float32
+REQUIRED_GLOBALS = ("P", "T")
 
 VULCAN_DIR = Path("/Users/imalsky/Desktop/Chemistry_Project/Vulcan/0D_full_NCHO/solar")
 PROFILE = "2000K_1bar"
@@ -85,9 +102,36 @@ def load_vulcan(profile: str):
     return t, MR.astype(np.float64), idx, T_K, barye
 
 
+def _load_export_with_metadata(path: Path) -> tuple[torch.nn.Module, dict]:
+    extra_files = {"metadata.json": ""}
+    ep = torch.export.load(str(path), extra_files=extra_files)
+    raw_meta = extra_files.get("metadata.json", "")
+    if not raw_meta:
+        raise RuntimeError("Export is missing embedded metadata.json")
+    meta = json.loads(raw_meta)
+    if not isinstance(meta, dict):
+        raise TypeError("Embedded metadata.json must be a JSON object")
+    model = ep.module().to(device=DEVICE, dtype=DTYPE)
+    return model, meta
+
+
+def _resolve_manifest_path(meta: dict) -> Path:
+    raw = meta.get("normalization_path")
+    if not isinstance(raw, str) or not raw.strip():
+        raise KeyError("Export metadata missing normalization_path")
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (ROOT / p).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"normalization_path from export metadata not found: {p}")
+    return p
+
+
 def _step(model, y: torch.Tensor, dt: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
     out = model(y, dt, g)
-    return out[:, 0, :] if out.ndim == 3 else out
+    if out.ndim != 2:
+        raise ValueError(f"export output must have shape [B,S], got {tuple(out.shape)}")
+    return out
 
 
 @torch.inference_mode()
@@ -144,20 +188,30 @@ def _interp_vulcan_logtime(t_abs: np.ndarray, y: np.ndarray, tq_abs: np.ndarray)
 
 
 def main():
-    plt.style.use("science.mplstyle")
+    try:
+        plt.style.use("science.mplstyle")
+    except Exception:
+        style_path = (ROOT / "testing" / "science.mplstyle").resolve()
+        try:
+            plt.style.use(str(style_path))
+        except Exception:
+            pass
 
     if not EXPORT_PATH.exists():
         raise FileNotFoundError(f"Missing export: {EXPORT_PATH}")
 
-    # Canonical channel order comes from the manifest used during training/export.
-    manifest = json.loads((PROCESSED_DIR / "normalization.json").read_text())
+    model, meta = _load_export_with_metadata(EXPORT_PATH)
+    manifest_path = _resolve_manifest_path(meta)
+    manifest = json.loads(manifest_path.read_text())
+
+    # Canonical channel order comes from the export-linked normalization manifest.
     species_keys = list(manifest["species_variables"])
     bases = [k[:-10] if k.endswith("_evolution") else k for k in species_keys]
-    gvars = list(manifest.get("global_variables") or manifest.get("meta", {}).get("global_variables") or [])
-
-    model = torch.export.load(EXPORT_PATH).module().to(device=DEVICE)
-    #model.eval()
+    gvars = list(manifest.get("global_variables") or [])
+    if gvars != list(REQUIRED_GLOBALS):
+        raise ValueError(f"normalization.json global_variables must be exactly {list(REQUIRED_GLOBALS)}")
     print(f"[model] {EXPORT_PATH.name}  device={DEVICE} dtype=torch.float32")
+    print(f"[manifest] {manifest_path}")
 
     t_all, MR_all, vidx, T_K, barye = load_vulcan(PROFILE)
 

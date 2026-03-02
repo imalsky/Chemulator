@@ -52,7 +52,7 @@ SEED = 1
 USE_ANCHOR_FIRST_CHUNK = True
 CHUNK_T_START_ATTEMPTS = 500  # random t_start attempts (after anchor)
 
-# If set, overrides dt selection regardless of config preprocessing.dt_mode
+# If set, overrides dt selection.
 DT_OVERRIDE: Optional[float] = None
 
 # Whether to apply preprocessing.drop_below rejection (strictly matches preprocessing).
@@ -141,12 +141,19 @@ def read_species_matrix(
         p = _unique_dataset_path(grp, leaf_index, name)
         arr = np.asarray(grp[p][...], dtype=np.float64)
 
-        if arr.ndim == 0 or int(arr.shape[0]) != int(t_len):
+        if arr.ndim == 1:
+            if int(arr.shape[0]) != int(t_len):
+                raise ValueError(
+                    f"Species dataset '{name}' must have shape [{t_len}] or [{t_len}, 1], got {arr.shape}"
+                )
+            col = arr
+        elif arr.ndim == 2 and int(arr.shape[0]) == int(t_len) and int(arr.shape[1]) == 1:
+            col = arr[:, 0]
+        else:
             raise ValueError(
-                f"Species dataset '{name}' must be time-aligned with length {t_len}, got {arr.shape}"
+                f"Species dataset '{name}' must be scalar-per-time with shape [{t_len}] or [{t_len}, 1], got {arr.shape}"
             )
 
-        col = arr.reshape(t_len, -1)[:, 0]
         if not np.all(np.isfinite(col)):
             raise ValueError(f"Species dataset '{name}' contains non-finite values")
         y[:, j] = col
@@ -203,17 +210,9 @@ def sample_dt(cfg: "PlotCfg", rng: np.random.Generator) -> float:
             raise ValueError(f"DT_OVERRIDE must be > 0, got {DT_OVERRIDE}")
         return float(DT_OVERRIDE)
 
-    if cfg.dt_mode == "fixed":
-        return float(cfg.dt)
-
-    # per_chunk
-    if cfg.dt_sampling == "loguniform":
-        lo = np.log10(cfg.dt_min)
-        hi = np.log10(cfg.dt_max)
-        return float(10.0 ** rng.uniform(lo, hi))
-
-    # uniform
-    return float(rng.uniform(cfg.dt_min, cfg.dt_max))
+    lo = np.log10(cfg.dt_min)
+    hi = np.log10(cfg.dt_max)
+    return float(10.0 ** rng.uniform(lo, hi))
 
 
 def pick_t_start(
@@ -272,8 +271,6 @@ class PlotCfg:
     raw_dir: Path
     raw_file_patterns: List[str]
 
-    dt: float
-    dt_mode: str
     dt_min: float
     dt_max: float
     dt_sampling: str
@@ -300,16 +297,10 @@ def load_plotcfg(cfg: Dict, *, cfg_path: Path) -> PlotCfg:
     if not isinstance(paths, dict):
         raise TypeError("config.paths must be an object")
 
-    # Prefer current schema key raw_dir; fall back to raw_data_dir if present.
-    raw_dir_key = None
-    if "raw_dir" in paths:
-        raw_dir_key = "raw_dir"
-    elif "raw_data_dir" in paths:
-        raw_dir_key = "raw_data_dir"
-    if raw_dir_key is None:
-        raise KeyError("config.paths must contain 'raw_dir' (or legacy 'raw_data_dir')")
+    if "raw_dir" not in paths:
+        raise KeyError("config.paths must contain 'raw_dir'")
 
-    raw_dir = _resolve_path(root, str(paths[raw_dir_key]))
+    raw_dir = _resolve_path(root, str(paths["raw_dir"]))
 
     data = cfg.get("data", {})
     if not isinstance(data, dict):
@@ -336,19 +327,16 @@ def load_plotcfg(cfg: Dict, *, cfg_path: Path) -> PlotCfg:
 
     time_key = pr.get("time_key", None)
     if not isinstance(time_key, str) or not time_key.strip():
-        # legacy: time_keys list
-        time_keys = pr.get("time_keys", None)
-        if isinstance(time_keys, list) and time_keys and isinstance(time_keys[0], str) and time_keys[0].strip():
-            time_key = str(time_keys[0]).strip()
-        else:
-            raise KeyError("config.preprocessing.time_key is missing (and no usable legacy time_keys found)")
+        raise KeyError("config.preprocessing.time_key is required")
     time_key = str(time_key).strip()
 
-    dt = float(pr.get("dt", 100.0))
-    dt_mode = str(pr.get("dt_mode", "fixed")).lower().strip()
-    dt_min = float(pr.get("dt_min", dt))
-    dt_max = float(pr.get("dt_max", dt))
-    dt_sampling = str(pr.get("dt_sampling", "uniform")).lower().strip()
+    dt_min_raw = pr.get("dt_min", None)
+    dt_max_raw = pr.get("dt_max", None)
+    if dt_min_raw is None or dt_max_raw is None:
+        raise KeyError("config.preprocessing must include dt_min and dt_max")
+    dt_min = float(dt_min_raw)
+    dt_max = float(dt_max_raw)
+    dt_sampling = str(pr.get("dt_sampling", "loguniform")).lower().strip()
     n_steps = int(pr.get("n_steps", 300))
     t_min = float(pr.get("t_min", 0.0))
     drop_below = float(pr.get("drop_below", 1e-35))
@@ -360,22 +348,16 @@ def load_plotcfg(cfg: Dict, *, cfg_path: Path) -> PlotCfg:
     if epsilon <= 0.0:
         raise ValueError(f"normalization.epsilon must be > 0, got {epsilon}")
 
-    if dt <= 0.0:
-        raise ValueError(f"preprocessing.dt must be > 0, got {dt}")
     if n_steps < 2:
         raise ValueError(f"preprocessing.n_steps must be >= 2, got {n_steps}")
-    if dt_min <= 0.0 or dt_max <= 0.0 or dt_max < dt_min:
-        raise ValueError(f"Invalid dt_min/dt_max: require 0 < dt_min <= dt_max (got {dt_min}, {dt_max})")
-    if dt_mode not in ("fixed", "per_chunk"):
-        raise ValueError("preprocessing.dt_mode must be 'fixed' or 'per_chunk'")
-    if dt_sampling not in ("uniform", "loguniform"):
-        raise ValueError("preprocessing.dt_sampling must be 'uniform' or 'loguniform'")
+    if dt_min <= 0.0 or dt_max <= 0.0 or dt_max <= dt_min:
+        raise ValueError(f"Invalid dt_min/dt_max: require 0 < dt_min < dt_max (got {dt_min}, {dt_max})")
+    if dt_sampling != "loguniform":
+        raise ValueError("preprocessing.dt_sampling must be 'loguniform'")
 
     return PlotCfg(
         raw_dir=raw_dir,
         raw_file_patterns=raw_file_patterns,
-        dt=dt,
-        dt_mode=dt_mode,
         dt_min=dt_min,
         dt_max=dt_max,
         dt_sampling=dt_sampling,
@@ -642,7 +624,7 @@ def main() -> None:
             axR.set_xlim(float(t_chunk[0]), float(t_chunk[-1]))
 
         fig.suptitle(
-            f"Raw vs Generated Chunk Overlay (dt_mode={pcfg.dt_mode}, n_steps={pcfg.n_steps}, eps={pcfg.epsilon:.1e})\n"
+            f"Raw vs Generated Chunk Overlay (dt_sampling={pcfg.dt_sampling}, n_steps={pcfg.n_steps}, eps={pcfg.epsilon:.1e})\n"
             f"Raw file: {raw_file.name}",
             fontsize=11,
             y=0.995,

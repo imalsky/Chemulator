@@ -161,7 +161,7 @@ def main() -> None:
 
     rng = np.random.default_rng(SEED)
 
-    for file_i, file_path in enumerate(files[:MAX_FILES_TO_CHECK]):
+    for file_path in files[:MAX_FILES_TO_CHECK]:
         print(f"\n[file] {file_path}")
         with h5py.File(file_path, "r") as f:
             keys = list(f.keys())
@@ -261,8 +261,6 @@ def main() -> None:
             else:
                 print("  file-scan: no dataset paths containing 'time' (or leaf in {t,time,times}) were found")
 
-        # default: stop after first file unless MAX_FILES_TO_CHECK > 1
-        _ = file_i
 
     print("\nDone.")
 

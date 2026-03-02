@@ -2,7 +2,7 @@
   "precision": {
     "_comment": [
       "Central dtype control for data + model + loss.",
-      "Supported dtype strings: bfloat16, float32, float64 (also bf16/fp32/fp64 aliases).",
+      "Supported dtype strings: bfloat16, float32, float64 (exact names only).",
       "compute_dtype + amp_mode determine Lightning precision:",
       "  - compute_dtype=bfloat16, amp_mode=mixed -> bf16-mixed (autocast bf16, weights typically fp32)",
       "  - compute_dtype=bfloat16, amp_mode=true  -> bf16-true  (pure bf16; requires model_dtype=input_dtype=bfloat16)",
@@ -25,7 +25,7 @@
   "paths": {
     "raw_dir": "data/raw",
     "processed_dir": "data/processed",
-    "work_dir": "models/v1_test"
+    "work_dir": "models/v2_bigger_batch"
   },
   "system": {
     "device": "auto",
@@ -48,7 +48,6 @@
       "true: state_dict must match",
       "false: allow missing/extra keys"
     ],
-    "mode": "train",
     "checkpoint": null,
     "load_weights_strict": true,
     "accelerator": "auto",
@@ -104,17 +103,17 @@
       "",
       "epsilon: floor value for log10 to avoid -inf (applied to species and log-min-max globals).",
       "min_std: minimum standard deviation floor; prevents division by near-zero std.",
-      "globals_default_method: fallback method for any global variable not listed in 'methods'.",
+      "globals_default_method: must be a valid method string (schema-required).",
       "",
-      "Supported method strings (with aliases resolved by _canonical_method):",
-      "  identity  (aliases: none, '')        -> no transformation",
-      "  standard  (default)                  -> z = (x - mean) / std",
-      "  min-max   (aliases: minmax, min_max) -> z = (x - min) / (max - min)",
-      "  log-min-max (aliases: logminmax, log_min_max, log-minmax) -> z = (log10(max(x,eps)) - log_min) / (log_max - log_min)",
+      "Supported method strings (exact, no aliases):",
+      "  standard    -> z = (x - mean) / std",
+      "  min-max     -> z = (x - min) / (max - min)",
+      "  log-standard -> z = (log10(max(x,eps)) - log_mean) / log_std",
+      "  log-min-max  -> z = (log10(max(x,eps)) - log_min) / (log_max - log_min)",
       "",
       "Per-key stats written to normalization.json include:",
       "  species: log_mean, log_std, log_min, log_max, epsilon",
-      "  globals: mean, std, min, max, log_min, log_max"
+      "  globals: mean, std, min, max, log_mean, log_std, log_min, log_max"
     ],
     "epsilon": 1e-30,
     "min_std": 1e-12,
@@ -137,7 +136,8 @@
       "  4. Write physical shards (unnormalized) to _tmp_physical/.",
       "  5. Compute normalization stats from train physical shards (streaming Welford).",
       "  6. Normalize all splits and write final shards + normalization.json.",
-      "  7. Write preprocessing_summary.json with counts and rejection breakdown."
+      "  7. Write preprocessing_summary.json with counts and rejection breakdown.",
+      "  8. Remove _tmp_physical/ after successful completion."
     ],
     "_comment_raw_file_patterns": [
       "Glob patterns for discovering HDF5 files under paths.raw_dir.",
@@ -149,22 +149,10 @@
       "*.hdf5"
     ],
     "_comment_dt": [
-      "dt: base timestep (seconds). Used directly when dt_mode='fixed'.",
-      "  When dt_mode='per_chunk', dt serves as the default for dt_min and dt_max if they are omitted.",
-      "",
-      "dt_mode: how dt is assigned per resampled chunk.",
-      "  'fixed' (aliases: 'constant') -> every chunk uses dt=dt; dt_min and dt_max are forced to dt.",
-      "  'per_chunk' (aliases: 'chunk', 'variable') -> dt is sampled per chunk from [dt_min, dt_max].",
-      "",
-      "dt_min, dt_max: range for per-chunk dt sampling. Must satisfy 0 < dt_min <= dt_max.",
-      "  Also used for dt normalization: dt_norm = clip((log10(dt) - log10(dt_min)) / (log10(dt_max) - log10(dt_min)), 0, 1).",
-      "",
-      "dt_sampling: distribution for sampling dt when dt_mode='per_chunk'.",
-      "  'loguniform' (default; triggered if 'log' appears in string) -> 10^uniform(log10(dt_min), log10(dt_max)).",
-      "  'uniform' -> uniform(dt_min, dt_max)."
+      "dt is always sampled per chunk from [dt_min, dt_max] using loguniform.",
+      "Require: 0 < dt_min < dt_max.",
+      "dt normalization uses: dt_norm = clip((log10(dt) - log10(dt_min)) / (log10(dt_max) - log10(dt_min)), 0, 1)."
     ],
-    "dt": 100.0,
-    "dt_mode": "per_chunk",
     "dt_min": 5e-2,
     "dt_max": 5e3,
     "dt_sampling": "loguniform",
@@ -205,7 +193,7 @@
       "test_fraction: fraction of trajectories assigned to the test split.",
       "train_fraction is implicit: 1 - val_fraction - test_fraction.",
       "Assignment is deterministic via SHA-1(seed:filename:trajname) -> uniform [0,1).",
-      "Backward-compat aliases: val_split, test_split (used if val_fraction/test_fraction absent)."
+      "Only val_fraction/test_fraction are supported."
     ],
     "val_fraction": 0.1,
     "test_fraction": 0.1,
@@ -263,14 +251,7 @@
     "layer_norm_eps": 1e-05,
     "predict_delta": true,
     "mlp": {
-      "hidden_dims": [
-        2048,
-        2048,
-        2048,
-        2048,
-        2048,
-        2048
-      ],
+      "hidden_dims": [2048, 2048, 2048, 2048, 2048, 2048],
       "residual": true
     },
     "autoencoder": {
@@ -301,7 +282,7 @@
       ">1: needs autoregressive enabled"
     ],
     "batch_size": 8192,
-    "max_epochs": 500,
+    "max_epochs": 1000,
     "checkpoint_mode": "none",
     "num_workers": 0,
     "pin_memory": false,
@@ -310,11 +291,11 @@
     "rollout_steps": 1,
     "loss": {
       "lambda_log10_mae": 1.0,
-      "lambda_z_mse": 0.1
+      "lambda_z_mse": 0.25
     },
     "optimizer": {
       "name": "adamw",
-      "lr": 0.0003,
+      "lr": 0.0001,
       "weight_decay": 0.0001,
       "exclude_norm_and_bias_from_weight_decay": true,
       "betas": [
@@ -323,15 +304,15 @@
       ],
       "eps": 1e-08,
       "fused": true,
-      "foreach": true
+      "foreach": false
     },
     "scheduler": {
       "enabled": true,
       "type": "cosine_with_warmup",
-      "warmup_epochs": 10,
+      "warmup_epochs": 50,
       "min_lr_ratio": 0.01,
       "_comment_plateau": [
-        "Keys below are only used when scheduler.type == 'plateau'."
+        "Keys below are only used when scheduler.type == 'ReduceLROnPlateau'."
       ],
       "factor": 0.5,
       "patience": 10,

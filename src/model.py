@@ -41,6 +41,7 @@ ActivationFactory = Callable[[], nn.Module]
 
 # Small output init for delta heads. This reduces early rollout blow-ups.
 _DELTA_OUT_INIT_STD = 1e-3
+_REQUIRED_GLOBALS = ("P", "T")
 
 
 # ==============================================================================
@@ -189,7 +190,6 @@ def get_activation(name: str) -> ActivationFactory:
         "relu": nn.ReLU,
         "gelu": nn.GELU,
         "silu": nn.SiLU,
-        "swish": nn.SiLU,
         "tanh": nn.Tanh,
         "leaky_relu": lambda: nn.LeakyReLU(0.1),
         "elu": nn.ELU,
@@ -685,11 +685,11 @@ def create_model(
         species_vars = data_cfg.get("species_variables")
         if not isinstance(species_vars, list) or not species_vars:
             raise KeyError("data.species_variables required.")
-        global_vars = data_cfg.get("global_variables", [])
-        if global_vars is None:
-            global_vars = []
+        global_vars = data_cfg.get("global_variables")
         if not isinstance(global_vars, list):
             raise TypeError("data.global_variables must be list.")
+        if list(global_vars) != list(_REQUIRED_GLOBALS):
+            raise ValueError(f"data.global_variables must be exactly {list(_REQUIRED_GLOBALS)}")
 
         if state_dim is None:
             state_dim = len(species_vars)
@@ -697,6 +697,8 @@ def create_model(
             global_dim = len(global_vars)
 
     S, G = int(state_dim), int(global_dim)
+    if G != len(_REQUIRED_GLOBALS):
+        raise ValueError(f"global_dim must be {len(_REQUIRED_GLOBALS)} (P and T), got {G}")
     log.info("Model dims: S=%d, G=%d", S, G)
 
     mcfg = config.get("model")

@@ -16,7 +16,6 @@ Saves:
 from __future__ import annotations
 
 import csv
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +23,25 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+
+
+def _default_run_dir() -> Path:
+    cfg_path = (ROOT / "config.json").resolve()
+    if cfg_path.exists():
+        try:
+            import json
+
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            paths = cfg.get("paths", {}) or {}
+            work_dir = paths.get("work_dir")
+            if isinstance(work_dir, str) and work_dir.strip():
+                p = Path(work_dir).expanduser()
+                if not p.is_absolute():
+                    p = (cfg_path.parent / p).resolve()
+                return p.resolve()
+        except Exception:
+            pass
+    return (ROOT / "models" / "v1_test").resolve()
 
 
 # =============================================================================
@@ -33,7 +50,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 @dataclass
 class Config:
-    run_dir: Path = ROOT / "models" / "fixed_dt_old"
+    run_dir: Path = _default_run_dir()
     metrics_name: str = "metrics.csv"
 
     out_name: str = "loss_curves.png"
@@ -163,11 +180,10 @@ def plot_losses(m, out_path: Path) -> None:
         tzm = _sanitize_for_log(m["train_loss_z_mse"])
         vzm = _sanitize_for_log(m["val_loss_z_mse"])
 
-        #ax.plot(epoch, tlm, linestyle="solid", label="train_log10_mae", color='red', linewidth=5, alpha=0.8)
-        #ax.plot(epoch, vlm, linestyle="dashed", label="val_log10_mae", color='red')
-
-        #ax.plot(epoch, tzm, linestyle="solid", label="train_z_mse", color='blue', linewidth=5, alpha=0.8)
-        #ax.plot(epoch, vzm, linestyle="dashed", label="val_z_mse", color='blue')
+        ax.plot(epoch, tlm, linestyle="solid", label="train_log10_mae", color="tab:red", linewidth=2.0, alpha=0.8)
+        ax.plot(epoch, vlm, linestyle="dashed", label="val_log10_mae", color="tab:red", linewidth=2.0, alpha=0.9)
+        ax.plot(epoch, tzm, linestyle="solid", label="train_z_mse", color="tab:blue", linewidth=2.0, alpha=0.8)
+        ax.plot(epoch, vzm, linestyle="dashed", label="val_z_mse", color="tab:blue", linewidth=2.0, alpha=0.9)
 
     ax.set_yscale("log")
     ax.set_xlabel("Epoch")

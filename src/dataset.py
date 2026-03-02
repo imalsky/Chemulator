@@ -11,7 +11,7 @@ What the model expects (per model.py and trainer.py):
   and log10(y_phys) can be recovered via:
       log10(y_phys) = z * log_std + log_mean
 
-- dt is already normalized to [0, 1] using log10 + min-max (see normalizer.py):
+- dt is already normalized to [0, 1] using log10 + min-max (see preprocessing.py):
       dt_norm = (log10(dt_phys) - log_min) / (log_max - log_min)
 
 - g (globals) is already normalized (method depends on your preprocessing/manifest).
@@ -217,7 +217,7 @@ class FlowMapRolloutDataset(Dataset):
         self.device = device
         self.storage_dtype = storage_dtype
         self.shard_cache_size = int(shard_cache_size)
-        
+
         self.manifest: Optional[Dict[str, object]] = None
         if validate_manifest:
             mpath = processed_dir / "normalization.json"
@@ -392,8 +392,6 @@ class FlowMapRolloutDataset(Dataset):
         self._preloaded_all = (y_all, g_all, dt_all)
         self._preloaded = True
 
-
-
     # -------------------------------------------------------------------------
     # On-demand loading (CPU)
     # -------------------------------------------------------------------------
@@ -433,7 +431,7 @@ class FlowMapRolloutDataset(Dataset):
     def __enter__(self) -> "FlowMapRolloutDataset":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
         self.close()
 
     # -------------------------------------------------------------------------

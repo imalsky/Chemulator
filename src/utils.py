@@ -101,15 +101,9 @@ def atomic_write_json(path: Union[str, os.PathLike], obj: Any, *, indent: int = 
 # ==============================================================================
 
 _ALLOWED_DTYPES: Dict[str, torch.dtype] = {
-    "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
-    "fp32": torch.float32,
     "float32": torch.float32,
-    "float": torch.float32,
-    "single": torch.float32,
-    "fp64": torch.float64,
     "float64": torch.float64,
-    "double": torch.float64,
 }
 
 
@@ -117,9 +111,9 @@ def parse_torch_dtype(value: Any, *, key: str) -> torch.dtype:
     """Parse a dtype string into a torch.dtype.
 
     Supported (case-insensitive):
-      - bfloat16 / bf16
-      - float32 / fp32 / float
-      - float64 / fp64 / double
+      - bfloat16
+      - float32
+      - float64
 
     Note:
       float16 is intentionally unsupported in this codebase.
@@ -168,12 +162,6 @@ class PrecisionConfig:
         if self.compute_dtype == torch.float64:
             return "64-true"
         raise ValueError(f"unsupported compute_dtype: {self.compute_dtype}")
-
-    @property
-    def uses_autocast(self) -> bool:
-        """True when we expect Lightning AMP/autocast to be active."""
-        return self.compute_dtype == torch.bfloat16 and self.amp_mode == "mixed"
-
 
 def parse_precision_config(cfg: Mapping[str, Any]) -> PrecisionConfig:
     """Parse and validate cfg["precision"] into a PrecisionConfig."""

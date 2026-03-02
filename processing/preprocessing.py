@@ -13,6 +13,7 @@ Outputs (under paths.processed_dir):
 
 Temporary stage (under paths.processed_dir):
   _tmp_physical/<split>/shard_*_physical.npz
+  (removed automatically on successful completion)
 
 Shard schema:
   Physical shards (temporary):
@@ -31,12 +32,11 @@ This script is intentionally strict:
 - Globals must be scalar per trajectory (time-series globals are rejected).
 
 Run:
-  python -m preprocessing --config /path/to/config.json
+  python -u processing/preprocessing.py
 """
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import logging
@@ -44,7 +44,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -69,9 +69,105 @@ def _configure_logging(level: str) -> None:
 log = logging.getLogger(__name__)
 
 
+_REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
+_REQUIRED_DT_SAMPLING = "loguniform"
+_ALLOWED_GLOBAL_METHODS = {"standard", "min-max", "log-min-max", "log-standard"}
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+_REQUIRED_TOP_LEVEL: Tuple[str, ...] = ("paths", "data", "normalization", "preprocessing", "system")
+_ALLOWED_TOP_LEVEL: Tuple[str, ...] = (
+    "precision",
+    "paths",
+    "normalization",
+    "preprocessing",
+    "system",
+    "runtime",
+    "data",
+    "dataset",
+    "model",
+    "training",
+)
+_REQUIRED_SECTION_KEYS: Dict[str, Tuple[str, ...]] = {
+    "paths": ("raw_dir", "processed_dir", "work_dir"),
+    "data": ("global_variables", "species_variables"),
+    "normalization": ("epsilon", "min_std", "globals_default_method", "methods"),
+    "preprocessing": (
+        "raw_file_patterns",
+        "dt_min",
+        "dt_max",
+        "dt_sampling",
+        "n_steps",
+        "t_min",
+        "output_trajectories_per_file",
+        "shard_size",
+        "overwrite",
+        "time_key",
+        "val_fraction",
+        "test_fraction",
+        "seed",
+        "pool_size",
+        "samples_per_source_trajectory",
+        "max_chunk_attempts_per_source",
+        "drop_below",
+    ),
+    "system": ("device", "log_level", "seed"),
+}
+_ALLOWED_SECTION_KEYS: Dict[str, Tuple[str, ...]] = {
+    "paths": ("raw_dir", "processed_dir", "work_dir"),
+    "data": ("global_variables", "species_variables"),
+    "normalization": ("epsilon", "min_std", "globals_default_method", "methods"),
+    # Keep dt/dt_mode here so parse_precfg can emit the targeted unsupported-message.
+    "preprocessing": tuple(list(_REQUIRED_SECTION_KEYS["preprocessing"]) + ["dt", "dt_mode"]),
+    "system": ("device", "log_level", "seed"),
+}
+
+
+def _validate_no_unknown_keys(mapping: Mapping[str, Any], *, allowed: Sequence[str], prefix: str = "") -> None:
+    allowed_set = set(allowed)
+    for raw_key in mapping.keys():
+        if not isinstance(raw_key, str):
+            raise TypeError("bad key")
+        if raw_key.strip() != raw_key:
+            raise KeyError("ambiguous key")
+        if raw_key.startswith("_"):
+            continue
+        if raw_key not in allowed_set:
+            path = f"{prefix}.{raw_key}" if prefix else raw_key
+            raise KeyError(f"unknown: {path}")
+
+
+def validate_required_config_keys(cfg: Mapping[str, Any]) -> None:
+    if not isinstance(cfg, Mapping):
+        raise TypeError("bad config")
+
+    _validate_no_unknown_keys(cfg, allowed=_ALLOWED_TOP_LEVEL)
+    for sec in _REQUIRED_TOP_LEVEL:
+        if sec not in cfg:
+            raise KeyError(f"missing: {sec}")
+
+    for sec, required_keys in _REQUIRED_SECTION_KEYS.items():
+        block = cfg[sec]
+        if not isinstance(block, Mapping):
+            raise TypeError(f"bad type: {sec}")
+
+        _validate_no_unknown_keys(block, allowed=_ALLOWED_SECTION_KEYS[sec], prefix=sec)
+        for key in required_keys:
+            if key not in block:
+                raise KeyError(f"missing: {sec}.{key}")
+
+
 # -----------------------------------------------------------------------------
 # Strict config parsing
 # -----------------------------------------------------------------------------
+
+
+def _parse_global_method(method: str, *, key: str) -> str:
+    m = str(method).lower().strip()
+    if m not in _ALLOWED_GLOBAL_METHODS:
+        raise ValueError(
+            f"Unsupported normalization method '{method}' for '{key}'. "
+            f"Supported: {sorted(_ALLOWED_GLOBAL_METHODS)}"
+        )
+    return m
 
 
 def _require(mapping: Dict, key: str) -> object:
@@ -138,11 +234,9 @@ class PreCfg:
     processed_dir: Path
     raw_file_patterns: List[str]
 
-    dt: float
-    dt_mode: str  # fixed | per_chunk
     dt_min: float
     dt_max: float
-    dt_sampling: str  # uniform | loguniform
+    dt_sampling: str  # loguniform only
 
     n_steps: int
     t_min: float
@@ -191,40 +285,55 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
     data = _require_dict(cfg, "data")
     global_variables = _require_str_list(data, "global_variables")
     species_variables = _require_str_list(data, "species_variables")
+    if global_variables != list(_REQUIRED_GLOBALS):
+        raise ValueError(f"config.data.global_variables must be exactly {list(_REQUIRED_GLOBALS)}")
 
     norm = _require_dict(cfg, "normalization")
     epsilon = _require_float(norm, "epsilon")
     min_std = _require_float(norm, "min_std")
-    globals_default_method = _require_str(norm, "globals_default_method")
+    globals_default_method = _parse_global_method(
+        _require_str(norm, "globals_default_method"),
+        key="normalization.globals_default_method",
+    )
     methods_obj = _require(norm, "methods")
     if not isinstance(methods_obj, dict):
         raise TypeError("config.normalization.methods must be an object")
+
+    raw_method_keys = [k.strip() for k in methods_obj.keys() if isinstance(k, str)]
+    if len(raw_method_keys) != len(methods_obj):
+        raise TypeError("config.normalization.methods must map strings to strings")
+    if len(set(raw_method_keys)) != len(raw_method_keys):
+        raise ValueError("config.normalization.methods contains duplicate keys after whitespace normalization")
+    missing_keys = [g for g in global_variables if g not in raw_method_keys]
+    unexpected_keys = [k for k in raw_method_keys if k not in global_variables]
+    if missing_keys or unexpected_keys:
+        raise ValueError(
+            "config.normalization.methods must define exactly data.global_variables. "
+            f"missing={missing_keys} unexpected={unexpected_keys}"
+        )
+
     methods: Dict[str, str] = {}
     for k, v in methods_obj.items():
         if not isinstance(k, str) or not isinstance(v, str):
             raise TypeError("config.normalization.methods must map strings to strings")
-        methods[k] = v
+        key = k.strip()
+        methods[key] = _parse_global_method(v, key=key)
 
     pr = _require_dict(cfg, "preprocessing")
     raw_file_patterns = _require_str_list(pr, "raw_file_patterns")
 
-    dt = _require_float(pr, "dt")
-    dt_mode = _require_str(pr, "dt_mode").lower()
-    if dt_mode not in ("fixed", "per_chunk"):
-        raise ValueError("preprocessing.dt_mode must be 'fixed' or 'per_chunk'")
-
+    if "dt" in pr:
+        raise ValueError("preprocessing.dt is unsupported; use dt_min/dt_max with loguniform sampling")
+    if "dt_mode" in pr:
+        raise ValueError("preprocessing.dt_mode is unsupported; variable dt is always enabled")
     dt_min = _require_float(pr, "dt_min")
     dt_max = _require_float(pr, "dt_max")
-    if dt_min <= 0.0 or dt_max <= 0.0 or dt_max < dt_min:
-        raise ValueError("Invalid dt range: require 0 < dt_min <= dt_max")
-
-    if dt_mode == "fixed":
-        if dt_min != dt or dt_max != dt:
-            raise ValueError("dt_mode='fixed' requires dt_min == dt_max == dt")
+    if dt_min <= 0.0 or dt_max <= 0.0 or dt_max <= dt_min:
+        raise ValueError("Invalid dt range: require 0 < dt_min < dt_max")
 
     dt_sampling = _require_str(pr, "dt_sampling").lower()
-    if dt_sampling not in ("uniform", "loguniform"):
-        raise ValueError("preprocessing.dt_sampling must be 'uniform' or 'loguniform'")
+    if dt_sampling != _REQUIRED_DT_SAMPLING:
+        raise ValueError(f"preprocessing.dt_sampling must be '{_REQUIRED_DT_SAMPLING}'")
 
     n_steps = _require_int(pr, "n_steps")
     if n_steps < 2:
@@ -270,8 +379,6 @@ def parse_precfg(cfg: Dict, *, cfg_path: Path) -> PreCfg:
         raw_dir=raw_dir,
         processed_dir=processed_dir,
         raw_file_patterns=raw_file_patterns,
-        dt=dt,
-        dt_mode=dt_mode,
         dt_min=dt_min,
         dt_max=dt_max,
         dt_sampling=dt_sampling,
@@ -326,6 +433,25 @@ def clean_processed_outputs(processed_dir: Path, *, overwrite: bool) -> None:
             if not overwrite:
                 raise RuntimeError(f"Refusing to overwrite existing output split dir: {d}")
             shutil.rmtree(d)
+    for name in ("normalization.json", "preprocessing_summary.json"):
+        p = processed_dir / name
+        if p.exists():
+            if not overwrite:
+                raise RuntimeError(f"Refusing to overwrite existing output file: {p}")
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+
+
+def remove_tmp_dir(path: Path) -> None:
+    if not path.exists():
+        raise RuntimeError(f"Expected temporary directory to exist: {path}")
+    if not path.is_dir():
+        raise RuntimeError(f"Temporary path is not a directory: {path}")
+    shutil.rmtree(path)
+    if path.exists():
+        raise RuntimeError(f"Failed to remove temporary directory: {path}")
 
 
 def flush_shard(
@@ -392,13 +518,9 @@ def split_for_trajectory(file_name: str, traj_name: str, *, seed: int, val_frac:
 
 
 def sample_dt(cfg: PreCfg, rng: np.random.Generator) -> float:
-    if cfg.dt_mode == "fixed":
-        return float(cfg.dt)
-    if cfg.dt_sampling == "loguniform":
-        lo = np.log10(cfg.dt_min)
-        hi = np.log10(cfg.dt_max)
-        return float(10.0 ** rng.uniform(lo, hi))
-    return float(rng.uniform(cfg.dt_min, cfg.dt_max))
+    lo = np.log10(cfg.dt_min)
+    hi = np.log10(cfg.dt_max)
+    return float(10.0 ** rng.uniform(lo, hi))
 
 
 def pick_t_start(
@@ -506,10 +628,19 @@ def read_species_matrix(
         p = _unique_dataset_path(grp, leaf_index, name)
         arr = np.asarray(grp[p][...], dtype=np.float64)
 
-        if arr.ndim == 0 or int(arr.shape[0]) != int(t_len):
-            raise ValueError(f"Species dataset '{name}' must be time-aligned with length {t_len}, got {arr.shape}")
+        if arr.ndim == 1:
+            if int(arr.shape[0]) != int(t_len):
+                raise ValueError(
+                    f"Species dataset '{name}' must have shape [{t_len}] or [{t_len}, 1], got {arr.shape}"
+                )
+            col = arr
+        elif arr.ndim == 2 and int(arr.shape[0]) == int(t_len) and int(arr.shape[1]) == 1:
+            col = arr[:, 0]
+        else:
+            raise ValueError(
+                f"Species dataset '{name}' must be scalar-per-time with shape [{t_len}] or [{t_len}, 1], got {arr.shape}"
+            )
 
-        col = arr.reshape(t_len, -1)[:, 0]
         if not np.all(np.isfinite(col)):
             raise ValueError(f"Species dataset '{name}' contains non-finite values")
         y[:, j] = col
@@ -529,8 +660,18 @@ def read_globals_vector(
     out = np.empty((len(global_vars),), dtype=np.float64)
 
     for j, name in enumerate(global_vars):
-        # Prefer per-trajectory attribute.
-        if name in grp.attrs:
+        attr_present = name in grp.attrs
+        if "/" in name:
+            ds_present = name in grp and isinstance(grp[name], h5py.Dataset)
+        else:
+            ds_present = len(leaf_index.get(name, [])) > 0
+
+        if attr_present and ds_present:
+            raise ValueError(
+                f"Global '{name}' is ambiguous: both attribute and dataset are present in trajectory group."
+            )
+
+        if attr_present:
             v = np.asarray(grp.attrs[name], dtype=np.float64).reshape(-1)
             if v.size != 1 or not np.isfinite(v[0]):
                 raise ValueError(f"Global attribute '{name}' must be a finite scalar")
@@ -549,6 +690,15 @@ def read_globals_vector(
         out[j] = float(arr[0])
 
     return out.astype(np.float32)
+
+
+def _is_non_finite_raw_error(err: BaseException) -> bool:
+    msg = str(err)
+    return (
+        "contains non-finite values" in msg
+        or "must be a finite scalar" in msg
+        or "must be a finite scalar dataset" in msg
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -612,11 +762,7 @@ def sample_file(
     dt_buf: Dict[str, List[np.ndarray]] = {"train": [], "validation": [], "test": []}
 
     rejects: Dict[str, int] = {
-        "not_group": 0,
-        "no_time": 0,
         "too_few_valid": 0,
-        "missing_species": 0,
-        "missing_globals": 0,
         "drop_below": 0,
         "non_finite": 0,
         "no_fit_chunk": 0,
@@ -628,6 +774,8 @@ def sample_file(
     target = int(cfg.output_trajectories_per_file)
     written = 0
 
+    step_offsets = np.arange(cfg.n_steps, dtype=np.float64)
+
     with h5py.File(file_path, "r") as fin:
         pool = reservoir_sample(fin.keys(), int(cfg.pool_size), rng)
         rng.shuffle(pool)
@@ -638,8 +786,9 @@ def sample_file(
 
             grp_obj = fin[traj_name]
             if not isinstance(grp_obj, h5py.Group):
-                rejects["not_group"] += 1
-                continue
+                raise TypeError(
+                    f"Raw schema mismatch: expected top-level group, got {type(grp_obj).__name__} at '{traj_name}' in {file_path}"
+                )
 
             grp: h5py.Group = grp_obj
 
@@ -648,31 +797,56 @@ def sample_file(
             # Time
             try:
                 t_raw = read_time(grp, time_key=cfg.time_key, leaf_index=leaf_index)
-            except (KeyError, ValueError, TypeError):
-                rejects["no_time"] += 1
-                continue
+            except (KeyError, ValueError, TypeError) as e:
+                if isinstance(e, ValueError) and _is_non_finite_raw_error(e):
+                    rejects["non_finite"] += 1
+                    log.debug(
+                        "Reject trajectory '%s' in %s: non-finite time values (%s)",
+                        traj_name,
+                        file_path.name,
+                        e,
+                    )
+                    continue
+                raise RuntimeError(
+                    f"Raw schema mismatch while reading time for trajectory '{traj_name}' in {file_path.name}: {e}"
+                ) from e
 
             T = int(t_raw.shape[0])
 
             # Species
             try:
                 y_raw = read_species_matrix(grp, t_len=T, species_vars=cfg.species_variables, leaf_index=leaf_index)
-            except KeyError:
-                rejects["missing_species"] += 1
-                continue
-            except (ValueError, TypeError):
-                rejects["non_finite"] += 1
-                continue
+            except (KeyError, ValueError, TypeError) as e:
+                if isinstance(e, ValueError) and _is_non_finite_raw_error(e):
+                    rejects["non_finite"] += 1
+                    log.debug(
+                        "Reject trajectory '%s' in %s: non-finite species values (%s)",
+                        traj_name,
+                        file_path.name,
+                        e,
+                    )
+                    continue
+                raise RuntimeError(
+                    f"Raw schema mismatch while reading species for trajectory '{traj_name}' in {file_path.name}: {e}"
+                ) from e
 
             # Globals
             try:
                 g_vec = read_globals_vector(grp, global_vars=cfg.global_variables, leaf_index=leaf_index)
-            except KeyError:
-                rejects["missing_globals"] += 1
-                continue
-            except (ValueError, TypeError):
-                rejects["non_finite"] += 1
-                continue
+            except (KeyError, ValueError, TypeError) as e:
+                if isinstance(e, ValueError) and _is_non_finite_raw_error(e):
+                    rejects["non_finite"] += 1
+                    log.debug(
+                        "Reject trajectory '%s' in %s: non-finite global values (%s)",
+                        traj_name,
+                        file_path.name,
+                        e,
+                    )
+                    continue
+                raise RuntimeError(
+                    f"Raw schema mismatch while reading globals for trajectory '{traj_name}' in {file_path.name}: {e}"
+                ) from e
+            g_vec32 = g_vec.astype(np.float32, copy=False)
 
             # Validity mask (matches training assumptions):
             # - Only consider positive times.
@@ -724,7 +898,7 @@ def sample_file(
                     rejects["no_fit_chunk"] += 1
                     continue
 
-                t_chunk = float(t_start) + np.arange(cfg.n_steps, dtype=np.float64) * float(dt_s)
+                t_chunk = float(t_start) + step_offsets * float(dt_s)
                 log_t_chunk = np.log10(t_chunk)
 
                 i0, i1, w = prepare_log_interp(log_t_valid, log_t_chunk)
@@ -735,7 +909,7 @@ def sample_file(
                     continue
 
                 y_buf[split].append(y_new.astype(np.float32, copy=False))
-                g_buf[split].append(g_vec.astype(np.float32, copy=False))
+                g_buf[split].append(g_vec32)
                 dt_buf[split].append(np.full(cfg.n_steps - 1, dt_s, dtype=np.float32))
 
                 counts_total[split] += 1
@@ -823,19 +997,6 @@ class RunningMeanVar:
         return self.mean, std
 
 
-def canonical_method(method: str) -> str:
-    m = str(method).lower().strip()
-    if m in ("none", ""):
-        return "identity"
-    if m in ("minmax", "min_max", "min-max"):
-        return "min-max"
-    if m in ("logminmax", "log-minmax", "log_min_max", "log-min-max"):
-        return "log-min-max"
-    if m in ("log10-standard", "log10_standard"):
-        return "log-standard"
-    return m
-
-
 def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str]]:
     """Compute normalization statistics from physical train shards."""
 
@@ -851,6 +1012,7 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
     logy_max = np.full(S, -np.inf, dtype=np.float64)
 
     rms_g = RunningMeanVar(G) if G > 0 else None
+    rms_glog = RunningMeanVar(G) if G > 0 else None
     g_min = np.full(G, np.inf, dtype=np.float64)
     g_max = np.full(G, -np.inf, dtype=np.float64)
     glog_min = np.full(G, np.inf, dtype=np.float64)
@@ -874,6 +1036,7 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
             g_max = np.maximum(g_max, np.max(g2, axis=0))
 
             glog = np.log10(np.maximum(g2, cfg.epsilon))
+            rms_glog.update(glog)  # type: ignore[union-attr]
             glog_min = np.minimum(glog_min, np.min(glog, axis=0))
             glog_max = np.maximum(glog_max, np.max(glog, axis=0))
 
@@ -881,8 +1044,12 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
 
     mu_g: Optional[np.ndarray] = None
     sd_g: Optional[np.ndarray] = None
+    mu_glog: Optional[np.ndarray] = None
+    sd_glog: Optional[np.ndarray] = None
     if G > 0 and rms_g is not None:
         mu_g, sd_g = rms_g.finalize(min_std=cfg.min_std)
+    if G > 0 and rms_glog is not None:
+        mu_glog, sd_glog = rms_glog.finalize(min_std=cfg.min_std)
 
     per_key_stats: Dict[str, Dict] = {}
     for i, name in enumerate(cfg.species_variables):
@@ -895,13 +1062,15 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
         }
 
     for i, name in enumerate(cfg.global_variables):
-        if mu_g is None or sd_g is None:
+        if mu_g is None or sd_g is None or mu_glog is None or sd_glog is None:
             raise RuntimeError("Globals configured but global stats unavailable")
         per_key_stats[name] = {
             "mean": float(mu_g[i]),
             "std": float(sd_g[i]),
             "min": float(g_min[i]),
             "max": float(g_max[i]),
+            "log_mean": float(mu_glog[i]),
+            "log_std": float(sd_glog[i]),
             "log_min": float(glog_min[i]),
             "log_max": float(glog_max[i]),
         }
@@ -910,7 +1079,7 @@ def compute_train_stats(out_tmp: Path, cfg: PreCfg) -> Tuple[Dict, Dict[str, str
     for s in cfg.species_variables:
         methods[s] = "log-standard"
     for g in cfg.global_variables:
-        methods[g] = canonical_method(cfg.methods.get(g, cfg.globals_default_method))
+        methods[g] = cfg.methods[g]
 
     return per_key_stats, methods
 
@@ -935,24 +1104,22 @@ def normalize_and_write(
     sd_s = np.array([per_key_stats[s]["log_std"] for s in cfg.species_variables], dtype=np.float64).reshape(1, 1, S)
 
     # Globals normalization vectors.
-    method_ids = np.zeros(G, dtype=np.int64)  # 0=identity, 1=standard, 2=min-max, 3=log-min-max
+    method_ids = np.zeros(G, dtype=np.int64)  # 0=standard, 1=min-max, 2=log-min-max, 3=log-standard
     g_mean = np.zeros(G, dtype=np.float64)
     g_std = np.ones(G, dtype=np.float64)
     g_min = np.zeros(G, dtype=np.float64)
     g_rng = np.ones(G, dtype=np.float64)
+    glog_mean = np.zeros(G, dtype=np.float64)
+    glog_std = np.ones(G, dtype=np.float64)
     glog_min = np.zeros(G, dtype=np.float64)
     glog_rng = np.ones(G, dtype=np.float64)
 
     for j, name in enumerate(cfg.global_variables):
-        m = canonical_method(methods[name])
+        m = methods[name]
         st = per_key_stats[name]
 
-        if m == "identity":
-            method_ids[j] = 0
-            continue
-
         if m == "standard":
-            method_ids[j] = 1
+            method_ids[j] = 0
             g_mean[j] = float(st["mean"])
             g_std[j] = float(st["std"])
             if g_std[j] <= 0.0:
@@ -960,7 +1127,7 @@ def normalize_and_write(
             continue
 
         if m == "min-max":
-            method_ids[j] = 2
+            method_ids[j] = 1
             g_min[j] = float(st["min"])
             g_rng[j] = float(st["max"]) - g_min[j]
             if g_rng[j] <= 0.0:
@@ -968,11 +1135,19 @@ def normalize_and_write(
             continue
 
         if m == "log-min-max":
-            method_ids[j] = 3
+            method_ids[j] = 2
             glog_min[j] = float(st["log_min"])
             glog_rng[j] = float(st["log_max"]) - glog_min[j]
             if glog_rng[j] <= 0.0:
                 raise ValueError(f"Global '{name}' has non-positive range for log-min-max")
+            continue
+
+        if m == "log-standard":
+            method_ids[j] = 3
+            glog_mean[j] = float(st["log_mean"])
+            glog_std[j] = float(st["log_std"])
+            if glog_std[j] <= 0.0:
+                raise ValueError(f"Global '{name}' has non-positive log-std for log-standard")
             continue
 
         raise ValueError(f"Unsupported global normalization method '{m}' for '{name}'")
@@ -981,7 +1156,8 @@ def normalize_and_write(
     dt_log_min = float(np.log10(cfg.dt_min))
     dt_log_max = float(np.log10(cfg.dt_max))
     dt_log_rng = dt_log_max - dt_log_min
-    dt_is_constant = (dt_log_rng == 0.0)
+    if dt_log_rng <= 0.0:
+        raise ValueError("Invalid dt normalization range: dt_max must be greater than dt_min")
 
     for split in ("train", "validation", "test"):
         physical_shards = iter_shards(out_tmp, split, "_physical")
@@ -999,17 +1175,17 @@ def normalize_and_write(
                 g_out = g2
 
                 # standard
-                std_mask = method_ids == 1
+                std_mask = method_ids == 0
                 if np.any(std_mask):
                     g_out = np.where(std_mask.reshape(1, G), (g2 - g_mean.reshape(1, G)) / g_std.reshape(1, G), g_out)
 
                 # min-max
-                mm_mask = method_ids == 2
+                mm_mask = method_ids == 1
                 if np.any(mm_mask):
                     g_out = np.where(mm_mask.reshape(1, G), (g2 - g_min.reshape(1, G)) / g_rng.reshape(1, G), g_out)
 
                 # log-min-max
-                lmm_mask = method_ids == 3
+                lmm_mask = method_ids == 2
                 if np.any(lmm_mask):
                     g_out = np.where(
                         lmm_mask.reshape(1, G),
@@ -1017,21 +1193,26 @@ def normalize_and_write(
                         g_out,
                     )
 
+                # log-standard
+                ls_mask = method_ids == 3
+                if np.any(ls_mask):
+                    g_out = np.where(
+                        ls_mask.reshape(1, G),
+                        (np.log10(np.maximum(g2, eps)) - glog_mean.reshape(1, G)) / glog_std.reshape(1, G),
+                        g_out,
+                    )
+
                 g_z = g_out.astype(np.float32, copy=False)
             else:
                 g_z = np.zeros((y.shape[0], 0), dtype=np.float32)
 
-            if dt_is_constant:
-                dt_norm = np.zeros_like(dt, dtype=np.float32)
-            else:
-                dt_norm = (np.log10(np.maximum(dt, eps)) - dt_log_min) / dt_log_rng
-                dt_norm = np.clip(dt_norm, 0.0, 1.0).astype(np.float32)
+            dt_norm = (np.log10(np.maximum(dt, eps)) - dt_log_min) / dt_log_rng
+            dt_norm = np.clip(dt_norm, 0.0, 1.0).astype(np.float32)
 
             np.savez(out_final / split / f"shard_{i:06d}.npz", y_mat=y_z, globals=g_z, dt_norm_mat=dt_norm)
 
     manifest = {
         "normalization_methods": methods,
-        "methods": methods,  # legacy alias
         "per_key_stats": per_key_stats,
         "epsilon": float(cfg.epsilon),
         "min_std": float(cfg.min_std),
@@ -1062,27 +1243,10 @@ def write_summary(
         f.write("\n")
 
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
-
-
-def default_config_path() -> Path:
-    # Repository layout: <repo_root>/config.json and <repo_root>/src/preprocessing.py
-    return Path(__file__).resolve().parents[1] / "config.json"
-
-
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, default=str(default_config_path()), help="Path to config.json")
-    return ap.parse_args()
-
-
 def main() -> None:
-    args = parse_args()
-
-    cfg_path = Path(args.config).expanduser().resolve()
+    cfg_path = DEFAULT_CONFIG_PATH.expanduser().resolve()
     cfg_dict = load_json(cfg_path)
+    validate_required_config_keys(cfg_dict)
 
     sys_cfg = _require_dict(cfg_dict, "system")
     _configure_logging(_require_str(sys_cfg, "log_level"))
@@ -1142,6 +1306,8 @@ def main() -> None:
     per_key_stats, methods = compute_train_stats(out_tmp, cfg)
     normalize_and_write(out_tmp=out_tmp, out_final=out_final, cfg=cfg, per_key_stats=per_key_stats, methods=methods)
     write_summary(out_final, cfg=cfg, counts_total=counts_total, rejects_total=rejects_total)
+    remove_tmp_dir(out_tmp)
+    log.info("Removed temporary physical shard directory: %s", out_tmp)
 
     log.info("Done in %.2fs", time.time() - t0)
 
