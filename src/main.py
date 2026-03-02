@@ -6,7 +6,7 @@ main.py
 - Preprocess if needed, then hydrate cfg.data.* from artifacts
 - Build datasets/dataloaders (single set of knobs; no *_val variants)
 - Build model
-- Train via Lightning-backed Trainer (CSV only)
+- Train via a small, explicit PyTorch training loop (JSONL metrics)
 """
 
 from __future__ import annotations
@@ -19,11 +19,13 @@ if sys.platform == "darwin":
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import json
-import time
 import shutil
 import logging
+import inspect
+import hashlib
+import subprocess
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List, Sequence
+from typing import Any, Dict, Optional, Tuple, Sequence
 
 
 import torch
@@ -33,7 +35,7 @@ from utils import (
     seed_everything,
     load_json_config,
     dump_json,
-    resolve_precision_and_dtype,
+    resolve_precision_policy,
 )
 from dataset import FlowMapPairsDataset, create_dataloader
 from model import create_model
@@ -42,47 +44,87 @@ from preprocessor import DataPreprocessor
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config.jsonc"
-GLOBAL_SEED = 42
-GLOBAL_WORK_DIR = REPO_ROOT / "models" / "autoencoder-flowmap"
-VALIDATION_SEED_OFFSET = 1337
+DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config_job0.jsonc"
+
+# Number of hash bytes used to derive a 32-bit seed.
+_SEED_BYTES = 4
+
+# Max items shown when previewing lists in error messages.
+_PREVIEW_MAX_ITEMS = 10
 
 
-# --------------------------------------------------------------------------------------
-# DDP / MPI env normalization (optional but helpful on clusters)
-# --------------------------------------------------------------------------------------
+def _resolve_repo_path(path_like: str | os.PathLike[str]) -> Path:
+    """Resolve config paths relative to repository root when not absolute."""
+    p = Path(path_like).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return (REPO_ROOT / p).resolve()
 
-def normalize_distributed_env() -> None:
+
+def reject_deprecated_config_keys(cfg: Dict[str, Any]) -> None:
+    """Fail fast on config keys that are not implemented in this codebase.
+
+    The goal is to avoid silent no-ops where a user expects a feature to be active.
     """
-    Lightning/DDP expects torchrun-style env vars (RANK/WORLD_SIZE/LOCAL_RANK).
-    Map common MPI/PMI/MVAPICH/SLURM env vars to torchrun equivalents only when missing.
-    """
-    if os.getenv("RANK") is None:
-        for k in ("SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK", "MV2_COMM_WORLD_RANK"):
-            v = os.getenv(k)
-            if v is not None:
-                os.environ["RANK"] = v
-                break
 
-    if os.getenv("WORLD_SIZE") is None:
-        for k in ("SLURM_NTASKS", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE"):
-            v = os.getenv(k)
-            if v is not None:
-                os.environ["WORLD_SIZE"] = v
-                break
+    deprecated: list[tuple[str, str]] = []
 
-    if os.getenv("LOCAL_RANK") is None:
-        for k in (
-            "SLURM_LOCALID",
-            "OMPI_COMM_WORLD_LOCAL_RANK",
-            "MPI_LOCALRANKID",
-            "MV2_COMM_WORLD_LOCAL_RANK",
-            "CUDA_LOCAL_RANK",
-        ):
-            v = os.getenv(k)
-            if v is not None:
-                os.environ["LOCAL_RANK"] = v
-                break
+    ds = cfg.get("dataset", {})
+    for k in (
+        "storage_dtype",
+        "skip_scan",
+        "skip_validate_grids",
+        "precompute_dt_table",
+        "share_times_across_batch",
+        "mmap_mode",
+        "uniform_offset_sampling_strict",
+        "assume_shared_grid",
+        "dt_epsilon",
+    ):
+        if k in ds:
+            deprecated.append(("dataset", k))
+
+    data_cfg = cfg.get("data", {})
+    if "target_species" in data_cfg:
+        deprecated.append(("data", "target_species"))
+
+    pre_cfg = cfg.get("preprocessing", {})
+    for k in ("num_workers", "allow_empty_splits"):
+        if k in pre_cfg:
+            deprecated.append(("preprocessing", k))
+
+    tr = cfg.get("training", {})
+    for k in (
+        "use_swa",
+        "swa_epoch_start",
+        "swa_annealing_epochs",
+        "swa_annealing_strategy",
+        "accumulate_grad_batches",
+        "auto_resume",
+    ):
+        if k in tr:
+            deprecated.append(("training", k))
+
+    loss_cfg = tr.get("adaptive_stiff_loss", {})
+    if "epsilon_phys" in loss_cfg:
+        deprecated.append(("training.adaptive_stiff_loss", "epsilon_phys"))
+
+    mcfg = cfg.get("model", {})
+    if "vae_mode" in mcfg:
+        deprecated.append(("model", "vae_mode"))
+    if "allow_partial_simplex" in mcfg:
+        deprecated.append(("model", "allow_partial_simplex"))
+
+    if deprecated:
+        keys = ", ".join(f"{a}.{b}" for a, b in deprecated)
+        raise KeyError(f"Unsupported config key(s): {keys}")
+
+
+def _derive_seed(base_seed: int, tag: str) -> int:
+    """Derive a deterministic, decorrelated seed from a base seed and a tag."""
+
+    h = hashlib.sha256(f"{int(base_seed)}:{tag}".encode("utf-8")).digest()
+    return int.from_bytes(h[:_SEED_BYTES], byteorder="little", signed=False)
 
 
 # --------------------------------------------------------------------------------------
@@ -91,20 +133,20 @@ def normalize_distributed_env() -> None:
 
 def setup_device(logger: logging.Logger) -> torch.device:
     """
-    Device selection:
-      - CUDA: uses LOCAL_RANK (or defaults to 0) and calls torch.cuda.set_device.
+    Single-device selection:
+      - CUDA: always uses cuda:0.
       - MPS: uses Apple MPS if available.
       - CPU: fallback.
     """
     if torch.cuda.is_available():
-        local_rank = int(os.getenv("LOCAL_RANK", "0") or "0")
-        device = torch.device(f"cuda:{local_rank}")
+        device = torch.device("cuda:0")
         torch.cuda.set_device(device)
         try:
-            dev_name = torch.cuda.get_device_name(local_rank)
-        except Exception:
+            dev_name = torch.cuda.get_device_name(0)
+        except Exception as e:
+            logger.warning("Could not query CUDA device name: %s", e)
             dev_name = "unknown"
-        logger.info(f"Set CUDA device to local_rank={local_rank} ({dev_name})")
+        logger.info(f"Set CUDA device to cuda:0 ({dev_name})")
         return device
 
     if torch.backends.mps.is_available():
@@ -115,7 +157,7 @@ def setup_device(logger: logging.Logger) -> torch.device:
     return torch.device("cpu")
 
 
-def optimize_hardware(system_cfg: Dict[str, Any], device: torch.device, logger: logging.Logger) -> None:
+def optimize_hardware(cfg: Dict[str, Any], device: torch.device, logger: logging.Logger) -> None:
     """
     Mirrors the intent of hardware.optimize_hardware:
       - TF32 / matmul precision
@@ -123,25 +165,27 @@ def optimize_hardware(system_cfg: Dict[str, Any], device: torch.device, logger: 
       - deterministic algorithms (optional)
       - optional CPU thread settings
     """
-    # Matmul precision (safe no-op if unsupported)
+    # Matmul precision is a best-effort global hint across backends.
     try:
         torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to set float32 matmul precision hint: %s", e)
 
-    # TF32 flags (CUDA only) — support both legacy key "tf32" and newer "allow_tf32"
-    tf32 = system_cfg.get("tf32", system_cfg.get("allow_tf32", True))
-    tf32 = bool(tf32)
+    system_cfg = cfg.get("system", {})
+    precision_cfg = cfg.get("precision", {})
+
+    # TF32 flags (CUDA only)
+    tf32 = bool(precision_cfg.get("tf32", False))
 
     if device.type == "cuda":
         try:
             torch.backends.cuda.matmul.allow_tf32 = tf32
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError("Failed to apply precision.tf32 to torch.backends.cuda.matmul.allow_tf32") from e
         try:
             torch.backends.cudnn.allow_tf32 = tf32
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError("Failed to apply precision.tf32 to torch.backends.cudnn.allow_tf32") from e
 
     # CPU thread control (optional): set both env + torch threads
     omp = system_cfg.get("omp_num_threads")
@@ -163,39 +207,43 @@ def optimize_hardware(system_cfg: Dict[str, Any], device: torch.device, logger: 
         try:
             torch.use_deterministic_algorithms(True)
         except Exception as e:
-            logger.warning(f"torch.use_deterministic_algorithms(True) failed: {e}")
+            raise RuntimeError(
+                "system.deterministic=true but torch.use_deterministic_algorithms(True) failed"
+            ) from e
         try:
             torch.backends.cudnn.deterministic = True
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError("system.deterministic=true but failed to set cudnn.deterministic=True") from e
         try:
             torch.backends.cudnn.benchmark = False
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError("system.deterministic=true but failed to set cudnn.benchmark=False") from e
         logger.info("Deterministic mode enabled (cudnn.benchmark forced False).")
     else:
         try:
             torch.use_deterministic_algorithms(False)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Could not disable deterministic algorithms explicitly: %s", e)
         try:
             torch.backends.cudnn.deterministic = False
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Could not set cudnn.deterministic=False: %s", e)
         try:
             torch.backends.cudnn.benchmark = cudnn_benchmark
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Could not set cudnn.benchmark=%s: %s", cudnn_benchmark, e)
         logger.info(f"cudnn.benchmark={cudnn_benchmark}")
 
     # Final effective settings summary (matches old behavior)
     try:
         eff_bench = bool(torch.backends.cudnn.benchmark)
-    except Exception:
+    except Exception as e:
+        logger.warning("Could not read cudnn.benchmark effective state: %s", e)
         eff_bench = cudnn_benchmark
     try:
         eff_det = bool(torch.backends.cudnn.deterministic)
-    except Exception:
+    except Exception as e:
+        logger.warning("Could not read cudnn.deterministic effective state: %s", e)
         eff_det = False
 
     logger.info(
@@ -208,6 +256,15 @@ def optimize_hardware(system_cfg: Dict[str, Any], device: torch.device, logger: 
 # Config hydration from processed artifacts
 # --------------------------------------------------------------------------------------
 
+def _preview(items: Sequence[str]) -> str:
+    """Format a list for error messages, truncating after _PREVIEW_MAX_ITEMS."""
+    items = list(items)
+    if len(items) <= _PREVIEW_MAX_ITEMS:
+        return "[" + ", ".join(repr(x) for x in items) + "]"
+    head = ", ".join(repr(x) for x in items[:_PREVIEW_MAX_ITEMS])
+    return f"[{head}, ...] (+{len(items) - _PREVIEW_MAX_ITEMS} more)"
+
+
 def hydrate_config_from_processed(
     cfg: Dict[str, Any],
     logger: logging.Logger,
@@ -216,20 +273,14 @@ def hydrate_config_from_processed(
     """
     Hydrate cfg.data from processed artifacts (normalization.json / preprocessing_summary.json).
 
-    Precedence rules:
-      - cfg.data.species_variables and cfg.data.target_species take precedence if non-empty.
-      - Empty or missing species/targets are treated as unspecified and will be filled from artifacts.
-      - Configured species/targets must be a subset of the processed species list.
-      - Hard error if any configured species is not present in processed artifacts.
-      - Hard error if species_variables and target_species are not identical after resolution.
-
-    Other fields (global_variables, time_variable) are kept consistent with artifacts because shard column
-    order and normalization stats are defined by the processed artifacts.
+    This codebase requires the configured schema to match the processed artifacts exactly.
+    If the config omits schema fields, they are filled from artifacts. If the config specifies
+    them, they must be identical (including order), otherwise an error is raised.
     """
     if processed_dir is None:
-        processed_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
+        processed_dir = _resolve_repo_path(cfg["paths"]["processed_data_dir"])
     else:
-        processed_dir = Path(processed_dir).expanduser().resolve()
+        processed_dir = _resolve_repo_path(processed_dir)
 
     if not processed_dir.exists():
         raise FileNotFoundError(f"[hydrate] Missing processed data dir: {processed_dir}")
@@ -237,30 +288,20 @@ def hydrate_config_from_processed(
     norm_path = processed_dir / "normalization.json"
     summary_path = processed_dir / "preprocessing_summary.json"
 
-    def _load_json(p: Path) -> Optional[Dict[str, Any]]:
-        if not p.exists():
-            return None
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning("[hydrate] Failed to read %s: %s", p.name, e)
-            return None
+    if not norm_path.exists():
+        raise FileNotFoundError(f"[hydrate] Missing normalization.json in {processed_dir}")
+    if not summary_path.exists():
+        raise FileNotFoundError(f"[hydrate] Missing preprocessing_summary.json in {processed_dir}")
 
-    def _preview(items: Sequence[str], max_items: int = 10) -> str:
-        items = list(items)
-        if len(items) <= max_items:
-            return "[" + ", ".join(repr(x) for x in items) + "]"
-        head = ", ".join(repr(x) for x in items[:max_items])
-        return f"[{head}, ...] (+{len(items) - max_items} more)"
+    with open(norm_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    with open(summary_path, "r", encoding="utf-8") as f:
+        summary = json.load(f)
 
-    manifest = _load_json(norm_path)
-    summary = _load_json(summary_path)
-
-    meta = (manifest or {}).get("meta", {}) if manifest else {}
-    processed_species = meta.get("species_variables") or (summary or {}).get("species_variables")
-    processed_globals = meta.get("global_variables") or (summary or {}).get("global_variables")
-    processed_time_var = meta.get("time_variable") or (summary or {}).get("time_variable")
+    meta = manifest.get("meta", {})
+    processed_species = meta.get("species_variables") or summary.get("species_variables")
+    processed_globals = meta.get("global_variables") or summary.get("global_variables")
+    processed_time_var = meta.get("time_variable") or summary.get("time_variable")
 
     if not processed_species:
         raise RuntimeError(
@@ -268,124 +309,57 @@ def hydrate_config_from_processed(
             f"in {processed_dir}"
         )
     processed_species = list(processed_species)
-    processed_set = set(processed_species)
 
-    # Validate processed invariants if target_species is present in artifacts.
-    processed_targets = (
-        meta.get("target_species")
-        or (manifest or {}).get("target_species")
-        or (summary or {}).get("target_species")
-    )
-    if processed_targets is not None:
-        processed_targets = list(processed_targets)
-        if processed_targets != processed_species:
-            raise RuntimeError(
-                "[hydrate] Processed artifacts contain inconsistent species/targets. "
-                f"species_variables={_preview(processed_species)}; target_species={_preview(processed_targets)}. "
-                "This codebase requires species_variables and target_species to be identical."
-            )
-
-    data_cfg = cfg.setdefault("data", {})
-
-    cfg_species_raw = data_cfg.get("species_variables", []) or []
-    cfg_targets_raw = data_cfg.get("target_species", []) or []
-
-    cfg_species: List[str] = list(cfg_species_raw) if cfg_species_raw else []
-    cfg_targets: List[str] = list(cfg_targets_raw) if cfg_targets_raw else []
-
-    def _check_duplicates(items: Sequence[str], label: str) -> None:
-        items = list(items)
-        if len(items) != len(set(items)):
-            dupes = [x for x in dict.fromkeys(items) if items.count(x) > 1]
-            raise ValueError(f"[hydrate] {label} contains duplicate entries: {dupes}")
-
-    species_specified = len(cfg_species) > 0
-    targets_specified = len(cfg_targets) > 0
-
-    if species_specified:
-        _check_duplicates(cfg_species, "cfg.data.species_variables")
-        missing = [s for s in cfg_species if s not in processed_set]
-        if missing:
-            raise ValueError(
-                "[hydrate] cfg.data.species_variables contains species not present in processed artifacts: "
-                f"{missing}. Processed species={_preview(processed_species)}"
-            )
-        logger.info(
-            "[hydrate] Keeping cfg.data.species_variables (%d of %d processed): %s",
-            len(cfg_species),
-            len(processed_species),
-            _preview(cfg_species),
-        )
-        resolved_species = list(cfg_species)
-    else:
-        resolved_species = list(processed_species)
-        logger.info(
-            "[hydrate] cfg.data.species_variables is empty; using %d species from processed artifacts: %s",
-            len(resolved_species),
-            _preview(resolved_species),
+    processed_targets = meta.get("target_species")
+    if processed_targets is not None and list(processed_targets) != processed_species:
+        raise RuntimeError(
+            "[hydrate] Processed artifacts contain inconsistent species/targets. "
+            f"species_variables={_preview(processed_species)}; target_species={_preview(list(processed_targets))}. "
+            "This codebase requires outputs to match inputs."
         )
 
-    if targets_specified:
-        _check_duplicates(cfg_targets, "cfg.data.target_species")
-        missing = [s for s in cfg_targets if s not in processed_set]
-        if missing:
-            raise ValueError(
-                "[hydrate] cfg.data.target_species contains species not present in processed artifacts: "
-                f"{missing}. Processed species={_preview(processed_species)}"
-            )
-        logger.info(
-            "[hydrate] Keeping cfg.data.target_species (%d): %s",
-            len(cfg_targets),
-            _preview(cfg_targets),
-        )
-        resolved_targets = list(cfg_targets)
-    else:
-        resolved_targets = list(resolved_species)
-        logger.info(
-            "[hydrate] cfg.data.target_species is empty; using the same list as species_variables (%d species).",
-            len(resolved_targets),
-        )
+    data_cfg = cfg.get("data")
+    if not isinstance(data_cfg, dict):
+        raise KeyError("[hydrate] cfg.data must be a mapping")
+    if "target_species" in data_cfg:
+        raise KeyError("[hydrate] Unsupported config key: data.target_species")
 
-    # Enforce invariant requested: targets must match species exactly (including order).
-    if resolved_targets != resolved_species:
+    cfg_species_raw = data_cfg.get("species_variables")
+    if not isinstance(cfg_species_raw, list) or len(cfg_species_raw) == 0:
+        raise ValueError("[hydrate] cfg.data.species_variables must be explicitly set and non-empty")
+    cfg_species = list(cfg_species_raw)
+    if cfg_species != processed_species:
         raise ValueError(
-            "[hydrate] cfg.data.target_species must be identical to cfg.data.species_variables. "
-            f"species_variables={_preview(resolved_species)}; target_species={_preview(resolved_targets)}"
+            "[hydrate] cfg.data.species_variables does not match processed artifacts. "
+            f"config={_preview(cfg_species)}; processed={_preview(processed_species)}"
         )
 
-    data_cfg["species_variables"] = list(resolved_species)
-    data_cfg["target_species"] = list(resolved_targets)
+    if processed_globals is None:
+        raise RuntimeError("[hydrate] Missing global_variables in processed artifacts")
+    processed_globals_list = list(processed_globals)
+    cfg_globals = list(data_cfg.get("global_variables") or [])
+    if cfg_globals:
+        if cfg_globals != processed_globals_list:
+            raise ValueError(
+                "[hydrate] cfg.data.global_variables does not match processed artifacts. "
+                f"config={_preview(cfg_globals)}; processed={_preview(processed_globals_list)}"
+            )
+    else:
+        data_cfg["global_variables"] = processed_globals_list
+        logger.info("[hydrate] cfg.data.global_variables is empty; using processed artifacts")
 
-    # Keep global_variables/time_variable consistent with processed artifacts.
-    if processed_globals:
-        prev_globals = list(data_cfg.get("global_variables", []) or [])
-        if not prev_globals:
-            logger.info(
-                "[hydrate] cfg.data.global_variables is empty; using processed artifacts: %s",
-                _preview(processed_globals),
+    if processed_time_var is None:
+        raise RuntimeError("[hydrate] Missing time_variable in processed artifacts")
+    cfg_time = data_cfg.get("time_variable")
+    if cfg_time:
+        if str(cfg_time) != str(processed_time_var):
+            raise ValueError(
+                "[hydrate] cfg.data.time_variable does not match processed artifacts. "
+                f"config={str(cfg_time)!r}; processed={str(processed_time_var)!r}"
             )
-        elif prev_globals != list(processed_globals):
-            logger.warning(
-                "[hydrate] Overriding cfg.data.global_variables to match processed artifacts. Config=%s; processed=%s",
-                _preview(prev_globals),
-                _preview(processed_globals),
-            )
-        data_cfg["global_variables"] = list(processed_globals)
-
-    if processed_time_var:
-        prev_time = data_cfg.get("time_variable")
-        if not prev_time:
-            logger.info(
-                "[hydrate] cfg.data.time_variable is empty; using processed artifacts: %r",
-                str(processed_time_var),
-            )
-        elif str(prev_time) != str(processed_time_var):
-            logger.warning(
-                "[hydrate] Overriding cfg.data.time_variable to match processed artifacts. Config=%r; processed=%r",
-                str(prev_time),
-                str(processed_time_var),
-            )
+    else:
         data_cfg["time_variable"] = str(processed_time_var)
+        logger.info("[hydrate] cfg.data.time_variable is empty; using processed artifacts")
 
     return processed_dir
 
@@ -393,11 +367,10 @@ def hydrate_config_from_processed(
 def ensure_preprocessed_data(cfg: Dict[str, Any], logger: logging.Logger) -> Path:
     """
     Reuse processed data if complete; otherwise run the preprocessor.
-
-    Safety: if preprocessing is required and WORLD_SIZE>1, exit.
     """
-    processed_dir = Path(cfg.get("paths", {}).get("processed_data_dir", "data/processed")).resolve()
-    overwrite_data = bool(cfg.get("preprocessing", {}).get("overwrite_data", False))
+    processed_dir = _resolve_repo_path(cfg["paths"]["processed_data_dir"])
+    overwrite_data = bool(cfg["preprocessing"]["overwrite_data"])
+    reuse_existing_data = bool(cfg["preprocessing"]["reuse_existing_data"])
 
     req_files = [
         processed_dir / "normalization.json",
@@ -409,38 +382,35 @@ def ensure_preprocessed_data(cfg: Dict[str, Any], logger: logging.Logger) -> Pat
         (processed_dir / split).exists() and any((processed_dir / split).glob("*.npz"))
         for split in ("train", "validation", "test")
     )
-    preprocessing_needed = overwrite_data or not (have_required and have_splits)
-
-    world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
-    multi = world_size > 1
-
-    if preprocessing_needed and multi:
-        logger.warning("Preprocessing is required but WORLD_SIZE>1 (multi-rank) is active")
-        raise SystemExit(2)
-
     if have_required and have_splits and not overwrite_data:
-        snap = processed_dir / "config.snapshot.json"
-        if snap.exists():
-            try:
-                snap_cfg = json.loads(snap.read_text(encoding="utf-8"))
-                data_snap = snap_cfg.get("data", {})
-                data_cfg = cfg.setdefault("data", {})
-                for k in ("species_variables", "global_variables", "time_variable", "target_species"):
-                    if data_snap.get(k) and not data_cfg.get(k):
-                        data_cfg[k] = data_snap[k]
-                logger.info("[pre] Reusing existing preprocessed data at %s", processed_dir)
-            except Exception as e:
-                logger.warning("[pre] Reusing existing data but failed to read config.snapshot.json: %s", e)
-        else:
-            logger.info("[pre] Reusing existing preprocessed data at %s", processed_dir)
+        if not reuse_existing_data:
+            raise FileExistsError(
+                "Preprocessed data already exists. "
+                "Set preprocessing.reuse_existing_data=true to reuse it, "
+                "or set preprocessing.overwrite_data=true to regenerate."
+            )
+        logger.info("[pre] Reusing existing preprocessed data at %s", processed_dir)
         return processed_dir
 
-    if overwrite_data and processed_dir.exists():
-        logger.warning("Deleting existing processed dir: %s", processed_dir)
-        shutil.rmtree(processed_dir, ignore_errors=True)
+    if processed_dir.exists():
+        nonempty = any(processed_dir.iterdir())
+        if nonempty and not overwrite_data:
+            raise FileExistsError(
+                "Processed data directory exists but is incomplete (or overwrite is disabled). "
+                "Set preprocessing.overwrite_data=true to regenerate, or point paths.processed_data_dir to a "
+                "different (empty) directory."
+            )
+        if overwrite_data and nonempty:
+            logger.warning("Deleting existing processed dir: %s", processed_dir)
+            shutil.rmtree(processed_dir)
 
     dp = DataPreprocessor(cfg, logger=logger.getChild("pre"))
     dp.run()
+
+    # Verify outputs exist after preprocessing.
+    if not all(p.exists() for p in req_files):
+        missing = [str(p) for p in req_files if not p.exists()]
+        raise RuntimeError(f"Preprocessing completed but required artifact(s) are missing: {missing}")
     return processed_dir
 
 
@@ -454,17 +424,23 @@ def build_datasets_and_loaders(
     runtime_dtype: torch.dtype,
     logger: logging.Logger,
 ) -> Tuple[FlowMapPairsDataset, FlowMapPairsDataset, torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-    dataset_cfg = cfg.get("dataset", {})
-    training_cfg = cfg.get("training", {})
-    processed_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
+    dataset_cfg = cfg["dataset"]
+    training_cfg = cfg["training"]
+    processed_dir = _resolve_repo_path(cfg["paths"]["processed_data_dir"])
 
-    pairs_per_traj = int(training_cfg.get("pairs_per_traj", 64))
-    min_steps = int(training_cfg.get("min_steps", 1))
-    max_steps = training_cfg.get("max_steps")
+    for key in ("pairs_per_traj", "min_steps", "max_steps"):
+        if key not in training_cfg:
+            raise KeyError(f"Missing config: training.{key}")
+
+    pairs_per_traj = int(training_cfg["pairs_per_traj"])
+    min_steps = int(training_cfg["min_steps"])
+    max_steps = training_cfg["max_steps"]
     max_steps = int(max_steps) if (max_steps is not None) else None
-    base_seed = int(cfg.get("system", {}).get("seed", 42))
+    base_seed = int(cfg["system"]["seed"])
 
-    preload_to_gpu = bool(dataset_cfg.get("preload_to_gpu", True))
+    if "preload_to_gpu" not in dataset_cfg:
+        raise KeyError("Missing config: dataset.preload_to_gpu")
+    preload_to_gpu = bool(dataset_cfg["preload_to_gpu"])
 
     train_dataset = FlowMapPairsDataset(
         processed_root=processed_dir, split="train", config=cfg,
@@ -472,18 +448,29 @@ def build_datasets_and_loaders(
         preload_to_gpu=preload_to_gpu, device=device, dtype=runtime_dtype, seed=base_seed,
         logger=logger.getChild("dataset.train"),
     )
+    val_seed = _derive_seed(base_seed, "validation")
     val_dataset = FlowMapPairsDataset(
         processed_root=processed_dir, split="validation", config=cfg,
         pairs_per_traj=pairs_per_traj, min_steps=min_steps, max_steps=max_steps,
-        preload_to_gpu=preload_to_gpu, device=device, dtype=runtime_dtype, seed=base_seed + VALIDATION_SEED_OFFSET,
+        preload_to_gpu=preload_to_gpu, device=device, dtype=runtime_dtype, seed=val_seed,
         logger=logger.getChild("dataset.val"),
     )
 
-    batch_size = int(dataset_cfg.get("batch_size_train", 64))
-    num_workers = int(dataset_cfg.get("num_workers", 0))
-    persistent = bool(dataset_cfg.get("persistent_workers", False))
-    pin_memory = bool(dataset_cfg.get("pin_memory", False))
-    prefetch_factor = int(dataset_cfg.get("prefetch_factor", 2))
+    for key in (
+        "batch_size_train",
+        "num_workers",
+        "persistent_workers",
+        "pin_memory",
+        "prefetch_factor",
+    ):
+        if key not in dataset_cfg:
+            raise KeyError(f"Missing config: dataset.{key}")
+
+    batch_size = int(dataset_cfg["batch_size_train"])
+    num_workers = int(dataset_cfg["num_workers"])
+    persistent = bool(dataset_cfg["persistent_workers"])
+    pin_memory = bool(dataset_cfg["pin_memory"])
+    prefetch_factor = int(dataset_cfg["prefetch_factor"])
 
     train_loader = create_dataloader(
         dataset=train_dataset,
@@ -508,7 +495,6 @@ def build_datasets_and_loaders(
     logger.info(
         f"[dl] B={batch_size} workers={num_workers} prefetch={prefetch_factor} "
         f"pin={pin_memory} persistent_workers={persistent} "
-        f"share_times_across_batch={bool(dataset_cfg.get('share_times_across_batch', False))}"
     )
     return train_dataset, val_dataset, train_loader, val_loader
 
@@ -518,13 +504,10 @@ def validate_dataloaders(
     val_loader: Optional[torch.utils.data.DataLoader],
     logger: logging.Logger,
 ) -> None:
-    try:
-        n_train_items = len(train_loader.dataset)
-        n_val_items = len(val_loader.dataset) if val_loader else 0
-        n_train_batches = len(train_loader)
-        n_val_batches = len(val_loader) if val_loader else 0
-    except Exception:
-        n_train_items = n_val_items = n_train_batches = n_val_batches = 0
+    n_train_items = len(train_loader.dataset)
+    n_val_items = len(val_loader.dataset) if val_loader else 0
+    n_train_batches = len(train_loader)
+    n_val_batches = len(val_loader) if val_loader else 0
 
     logger.info(
         f"Dataset stats: train={n_train_items} items/{n_train_batches} batches; "
@@ -543,6 +526,38 @@ def validate_dataloaders(
 def build_model(cfg: Dict[str, Any], logger: logging.Logger) -> torch.nn.Module:
     logger.info("Creating model...")
     model = create_model(cfg, logger=logger.getChild("model"))
+
+    tcfg = cfg["training"]
+    if "torch_compile" not in tcfg:
+        raise KeyError("Missing config: training.torch_compile")
+    if bool(tcfg["torch_compile"]):
+        if not hasattr(torch, "compile"):
+            raise ValueError("torch.compile not available")
+
+        for key in (
+            "torch_compile_backend",
+            "torch_compile_mode",
+            "compile_dynamic",
+            "compile_fullgraph",
+        ):
+            if key not in tcfg:
+                raise KeyError(f"Missing config: training.{key}")
+
+        backend = str(tcfg["torch_compile_backend"])
+        mode = str(tcfg["torch_compile_mode"])
+        dynamic = bool(tcfg["compile_dynamic"])
+        fullgraph = bool(tcfg["compile_fullgraph"])
+
+        compile_kwargs: dict[str, Any] = {"backend": backend, "mode": mode}
+        sig = inspect.signature(torch.compile)
+        if "dynamic" in sig.parameters:
+            compile_kwargs["dynamic"] = dynamic
+        if "fullgraph" in sig.parameters:
+            compile_kwargs["fullgraph"] = fullgraph
+
+        model = torch.compile(model, **compile_kwargs)
+        logger.info("Enabled torch.compile")
+
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {n_params/1e6:.2f}M")
     return model
@@ -552,116 +567,120 @@ def build_model(cfg: Dict[str, Any], logger: logging.Logger) -> torch.nn.Module:
 # Training entrypoint
 # --------------------------------------------------------------------------------------
 
+def _require_export_script() -> Path:
+    """Return the export script path or fail fast if it's missing."""
+    export_script = REPO_ROOT / "testing" / "export.py"
+    if not export_script.is_file():
+        raise FileNotFoundError(f"Missing export script: {export_script}")
+    return export_script
+
+
+def export_physical_artifacts(work_dir: Path, logger: logging.Logger) -> Tuple[Path, Path]:
+    """Generate physical-I/O exported model and companion metadata in work_dir."""
+    export_script = _require_export_script()
+
+    env = os.environ.copy()
+    env["CHEMULATOR_MODEL_DIR"] = str(work_dir)
+
+    logger.info("Exporting physical-I/O artifact via %s", export_script)
+    proc = subprocess.run(
+        [sys.executable, str(export_script)],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if proc.stdout:
+        for line in proc.stdout.strip().splitlines():
+            logger.info("[export] %s", line)
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        stdout = proc.stdout.strip()
+        raise RuntimeError(
+            f"Physical artifact export failed (exit={proc.returncode}). "
+            f"stdout={stdout!r}; stderr={stderr!r}"
+        )
+
+    model_path = work_dir / "physical_model_k1_cpu.pt2"
+    metadata_path = work_dir / "physical_model_metadata.json"
+    missing = [str(p) for p in (model_path, metadata_path) if not p.is_file()]
+    if missing:
+        raise RuntimeError(f"Physical artifact export completed but files are missing: {missing}")
+
+    logger.info("Export complete: model=%s metadata=%s", model_path, metadata_path)
+    return model_path, metadata_path
+
+
 def main() -> None:
-    """Main training entrypoint (rank-0 writes; N GPU safe)."""
+    """Main training entrypoint (single-process only)."""
     cfg_path_str = os.getenv("FLOWMAP_CONFIG", str(DEFAULT_CONFIG_PATH))
     cfg_path = Path(cfg_path_str).expanduser().resolve()
     cfg = load_json_config(cfg_path)
+    reject_deprecated_config_keys(cfg)
 
-    if "paths" not in cfg or "processed_data_dir" not in cfg["paths"]:
-        raise KeyError("cfg.paths.processed_data_dir is required")
+    # Validate required top-level sections and their keys.
+    _required_sections: dict[str, tuple[str, ...]] = {
+        "paths": ("processed_data_dir", "raw_data_files", "work_dir", "overwrite"),
+        "system": ("seed",),
+        "precision": ("amp", "dataset_dtype", "io_dtype", "time_io_dtype", "normalize_dtype", "tf32"),
+        "preprocessing": ("overwrite_data", "reuse_existing_data"),
+        "dataset": (),
+        "data": (),
+        "normalization": (),
+        "training": (),
+    }
+    for section, keys in _required_sections.items():
+        if section not in cfg or not isinstance(cfg[section], dict):
+            raise KeyError(f"Missing config: {section}")
+        for key in keys:
+            if key not in cfg[section]:
+                raise KeyError(f"Missing config: {section}.{key}")
 
-    cfg.setdefault("system", {})
-    cfg["system"].setdefault("seed", GLOBAL_SEED)
+    raw_files = cfg["paths"]["raw_data_files"]
+    if not isinstance(raw_files, list) or len(raw_files) == 0:
+        raise ValueError("paths.raw_data_files must be explicitly set and non-empty")
 
-    cfg.setdefault("dataset", {})
+    # Fail early if the required physical-artifact exporter is unavailable.
+    _require_export_script()
 
-    cfg.setdefault("mixed_precision", {})
-    cfg["mixed_precision"].setdefault("mode", "bf16")
+    work_dir = _resolve_repo_path(cfg["paths"]["work_dir"])
+    overwrite = bool(cfg["paths"]["overwrite"])
+    if work_dir.exists() and overwrite:
+        print(f"[main] Deleting existing work dir: {work_dir}", flush=True)
+        shutil.rmtree(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
 
-    normalize_distributed_env()
-
-    work_dir = Path(cfg.get("paths", {}).get("work_dir", GLOBAL_WORK_DIR)).expanduser().resolve()
-    overwrite = bool(cfg.get("paths", {}).get("overwrite", False))
-
-    rank_env = (
-        os.getenv("RANK")
-        or os.getenv("SLURM_PROCID")
-        or os.getenv("PMI_RANK")
-        or os.getenv("OMPI_COMM_WORLD_RANK")
-        or os.getenv("MV2_COMM_WORLD_RANK")
-        or "0"
-    )
-    try:
-        global_rank = int(rank_env)
-    except Exception:
-        global_rank = 0
-
-    if global_rank == 0:
-        if work_dir.exists() and overwrite:
-            print(f"[main] Deleting existing work dir: {work_dir}", flush=True)
-            shutil.rmtree(work_dir, ignore_errors=True)
-        work_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            (work_dir / ".ready").write_text("ok", encoding="utf-8")
-        except Exception:
-            pass
-    else:
-        for _ in range(600):
-            if work_dir.exists() and (work_dir / ".ready").exists():
-                break
-            time.sleep(0.1)
-        work_dir.mkdir(parents=True, exist_ok=True)
-
-    if global_rank == 0:
-        setup_logging(log_file=work_dir / "train.log", level=logging.INFO)
-    else:
-        setup_logging(level=logging.INFO)
+    setup_logging(log_file=work_dir / "train.log", level=logging.INFO)
     logger = logging.getLogger("main")
     logger.info(f"Work directory: {work_dir}")
 
     seed_everything(int(cfg["system"]["seed"]))
     device = setup_device(logger)
-    optimize_hardware(cfg.get("system", {}), device, logger)
+    optimize_hardware(cfg, device, logger)
 
-    pl_precision, runtime_dtype = resolve_precision_and_dtype(cfg, device, logger)
-    logger.info(f"Resolved Lightning precision={pl_precision}; dataset runtime dtype={runtime_dtype}")
+    policy = resolve_precision_policy(cfg, device)
+    runtime_dtype = policy.dataset_dtype
+    logger.info(
+        "Precision: amp=%s amp_dtype=%s dataset_dtype=%s io_dtype=%s",
+        str(policy.amp_mode),
+        str(policy.amp_dtype).replace("torch.", ""),
+        str(policy.dataset_dtype).replace("torch.", ""),
+        str(cfg["precision"]["io_dtype"]),
+    )
 
-    if global_rank == 0:
-        processed_dir = ensure_preprocessed_data(cfg, logger)
-        try:
-            (work_dir / ".data.ready").write_text("ok", encoding="utf-8")
-        except Exception:
-            pass
-    else:
-        processed_dir = Path(cfg.get("paths", {}).get("processed_data_dir", "data/processed")).resolve()
-        req_files = [
-            processed_dir / "normalization.json",
-            processed_dir / "preprocessing_summary.json",
-            processed_dir / "shard_index.json",
-        ]
-        have_required = all(p.exists() for p in req_files)
-        have_splits = all(
-            (processed_dir / split).exists() and any((processed_dir / split).glob("*.npz"))
-            for split in ("train", "validation", "test")
-        )
-        overwrite_data = bool(cfg.get("preprocessing", {}).get("overwrite_data", False))
-        preprocessing_needed = overwrite_data or not (have_required and have_splits)
+    processed_dir = ensure_preprocessed_data(cfg, logger)
 
-        world_size = int(os.getenv("WORLD_SIZE", "1") or "1")
-        multi = world_size > 1
-
-        if preprocessing_needed and multi:
-            logger.warning("Preprocessing is required but WORLD_SIZE>1 (multi-rank) is active")
-            raise SystemExit(2)
-
-        for _ in range(3600):
-            if (work_dir / ".data.ready").exists():
-                break
-            time.sleep(0.1)
-        processed_dir = Path(cfg["paths"]["processed_data_dir"]).expanduser().resolve()
-
-    assert processed_dir.exists(), "Processed data dir must exist after preprocessing/hydration"
+    if not processed_dir.exists():
+        raise FileNotFoundError("Processed data dir must exist after preprocessing/hydration")
 
     hydrate_config_from_processed(cfg, logger, processed_dir)
 
-    if global_rank == 0:
-        dump_json(work_dir / "config.json", cfg)
-        logger.info("Saved final hydrated config")
-    else:
-        logger.info("Config hydrated (rank>0; no file write)")
+    dump_json(work_dir / "config.json", cfg)
+    logger.info("Saved final hydrated config")
 
-    train_ds, val_ds, train_loader, val_loader = build_datasets_and_loaders(
+    _, _, train_loader, val_loader = build_datasets_and_loaders(
         cfg=cfg, device=device, runtime_dtype=runtime_dtype, logger=logger
     )
     validate_dataloaders(train_loader=train_loader, val_loader=val_loader, logger=logger)
@@ -676,13 +695,11 @@ def main() -> None:
         work_dir=work_dir,
         device=device,
         logger=logger.getChild("trainer"),
-        pl_precision_override=pl_precision,
+        precision_policy=policy,
     )
     best_val_loss = trainer.train()
-    if global_rank == 0:
-        logger.info(f"Training complete. Best val loss: {best_val_loss:.6e}")
-    else:
-        logger.info("Training complete (rank>0).")
+    logger.info(f"Training complete. Best val loss: {best_val_loss:.6e}")
+    export_physical_artifacts(work_dir=work_dir, logger=logger)
 
 
 if __name__ == "__main__":

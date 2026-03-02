@@ -2,8 +2,8 @@
   "paths": {
     // Directory containing processed shards
     "processed_data_dir": "data/processed",
-    // List of raw HDF5 files (optional; auto-detect if empty)
-    "raw_data_files": [],
+    // List of raw HDF5 files (required; no auto-detection fallback)
+    "raw_data_files": ["data/raw/run10018-result.h5"],
     // Directory for logs/checkpoints/exports
     "work_dir": "models/final_version",
     // Delete existing work_dir before start
@@ -15,21 +15,25 @@
     "cudnn_benchmark": true,
     // Force deterministic operations (slower)
     "deterministic": false,
-    // Model parameter dtype (fallback only; preprocessing uses io_dtype if set)
-    "dtype": "float32",
-    // On-disk NPZ dtype for preprocessing output
-    "io_dtype": "float32",
-    // Allow TF32 tensor cores on Ampere/Hopper
-    "tf32": true,
     // Max OpenMP threads for CPU ops
     "omp_num_threads": 4,
     // Global RNG seed
     "seed": 42
   },
 
-  "mixed_precision": {
-    // AMP precision: "bf16", "fp16", or "none"
-    "mode": "bf16"
+  "precision": {
+    // AMP precision: "bf16", "fp16", or "off"
+    "amp": "off",
+    // Dataset/model input dtype: "auto" | "float32" | "float64"
+    "dataset_dtype": "float32",
+    // On-disk NPZ dtype for preprocessing output
+    "io_dtype": "float32",
+    // Time vector dtype for preprocessing output
+    "time_io_dtype": "float32",
+    // Stats/normalization math dtype
+    "normalize_dtype": "float32",
+    // Allow TF32 tensor cores on Ampere/Hopper (CUDA only)
+    "tf32": false
   },
 
   "data": {
@@ -37,23 +41,32 @@
     "global_variables": ["P", "T"],
     // Name of the time column in raw files
     "time_variable": "t_time",
-    // Species list; hydrated from artifacts if empty
-    "species_variables": [],
-    // Subset of species to predict; empty = all
-    "target_species": []
+    // Species list (required; no auto-detection fallback)
+    "species_variables": ["C2H2_evolution",
+                          "CH4_evolution",
+                          "CO2_evolution",
+                          "CO_evolution",
+                          "H2O_evolution",
+                          "H2_evolution",
+                          "HCN_evolution",
+                          "H_evolution",
+                          "N2_evolution",
+                          "NH3_evolution",
+                          "OH_evolution",
+                          "O_evolution"]
   },
 
   "normalization": {
     // Default normalization for unspecified keys
     "default_method": "log-standard",
-    // Small positive floor for log transforms
+    // Manifest compatibility field (validated > 0 but not used as a runtime clamp)
     "epsilon": 1e-30,
     // Per-key normalization methods
     "methods": {
       "P": "log-min-max",
       "T": "standard",
-      "dt": "log-min-max",
-      "t_time": "log-min-max"
+      // t_time includes t=0 in this dataset, so use a non-log method.
+      "t_time": "min-max"
     },
     // Minimum stddev to avoid division blow-up
     "min_std": 1e-10
@@ -66,45 +79,23 @@
     "min_value_threshold": 1e-30,
     // Compress NPZ shards (smaller, slower I/O)
     "npz_compressed": false,
-    // Workers for preprocessing (I/O bound; ignored under MPI)
-    "num_workers": 32,
     // Trajectories per output shard
     "trajectories_per_shard": 65536,
     // Drop t=0 row when exporting shards
     "skip_first_timestep": false,
-    // Reuse the data if possible
-    "overwrite_data": false
+    // Rebuild processed data (deletes existing processed_data_dir if true)
+    "overwrite_data": false,
+    // Reuse existing processed data only when explicitly enabled
+    "reuse_existing_data": false
   },
 
   "dataset": {
     // Global training batch size
     "batch_size_train": 4096,
-
-    // Optional: override dataset tensor dtype (null = use AMP dtype on CUDA; float32 forced on CPU/MPS)
-    // Allowed strings: "float32", "float16", "bf16"/"bfloat16"
-    "storage_dtype": null,
-
-    // np.load mmap mode for reading shard .npz files ("r" = memmap; null/false disables memmap)
-    "mmap_mode": "r",
-
-    // Avoid full shard scan for the preprocessed data; trust metadata files
-    "skip_scan": true,
-    // Skip time-grid monotonicity checks
-    "skip_validate_grids": true,
-    // Precompute normalized Δt table for shared grids
-    "precompute_dt_table": true,
     // Return K targets per anchor (K=times_per_anchor)
     "multi_time_per_anchor": true,
     // K: number of target steps per anchor when multi_time_per_anchor
     "times_per_anchor": 2,
-    // Use same offsets for entire batch
-    "share_times_across_batch": false,
-    // Sample offsets uniformly then fit anchors
-    "uniform_offset_sampling_strict": false,
-    // Assume all trajectories share the same time grid
-    "assume_shared_grid": true,
-    // Δt clamp floor before normalization
-    "dt_epsilon": 1e-30,
     // Use the very first anchor point
     "use_first_anchor": true,
     // DataLoader workers
@@ -133,8 +124,6 @@
     "activation": "silu",
     // Dropout rate in MLPs
     "dropout": 0.0,
-    // Use VAE-style stochastic encoder (if supported by your model.py)
-    "vae_mode": false,
     // Predict Δz and add to z (residual dynamics)
     "dynamics_residual": false,
     // Decoder predicts Δy in z-space
@@ -142,9 +131,7 @@
     // Decoder predicts Δlog10(y) in physical space
     "predict_delta_log_phys": false,
     // Use log-softmax head for simplex outputs
-    "softmax_head": false,
-    // Allow softmax on subset of species
-    "allow_partial_simplex": false
+    "softmax_head": false
   },
 
   "training": {
@@ -152,10 +139,8 @@
     "epochs": 500,
     // Clip grad-norm at this value (0 = disabled)
     "gradient_clip": 0.0,
-    // Gradient accumulation steps
-    "accumulate_grad_batches": 1,
 
-    // Optimizer choice: "adamw" (default) or "lamb"
+    // Optimizer: "adamw"
     "optimizer": "adamw",
 
     "torch_compile": false,
@@ -170,14 +155,10 @@
     "min_lr": 5e-7,
     // Linear warmup epochs before cosine
     "warmup_epochs": 10,
+    // Warmup start factor for LinearLR (relative to lr)
+    "warmup_start_factor": 0.1,
     // Weight decay for AdamW
     "weight_decay": 1e-4,
-
-    // SWA: no separate lr/min_lr; it derives from the main schedule
-    "use_swa": false,
-    "swa_epoch_start": 0.8, // fraction of total epochs OR absolute int epoch
-    "swa_annealing_epochs": 10,
-    "swa_annealing_strategy": "cos",
 
     // Limit training steps per epoch (0 = no limit)
     "max_train_steps_per_epoch": 0,
@@ -185,8 +166,6 @@
     "max_val_batches": 0,
     // Checkpoint path to resume from (optional)
     "resume": null,
-    // Allow auto-resume from config/env/CLI
-    "auto_resume": true,
 
     // Subsample fraction of trajectories during preprocessing
     "use_fraction": 1.0,
@@ -206,9 +185,8 @@
       "lambda_z": 0.25,
       "use_weighting": false, // Set to false for equal 1.0 weights
       "weight_power": 0.5,   // Change to 1.0 for linear weighting
-      "w_min": 0.5,          // The lowest weight a species can have
-      "w_max": 2.0,          // The highest weight a species can have
-      "epsilon_phys": 1e-20
+      "w_min": 0.5,          // If weighting=true, computed weights must be >= this
+      "w_max": 2.0           // If weighting=true, computed weights must be <= this
     }
   }
 }

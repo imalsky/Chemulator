@@ -1,257 +1,387 @@
 #!/usr/bin/env python3
-"""
-normalizer.py
+"""normalizer.py
+
+Normalization is driven entirely by the preprocessing manifest (normalization.json).
+
+Key design points:
+  - Per-key normalization methods are allowed to vary (species included).
+  - Supported methods: "standard", "min-max", "log-standard", "log-min-max".
+  - Δt normalization is defined by manifest["dt"] with log10-minmax bounds.
+
+This module is intentionally strict:
+  - Missing stats or unknown methods raise immediately.
+  - No silent warnings or heuristic tolerance.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Any, Sequence, Optional
-import warnings
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, Optional, Sequence
+
 import torch
 
-MIN_RANGE_EPSILON = 1e-12
-R_TOLERANCE = 1e-6
+
+@dataclass(frozen=True)
+class DtSpec:
+    """Δt normalization specification."""
+
+    log_min: float
+    log_max: float
+
+    @property
+    def range_log(self) -> float:
+        r = self.log_max - self.log_min
+        if r <= 0.0:
+            raise ValueError("Invalid dt spec")
+        return r
+
 
 class NormalizationHelper:
-    """
-    Manages normalization using preprocessed statistics.
-    """
+    """Applies normalization and inverse normalization using a manifest."""
 
-    def __init__(
-            self,
-            manifest: Dict[str, Any],
-            device: Optional[torch.device] = None,
-    ) -> None:
-        """
-        Initialize normalization helper.
-
-        Args:
-            manifest: Dict loaded from normalization.json with keys:
-              - per_key_stats: per-variable stats dicts (means, stds, mins, maxes, etc.)
-              - normalization_methods: per-variable method names ('standard', 'min-max', 'log-standard', 'log-min-max')
-              - dt: {'log_min': float, 'log_max': float} for Δt log10 bounds
-              - epsilon: small positive floor used for log transforms (default 1e-30)
-              - min_std: minimum std clamp for 'standard' normalization (default 1e-10)
-            device: Optional torch.device for any tensors created internally
-        """
-        self.manifest = manifest or {}
+    def __init__(self, manifest: Mapping[str, Any], device: Optional[torch.device] = None) -> None:
+        self.manifest: Mapping[str, Any] = manifest
         self.device = device
 
-        # Per-variable normalization config
-        self.per_key_stats = dict(self.manifest.get("per_key_stats", {}))
-        self.methods = dict(self.manifest.get("normalization_methods", {}))
+        per_key_stats = manifest.get("per_key_stats")
+        methods = manifest.get("normalization_methods")
+        if not isinstance(per_key_stats, Mapping) or not isinstance(methods, Mapping):
+            raise ValueError("Invalid normalization manifest")
 
-        # Numerical stability knobs
-        self.epsilon = float(self.manifest.get("epsilon", 1e-30))
-        self.min_std = float(self.manifest.get("min_std", 1e-10))
+        self.per_key_stats: Dict[str, Dict[str, float]] = {
+            str(k): dict(v) for k, v in per_key_stats.items()  # type: ignore[arg-type]
+        }
+        self.methods: Dict[str, str] = {str(k): str(v) for k, v in methods.items()}
 
-        # Δt
-        self.dt_spec = self.manifest.get("dt", None)
-        if self.dt_spec is None:
+        raw_epsilon = manifest.get("epsilon")
+        raw_min_std = manifest.get("min_std")
+        if raw_epsilon is None:
+            raise KeyError("Missing required manifest key: 'epsilon'")
+        if raw_min_std is None:
+            raise KeyError("Missing required manifest key: 'min_std'")
+        self.epsilon = float(raw_epsilon)
+        self.min_std = float(raw_min_std)
+        if self.epsilon <= 0.0 or self.min_std <= 0.0:
+            raise ValueError("Invalid normalization manifest")
+
+        dt = manifest.get("dt")
+        if not isinstance(dt, Mapping):
             raise ValueError("dt normalization spec missing")
 
-        # Validate dt-spec and derive physical bounds used by the dataset
-        try:
-            log_min = float(self.dt_spec["log_min"])
-            log_max = float(self.dt_spec["log_max"])
-        except Exception as e:
-            raise ValueError("Bad dt spec; expected {'log_min': <float>, 'log_max': <float>}.") from e
+        self.dt_spec = DtSpec(log_min=float(dt["log_min"]), log_max=float(dt["log_max"]))
+        self._vec_cache: Dict[tuple[tuple[str, ...], str, str, torch.dtype], torch.Tensor] = {}
 
-        # Derived physical Δt bounds (seconds). Clamp lower bound by epsilon to stay > 0 for logs.
-        self.dt_min_phys: float = max(10.0 ** log_min, float(self.epsilon))
-        self.dt_max_phys: float = 10.0 ** log_max
+    def normalize(self, x: torch.Tensor, keys: Sequence[str]) -> torch.Tensor:
+        """Normalize columns of x according to per-key methods."""
 
-    def normalize(
-            self,
-            x: torch.Tensor,
-            keys: Sequence[str]
-    ) -> torch.Tensor:
-        """
-        Normalize data using per-variable methods.
-        """
         if x.ndim == 1:
-            # Handle 1D input as single column
-            if len(keys) != 1:
-                raise ValueError(f"1D input requires single key, got {len(keys)}")
-            return self._normalize_columns(x.unsqueeze(-1), keys)[..., 0]
+            if x.shape[0] != len(keys):
+                raise ValueError("Shape mismatch")
+            return self._normalize_columns(x.unsqueeze(0), keys)[0]
 
         return self._normalize_columns(x, keys)
 
-    def denormalize(
-            self,
-            x: torch.Tensor,
-            keys: Sequence[str]
-    ) -> torch.Tensor:
-        """
-        Inverse normalization operation.
-        """
+    def denormalize(self, x: torch.Tensor, keys: Sequence[str]) -> torch.Tensor:
+        """Inverse normalization."""
+
         if x.ndim == 1:
-            if len(keys) != 1:
-                raise ValueError(f"1D input requires single key, got {len(keys)}")
-            return self._denormalize_columns(x.unsqueeze(-1), keys)[..., 0]
+            if x.shape[0] != len(keys):
+                raise ValueError("Shape mismatch")
+            return self._denormalize_columns(x.unsqueeze(0), keys)[0]
 
         return self._denormalize_columns(x, keys)
 
     def normalize_dt_from_phys(self, dt_phys: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize physical Δt (seconds) to [0,1] using log10 + min-max from the dt-spec.
-        """
+        """Normalize physical Δt (seconds) to [0, 1] using log10-minmax."""
+
         if not torch.is_floating_point(dt_phys):
-            dt_phys = dt_phys.float()
+            dt_phys = dt_phys.to(torch.float32)
 
-        # Spec
-        log_min = float(self.dt_spec["log_min"])
-        log_max = float(self.dt_spec["log_max"])
-        range_log = max(log_max - log_min, MIN_RANGE_EPSILON)
-
-        phys_min, phys_max = self.dt_min_phys, self.dt_max_phys
-
-        # Tolerate tiny round-off near bounds
-        rtol = R_TOLERANCE
-        phys_min_eff, phys_max_eff = phys_min * (1.0 - rtol), phys_max * (1.0 + rtol)
-
-        # OOD check (with tolerance)
-        ood_mask = (dt_phys < phys_min_eff) | (dt_phys > phys_max_eff)
-        if torch.any(ood_mask):
-            n_ood = int(ood_mask.sum().item())
-            n_tot = int(dt_phys.numel())
-            mn = float(torch.nanmin(dt_phys).item())
-            mx = float(torch.nanmax(dt_phys).item())
-            warnings.warn(
-                f"[normalize_dt_from_phys] {n_ood}/{n_tot} ({100.0 * n_ood / n_tot:.1f}%) Δt values "
-                f"outside training range [{phys_min:.3e}, {phys_max:.3e}] seconds. "
-                f"Found values in range [{mn:.3e}, {mx:.3e}]. Values will be clamped.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-        # Clamp to strict spec bounds before log (not to the tolerant bounds)
-        dt_clamped = dt_phys.clamp(min=max(self.epsilon, phys_min), max=phys_max)
-        dt_log = torch.log10(dt_clamped)
-
-        # Normalize to [0,1]
-        dt_norm = (dt_log - log_min) / range_log
-        dt_norm = dt_norm.clamp_(0.0, 1.0)  # 1-line FP guard
-
+        self._require_strictly_positive(dt_phys, context="dt normalization")
+        dt_log = torch.log10(dt_phys)
+        dt_norm = (dt_log - self.dt_spec.log_min) / self.dt_spec.range_log
         return dt_norm
 
-    def denormalize_dt_to_phys(
-            self,
-            dt_norm: torch.Tensor
+    def validate_dt_norm(self, dt_norm: torch.Tensor) -> None:
+        """Hard error if any normalized dt values are outside [0, 1]."""
+        finite_mask = torch.isfinite(dt_norm)
+        if not finite_mask.all():
+            bad_count = int((~finite_mask).sum().item())
+            raise ValueError(f"Normalized dt contains non-finite values (count={bad_count})")
+
+        below = dt_norm < 0.0
+        above = dt_norm > 1.0
+        bad_mask = below | above
+        if torch.any(bad_mask):
+            lo = float(dt_norm.min())
+            hi = float(dt_norm.max())
+            bad_flat = torch.nonzero(bad_mask.reshape(-1), as_tuple=False).reshape(-1)
+            bad_count = int(bad_flat.numel())
+            sample_n = min(5, bad_count)
+            flat = dt_norm.reshape(-1)
+            sample_vals = [float(flat[int(i)].item()) for i in bad_flat[:sample_n]]
+            raise ValueError(
+                f"Normalized dt out of range [0, 1]: min={lo:.6g}, max={hi:.6g}. "
+                f"n_bad={bad_count}, sample_bad={sample_vals}. "
+                "This indicates dt extrapolation beyond the trained range."
+            )
+
+    def denormalize_dt_to_phys(self, dt_norm: torch.Tensor) -> torch.Tensor:
+        """Convert normalized Δt back to physical units (seconds)."""
+
+        if not torch.is_floating_point(dt_norm):
+            dt_norm = dt_norm.to(torch.float32)
+
+        self.validate_dt_norm(dt_norm)
+
+        dt_log = self.dt_spec.log_min + dt_norm * self.dt_spec.range_log
+        return torch.pow(10.0, dt_log)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_stat_vector(
+        self,
+        keys: Sequence[str],
+        stat_name: str,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> torch.Tensor:
-        """
-        Convert normalized dt back to physical units.
-        """
-        log_min = float(self.dt_spec["log_min"])
-        log_max = float(self.dt_spec["log_max"])
+        keys_tuple = tuple(keys)
+        cache_key = (keys_tuple, str(stat_name), str(device), dtype)
+        cached = self._vec_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        # Inverse transform
-        dt_norm = torch.clamp(dt_norm, 0.0, 1.0)
-        dt_log = log_min + dt_norm * (log_max - log_min)
-        dt_phys = torch.pow(10.0, dt_log)
+        values: list[float] = []
+        for key in keys_tuple:
+            stats = self.per_key_stats.get(key)
+            if stats is None:
+                raise KeyError(f"Missing normalization stats for key: {key}")
+            if stat_name not in stats:
+                raise KeyError(f"Missing normalization stat '{stat_name}' for key: {key}")
+            values.append(float(stats[stat_name]))
 
-        return torch.clamp(dt_phys, min=self.epsilon)
+        vec = torch.tensor(values, device=device, dtype=dtype)
+        self._vec_cache[cache_key] = vec
+        return vec
 
-    def _normalize_columns(
-            self,
-            x: torch.Tensor,
-            keys: Sequence[str]
-    ) -> torch.Tensor:
-        """Normalize each column using its specified method."""
+    @staticmethod
+    def _require_strictly_positive(x: torch.Tensor, *, context: str) -> None:
+        if not torch.isfinite(x).all():
+            raise ValueError(f"Non-finite value encountered during {context}")
+        if torch.any(x <= 0):
+            min_val = float(x.min())
+            raise ValueError(
+                f"Non-positive value encountered during {context}: min={min_val:.6g}"
+            )
+
+    def _normalize_columns(self, x: torch.Tensor, keys: Sequence[str]) -> torch.Tensor:
         if x.ndim < 2:
-            raise ValueError("Expected at least 2D tensor")
+            raise ValueError("Expected 2D+")
+        if x.shape[-1] != len(keys):
+            raise ValueError("Shape mismatch")
 
-        num_keys = len(keys)
-        if x.shape[-1] != num_keys:
-            raise ValueError(f"Shape mismatch: {x.shape[-1]} cols vs {num_keys} keys")
+        methods = [self.methods.get(k) for k in keys]
+        if any(m is None for m in methods):
+            raise KeyError("Missing normalization method")
 
-        result = x.clone()
+        # Fast path: all columns share the same method.
+        m0 = methods[0]
+        if all(m == m0 for m in methods):
+            if m0 == "standard":
+                means = self._get_stat_vector(keys, "mean", device=x.device, dtype=x.dtype)
+                stds = self._get_stat_vector(keys, "std", device=x.device, dtype=x.dtype)
+                if torch.any(stds <= 0):
+                    raise ValueError("Invalid std")
+                if torch.any(stds < self.min_std):
+                    raise ValueError("std below min_std")
+                return (x - means) / stds
 
-        for col_idx, key in enumerate(keys):
-            method = str(self.methods.get(key, "log-standard"))
-            stats = self.per_key_stats.get(key, {})
+            if m0 == "min-max":
+                vmins = self._get_stat_vector(keys, "min", device=x.device, dtype=x.dtype)
+                vmaxs = self._get_stat_vector(keys, "max", device=x.device, dtype=x.dtype)
+                rng = vmaxs - vmins
+                if torch.any(rng <= 0):
+                    raise ValueError("Invalid min-max range")
+                return (x - vmins) / rng
 
-            col_data = result[..., col_idx]
+            if m0 == "log-standard":
+                log_means = self._get_stat_vector(keys, "log_mean", device=x.device, dtype=x.dtype)
+                log_stds = self._get_stat_vector(keys, "log_std", device=x.device, dtype=x.dtype)
+                if torch.any(log_stds <= 0):
+                    raise ValueError("Invalid log_std")
+                if torch.any(log_stds < self.min_std):
+                    raise ValueError("log_std below min_std")
+                self._require_strictly_positive(x, context="log-standard normalization")
+                x_log = torch.log10(x)
+                return (x_log - log_means) / log_stds
+
+            if m0 == "log-min-max":
+                log_mins = self._get_stat_vector(keys, "log_min", device=x.device, dtype=x.dtype)
+                log_maxs = self._get_stat_vector(keys, "log_max", device=x.device, dtype=x.dtype)
+                rng = log_maxs - log_mins
+                if torch.any(rng <= 0):
+                    raise ValueError("Invalid log-min-max range")
+                self._require_strictly_positive(x, context="log-min-max normalization")
+                x_log = torch.log10(x)
+                return (x_log - log_mins) / rng
+
+        # Fallback: per-column methods.
+        out = x.clone()
+        for col, key in enumerate(keys):
+            method = self.methods.get(key)
+            if method is None:
+                raise KeyError(f"Missing normalization method for key: {key}")
+
+            stats = self.per_key_stats.get(key)
+            if stats is None:
+                raise KeyError(f"Missing normalization stats for key: {key}")
+
+            v = out[..., col]
 
             if method == "standard":
-                mean = float(stats.get("mean", 0.0))
-                std = max(float(stats.get("std", 1.0)), self.min_std)
-                col_norm = (col_data - mean) / std
+                mean = float(stats["mean"])
+                std = float(stats["std"])
+                if std <= 0.0:
+                    raise ValueError("Invalid std")
+                if std < self.min_std:
+                    raise ValueError(f"std below min_std for key: {key}")
+                out[..., col] = (v - mean) / std
 
             elif method == "min-max":
-                min_val = float(stats.get("min", 0.0))
-                max_val = float(stats.get("max", 1.0))
-                range_val = max(max_val - min_val, 1e-12)
-                col_norm = (col_data - min_val) / range_val
+                vmin = float(stats["min"])
+                vmax = float(stats["max"])
+                rng = vmax - vmin
+                if rng <= 0.0:
+                    raise ValueError("Invalid min-max range")
+                out[..., col] = (v - vmin) / rng
 
             elif method == "log-standard":
-                log_mean = float(stats.get("log_mean", 0.0))
-                log_std = max(float(stats.get("log_std", 1.0)), self.min_std)
-                col_log = torch.log10(torch.clamp(col_data, min=self.epsilon))
-                col_norm = (col_log - log_mean) / log_std
+                log_mean = float(stats["log_mean"])
+                log_std = float(stats["log_std"])
+                if log_std <= 0.0:
+                    raise ValueError("Invalid log_std")
+                if log_std < self.min_std:
+                    raise ValueError(f"log_std below min_std for key: {key}")
+                self._require_strictly_positive(v, context=f"log-standard normalization for key '{key}'")
+                v_log = torch.log10(v)
+                out[..., col] = (v_log - log_mean) / log_std
 
             elif method == "log-min-max":
-                log_min = float(stats.get("log_min", -3.0))
-                log_max = float(stats.get("log_max", 8.0))
-                range_val = max(log_max - log_min, 1e-12)
-                col_log = torch.log10(torch.clamp(col_data, min=self.epsilon))
-                col_norm = (col_log - log_min) / range_val
+                log_min = float(stats["log_min"])
+                log_max = float(stats["log_max"])
+                rng = log_max - log_min
+                if rng <= 0.0:
+                    raise ValueError("Invalid log-min-max range")
+                self._require_strictly_positive(v, context=f"log-min-max normalization for key '{key}'")
+                v_log = torch.log10(v)
+                out[..., col] = (v_log - log_min) / rng
 
             else:
-                raise ValueError(f"Unknown method '{method}' for key '{key}'")
+                raise ValueError(f"Unknown normalization method: {method}")
 
-            result[..., col_idx] = col_norm
+        return out
 
-        return result
-
-    def _denormalize_columns(
-            self,
-            x: torch.Tensor,
-            keys: Sequence[str]
-    ) -> torch.Tensor:
-        """Denormalize each column using its specified method."""
+    def _denormalize_columns(self, x: torch.Tensor, keys: Sequence[str]) -> torch.Tensor:
         if x.ndim < 2:
-            raise ValueError("Expected at least 2D tensor")
+            raise ValueError("Expected 2D+")
+        if x.shape[-1] != len(keys):
+            raise ValueError("Shape mismatch")
 
-        num_keys = len(keys)
-        if x.shape[-1] != num_keys:
-            raise ValueError(f"Shape mismatch: {x.shape[-1]} cols vs {num_keys} keys")
+        methods = [self.methods.get(k) for k in keys]
+        if any(m is None for m in methods):
+            raise KeyError("Missing normalization method")
 
-        result = x.clone()
+        m0 = methods[0]
+        if all(m == m0 for m in methods):
+            if m0 == "standard":
+                means = self._get_stat_vector(keys, "mean", device=x.device, dtype=x.dtype)
+                stds = self._get_stat_vector(keys, "std", device=x.device, dtype=x.dtype)
+                if torch.any(stds <= 0):
+                    raise ValueError("Invalid std")
+                if torch.any(stds < self.min_std):
+                    raise ValueError("std below min_std")
+                return x * stds + means
 
-        for col_idx, key in enumerate(keys):
-            method = str(self.methods.get(key, "log-standard"))
-            stats = self.per_key_stats.get(key, {})
+            if m0 == "min-max":
+                vmins = self._get_stat_vector(keys, "min", device=x.device, dtype=x.dtype)
+                vmaxs = self._get_stat_vector(keys, "max", device=x.device, dtype=x.dtype)
+                rng = vmaxs - vmins
+                if torch.any(rng <= 0):
+                    raise ValueError("Invalid min-max range")
+                return x * rng + vmins
 
-            col_data = result[..., col_idx]
+            if m0 == "log-standard":
+                log_means = self._get_stat_vector(keys, "log_mean", device=x.device, dtype=x.dtype)
+                log_stds = self._get_stat_vector(keys, "log_std", device=x.device, dtype=x.dtype)
+                if torch.any(log_stds <= 0):
+                    raise ValueError("Invalid log_std")
+                if torch.any(log_stds < self.min_std):
+                    raise ValueError("log_std below min_std")
+                log_v = x * log_stds + log_means
+                return torch.pow(10.0, log_v)
+
+            if m0 == "log-min-max":
+                log_mins = self._get_stat_vector(keys, "log_min", device=x.device, dtype=x.dtype)
+                log_maxs = self._get_stat_vector(keys, "log_max", device=x.device, dtype=x.dtype)
+                rng = log_maxs - log_mins
+                if torch.any(rng <= 0):
+                    raise ValueError("Invalid log-min-max range")
+                log_v = x * rng + log_mins
+                return torch.pow(10.0, log_v)
+
+        out = x.clone()
+        for col, key in enumerate(keys):
+            method = self.methods.get(key)
+            if method is None:
+                raise KeyError(f"Missing normalization method for key: {key}")
+
+            stats = self.per_key_stats.get(key)
+            if stats is None:
+                raise KeyError(f"Missing normalization stats for key: {key}")
+
+            v = out[..., col]
 
             if method == "standard":
-                mean = float(stats.get("mean", 0.0))
-                std = max(float(stats.get("std", 1.0)), self.min_std)
-                col_denorm = col_data * std + mean
+                mean = float(stats["mean"])
+                std = float(stats["std"])
+                if std <= 0.0:
+                    raise ValueError("Invalid std")
+                if std < self.min_std:
+                    raise ValueError(f"std below min_std for key: {key}")
+                out[..., col] = v * std + mean
 
             elif method == "min-max":
-                min_val = float(stats.get("min", 0.0))
-                max_val = float(stats.get("max", 1.0))
-                range_val = max(max_val - min_val, 1e-12)
-                col_denorm = col_data * range_val + min_val
+                vmin = float(stats["min"])
+                vmax = float(stats["max"])
+                rng = vmax - vmin
+                if rng <= 0.0:
+                    raise ValueError("Invalid min-max range")
+                out[..., col] = v * rng + vmin
 
             elif method == "log-standard":
-                log_mean = float(stats.get("log_mean", 0.0))
-                log_std = max(float(stats.get("log_std", 1.0)), self.min_std)
-                col_log = col_data * log_std + log_mean
-                col_denorm = torch.pow(10.0, col_log)
+                log_mean = float(stats["log_mean"])
+                log_std = float(stats["log_std"])
+                if log_std <= 0.0:
+                    raise ValueError("Invalid log_std")
+                if log_std < self.min_std:
+                    raise ValueError(f"log_std below min_std for key: {key}")
+                log_v = v * log_std + log_mean
+                out[..., col] = torch.pow(10.0, log_v)
 
             elif method == "log-min-max":
-                log_min = float(stats.get("log_min", -3.0))
-                log_max = float(stats.get("log_max", 8.0))
-                range_val = max(log_max - log_min, 1e-12)
-                col_log = col_data * range_val + log_min
-                col_denorm = torch.pow(10.0, col_log)
+                log_min = float(stats["log_min"])
+                log_max = float(stats["log_max"])
+                rng = log_max - log_min
+                if rng <= 0.0:
+                    raise ValueError("Invalid log-min-max range")
+                log_v = v * rng + log_min
+                out[..., col] = torch.pow(10.0, log_v)
 
             else:
-                raise ValueError(f"Unknown method '{method}' for key '{key}'")
+                raise ValueError(f"Unknown normalization method: {method}")
 
-            result[..., col_idx] = col_denorm
-
-        return result
+        return out

@@ -1,158 +1,144 @@
 #!/usr/bin/env python3
-"""
-training.py
-
-Plot training curves from the epoch-level CSV written by trainer.py.
-
-Expected (new) layout:
-  MODEL_DIR/metrics.csv
-
-Fallbacks (legacy Lightning layouts) if metrics.csv isn't found directly:
-  MODEL_DIR/csv/version_*/metrics.csv
-  MODEL_DIR/lightning_logs/version_*/metrics.csv
-
-Behavior:
-  - Loads metrics.csv (or merges versioned metrics.csv files)
-  - Collapses duplicates per epoch by keeping the last row (resume-safe)
-  - Drops epochs with missing train_loss (common for epoch 1 in your log)
-  - Reindexes epochs from 0 for plotting
-  - Saves MODEL_DIR/plots/training.png
-"""
+"""Plot training curves from trainer metrics.jsonl."""
 
 from __future__ import annotations
 
-import sys
+import json
+import math
+import os
+import warnings
 from pathlib import Path
+from typing import Any, Dict, List
 
-import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-
-plt.style.use("science.mplstyle")
-plt.rcParams.update({"mathtext.default": "regular"})  # regular font for exponents
+import numpy as np
 
 
-# ---------------- Paths ----------------
 REPO = Path(__file__).resolve().parent.parent
-#MODEL_DIR = REPO / "models" / "big_big_big"
-MODEL_DIR = REPO / "models" / "final_model"
+MODEL_DIR = Path(
+    os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_version"))
+).expanduser().resolve()
 
-PLOT_DIR = MODEL_DIR / "plots"
-OUTFILE = PLOT_DIR / "training.png"
-
-
-def _read_one_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-
-    # Normalize / coerce expected numeric columns (silently creates NaNs if missing/bad)
-    for col in ("epoch", "step", "lr", "train_loss", "val_loss"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df
+METRICS_PATH = MODEL_DIR / "metrics.jsonl"
+OUTFILE = MODEL_DIR / "plots" / "training.png"
 
 
-def load_metrics(model_dir: Path) -> pd.DataFrame:
-    # New layout
-    direct = model_dir / "metrics.csv"
-    if direct.is_file():
-        df = _read_one_csv(direct)
-        df["_src"] = str(direct)
-        return df
-
-    # Legacy layouts: merge versioned CSVs in order
-    candidates = []
-    candidates += sorted((model_dir / "csv").glob("version_*/metrics.csv"))
-    candidates += sorted((model_dir / "lightning_logs").glob("version_*/metrics.csv"))
-
-    if not candidates:
-        raise FileNotFoundError(
-            f"Could not find metrics.csv in:\n"
-            f"  - {direct}\n"
-            f"  - {model_dir/'csv'/'version_*/metrics.csv'}\n"
-            f"  - {model_dir/'lightning_logs'/'version_*/metrics.csv'}"
-        )
-
-    dfs = []
-    for p in candidates:
-        dfi = _read_one_csv(p)
-        dfi["_src"] = str(p)
-        dfs.append(dfi)
-
-    return pd.concat(dfs, ignore_index=True)
+def _safe_float(value: Any) -> float:
+    try:
+        x = float(value)
+    except Exception:
+        return float("nan")
+    return x if math.isfinite(x) else float("nan")
 
 
-def format_sci(x, _pos):
-    if x == 0:
-        return "0"
-    s = f"{x:.1e}"
-    base, exponent = s.split("e")
-    return r"${} \times 10^{{{}}}$".format(base, int(exponent))
+def _load_metrics_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing metrics file: {path}")
+
+    records: List[Dict[str, Any]] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in {path} line {lineno}") from e
+        if not isinstance(obj, dict):
+            raise ValueError(f"metrics.jsonl line {lineno} must be a JSON object")
+        if "epoch" not in obj:
+            raise KeyError(f"metrics.jsonl line {lineno} missing key: epoch")
+        records.append(obj)
+
+    if not records:
+        raise RuntimeError(f"No metrics records found in {path}")
+    return records
+
+
+def _collapse_last_per_epoch(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    collapsed: Dict[int, Dict[str, Any]] = {}
+    for rec in records:
+        epoch = int(rec["epoch"])
+        collapsed[epoch] = rec
+    return [collapsed[e] for e in sorted(collapsed.keys())]
 
 
 def main() -> int:
-    df = load_metrics(MODEL_DIR)
+    try:
+        plt.style.use("science.mplstyle")
+    except OSError:
+        warnings.warn("science.mplstyle not found; using matplotlib defaults.")
 
-    # If you have repeated epochs (resumes/rewrites), keep the last record per epoch.
-    if "epoch" not in df.columns:
-        raise RuntimeError("metrics.csv is missing required column: 'epoch'")
+    rows = _collapse_last_per_epoch(_load_metrics_jsonl(METRICS_PATH))
 
-    # Sort so "last" means latest-by-step if step exists, else latest row order
-    sort_cols = ["epoch"]
-    if "step" in df.columns:
-        sort_cols.append("step")
-    df = df.sort_values(sort_cols).groupby("epoch", as_index=False).last()
+    epochs: List[int] = []
+    train_loss: List[float] = []
+    val_loss: List[float] = []
+    train_mult: List[float] = []
+    val_mult: List[float] = []
 
-    # Drop rows where train_loss is missing (your epoch 1 has blank train_* fields)
-    if "train_loss" not in df.columns:
-        raise RuntimeError("metrics.csv is missing required column: 'train_loss'")
+    for rec in rows:
+        ep = int(rec["epoch"]) + 1
+        tr = rec.get("train")
+        if not isinstance(tr, dict):
+            continue
 
-    df_plot = df.dropna(subset=["train_loss"]).reset_index(drop=True)
+        tr_loss = _safe_float(tr.get("loss"))
+        if not math.isfinite(tr_loss) or tr_loss <= 0.0:
+            continue
 
-    if df_plot.empty:
-        raise RuntimeError("After dropping NaN train_loss rows, nothing is left to plot.")
+        va = rec.get("val")
+        va_loss = float("nan")
+        va_mult_val = float("nan")
+        if isinstance(va, dict):
+            va_loss = _safe_float(va.get("loss"))
+            if not (math.isfinite(va_loss) and va_loss > 0.0):
+                va_loss = float("nan")
+            va_mult_val = _safe_float(va.get("mult_err_proxy"))
 
-    # Reindex epochs from 0 for plotting (keeps original epoch in df_plot['epoch'])
-    df_plot["epoch_plot"] = range(len(df_plot))
+        epochs.append(ep)
+        train_loss.append(tr_loss)
+        val_loss.append(va_loss)
+        train_mult.append(_safe_float(tr.get("mult_err_proxy")))
+        val_mult.append(va_mult_val)
 
-    # Guard for log-scale: remove non-positive losses if they somehow appear
-    for c in ("train_loss", "val_loss"):
-        if c in df_plot.columns:
-            df_plot.loc[df_plot[c] <= 0, c] = float("nan")
+    if not epochs:
+        raise RuntimeError("No valid train loss values found in metrics.jsonl")
 
-    print(df_plot.head(5).to_string(index=False))
-    print()
-    print()
-    print(df_plot.tail(5).to_string(index=False))
+    x = np.asarray(epochs, dtype=float)
+    y_train = np.asarray(train_loss, dtype=float)
+    y_val = np.asarray(val_loss, dtype=float)
+    y_train_mult = np.asarray(train_mult, dtype=float)
+    y_val_mult = np.asarray(val_mult, dtype=float)
 
-    # ---------------- Plot ----------------
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, (ax_loss, ax_mult) = plt.subplots(1, 2, figsize=(12, 5))
 
-    ax.plot(df_plot["epoch_plot"], df_plot["train_loss"], label="Train")
-    if "val_loss" in df_plot.columns and df_plot["val_loss"].notna().any():
-        ax.plot(df_plot["epoch_plot"], df_plot["val_loss"], label="Val")
+    ax_loss.plot(x, y_train, label="Train loss")
+    if np.isfinite(y_val).any():
+        ax_loss.plot(x, y_val, label="Val loss")
+    ax_loss.set_xlabel("Epoch")
+    ax_loss.set_ylabel("Loss")
+    ax_loss.set_yscale("log")
+    ax_loss.legend(loc="best")
+    ax_loss.set_box_aspect(1)
 
-    ax.set(
-        xlabel="Epoch (reindexed)",
-        ylabel="Loss",
-        yscale="log",
-        box_aspect=1,
-    )
-    ax.set_xlim(df_plot["epoch_plot"].min(), df_plot["epoch_plot"].max())
-    ax.legend()
+    ax_mult.plot(x, y_train_mult, label="Train mult_err_proxy")
+    if np.isfinite(y_val_mult).any():
+        ax_mult.plot(x, y_val_mult, label="Val mult_err_proxy")
+    ax_mult.set_xlabel("Epoch")
+    ax_mult.set_ylabel("mult_err_proxy")
+    ax_mult.set_yscale("log")
+    ax_mult.legend(loc="best")
+    ax_mult.set_box_aspect(1)
 
-    # Secondary x-axis: steps (aligned to the plotted epochs)
-    if "step" in df_plot.columns and df_plot["step"].notna().any():
-        ax2 = ax.twiny()
-        ax2.set_xlim(df_plot["step"].min(), df_plot["step"].max())
-        ax2.set_xlabel("Step")
-        ax2.xaxis.set_major_formatter(ticker.FuncFormatter(format_sci))
-
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    OUTFILE.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUTFILE, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    print(f"Saved: {OUTFILE}")
+    print(f"Loaded metrics: {METRICS_PATH}")
+    print(f"Epochs plotted: {len(epochs)} (min={min(epochs)}, max={max(epochs)})")
+    print(f"Saved plot: {OUTFILE}")
     return 0
 
 

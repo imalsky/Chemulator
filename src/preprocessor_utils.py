@@ -6,32 +6,31 @@ Helper functions and classes for data preprocessing pipeline.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from pathlib import Path
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import numpy as np
-
-try:
-    import h5py
-except ImportError:
-    h5py = None
-
-
-TIME_DECREASE_TOLERANCE = 0.0
-ALLOW_EQUAL_TIMEPOINTS = False
-
-DEFAULT_HDF5_CHUNK_SIZE = 0  # 0 means use dataset native chunk
 SHARD_FILENAME_FORMAT = "shard_{split}_{filetag}_{idx:05d}.npz"
+
+_BYTES_PER_KIB: float = 1024.0
+_HASH_DENOM: float = float(1 << 64)
+_NP_DTYPE_ALIAS_MAP: dict[str, np.dtype] = {
+    "float32": np.dtype("float32"),
+    "fp32": np.dtype("float32"),
+    "float64": np.dtype("float64"),
+    "fp64": np.dtype("float64"),
+}
 
 
 def format_bytes(num_bytes: int | float) -> str:
     """Format byte count as human-readable string."""
     num_bytes = float(num_bytes)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if num_bytes < 1024.0 or unit == "TiB":
+        if num_bytes < _BYTES_PER_KIB or unit == "TiB":
             return f"{num_bytes:.1f} {unit}"
-        num_bytes /= 1024.0
+        num_bytes /= _BYTES_PER_KIB
     return f"{num_bytes:.1f} TiB"
 
 
@@ -59,15 +58,25 @@ def load_config_value(
     return current
 
 
-def get_storage_dtype(config: Dict[str, Any]) -> np.dtype:
-    """Get numpy dtype for storage from configuration."""
-    system_config = config.get("system", {})
-    dtype_str = str(system_config.get("io_dtype", system_config.get("dtype", "float32"))).lower()
-    
-    if dtype_str not in {"float32", "float64"}:
-        raise ValueError(f"Unsupported dtype '{dtype_str}'. Use 'float32' or 'float64'.")
-    
-    return np.float32 if dtype_str == "float32" else np.float64
+def parse_precision_np_dtype(value: Any, field_name: str) -> np.dtype:
+    """Parse precision dtype names with alias support (float32/fp32/float64/fp64)."""
+    key = str(value).strip().lower()
+    if key not in _NP_DTYPE_ALIAS_MAP:
+        raise ValueError(f"Unsupported {field_name}")
+    return _NP_DTYPE_ALIAS_MAP[key]
+
+
+def get_storage_dtype(config: Mapping[str, Any]) -> np.dtype:
+    """On-disk dtype for NPZ shards (single source of truth).
+
+    The codebase expects this to live under config["precision"]["io_dtype"].
+    """
+
+    precision = config.get("precision")
+    if not isinstance(precision, Mapping):
+        raise KeyError("Missing config: precision")
+
+    return parse_precision_np_dtype(precision.get("io_dtype"), "precision.io_dtype")
 
 
 def deterministic_hash(text: str, seed: int) -> float:
@@ -75,7 +84,7 @@ def deterministic_hash(text: str, seed: int) -> float:
     encoded = f"{seed}:{text}".encode("utf-8")
     hash_bytes = hashlib.sha256(encoded).digest()
     hash_int = int.from_bytes(hash_bytes[:8], "big", signed=False)
-    return hash_int / float(1 << 64)
+    return hash_int / _HASH_DENOM
 
 
 class WelfordAccumulator:
@@ -131,9 +140,14 @@ class WelfordAccumulator:
         
         variance = max(0.0, self.M2 / self.count)
         std = math.sqrt(variance)
+        if std < min_std:
+            logging.getLogger(__name__).warning(
+                "Welford std=%.6g below min_std=%.6g; clamping to min_std", std, min_std
+            )
+            std = min_std
         return (
             float(self.mean),
-            float(max(std, min_std)),
+            float(std),
             float(self.min_val),
             float(self.max_val)
         )
@@ -170,9 +184,12 @@ class RunningStatistics:
         
         if self.raw is not None:
             self.raw.update(array)
-        
+
         if self.log is not None:
-            log_values = np.log10(np.clip(array, self.epsilon, None))
+            if np.any(array <= 0):
+                min_val = float(np.min(array))
+                raise ValueError(f"Non-positive value encountered in log statistics: min={min_val:.6g}")
+            log_values = np.log10(array)
             self.log.update(log_values)
     
     def to_manifest(self, min_std: float) -> Dict[str, float]:
@@ -199,6 +216,8 @@ class RunningStatistics:
         
         return output
 
+
+
 def get_normalization_flags(method: str) -> Tuple[bool, bool, bool]:
     """
     Get flags for which statistics are needed for a normalization method.
@@ -210,8 +229,8 @@ def get_normalization_flags(method: str) -> Tuple[bool, bool, bool]:
     elif method == "min-max":
         return False, True, False
     elif method == "log-standard":
-        return True, False, True
+        return False, False, True
     elif method == "log-min-max":
-        return False, True, True
+        return False, False, True
     else:
         raise ValueError(f"Unknown normalization method: '{method}'")

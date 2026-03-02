@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-"""
-Utility Functions Module
+"""utils.py
+
+Small, dependency-light utilities used across the codebase.
+
+Design principles for this repository:
+  - Fail fast with simple error messages.
+  - Keep precision control centralized in the config.
+  - Prefer explicit, readable code over clever fallbacks.
 """
 
 from __future__ import annotations
@@ -9,279 +15,326 @@ import json
 import logging
 import os
 import random
-import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union, Tuple
+from typing import Any, Mapping, Sequence
 
 import numpy as np
-
-try:
-    import torch
-except ImportError:
-    torch = None
-
-# Module-level state for logging configuration
-_logging_configured = False
+import torch
 
 
-def setup_logging(
-        log_file: Optional[Union[str, os.PathLike]] = None,
-        level: int = logging.INFO
-) -> None:
+# -----------------------------------------------------------------------------
+# Logging / reproducibility
+# -----------------------------------------------------------------------------
+
+
+_LOGGING_CONFIGURED = False
+
+
+def setup_logging(*, log_file: Path | None = None, level: int = logging.INFO) -> None:
+    """Configure the root logger.
+
+    The function is idempotent for the console handler.
     """
-    Configure root logger with console and optional file output.
-    """
-    global _logging_configured
-    root_logger = logging.getLogger()
-    root_logger.setLevel(level)
 
-    # Define consistent formatter for all handlers
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-7s | %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+    global _LOGGING_CONFIGURED
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-7s | %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Configure console handler once
-    if not _logging_configured:
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(level)
-        console_handler.setFormatter(formatter)
-        root_logger.addHandler(console_handler)
-        _logging_configured = True
+    if not _LOGGING_CONFIGURED:
+        h = logging.StreamHandler()
+        h.setLevel(level)
+        h.setFormatter(fmt)
+        root.addHandler(h)
+        _LOGGING_CONFIGURED = True
 
-    # Add file handler if requested and not already present
     if log_file is not None:
-        # Check if file handler already exists for this path
-        file_path = Path(log_file).resolve()
-        has_file_handler = any(
-            isinstance(h, logging.FileHandler) and
-            Path(h.baseFilename).resolve() == file_path
-            for h in root_logger.handlers
-        )
+        log_file = Path(log_file).expanduser().resolve()
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        existing_file_handler = False
+        for handler in root.handlers:
+            if isinstance(handler, logging.FileHandler):
+                try:
+                    if Path(handler.baseFilename).resolve() == log_file:
+                        handler.setLevel(level)
+                        handler.setFormatter(fmt)
+                        existing_file_handler = True
+                        break
+                except Exception:
+                    continue
+        if not existing_file_handler:
+            fh = logging.FileHandler(log_file, encoding="utf-8")
+            fh.setLevel(level)
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
 
-        if not has_file_handler:
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_handler = logging.FileHandler(file_path, encoding="utf-8")
-            file_handler.setLevel(level)
-            file_handler.setFormatter(formatter)
-            root_logger.addHandler(file_handler)
 
+def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch RNGs."""
 
-def seed_everything(seed: int = 42) -> None:
-    """
-    Set random seeds
-    """
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
     random.seed(seed)
     np.random.seed(seed)
 
-    # Set Python hash seed for consistent dictionary ordering
-    try:
-        os.environ["PYTHONHASHSEED"] = str(seed)
-    except Exception:
-        pass
-
-    # Seed PyTorch if available
-    if torch is not None:
-        try:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(seed)
-                torch.cuda.manual_seed_all(seed)
-        except Exception:
-            pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 
 def strip_jsonc_comments(text: str) -> str:
+    """Remove // and /* */ comments from JSONC.
+
+    This parser is string-aware: comment markers inside JSON strings are
+    preserved as literal text.
     """
-    Remove comments from JSONC (JSON with Comments).
-    """
-    # Remove block comments first
-    block_comment_pattern = re.compile(r"/\*.*?\*/", re.DOTALL)
-    text = block_comment_pattern.sub("", text)
 
-    # Process line-by-line to handle // comments while preserving strings
-    output_lines = []
+    out: list[str] = []
+    i = 0
+    n = len(text)
 
-    for line in text.splitlines():
-        cleaned_chars = []
-        in_string = False
-        escaped = False
-        i = 0
+    in_str = False
+    esc = False
+    in_line_comment = False
+    in_block_comment = False
 
-        while i < len(line):
-            ch = line[i]
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
 
-            # Handle string content
-            if in_string:
-                cleaned_chars.append(ch)
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-                i += 1
-                continue
-
-            # Start of string
-            if ch == '"':
-                in_string = True
-                cleaned_chars.append(ch)
-                i += 1
-                continue
-
-            # Check for line comment outside strings
-            if ch == "/" and i + 1 < len(line) and line[i + 1] == "/":
-                break  # Ignore rest of line
-
-            cleaned_chars.append(ch)
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                out.append(ch)
             i += 1
+            continue
 
-        output_lines.append("".join(cleaned_chars))
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
 
-    return "\n".join(output_lines)
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+
+        # Not in string/comment.
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
 
 
-def load_json_config(path: Union[str, os.PathLike]) -> dict:
-    """
-    Load JSON or JSONC configuration file.
-    """
-    file_path = Path(path)
+def load_json_config(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Load JSON or JSONC config."""
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        raw_text = f.read()
+    p = Path(path).expanduser().resolve()
+    raw = p.read_text(encoding="utf-8")
 
-    # Try standard JSON first
     try:
-        return json.loads(raw_text)
+        return json.loads(raw)
     except json.JSONDecodeError:
         pass
 
-    # Try json5 library for proper JSONC support
+    cleaned = strip_jsonc_comments(raw)
     try:
-        import json5
-        return json5.loads(raw_text)
-    except (ImportError, Exception):
-        pass
-
-    # Fallback to manual comment stripping
-    cleaned_text = strip_jsonc_comments(raw_text)
-    try:
-        return json.loads(cleaned_text)
+        return json.loads(cleaned)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse JSON/JSONC at {file_path}: {e}") from e
+        raise ValueError(f"Failed to parse config: {p}") from e
 
 
-def dump_json(path: Union[str, os.PathLike], obj: Any, indent: int = 2) -> None:
+def dump_json(path: str | os.PathLike[str], obj: Any, *, indent: int = 2) -> None:
+    """Write JSON with deterministic formatting (atomic replace)."""
+
+    p = Path(path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    text = json.dumps(obj, indent=indent, sort_keys=True, ensure_ascii=False) + "\n"
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8", newline="\n")
+    tmp.replace(p)
+
+
+# -----------------------------------------------------------------------------
+# Config helpers
+# -----------------------------------------------------------------------------
+
+
+def cfg_get(cfg: Mapping[str, Any], path: Sequence[str]) -> Any:
+    """Get a nested config value; raise KeyError with a short message if missing."""
+
+    cur: Any = cfg
+    for key in path:
+        if not isinstance(cur, Mapping) or key not in cur:
+            raise KeyError(f"Missing config: {'.'.join(path)}")
+        cur = cur[key]
+    return cur
+
+
+# -----------------------------------------------------------------------------
+# Precision policy (single source of truth)
+# -----------------------------------------------------------------------------
+
+
+_NP_DTYPE_MAP: dict[str, np.dtype] = {
+    "float32": np.dtype("float32"),
+    "fp32": np.dtype("float32"),
+    "float64": np.dtype("float64"),
+    "fp64": np.dtype("float64"),
+}
+
+
+_TORCH_DTYPE_MAP: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "32": torch.float32,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float64": torch.float64,
+    "fp64": torch.float64,
+    "64": torch.float64,
+}
+
+
+@dataclass(frozen=True)
+class PrecisionPolicy:
+    """Resolved precision settings used by preprocessing, dataset, and training."""
+
+    amp_dtype: torch.dtype
+    dataset_dtype: torch.dtype
+    normalize_dtype: torch.dtype
+    io_dtype: np.dtype
+    time_io_dtype: np.dtype
+    tf32: bool
+
+    @property
+    def use_amp(self) -> bool:
+        """True when autocast/GradScaler should be enabled."""
+        return self.amp_dtype != torch.float32
+
+    @property
+    def amp_mode(self) -> str:
+        """Human-readable AMP mode string."""
+        if self.amp_dtype == torch.bfloat16:
+            return "bf16-mixed"
+        if self.amp_dtype == torch.float16:
+            return "16-mixed"
+        return "off"
+
+
+def _parse_np_dtype(name: str) -> np.dtype:
+    key = str(name).strip().lower()
+    if key not in _NP_DTYPE_MAP:
+        raise ValueError("Unsupported precision.io_dtype")
+    return _NP_DTYPE_MAP[key]
+
+
+def _parse_torch_dtype(name: str) -> torch.dtype:
+    key = str(name).strip().lower()
+    if key not in _TORCH_DTYPE_MAP:
+        raise ValueError("Unsupported dtype")
+    return _TORCH_DTYPE_MAP[key]
+
+
+def resolve_precision_policy(cfg: Mapping[str, Any], device: torch.device) -> PrecisionPolicy:
+    """Resolve a single precision policy from cfg["precision"].
+
+    Required keys:
+      precision.amp
+      precision.dataset_dtype
+      precision.io_dtype
+      precision.normalize_dtype
+      precision.time_io_dtype
+      precision.tf32
+
+    Notes:
+      - "dataset_dtype" controls the in-memory dtype for y/g/dt batches.
+      - "normalize_dtype" controls dtype used for normalization math.
+      - "io_dtype" and "time_io_dtype" control NPZ on-disk dtypes.
+      - We fail fast if the requested precision is incompatible with CPU/MPS.
     """
-    Write JSON with consistent formatting.
-    """
-    file_path = Path(path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Serialize with consistent formatting
-    json_text = json.dumps(
-        obj,
-        indent=indent,
-        sort_keys=True,
-        ensure_ascii=False
-    )
+    p = cfg_get(cfg, ["precision"])
+    if not isinstance(p, Mapping):
+        raise ValueError("precision must be a mapping")
 
-    # Use atomic write pattern
-    temp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    amp_raw = str(cfg_get(p, ["amp"]))
+    amp_key = amp_raw.strip().lower()
 
-    try:
-        with open(temp_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(json_text)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-
-        temp_path.replace(file_path)
-
-    except Exception:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        raise
-
-
-def _map_storage_dtype(name: Optional[str]) -> Optional['torch.dtype']:
-    """
-    Map dtype string to PyTorch dtype.
-    """
-    if torch is None or not name:
-        return None
-
-    dtype_map = {
-        # bfloat16 variants
-        "bf16": torch.bfloat16,
-        "bfloat16": torch.bfloat16,
-        # float16 variants
-        "fp16": torch.float16,
-        "float16": torch.float16,
-        "half": torch.float16,
-        "16": torch.float16,
-        # float32 variants
-        "fp32": torch.float32,
-        "float32": torch.float32,
-        "32": torch.float32,
-    }
-
-    return dtype_map.get(str(name).strip().lower())
-
-
-def resolve_precision_and_dtype(
-        cfg: dict,
-        device: 'torch.device',
-        logger: Optional[logging.Logger] = None
-) -> Tuple[Union[str, int], 'torch.dtype']:
-    """
-    Resolve Lightning precision and runtime dtype from configuration.
-    """
-    mp_cfg = cfg.get("mixed_precision", {}) or {}
-    mode = (
-        mp_cfg.get("mode")
-        or mp_cfg.get("precision")
-        or cfg.get("precision")
-        or "bf16"  # default
-    )
-    mode = str(mode).lower().strip()
-
-    # Lightning precision field and corresponding "AMP dtype" used for runtime dtype
-    if mode in {"bf16", "bfloat16", "bf16-mixed", "bfloat16-mixed"}:
-        pl_precision = "bf16-mixed"
+    if amp_key in {"bf16", "bfloat16", "bf16-mixed", "bfloat16-mixed"}:
         amp_dtype = torch.bfloat16
-    elif mode in {"fp16", "float16", "16-mixed", "fp16-mixed"}:
-        pl_precision = "16-mixed"
+    elif amp_key in {"fp16", "float16", "16", "16-mixed", "fp16-mixed"}:
         amp_dtype = torch.float16
-    elif mode in {"fp32", "float32", "32"}:
-        pl_precision = 32
+    elif amp_key in {"fp32", "float32", "32", "32-true", "none", "off"}:
         amp_dtype = torch.float32
     else:
-        # Unknown => safe default
-        pl_precision = "bf16-mixed"
-        amp_dtype = torch.bfloat16
+        raise ValueError("Unsupported precision.amp")
 
-    dataset_dtype_str = cfg.get("dataset", {}).get("storage_dtype")
-    runtime_dtype = _map_storage_dtype(dataset_dtype_str) or amp_dtype
+    dataset_raw = str(cfg_get(p, ["dataset_dtype"]))
+    dataset_key = dataset_raw.strip().lower()
+    if dataset_key == "auto":
+        dataset_dtype = amp_dtype
+    else:
+        dataset_dtype = _parse_torch_dtype(dataset_key)
 
-    dev_type = getattr(device, "type", str(device))
+    io_dtype = _parse_np_dtype(str(cfg_get(p, ["io_dtype"])))
+    time_io_dtype = _parse_np_dtype(str(cfg_get(p, ["time_io_dtype"])))
 
-    # Force FP32 on CPU
-    if dev_type == "cpu":
-        runtime_dtype = torch.float32
-        pl_precision = 32
-        if logger:
-            logger.info("CPU detected — forcing FP32 (Lightning=32, Dataset=float32).")
+    normalize_key = str(cfg_get(p, ["normalize_dtype"])).strip().lower()
+    normalize_dtype = _parse_torch_dtype(normalize_key)
+    if normalize_dtype not in {torch.float32, torch.float64}:
+        raise ValueError("precision.normalize_dtype must be float32 or float64")
 
-    # Force FP32 on Apple MPS (avoid BF16/FP16 matmul asserts)
-    if dev_type == "mps":
-        runtime_dtype = torch.float32
-        pl_precision = 32
-        if logger:
-            logger.info("MPS detected — forcing FP32 (Lightning=32, Dataset=float32).")
+    tf32 = bool(cfg_get(p, ["tf32"]))
 
-    if logger:
-        logger.info(f"Precision config: Lightning={pl_precision}, Dataset={runtime_dtype}")
+    # Device capability checks (fail fast instead of silently overriding).
+    dev_type = device.type
+    if dev_type in {"cpu", "mps"}:
+        if amp_dtype != torch.float32 or dataset_dtype != torch.float32:
+            raise ValueError("On CPU/MPS, use precision.amp=fp32 and precision.dataset_dtype=float32")
 
-    return pl_precision, runtime_dtype
+    return PrecisionPolicy(
+        amp_dtype=amp_dtype,
+        dataset_dtype=dataset_dtype,
+        normalize_dtype=normalize_dtype,
+        io_dtype=io_dtype,
+        time_io_dtype=time_io_dtype,
+        tf32=tf32,
+    )
