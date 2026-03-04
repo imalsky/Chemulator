@@ -16,7 +16,6 @@ Saves:
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -24,47 +23,35 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# -----------------------------------------------------------------------------
+# User-editable settings
+# -----------------------------------------------------------------------------
 
-def _default_run_dir() -> Path:
-    cfg_path = (ROOT / "config.json").resolve()
-    if cfg_path.exists():
-        try:
-            import json
+# Run/artifact selection (main knobs).
+RUN_DIR: str = "models/v2_bigger_batch"  # Absolute path or repo-relative path
+METRICS_FILE: str = "metrics.csv"
 
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            paths = cfg.get("paths", {}) or {}
-            work_dir = paths.get("work_dir")
-            if isinstance(work_dir, str) and work_dir.strip():
-                p = Path(work_dir).expanduser()
-                if not p.is_absolute():
-                    p = (cfg_path.parent / p).resolve()
-                return p.resolve()
-        except Exception:
-            pass
-    return (ROOT / "models" / "v1_test").resolve()
+# Output.
+OUT_NAME: str = "loss_curves.png"
+PLOTS_SUBDIR: str = "plots"  # Relative to RUN_DIR
 
+# Plot behavior.
+PLOT_COMPONENTS: bool = False  # Set True to also plot log10_mae and z_mse losses
+SMOOTHING: int = 0             # 0 disables; otherwise moving-average window in epochs
 
-# =============================================================================
-# Config
-# =============================================================================
-
-@dataclass
-class Config:
-    run_dir: Path = _default_run_dir()
-    metrics_name: str = "metrics.csv"
-
-    out_name: str = "loss_curves.png"
-    plot_components: bool = True   # also plot log10_mae and z_mse losses
-    smoothing: int = 0             # 0 disables; otherwise moving-average window in epochs
-
-    style_candidates: tuple[Path | str, ...] = (
-        ROOT / "science.mplstyle",
-        ROOT / "testing" / "science.mplstyle",
-        "science.mplstyle",
-    )
+# Style candidates (first match wins).
+STYLE_CANDIDATES: tuple[Path | str, ...] = (
+    ROOT / "science.mplstyle",
+    ROOT / "testing" / "science.mplstyle",
+    "science.mplstyle",
+)
 
 
-CFG = Config()
+def _resolve_repo_path(raw: str) -> Path:
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (ROOT / p).resolve()
+    return p.resolve()
 
 
 # =============================================================================
@@ -72,7 +59,7 @@ CFG = Config()
 # =============================================================================
 
 def apply_style() -> None:
-    for s in CFG.style_candidates:
+    for s in STYLE_CANDIDATES:
         try:
             if isinstance(s, Path):
                 if s.exists():
@@ -112,19 +99,34 @@ def load_metrics_csv(path: Path):
     if not rows:
         raise ValueError(f"No rows in: {path}")
 
-    # Keep last occurrence per epoch (useful across resumes/restarts)
-    by_epoch = {}
+    # Merge rows per epoch because train/val metrics may be logged on separate rows.
+    metric_names = (
+        "train_loss",
+        "val_loss",
+        "train_loss_log10_mae",
+        "val_loss_log10_mae",
+        "train_loss_z_mse",
+        "val_loss_z_mse",
+    )
+    by_epoch: dict[int, dict[str, float | None]] = {}
     for r in rows:
         e = _to_float(r.get("epoch", ""))
         if e is None:
             continue
-        by_epoch[int(e)] = r
+        epoch = int(e)
+        metrics = by_epoch.setdefault(epoch, {k: None for k in metric_names})
+        for k in metric_names:
+            v = _to_float(r.get(k, ""))
+            if v is not None:
+                metrics[k] = v
 
     epochs = np.array(sorted(by_epoch.keys()), dtype=np.int64)
-    last_rows = [by_epoch[int(e)] for e in epochs]
 
     def col(name: str):
-        return np.array([_to_float(r.get(name, "")) for r in last_rows], dtype=np.float64)
+        return np.array(
+            [by_epoch[int(e)][name] if by_epoch[int(e)][name] is not None else np.nan for e in epochs],
+            dtype=np.float64,
+        )
 
     return {
         "epoch": epochs,
@@ -159,22 +161,50 @@ def _sanitize_for_log(y: np.ndarray) -> np.ndarray:
 # Plotting
 # =============================================================================
 
-def plot_losses(m, out_path: Path) -> None:
+def _resolve_metrics_path(run_dir: Path) -> Path:
+    return (run_dir / METRICS_FILE).resolve()
+
+
+def _resolve_output_path(run_dir: Path) -> Path:
+    return (run_dir / PLOTS_SUBDIR / OUT_NAME).resolve()
+
+
+def plot_losses(m, out_path: Path, *, run_name: str) -> None:
     epoch = m["epoch"]
 
     train = _sanitize_for_log(m["train_loss"])
     val = _sanitize_for_log(m["val_loss"])
 
-    if CFG.smoothing and CFG.smoothing > 1:
-        train = moving_average(train, CFG.smoothing)
-        val = moving_average(val, CFG.smoothing)
+    if SMOOTHING and SMOOTHING > 1:
+        train = moving_average(train, SMOOTHING)
+        val = moving_average(val, SMOOTHING)
 
-    fig, ax = plt.subplots(figsize=(7, 7))
+    fig, ax = plt.subplots(figsize=(6, 6))
 
-    ax.plot(epoch, train, label="train_loss", color='black', linestyle="solid", linewidth=3, alpha=0.5)
-    ax.plot(epoch, val, label="val_loss", color='black', linestyle="dashed", linewidth=3)
 
-    if CFG.plot_components:
+    ax.plot(
+        epoch,
+        val,
+        label="val_loss",
+        color="black",
+        linestyle=(0, (7, 8)),
+        linewidth=2,
+        alpha=0.95,
+        dash_capstyle="round",
+    )
+    ax.plot(
+        epoch,
+        train,
+        label="train_loss",
+        color="black",
+        linestyle="solid",
+        linewidth=2,
+        alpha=1,
+        solid_capstyle="round",
+    )
+
+
+    if PLOT_COMPONENTS:
         tlm = _sanitize_for_log(m["train_loss_log10_mae"])
         vlm = _sanitize_for_log(m["val_loss_log10_mae"])
         tzm = _sanitize_for_log(m["train_loss_z_mse"])
@@ -182,13 +212,13 @@ def plot_losses(m, out_path: Path) -> None:
 
         ax.plot(epoch, tlm, linestyle="solid", label="train_log10_mae", color="tab:red", linewidth=2.0, alpha=0.8)
         ax.plot(epoch, vlm, linestyle="dashed", label="val_log10_mae", color="tab:red", linewidth=2.0, alpha=0.9)
-        ax.plot(epoch, tzm, linestyle="solid", label="train_z_mse", color="tab:blue", linewidth=2.0, alpha=0.8)
         ax.plot(epoch, vzm, linestyle="dashed", label="val_z_mse", color="tab:blue", linewidth=2.0, alpha=0.9)
+        ax.plot(epoch, tzm, linestyle="solid", label="train_z_mse", color="tab:blue", linewidth=2.0, alpha=0.8)
+
 
     ax.set_yscale("log")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
-    ax.set_title(f"Training curves: {CFG.run_dir.name}")
     ax.set_box_aspect(1)  # square plot area
 
     ax.legend(loc="best", fontsize=8)
@@ -205,10 +235,12 @@ def plot_losses(m, out_path: Path) -> None:
 
 def main() -> None:
     apply_style()
-    metrics_path = (CFG.run_dir / CFG.metrics_name).resolve()
+    run_dir = _resolve_repo_path(RUN_DIR)
+    metrics_path = _resolve_metrics_path(run_dir)
+    out_path = _resolve_output_path(run_dir)
+    print(f"[config] run_dir={run_dir} metrics={metrics_path} out={out_path}")
     m = load_metrics_csv(metrics_path)
-    out_path = CFG.run_dir / "plots" / CFG.out_name
-    plot_losses(m, out_path)
+    plot_losses(m, out_path, run_name=run_dir.name)
 
 
 if __name__ == "__main__":

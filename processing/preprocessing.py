@@ -40,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -1233,10 +1234,21 @@ def write_summary(
     counts_total: Dict[str, int],
     rejects_total: Dict[str, int],
 ) -> None:
+    base = out_final.resolve()
+    cfg_serialized: Dict[str, Any] = {}
+    for k, v in cfg.__dict__.items():
+        if isinstance(v, Path):
+            try:
+                cfg_serialized[k] = os.path.relpath(str(v.resolve()), str(base))
+            except Exception:
+                cfg_serialized[k] = str(v)
+        else:
+            cfg_serialized[k] = v
+
     summary = {
         "counts_total": counts_total,
         "rejects_total": rejects_total,
-        "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.__dict__.items()},
+        "config": cfg_serialized,
     }
     with open(out_final / "preprocessing_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

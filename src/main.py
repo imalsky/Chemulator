@@ -287,6 +287,47 @@ def _resolve_path(root: Path, p: str) -> str:
     return str((root / pth).resolve())
 
 
+def _to_relative_path_str(p: str, *, start: Path) -> str:
+    """
+    Persist path-like config fields as relative to `start` for portability.
+    """
+    pth = Path(str(p).strip()).expanduser()
+    if not pth.is_absolute():
+        return str(pth)
+    try:
+        return os.path.relpath(str(pth.resolve()), str(start.resolve()))
+    except Exception:
+        return str(pth)
+
+
+def _portable_config_snapshot(cfg: Mapping[str, Any], *, save_dir: Path) -> Dict[str, Any]:
+    """
+    Build a config snapshot suitable for disk persistence.
+
+    Runtime uses absolute resolved paths internally; for portability we save
+    path-like fields relative to the run directory.
+    """
+    out = dict(cfg)
+
+    paths_raw = out.get("paths")
+    if isinstance(paths_raw, Mapping):
+        paths_out: Dict[str, Any] = dict(paths_raw)
+        for k, v in paths_out.items():
+            if isinstance(v, str) and v.strip():
+                paths_out[k] = _to_relative_path_str(v, start=save_dir)
+        out["paths"] = paths_out
+
+    runtime_raw = out.get("runtime")
+    if isinstance(runtime_raw, Mapping):
+        runtime_out: Dict[str, Any] = dict(runtime_raw)
+        ckpt = runtime_out.get("checkpoint")
+        if isinstance(ckpt, str) and ckpt.strip():
+            runtime_out["checkpoint"] = _to_relative_path_str(ckpt, start=save_dir)
+        out["runtime"] = runtime_out
+
+    return out
+
+
 def resolve_paths(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, Any]:
     """Resolve cfg.paths[*] relative to the config file directory."""
     root = _repo_root(cfg_path)
@@ -669,7 +710,7 @@ def main() -> None:
         precision_config=prec,
         train_batches_per_epoch=train_batches_per_epoch,
     )
-    atomic_write_json(work_dir / "config.resolved.json", dict(cfg))
+    atomic_write_json(work_dir / "config.resolved.json", _portable_config_snapshot(cfg, save_dir=work_dir))
 
     ckpt_val = runtime.get("checkpoint", None)
     ckpt_path: Optional[Path] = None

@@ -4,7 +4,7 @@
 Measures a single autoregressive jump y_next = model(y, dt, g) for different batch sizes.
 Prints amortized latency per sample (microseconds/sample) and saves a log-log plot.
 
-Expected artifacts in CFG.run_dir (produced by testing/export.py):
+Expected artifacts in RUN_DIR (produced by testing/export.py):
   - export_cpu_dynB_1step_phys.pt2
   - export_mps_dynB_1step_phys.pt2 (optional)
 """
@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -24,28 +23,22 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# -----------------------------------------------------------------------------
+# User-editable settings
+# -----------------------------------------------------------------------------
 
-def _default_run_dir() -> Path:
-    cfg_path = (ROOT / "config.json").resolve()
-    if cfg_path.exists():
-        try:
-            import json
+# Run/artifact selection (main knobs).
+RUN_DIR: str = "models/v2_bigger_batch"  # Absolute path or repo-relative path
+PROCESSED_DIR: str = "data/processed"  # Absolute path or repo-relative path
+EXPORT_CPU_FILE: str = "export_cpu_dynB_1step_phys.pt2"
+EXPORT_MPS_FILE: str = "export_mps_dynB_1step_phys.pt2"
+PLOTS_SUBDIR: str = "plots"  # Relative to RUN_DIR
 
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            paths = cfg.get("paths", {}) or {}
-            work_dir = paths.get("work_dir")
-            if isinstance(work_dir, str) and work_dir.strip():
-                p = Path(work_dir).expanduser()
-                if not p.is_absolute():
-                    p = (cfg_path.parent / p).resolve()
-                return p.resolve()
-        except Exception:
-            pass
-    return (ROOT / "models" / "v1_test").resolve()
+# Benchmark loop knobs.
+WARMUP: int = 5
+ITERS: int = 20
+BATCH_SIZES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 
-# -------------------------
-# User-tunable global knobs
-# -------------------------
 # Input dtype for benchmarking. Set to one of:
 #   - "auto"     (recommended): infer from the loaded exported module
 #   - "float32"  (fp32)
@@ -59,29 +52,27 @@ DTYPE: str = "auto"
 ALLOW_UNSAFE_DTYPE_MISMATCH_ON_MPS: bool = False
 
 
-@dataclass
-class Config:
-    run_dir: Path = _default_run_dir()
-    processed_dir: Path = ROOT / "data" / "processed"
-
-    export_cpu: str = "export_cpu_dynB_1step_phys.pt2"
-    export_mps: str = "export_mps_dynB_1step_phys.pt2"
-
-    warmup: int = 50
-    iters: int = 200
-
-    batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)
+def _resolve_repo_path(raw: str) -> Path:
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (ROOT / p).resolve()
+    return p.resolve()
 
 
-CFG = Config()
+def _resolve_export_path(*, run_dir: Path, file_name: str) -> Path:
+    return (run_dir / file_name).resolve()
 
 
-def _resolve_processed_dir() -> Path:
-    explicit = CFG.processed_dir.resolve()
-    if (explicit / "normalization.json").exists():
-        return explicit
+def _resolve_plots_dir(run_dir: Path) -> Path:
+    return (run_dir / PLOTS_SUBDIR).resolve()
 
-    for cfg_path in (CFG.run_dir / "config.resolved.json", CFG.run_dir / "config.json"):
+
+def _resolve_processed_dir(run_dir: Path) -> Path:
+    candidates: list[Path] = []
+
+    candidates.append(_resolve_repo_path(PROCESSED_DIR))
+
+    for cfg_path in (run_dir / "config.resolved.json", run_dir / "config.json"):
         if not cfg_path.exists():
             continue
         try:
@@ -97,12 +88,23 @@ def _resolve_processed_dir() -> Path:
         cand = Path(p).expanduser()
         if not cand.is_absolute():
             cand = (cfg_path.parent / cand).resolve()
+        candidates.append(cand.resolve())
+
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+
+    for cand in ordered:
         if (cand / "normalization.json").exists():
             return cand
 
+    tried = "\n".join(f"  - {p}" for p in ordered)
     raise FileNotFoundError(
-        "Could not resolve processed_dir containing normalization.json. "
-        "Set CFG.processed_dir or ensure run config has paths.processed_dir."
+        "Could not resolve processed_dir containing normalization.json.\n"
+        f"Tried:\n{tried}"
     )
 
 
@@ -291,7 +293,7 @@ def _save_plot(rows: list[dict], run_dir: Path) -> Path | None:
 
     _try_science_style(plt)
 
-    plots_dir = (run_dir / "plots").resolve()
+    plots_dir = _resolve_plots_dir(run_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     grouped: dict[tuple[str, str], list[dict]] = {}
@@ -301,40 +303,45 @@ def _save_plot(rows: list[dict], run_dir: Path) -> Path | None:
     for k in grouped:
         grouped[k] = sorted(grouped[k], key=lambda x: int(x["B"]))
 
-    plt.figure()
+    fig, ax = plt.subplots(figsize=(6, 6))
     for (backend, dtype), rs in grouped.items():
         bs = [int(r["B"]) for r in rs]
         us = [float(r["us_per_sample"]) for r in rs]
-        plt.plot(bs, us, marker="o", label=f"{backend} ({dtype})")
+        ax.plot(bs, us, marker="o", label=f"{backend} ({dtype})")
 
-    plt.xlabel("batch size B")
-    plt.ylabel("amortized latency (\u03bcs/sample)")
-    plt.title("1-step AR benchmark (amortized per-sample)")
+    ax.set_xlabel("batch size B")
+    ax.set_ylabel("amortized latency (\u03bcs/sample)")
 
     # Log-log axes.
     try:
-        plt.xscale("log", base=2)
+        ax.set_xscale("log", base=2)
     except TypeError:
-        plt.xscale("log", basex=2)
-    plt.yscale("log")
+        ax.set_xscale("log", basex=2)
+    ax.set_yscale("log")
 
-    plt.legend()
-    plt.tight_layout()
+    ax.legend()
+    ax.set_box_aspect(1)  # square plot area
+    fig.tight_layout()
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = DTYPE.strip().lower().replace("float", "fp")
     out = plots_dir / f"benchmark_1step_us_per_sample_{tag}_{ts}.png"
-    plt.savefig(out, dpi=200)
-    plt.close()
+    fig.savefig(out, dpi=200)
+    plt.close(fig)
     return out
 
 
 def main() -> None:
-    processed_dir = _resolve_processed_dir()
+    run_dir = _resolve_repo_path(RUN_DIR)
+    cpu_export = _resolve_export_path(run_dir=run_dir, file_name=EXPORT_CPU_FILE)
+    mps_export = _resolve_export_path(run_dir=run_dir, file_name=EXPORT_MPS_FILE)
+    processed_dir = _resolve_processed_dir(run_dir)
     S, G = _infer_dims(processed_dir)
 
     print(f"processed_dir: {processed_dir}")
-    print(f"run_dir:       {CFG.run_dir}")
+    print(f"run_dir:       {run_dir}")
+    print(f"cpu_export:    {cpu_export}")
+    print(f"mps_export:    {mps_export}")
     print(f"dims:          S={S} G={G}")
     print(f"dtype:         {DTYPE}")
     print("")
@@ -342,11 +349,10 @@ def main() -> None:
     rows: list[dict] = []
 
     # CPU
-    cpu_export = (CFG.run_dir / CFG.export_cpu).resolve()
     model_cpu = _load_export(cpu_export, "cpu")
     cpu_dtype = _select_input_dtype(model_cpu, backend="cpu")
 
-    for B in CFG.batch_sizes:
+    for B in BATCH_SIZES:
         if not _supports_batch(model_cpu, device="cpu", dtype=cpu_dtype, B=B, S=S, G=G):
             print(f"cpu: batch B={B} unsupported by export; skipping")
             continue
@@ -358,8 +364,8 @@ def main() -> None:
             B=B,
             S=S,
             G=G,
-            iters=CFG.iters,
-            warmup=CFG.warmup,
+            iters=ITERS,
+            warmup=WARMUP,
         )
         rows.append(
             {
@@ -372,12 +378,11 @@ def main() -> None:
 
     # MPS (optional)
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        mps_export = (CFG.run_dir / CFG.export_mps).resolve()
         if mps_export.exists():
             model_mps = _load_export(mps_export, "mps")
             mps_dtype = _select_input_dtype(model_mps, backend="mps")
 
-            for B in CFG.batch_sizes:
+            for B in BATCH_SIZES:
                 if not _supports_batch(model_mps, device="mps", dtype=mps_dtype, B=B, S=S, G=G):
                     print(f"mps: batch B={B} unsupported by export (dtype={_dtype_tag(mps_dtype)}); skipping")
                     continue
@@ -389,8 +394,8 @@ def main() -> None:
                     B=B,
                     S=S,
                     G=G,
-                    iters=CFG.iters,
-                    warmup=CFG.warmup,
+                    iters=ITERS,
+                    warmup=WARMUP,
                 )
                 rows.append(
                     {
@@ -408,7 +413,7 @@ def main() -> None:
     print("")
     _print_table(rows)
 
-    out = _save_plot(rows, CFG.run_dir)
+    out = _save_plot(rows, run_dir)
     if out is not None:
         print(f"\nSaved plot: {out}")
 

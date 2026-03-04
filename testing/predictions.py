@@ -26,46 +26,52 @@ from matplotlib.lines import Line2D
 
 ROOT = Path(__file__).resolve().parents[1]
 
-
-def _default_run_dir() -> Path:
-    cfg_path = (ROOT / "config.json").resolve()
-    if cfg_path.exists():
-        try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            paths = cfg.get("paths", {}) or {}
-            work_dir = paths.get("work_dir")
-            if isinstance(work_dir, str) and work_dir.strip():
-                p = Path(work_dir).expanduser()
-                if not p.is_absolute():
-                    p = (cfg_path.parent / p).resolve()
-                return p.resolve()
-        except Exception:
-            pass
-    return (ROOT / "models" / "v1_test").resolve()
-
 # -----------------------------------------------------------------------------
-# Defaults
+# User-editable settings
 # -----------------------------------------------------------------------------
 
-RUN_DIR: Path = _default_run_dir()
-EXPORT_NAME: str = "export_cpu_dynB_1step_phys.pt2"
+# Model/artifact selection (main knobs you typically edit first).
+MODEL_RUN_DIR: str = "models/v2_bigger_batch"  # Absolute path or repo-relative path
+MODEL_EXPORT_FILE: str = "export_cpu_dynB_1step_phys.pt2"
 
-SPLIT: str = "test"
-SHARD_INDEX: int | None = None  # None => randomly select a shard from the chosen split
-SHARD_RANDOM_SEED: int | None = None  # Optional reproducible seed; None => fresh randomness each run
-SAMPLE_INDEX: int | None = None  # None => randomly select a sample/chunk from the selected shard
-SAMPLE_RANDOM_SEED: int | None = None  # Optional reproducible seed; None => fresh randomness each run
-START_INDEX: int = 1
-N_STEPS: int = 200
+# Inference settings.
+INFER_DEVICE: torch.device = torch.device("cpu")
+INFER_DTYPE: torch.dtype = torch.float32
 
+# Data selection.
+EVAL_SPLIT: str = "test"
+EVAL_SHARD_INDEX: int | None = None  # None => randomly select a shard from the chosen split
+EVAL_SHARD_RANDOM_SEED: int | None = None  # Optional reproducible seed; None => fresh randomness each run
+EVAL_SAMPLE_INDEX: int | None = None  # None => randomly select a sample/chunk from the selected shard
+EVAL_SAMPLE_RANDOM_SEED: int | None = None  # Optional reproducible seed; None => fresh randomness each run
+
+# Rollout window.
+ROLLOUT_START_INDEX: int = 1
+ROLLOUT_STEPS: int = 200
+
+# Plotting/output.
+PLOTS_SUBDIR: str = "plots"  # Relative to MODEL_RUN_DIR
+PLOT_TIME_LOG_SCALE: bool = False  # If True, use log-scale on time axis
 PLOT_Y_LIM: Tuple[float, float] = (1e-30, 3.0)
 PLOT_MARKER_EVERY: int = 10
 PLOT_STYLE: str | None = str((ROOT / "testing" / "science.mplstyle").resolve())
 
-DEVICE: torch.device = torch.device("cpu")
-DTYPE: torch.dtype = torch.float32
-
 REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
+
+
+def _resolve_repo_path(raw: str) -> Path:
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (ROOT / p).resolve()
+    return p.resolve()
+
+
+def _resolve_export_path(run_dir: Path) -> Path:
+    return (run_dir / MODEL_EXPORT_FILE).resolve()
+
+
+def _resolve_output_dir(run_dir: Path) -> Path:
+    return (run_dir / PLOTS_SUBDIR).resolve()
 
 
 def _load_export_module(export_path: Path) -> Tuple[torch.nn.Module, Dict[str, Any]]:
@@ -77,7 +83,7 @@ def _load_export_module(export_path: Path) -> Tuple[torch.nn.Module, Dict[str, A
     meta = json.loads(meta_raw)
     if not isinstance(meta, dict):
         raise TypeError("embedded metadata.json must be a JSON object")
-    model = ep.module().to(device=DEVICE, dtype=DTYPE)
+    model = ep.module().to(device=INFER_DEVICE, dtype=INFER_DTYPE)
     return model, meta
 
 
@@ -191,9 +197,9 @@ def _choose_shard(processed_dir: Path, *, split: str, shard_index: int | None) -
         raise FileNotFoundError(f"no shards found under {shard_dir}")
 
     if shard_index is None:
-        rng = np.random.default_rng(SHARD_RANDOM_SEED)
+        rng = np.random.default_rng(EVAL_SHARD_RANDOM_SEED)
         picked = int(rng.integers(0, len(shards)))
-        seed_msg = f", seed={SHARD_RANDOM_SEED}" if SHARD_RANDOM_SEED is not None else ""
+        seed_msg = f", seed={EVAL_SHARD_RANDOM_SEED}" if EVAL_SHARD_RANDOM_SEED is not None else ""
         print(f"[data] randomly selected shard index {picked} of {len(shards)}{seed_msg}")
         return picked, shards[picked]
 
@@ -216,9 +222,9 @@ def _choose_sample(n_samples: int, *, sample_index: int | None) -> int:
         raise ValueError(f"selected shard has no samples/chunks (N={n_samples})")
 
     if sample_index is None:
-        rng = np.random.default_rng(SAMPLE_RANDOM_SEED)
+        rng = np.random.default_rng(EVAL_SAMPLE_RANDOM_SEED)
         picked = int(rng.integers(0, n_samples))
-        seed_msg = f", seed={SAMPLE_RANDOM_SEED}" if SAMPLE_RANDOM_SEED is not None else ""
+        seed_msg = f", seed={EVAL_SAMPLE_RANDOM_SEED}" if EVAL_SAMPLE_RANDOM_SEED is not None else ""
         print(f"[data] randomly selected sample index {picked} of {n_samples}{seed_msg}")
         return picked
 
@@ -239,9 +245,9 @@ def _rollout(
     if g_phys.shape != (len(REQUIRED_GLOBALS),):
         raise ValueError(f"g_phys must have shape ({len(REQUIRED_GLOBALS)},), got {g_phys.shape}")
 
-    y = torch.from_numpy(y0_phys.astype(np.float32, copy=False)).to(device=DEVICE, dtype=DTYPE).unsqueeze(0)
-    g = torch.from_numpy(g_phys.astype(np.float32, copy=False)).to(device=DEVICE, dtype=DTYPE).unsqueeze(0)
-    dt_all = torch.from_numpy(dt_seconds.astype(np.float32, copy=False)).to(device=DEVICE, dtype=DTYPE)
+    y = torch.from_numpy(y0_phys.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=INFER_DTYPE).unsqueeze(0)
+    g = torch.from_numpy(g_phys.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=INFER_DTYPE).unsqueeze(0)
+    dt_all = torch.from_numpy(dt_seconds.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=INFER_DTYPE)
 
     preds: List[torch.Tensor] = []
     for k in range(int(dt_all.shape[0])):
@@ -287,13 +293,18 @@ def _plot(*, t_sec: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, species_
             markeredgewidth=0.9,
         )
 
+    if PLOT_TIME_LOG_SCALE:
+        if float(np.min(t_sec)) <= 0.0:
+            raise ValueError("PLOT_TIME_LOG_SCALE=True requires strictly positive evaluation times.")
+        ax.set_xscale("log")
+
     ax.set_yscale("log")
     ax.set(
         xlim=(float(t_sec[0]), float(t_sec[-1])),
         ylim=PLOT_Y_LIM,
         xlabel="Time (s)",
         ylabel="Relative Abundance",
-        title=f"Autoregressive rollout ({SPLIT}): {len(t_sec)} steps (exported 1-step PHYS model)",
+        title=f"Autoregressive rollout ({EVAL_SPLIT}): {len(t_sec)} steps (exported 1-step PHYS model)",
     )
     ax.set_box_aspect(1)
 
@@ -348,12 +359,19 @@ def main() -> None:
     if PLOT_STYLE is not None:
         plt.style.use(PLOT_STYLE)
 
-    export_path = (RUN_DIR / EXPORT_NAME).resolve()
+    run_dir = _resolve_repo_path(MODEL_RUN_DIR)
+    export_path = _resolve_export_path(run_dir)
     if not export_path.exists():
         raise FileNotFoundError(f"missing export: {export_path}")
 
+    output_dir = _resolve_output_dir(run_dir)
+    print(
+        f"[config] export={export_path} run_dir={run_dir} "
+        f"device={INFER_DEVICE.type} dtype={INFER_DTYPE} split={EVAL_SPLIT}"
+    )
+
     model, meta = _load_export_module(export_path)
-    print(f"[model] {export_path.name} device={DEVICE.type} dtype={DTYPE}")
+    print(f"[model] file={export_path.name} meta.export_device_tag={meta.get('export_device_tag')}")
 
     norm_path = _resolve_normalization_path(meta)
     processed_dir = norm_path.parent
@@ -366,27 +384,27 @@ def main() -> None:
     if global_keys != list(REQUIRED_GLOBALS):
         raise ValueError(f"normalization.json global_variables must be exactly {list(REQUIRED_GLOBALS)}")
 
-    shard_index, shard_path = _choose_shard(processed_dir, split=SPLIT, shard_index=SHARD_INDEX)
+    shard_index, shard_path = _choose_shard(processed_dir, split=EVAL_SPLIT, shard_index=EVAL_SHARD_INDEX)
     y_mat, g_mat, dt_norm_mat = _load_shard(shard_path)
     n_samples = int(y_mat.shape[0])
-    sample_index = _choose_sample(n_samples, sample_index=SAMPLE_INDEX)
-    print(f"[data] split={SPLIT} shard={shard_path.name} sample={sample_index} n_samples={n_samples}")
+    sample_index = _choose_sample(n_samples, sample_index=EVAL_SAMPLE_INDEX)
+    print(f"[data] split={EVAL_SPLIT} shard={shard_path.name} sample={sample_index} n_samples={n_samples}")
 
     y_z = y_mat[sample_index]
     g_z = g_mat[sample_index]
     dt_norm = dt_norm_mat[sample_index]
 
     T = int(y_z.shape[0])
-    if START_INDEX < 0 or START_INDEX >= T - 1:
-        raise IndexError(f"START_INDEX out of range: {START_INDEX} (trajectory has T={T})")
+    if ROLLOUT_START_INDEX < 0 or ROLLOUT_START_INDEX >= T - 1:
+        raise IndexError(f"ROLLOUT_START_INDEX out of range: {ROLLOUT_START_INDEX} (trajectory has T={T})")
 
-    max_steps = int((T - 1) - START_INDEX)
-    if N_STEPS <= 0 or N_STEPS > max_steps:
-        raise ValueError(f"N_STEPS must be in [1, {max_steps}], got {N_STEPS}")
+    max_steps = int((T - 1) - ROLLOUT_START_INDEX)
+    if ROLLOUT_STEPS <= 0 or ROLLOUT_STEPS > max_steps:
+        raise ValueError(f"ROLLOUT_STEPS must be in [1, {max_steps}], got {ROLLOUT_STEPS}")
 
-    y0_z = y_z[START_INDEX]
-    y_true_z = y_z[START_INDEX + 1 : START_INDEX + 1 + N_STEPS]
-    dt_seq_norm = dt_norm[START_INDEX : START_INDEX + N_STEPS]
+    y0_z = y_z[ROLLOUT_START_INDEX]
+    y_true_z = y_z[ROLLOUT_START_INDEX + 1 : ROLLOUT_START_INDEX + 1 + ROLLOUT_STEPS]
+    dt_seq_norm = dt_norm[ROLLOUT_START_INDEX : ROLLOUT_START_INDEX + ROLLOUT_STEPS]
 
     y0_phys = _denormalize_species(y0_z[None, :], species_keys, manifest)[0]
     y_true_phys = _denormalize_species(y_true_z, species_keys, manifest)
@@ -398,11 +416,10 @@ def main() -> None:
 
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     out_path = (
-        RUN_DIR
-        / "plots"
+        output_dir
         / (
-            f"autoregressive_rollout_{SPLIT}_{shard_path.stem}"
-            f"_sample-{sample_index}_start-{START_INDEX}_steps-{N_STEPS}"
+            f"autoregressive_rollout_{EVAL_SPLIT}_{shard_path.stem}"
+            f"_sample-{sample_index}_start-{ROLLOUT_START_INDEX}_steps-{ROLLOUT_STEPS}"
             f"_run-{run_stamp}.png"
         )
     )

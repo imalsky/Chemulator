@@ -65,7 +65,7 @@ from model import create_model  # noqa: E402
 REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 
 # Runtime settings (edit here; no argparse).
-RUN_DIR = (REPO_ROOT / "models" / "v1_test").resolve()
+RUN_DIR = (REPO_ROOT / "models" / "v2_bigger_batch").resolve()
 CHECKPOINT = "checkpoints/last.ckpt"  # relative paths are resolved against run config directory
 EXPORT_DEVICES = "cpu,cuda"  # requested targets; unavailable devices are skipped with CPU fallback
 EXPORT_DTYPE = "float32"
@@ -125,6 +125,20 @@ def _load_json(path: Path) -> Dict[str, Any]:
     if not isinstance(obj, dict):
         raise TypeError(f"JSON root must be an object: {path}")
     return obj
+
+
+def _resolve_path_like(raw: str, *, base: Path) -> Path:
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        return (base / p).resolve()
+    return p.resolve()
+
+
+def _to_repo_relative_str(path: Path) -> str:
+    try:
+        return os.path.relpath(str(path.resolve()), str(REPO_ROOT.resolve()))
+    except Exception:
+        return str(path)
 
 
 def _load_resolved_config(run_dir: Path) -> Tuple[Dict[str, Any], Path]:
@@ -607,12 +621,52 @@ def _resolve_processed_dir(cfg: Mapping[str, Any], *, cfg_path: Path) -> Path:
     if not isinstance(processed, str) or not processed.strip():
         raise KeyError("config.paths.processed_dir is required")
 
-    p = Path(processed).expanduser()
-    if not p.is_absolute():
-        p = (cfg_path.parent / p).resolve()
-    if not (p / "normalization.json").exists():
-        raise FileNotFoundError(f"normalization.json not found under processed_dir: {p}")
-    return p
+    candidates: List[Path] = []
+
+    def _add_candidate(raw_path: Path) -> None:
+        p = raw_path.resolve()
+        if p not in candidates:
+            candidates.append(p)
+
+    # Primary source: config.resolved.json
+    _add_candidate(_resolve_path_like(processed, base=cfg_path.parent))
+
+    # If this run dir came from another machine, the saved absolute path can be stale.
+    # Try remapping suffixes of the stale absolute path under this repo root.
+    primary_raw = Path(processed).expanduser()
+    if primary_raw.is_absolute():
+        parts = primary_raw.parts
+        for idx in range(1, len(parts)):
+            suffix = Path(*parts[idx:])
+            if len(suffix.parts) >= 2:
+                _add_candidate((REPO_ROOT / suffix))
+
+    # Fallback to repo config and canonical default.
+    repo_cfg_path = REPO_ROOT / "config.json"
+    if repo_cfg_path.exists():
+        try:
+            repo_cfg = _load_json(repo_cfg_path)
+            repo_paths = repo_cfg.get("paths", {}) or {}
+            if isinstance(repo_paths, Mapping):
+                repo_processed = repo_paths.get("processed_dir")
+                if isinstance(repo_processed, str) and repo_processed.strip():
+                    _add_candidate(_resolve_path_like(repo_processed, base=repo_cfg_path.parent))
+        except Exception:
+            pass
+
+    _add_candidate((REPO_ROOT / "data" / "processed"))
+
+    for cand in candidates:
+        if (cand / "normalization.json").exists():
+            if cand != candidates[0]:
+                print(f"processed_dir fallback: using {cand} (configured: {candidates[0]})")
+            return cand
+
+    tried = "\n".join(f"  - {c}" for c in candidates)
+    raise FileNotFoundError(
+        "normalization.json not found under any processed_dir candidate.\n"
+        f"Configured: {processed}\nTried:\n{tried}"
+    )
 
 
 def _parse_dtype(dtype_str: str) -> torch.dtype:
@@ -734,10 +788,10 @@ def _export_one(
 
     meta = {
         "format": "1step_physical_dynB",
-        "run_dir": str(run_dir),
-        "config_path": str(cfg_path),
-        "checkpoint_path": str(ckpt_path),
-        "normalization_path": str(manifest_path),
+        "run_dir": _to_repo_relative_str(run_dir),
+        "config_path": _to_repo_relative_str(cfg_path),
+        "checkpoint_path": _to_repo_relative_str(ckpt_path),
+        "normalization_path": _to_repo_relative_str(manifest_path),
         "torch_version": torch.__version__,
         "torch_cuda_version": getattr(torch.version, "cuda", None),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
