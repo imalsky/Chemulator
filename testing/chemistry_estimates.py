@@ -8,6 +8,9 @@ import json
 import logging
 import math
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+
 import re
 import sys
 import warnings
@@ -43,8 +46,9 @@ PRED_CHUNK = 32768
 EXPORT_MAX_BATCH = 4096
 
 OUTFILE = MODEL_DIR / "reports" / "chemistry_test_estimates.json"
-PLOTFILE = MODEL_DIR / "plots" / "chemistry_test_estimates.png"
+PLOTFILE = MODEL_DIR / "plots" / "Fig5.pdf"
 PLOT_MAX_POINTS = 20000
+
 
 if plt is not None:
     try:
@@ -525,15 +529,18 @@ def _plot_scatter_panel_loglog(ax: Any, x_vals: List[float], y_vals: List[float]
 
     x = torch.tensor(x_vals, dtype=torch.float64).numpy()
     y = torch.tensor(y_vals, dtype=torch.float64).numpy()
+
     lo = float(min(x.min(), y.min()))
     hi = float(max(x.max(), y.max()))
-    lo = max(lo * 0.8, 1e-30)
-    hi = max(hi * 1.2, lo * 1.01)
+
+    lo = max(lo * 5, 1e-30)
+    hi = max(hi * 5, lo * 1.01)
 
     ax.loglog(x, y, ".", alpha=0.25, markersize=3)
     ax.loglog([lo, hi], [lo, hi], "k--", linewidth=1.2)
-    ax.set_xlim(lo, hi)
-    ax.set_ylim(lo, hi)
+
+    ax.set_xlim(1e-10, 1e10)
+    ax.set_ylim(1e-10, 1e10)
     ax.set_title(title)
     ax.set_xlabel("True")
     ax.set_ylabel("Predicted")
@@ -582,9 +589,9 @@ def _write_results_plot(
         return None
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 5.5))
-    _plot_scatter_panel_loglog(axes[0], co_true, co_pred, "(C/O)/(C/O)_sun")
-    _plot_scatter_panel_linear(axes[1], mh_true, mh_pred, "[M/H]_proxy (dex)")
-    fig.suptitle("Chemistry Estimates on Test Split", fontsize=12)
+    _plot_scatter_panel_loglog(axes[0], co_true, co_pred, "C/O Ratio")
+    _plot_scatter_panel_linear(axes[1], mh_true, mh_pred, "[M/H] (proxy)")
+    #fig.suptitle("Chemistry Estimates on Test Split", fontsize=12)
     fig.tight_layout()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
