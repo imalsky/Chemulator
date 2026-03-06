@@ -23,7 +23,7 @@ Optional curriculum (training only):
 
 Logging:
 - Uses Lightning CSVLogger. All self.log(...) metrics are written to metrics.csv.
-- LearningRateMonitor logs LR automatically (naming depends on Lightning version).
+- LearningRateMonitor logs LR automatically.
 - epoch_time_sec is logged manually (so we do not need Timer).
 
 Batch contract (from dataset.py):
@@ -116,6 +116,39 @@ def _build_optimizer_param_groups(
     if no_decay:
         groups.append({"params": no_decay, "weight_decay": 0.0})
     return groups
+
+
+class WarmupReduceLROnPlateau(torch.optim.lr_scheduler.ReduceLROnPlateau):
+    """ReduceLROnPlateau with linear warmup over optimizer steps."""
+
+    def __init__(self, optimizer: torch.optim.Optimizer, *, warmup_steps: int, **kwargs: Any) -> None:
+        self.warmup_steps = int(max(0, warmup_steps))
+        self.warmup_step_count = 0
+        self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        super().__init__(optimizer, **kwargs)
+        if self.warmup_steps > 0:
+            self._set_warmup_lrs(step=0)
+
+    @property
+    def warmup_active(self) -> bool:
+        return self.warmup_step_count < self.warmup_steps
+
+    def _set_warmup_lrs(self, *, step: int) -> None:
+        scale = float(step) / float(max(1, self.warmup_steps))
+        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            group["lr"] = float(base_lr) * scale
+        self._last_lr = [float(group["lr"]) for group in self.optimizer.param_groups]
+
+    def step_warmup(self) -> None:
+        if not self.warmup_active:
+            return
+        self.warmup_step_count += 1
+        self._set_warmup_lrs(step=self.warmup_step_count)
+
+    def step(self, metrics: Any, epoch: Optional[int] = None) -> None:
+        if self.warmup_active:
+            return
+        super().step(metrics, epoch=epoch)
 
 
 # ==============================================================================
@@ -640,9 +673,62 @@ class FlowMapRolloutModule(pl.LightningModule):
         sched_list = list(sched) if isinstance(sched, (list, tuple)) else [sched]
         for s in sched_list:
             sch = s.scheduler if hasattr(s, "scheduler") else s
+            if isinstance(sch, WarmupReduceLROnPlateau):
+                sch.step_warmup()
+                continue
             if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 continue
             sch.step()
+
+    def optimizer_step(self, *args: Any, **kwargs: Any) -> None:
+        super().optimizer_step(*args, **kwargs)
+        if not self.automatic_optimization:
+            return
+
+        sched = self.lr_schedulers()
+        if sched is None:
+            return
+
+        sched_list = list(sched) if isinstance(sched, (list, tuple)) else [sched]
+        for s in sched_list:
+            sch = s.scheduler if hasattr(s, "scheduler") else s
+            if isinstance(sch, WarmupReduceLROnPlateau):
+                sch.step_warmup()
+
+    def _scheduler_steps_per_epoch(self) -> int:
+        if self.trainer is None:
+            raise RuntimeError("Trainer must be attached before configure_optimizers for scheduler warmup.")
+
+        num_training_batches = getattr(self.trainer, "num_training_batches", None)
+        try:
+            num_batches = float(num_training_batches)
+        except (TypeError, ValueError):
+            num_batches = 0.0
+
+        if math.isfinite(num_batches) and num_batches > 0.0:
+            acc = self._accumulate_grad_batches()
+            return int(max(1, math.ceil(num_batches / float(acc))))
+
+        max_steps = int(self.trainer.estimated_stepping_batches)
+        if max_steps <= 0:
+            raise RuntimeError(f"estimated_stepping_batches={max_steps}; cannot build scheduler warmup.")
+
+        max_epochs = max(1, int(self.max_epochs))
+        return int(max(1, math.ceil(float(max_steps) / float(max_epochs))))
+
+    def _scheduler_warmup_steps(self, warmup_epochs: int) -> int:
+        if warmup_epochs <= 0:
+            return 0
+        if self.trainer is None:
+            raise RuntimeError("Trainer must be attached before configure_optimizers for scheduler warmup.")
+
+        max_steps = int(self.trainer.estimated_stepping_batches)
+        if max_steps <= 0:
+            raise RuntimeError(f"estimated_stepping_batches={max_steps}; cannot build scheduler warmup.")
+
+        steps_per_epoch = self._scheduler_steps_per_epoch()
+        warmup_steps = int(warmup_epochs) * max(1, steps_per_epoch)
+        return int(max(0, min(warmup_steps, max_steps)))
 
 
     # ------------------------
@@ -909,21 +995,28 @@ class FlowMapRolloutModule(pl.LightningModule):
         if not bool(sched_cfg.get("enabled", False)):
             return opt
 
-        sched_type_raw = str(sched_cfg.get("type", "ReduceLROnPlateau")).strip()
+        sched_type_raw = str(sched_cfg["type"]).strip()
         sched_type = sched_type_raw.lower()
 
-        if sched_type == "reducelronplateau":
-            factor = float(sched_cfg.get("factor", 0.5))
-            patience = int(sched_cfg.get("patience", 10))
-            threshold = float(sched_cfg.get("threshold", 1e-4))
-            min_lr = float(sched_cfg.get("min_lr", 1e-7))
-            mode = str(sched_cfg.get("mode", "min"))
-            monitor = str(sched_cfg.get("monitor", "val_loss"))
+        if sched_type in {"reducelronplateau", "reduce_on_plateau"}:
+            factor = float(sched_cfg["factor"])
+            patience = int(sched_cfg["patience"])
+            threshold = float(sched_cfg["threshold"])
+            min_lr = float(sched_cfg["min_lr"])
+            mode = str(sched_cfg["mode"])
+            monitor = str(sched_cfg["monitor"])
+            warmup_steps = self._scheduler_warmup_steps(int(sched_cfg["warmup_epochs"]))
             if monitor != "val_loss":
                 raise ValueError("scheduler.monitor must be 'val_loss'")
 
-            sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt, mode=mode, factor=factor, patience=patience, threshold=threshold, min_lr=min_lr
+            sched = WarmupReduceLROnPlateau(
+                opt,
+                warmup_steps=warmup_steps,
+                mode=mode,
+                factor=factor,
+                patience=patience,
+                threshold=threshold,
+                min_lr=min_lr,
             )
 
             return {
@@ -940,7 +1033,7 @@ class FlowMapRolloutModule(pl.LightningModule):
         if sched_type != "cosine_with_warmup":
             raise ValueError(
                 f"Unsupported scheduler type '{sched_type_raw}' "
-                "(supported: ReduceLROnPlateau, cosine_with_warmup)"
+                "(supported: reduce_on_plateau, ReduceLROnPlateau, cosine_with_warmup)"
             )
 
         # Cosine schedule with optional warmup (step-based).
@@ -950,15 +1043,9 @@ class FlowMapRolloutModule(pl.LightningModule):
         if max_steps <= 0:
             raise RuntimeError(f"estimated_stepping_batches={max_steps}; cannot build cosine schedule.")
 
-        warmup_epochs = int(sched_cfg.get("warmup_epochs", 0))
-        min_lr_ratio = float(sched_cfg.get("min_lr_ratio", 0.0))
-
-        warmup_steps = 0
-        if warmup_epochs > 0:
-            steps_per_epoch = int(self.trainer.estimated_stepping_batches) // max(1, int(self.max_epochs))
-            warmup_steps = int(warmup_epochs) * max(1, steps_per_epoch)
-
-        warmup_steps = int(max(0, min(warmup_steps, max_steps)))
+        warmup_epochs = int(sched_cfg["warmup_epochs"])
+        min_lr_ratio = float(sched_cfg["min_lr_ratio"])
+        warmup_steps = self._scheduler_warmup_steps(warmup_epochs)
 
         def lr_lambda(step: int) -> float:
             s = int(step)
@@ -1026,8 +1113,7 @@ def build_lightning_trainer(
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # CSVLogger: ensure log_dir resolves to work_dir (avoid versioned subdirs).
-    # Using name="." is a robust way to keep outputs at save_dir across Lightning variants.
+    # CSVLogger: keep outputs rooted directly under work_dir.
     csv_logger = CSVLogger(save_dir=str(work_dir), name=".", version="")
 
     # Warn if Lightning still chooses a subdirectory (best-effort; does not crash training).
@@ -1080,6 +1166,4 @@ def build_lightning_trainer(
         deterministic=bool(runtime.get("deterministic", False)),
     )
 
-    sig = inspect.signature(pl.Trainer)
-    trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if k in sig.parameters}
     return pl.Trainer(**trainer_kwargs)

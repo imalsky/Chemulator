@@ -1,7 +1,7 @@
 # Autoregressive Chemical Kinetics Emulator Specification
 
-Version: 1.4  
-Date: 2026-02-27  
+Version: 1.5
+Date: 2026-03-06
 Audience: Professional collaborators and maintainers
 
 ## 0. Execution Environment
@@ -59,12 +59,15 @@ Audience: Professional collaborators and maintainers
 13. Autoregressive controls (`skip_steps`, detach behavior, backward mode) are retained.
 14. Optimizer support is restricted to `AdamW` only.
 15. Scheduler support is restricted to:
-16. `ReduceLROnPlateau`
+16. `reduce_on_plateau` (canonical config value; compatibility value `ReduceLROnPlateau` is accepted)
 17. `cosine_with_warmup`
 18. `torch.compile` support is retained and optional.
 19. Compile default remains enabled with default compile settings.
 20. Relative `runtime.checkpoint` paths are resolved against the config-file directory.
 21. `runtime.checkpoint` must exist and be a file; otherwise training must hard-fail.
+22. Training framework imports must use `lightning.pytorch`.
+23. Direct source imports from `pytorch_lightning` are unsupported and must not appear in the repository.
+24. Trainer/logger integration targets the current `lightning.pytorch` API directly; legacy PyTorch Lightning compatibility shims are not part of the supported codebase.
 
 ## 4.3 Export and Inference
 1. Export contract is physical-space one-step inference.
@@ -139,9 +142,11 @@ Audience: Professional collaborators and maintainers
 1. Tooling must be installed in Conda environment `nn`.
 2. Canonical install commands:
 3. `conda activate nn`
-4. `pip install pyflakes`
-5. `pip install vulture`
-6. `pip install ruff`
+4. `pip install lightning`
+5. `pip install pyflakes`
+6. `pip install vulture`
+7. `pip install ruff`
+8. The codebase targets the `lightning.pytorch` namespace; direct imports from `pytorch_lightning` are non-canonical even if that package is present transitively in the environment.
 
 ### 9.2 Dead Code Search Workflow
 1. Run checks from project root under environment `nn`.

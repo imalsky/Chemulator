@@ -44,7 +44,6 @@ def _default_run_dir() -> Path:
 
 RUN_DIR = _default_run_dir()
 OUT_DIR = (RUN_DIR / "plots").resolve()
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 EXPORT_PATH = (RUN_DIR / "export_cpu_dynB_1step_phys.pt2").resolve()
 
@@ -196,6 +195,8 @@ def main():
             plt.style.use(str(style_path))
         except Exception:
             pass
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if not EXPORT_PATH.exists():
         raise FileNotFoundError(f"Missing export: {EXPORT_PATH}")

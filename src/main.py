@@ -149,13 +149,6 @@ _REQUIRED_CONFIG_KEYS: Tuple[str, ...] = (
     "training.scheduler.enabled",
     "training.scheduler.type",
     "training.scheduler.warmup_epochs",
-    "training.scheduler.min_lr_ratio",
-    "training.scheduler.factor",
-    "training.scheduler.patience",
-    "training.scheduler.threshold",
-    "training.scheduler.min_lr",
-    "training.scheduler.mode",
-    "training.scheduler.monitor",
     "training.autoregressive_training.enabled",
     "training.autoregressive_training.skip_steps",
     "training.autoregressive_training.detach_between_steps",
@@ -173,6 +166,14 @@ _OPTIONAL_CONFIG_KEYS: Tuple[str, ...] = (
     "runtime.mode",
     # Optional perf knob for manual-optimization training path (default in code if absent).
     "runtime.log_grad_norm",
+    # Scheduler-specific keys are validated conditionally from training.scheduler.type.
+    "training.scheduler.min_lr_ratio",
+    "training.scheduler.factor",
+    "training.scheduler.patience",
+    "training.scheduler.threshold",
+    "training.scheduler.min_lr",
+    "training.scheduler.mode",
+    "training.scheduler.monitor",
 )
 
 # Mapping keys under these dotted paths are dynamic (validated elsewhere).
@@ -274,6 +275,24 @@ def validate_required_config_keys(cfg: Mapping[str, Any]) -> None:
     for key in _REQUIRED_CONFIG_KEYS:
         _require_dotted(cfg, key)
     _validate_no_unknown_config_keys(cfg)
+    _validate_scheduler_config(cfg)
+
+
+def _validate_scheduler_config(cfg: Mapping[str, Any]) -> None:
+    tcfg = _require_dict(cfg, "training")
+    sched_cfg = _require_dict(tcfg, "scheduler")
+    sched_type = _as_str(_require(sched_cfg, "type"), "training.scheduler.type").lower()
+
+    if sched_type == "cosine_with_warmup":
+        _require(sched_cfg, "min_lr_ratio")
+        return
+
+    if sched_type in {"reduce_on_plateau", "reducelronplateau"}:
+        for key in ("factor", "patience", "threshold", "min_lr", "mode", "monitor"):
+            _require(sched_cfg, key)
+        return
+
+    raise ValueError("bad training.scheduler.type")
 
 
 def _repo_root(cfg_path: Path) -> Path:
@@ -645,10 +664,10 @@ def main() -> None:
     # Manifest must exist; config.data must match it if manifest provides variable lists.
     manifest, species_vars, global_vars = load_manifest_and_validate_config(cfg, processed_dir)
 
-    preload_device = select_preload_device(cfg)
+    preload_to_device = _as_bool(_require(ds_cfg, "preload_to_device"), "dataset.preload_to_device")
+    preload_device = select_preload_device(cfg) if preload_to_device else torch.device("cpu")
     log.info("preload device: %s", preload_device)
 
-    preload_to_device = _as_bool(_require(ds_cfg, "preload_to_device"), "dataset.preload_to_device")
     num_workers = _as_int(_require(tcfg, "num_workers"), "training.num_workers")
     configure_runtime_warning_filters(preload_to_device=preload_to_device, num_workers=num_workers)
 

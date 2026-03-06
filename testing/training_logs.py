@@ -157,6 +157,13 @@ def _sanitize_for_log(y: np.ndarray) -> np.ndarray:
     return y2
 
 
+def _format_final_metric(y: np.ndarray) -> str:
+    finite = y[np.isfinite(y)]
+    if finite.size == 0:
+        return "n/a"
+    return f"{float(finite[-1]):.3e}"
+
+
 # =============================================================================
 # Plotting
 # =============================================================================
@@ -179,13 +186,16 @@ def plot_losses(m, out_path: Path, *, run_name: str) -> None:
         train = moving_average(train, SMOOTHING)
         val = moving_average(val, SMOOTHING)
 
+    train_label = f"train_loss (final={_format_final_metric(train)})"
+    val_label = f"val_loss (final={_format_final_metric(val)})"
+
     fig, ax = plt.subplots(figsize=(6, 6))
 
 
     ax.plot(
         epoch,
         val,
-        label="val_loss",
+        label=val_label,
         color="black",
         linestyle=(0, (7, 8)),
         linewidth=2,
@@ -195,7 +205,7 @@ def plot_losses(m, out_path: Path, *, run_name: str) -> None:
     ax.plot(
         epoch,
         train,
-        label="train_loss",
+        label=train_label,
         color="black",
         linestyle="solid",
         linewidth=2,

@@ -308,11 +308,13 @@
     },
     "scheduler": {
       "enabled": true,
-      "type": "cosine_with_warmup",
+      "type": "reduce_on_plateau",
       "warmup_epochs": 50,
-      "min_lr_ratio": 0.01,
       "_comment_plateau": [
-        "Keys below are only used when scheduler.type == 'ReduceLROnPlateau'."
+        "Keys below are only used when scheduler.type is reduce_on_plateau or ReduceLROnPlateau."
+      ],
+      "_comment_cosine": [
+        "Set scheduler.min_lr_ratio when scheduler.type is cosine_with_warmup."
       ],
       "factor": 0.5,
       "patience": 10,
