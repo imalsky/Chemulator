@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # -----------------------------------------------------------------------------
 
 # Run/artifact selection (main knobs).
-RUN_DIR: str = "models/v2_bigger_batch"  # Absolute path or repo-relative path
+RUN_DIR: str = "models/v3"  # Absolute path or repo-relative path
 PROCESSED_DIR: str = "data/processed"  # Absolute path or repo-relative path
 EXPORT_CPU_FILE: str = "export_cpu_dynB_1step_phys.pt2"
 EXPORT_MPS_FILE: str = "export_mps_dynB_1step_phys.pt2"

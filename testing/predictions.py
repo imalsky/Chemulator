@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # -----------------------------------------------------------------------------
 
 # Model/artifact selection (main knobs you typically edit first).
-MODEL_RUN_DIR: str = "models/v2_bigger_batch"  # Absolute path or repo-relative path
+MODEL_RUN_DIR: str = "models/v3"  # Absolute path or repo-relative path
 MODEL_EXPORT_FILE: str = "export_cpu_dynB_1step_phys.pt2"
 
 # Inference settings.

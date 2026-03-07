@@ -23,6 +23,10 @@ models/
 tuning_results/
 test/models/
 *.pt
+*.pt2
 *.ckpt
+*.pdf
+*.png
+*.jpg
 *.tfevents*
 .DS_Store
