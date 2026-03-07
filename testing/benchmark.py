@@ -5,9 +5,17 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.runtime import prepare_platform_environment
+
+prepare_platform_environment()
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,6 +23,7 @@ import torch
 
 
 REPO = Path(__file__).resolve().parent.parent
+STYLE_PATH = Path(__file__).with_name("science.mplstyle")
 MODEL_DIR = Path(
     os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_version"))
 ).expanduser().resolve()
@@ -25,8 +34,10 @@ META_PATH = MODEL_DIR / "physical_model_metadata.json"
 
 WARMUP_STEPS = 10
 MEASURE_STEPS = 200
-MAX_BATCH_CPU = 8192
-MAX_BATCH_GPU = 8192
+# Keep benchmark probes within the export wrapper's declared dynamic batch range.
+EXPORT_MAX_BATCH = 4096
+MAX_BATCH_CPU = EXPORT_MAX_BATCH
+MAX_BATCH_GPU = EXPORT_MAX_BATCH
 
 VULCAN_BASELINE_Y = 100.0
 YMIN, YMAX = 10.0, 1.0e7
@@ -205,7 +216,7 @@ def main() -> int:
         return 0
 
     try:
-        plt.style.use("science.mplstyle")
+        plt.style.use(str(STYLE_PATH))
     except OSError:
         pass
 

@@ -35,7 +35,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import torch
 
-from normalizer import NormalizationHelper
+from src.normalizer import NormalizationHelper
 
 # PyTorch RNG seeds are 32-bit unsigned integers.
 _RNG_MODULUS = 2**32

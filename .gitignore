@@ -1,29 +1,48 @@
-# Ignore everything inside the data folder
+# Data and model artifacts
 data/*
 !data/.gitkeep
-
-figures/*
-figures/
-
-plots/*
-plots/
-
-logs/*
-logs/
-
-
-# Exclude older code that I want to keep just in case
-old_code/
-
-old/*
-old/
-
-models/*
 models/
-
+logs/
+plots/
+figures/
+reports/
 tuning_results/
 test/models/
-*.pt
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Notebook and editor state
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
+
+# Generated training/export artifacts
 *.ckpt
 *.tfevents*
-.DS_Store
+*.pt
+*.pt2
+*.pth
+*.onnx
+*.npz
+
+# Generated plots and figures
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.gif
+*.pdf
+
+# Historical scratch areas
+old/
+old_code/

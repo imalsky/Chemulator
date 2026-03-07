@@ -15,6 +15,7 @@ import numpy as np
 
 
 REPO = Path(__file__).resolve().parent.parent
+STYLE_PATH = Path(__file__).with_name("science.mplstyle")
 MODEL_DIR = Path(
     os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_version"))
 ).expanduser().resolve()
@@ -65,7 +66,7 @@ def _collapse_last_per_epoch(records: List[Dict[str, Any]]) -> List[Dict[str, An
 
 def main() -> int:
     try:
-        plt.style.use("science.mplstyle")
+        plt.style.use(str(STYLE_PATH))
     except OSError:
         warnings.warn("science.mplstyle not found; using matplotlib defaults.")
 

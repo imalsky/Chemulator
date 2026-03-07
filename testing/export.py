@@ -19,20 +19,19 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence, Tuple
 
-# Mirror main.py behavior on macOS to avoid duplicate OpenMP aborts in local envs.
-if sys.platform == "darwin":
-    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.runtime import prepare_platform_environment
+
+prepare_platform_environment()
 
 import torch
 import torch.nn as nn
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SRC = REPO_ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-import model as model_module  # type: ignore  # noqa: E402
+from src import model as model_module  # noqa: E402
 
 
 create_model = model_module.create_model

@@ -13,10 +13,14 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
-# Resolve duplicate OpenMP on macOS (avoid setting this on Linux)
-if sys.platform == "darwin":
-    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.runtime import prepare_platform_environment, select_best_device
+
+prepare_platform_environment()
 
 import json
 import shutil
@@ -24,23 +28,22 @@ import logging
 import inspect
 import hashlib
 import subprocess
-from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Sequence
 
 
 import torch
 
-from utils import (
+from src.utils import (
     setup_logging,
     seed_everything,
     load_json_config,
     dump_json,
     resolve_precision_policy,
 )
-from dataset import FlowMapPairsDataset, create_dataloader
-from model import create_model
-from trainer import Trainer
-from preprocessor import DataPreprocessor
+from src.dataset import FlowMapPairsDataset, create_dataloader
+from src.model import create_model
+from src.trainer import Trainer
+from src.preprocessor import DataPreprocessor
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -132,29 +135,8 @@ def _derive_seed(base_seed: int, tag: str) -> int:
 # --------------------------------------------------------------------------------------
 
 def setup_device(logger: logging.Logger) -> torch.device:
-    """
-    Single-device selection:
-      - CUDA: always uses cuda:0.
-      - MPS: uses Apple MPS if available.
-      - CPU: fallback.
-    """
-    if torch.cuda.is_available():
-        device = torch.device("cuda:0")
-        torch.cuda.set_device(device)
-        try:
-            dev_name = torch.cuda.get_device_name(0)
-        except Exception as e:
-            logger.warning("Could not query CUDA device name: %s", e)
-            dev_name = "unknown"
-        logger.info(f"Set CUDA device to cuda:0 ({dev_name})")
-        return device
-
-    if torch.backends.mps.is_available():
-        logger.info("Using Apple MPS")
-        return torch.device("mps")
-
-    logger.info("Using CPU")
-    return torch.device("cpu")
+    """Select a single runtime device using the canonical CUDA -> MPS -> CPU order."""
+    return select_best_device(logger=logger)
 
 
 def optimize_hardware(cfg: Dict[str, Any], device: torch.device, logger: logging.Logger) -> None:
@@ -584,7 +566,7 @@ def export_physical_artifacts(work_dir: Path, logger: logging.Logger) -> Tuple[P
 
     logger.info("Exporting physical-I/O artifact via %s", export_script)
     proc = subprocess.run(
-        [sys.executable, str(export_script)],
+        [sys.executable, "-m", "testing.export"],
         cwd=str(REPO_ROOT),
         env=env,
         capture_output=True,

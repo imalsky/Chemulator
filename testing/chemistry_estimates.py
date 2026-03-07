@@ -8,15 +8,19 @@ import json
 import logging
 import math
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-
 import re
 import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.runtime import prepare_platform_environment, select_best_device
+
+prepare_platform_environment()
 
 import torch
 from torch.utils.data import DataLoader
@@ -28,6 +32,7 @@ except Exception:
 
 
 REPO = Path(__file__).resolve().parent.parent
+STYLE_PATH = Path(__file__).with_name("science.mplstyle")
 MODEL_DIR = Path(
     os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_version"))
 ).expanduser().resolve()
@@ -52,15 +57,13 @@ PLOT_MAX_POINTS = 20000
 
 if plt is not None:
     try:
-        plt.style.use("science.mplstyle")
+        plt.style.use(str(STYLE_PATH))
     except OSError:
         warnings.warn("science.mplstyle not found; using matplotlib defaults.")
 
-
-sys.path.insert(0, str(REPO / "src"))
-from dataset import FlowMapPairsDataset  # noqa: E402
-from utils import load_json_config as load_json  # noqa: E402
-from utils import resolve_precision_policy, seed_everything, setup_logging  # noqa: E402
+from src.dataset import FlowMapPairsDataset  # noqa: E402
+from src.utils import load_json_config as load_json  # noqa: E402
+from src.utils import resolve_precision_policy, seed_everything, setup_logging  # noqa: E402
 
 
 _SEED_BYTES = 4
@@ -204,16 +207,6 @@ class ElementVectors:
 def _derive_seed(base_seed: int, tag: str) -> int:
     h = hashlib.sha256(f"{int(base_seed)}:{tag}".encode("utf-8")).digest()
     return int.from_bytes(h[:_SEED_BYTES], byteorder="little", signed=False)
-
-
-def _choose_device(force_cpu: bool) -> torch.device:
-    if force_cpu:
-        return torch.device("cpu")
-    if torch.cuda.is_available():
-        return torch.device("cuda:0")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def _resolve_cfg_path(path_like: str | os.PathLike[str], *, base_dir: Path) -> Path:
@@ -606,7 +599,7 @@ def main() -> int:
 
     cfg = load_json(CONFIG_PATH)
     seed_everything(int(cfg["system"]["seed"]))
-    device = _choose_device(FORCE_CPU)
+    device = select_best_device(force_cpu=FORCE_CPU)
     log.info("Using device: %s", device.type)
 
     policy = resolve_precision_policy(cfg, device)

@@ -5,9 +5,17 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import warnings
 from pathlib import Path
 from typing import List, Tuple
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.runtime import prepare_platform_environment
+
+prepare_platform_environment()
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,16 +23,17 @@ import torch
 from matplotlib.lines import Line2D
 
 
-try:
-    plt.style.use("science.mplstyle")
-except OSError:
-    warnings.warn("science.mplstyle not found; using matplotlib defaults.")
-
-
 REPO = Path(__file__).resolve().parent.parent
+STYLE_PATH = Path(__file__).with_name("science.mplstyle")
 MODEL_DIR = Path(
     os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_version"))
 ).expanduser().resolve()
+
+
+try:
+    plt.style.use(str(STYLE_PATH))
+except OSError:
+    warnings.warn("science.mplstyle not found; using matplotlib defaults.")
 
 MODEL_PATH = MODEL_DIR / "physical_model_k1_cpu.pt2"
 METADATA_PATH = MODEL_DIR / "physical_model_metadata.json"

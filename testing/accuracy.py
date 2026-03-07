@@ -5,9 +5,17 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.runtime import prepare_platform_environment
+
+prepare_platform_environment()
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,16 +23,17 @@ import torch
 from matplotlib.ticker import LogLocator, NullFormatter, NullLocator
 
 
-try:
-    plt.style.use("science.mplstyle")
-except OSError:
-    warnings.warn("science.mplstyle not found; using matplotlib defaults.")
-
-
 REPO = Path(__file__).resolve().parent.parent
+STYLE_PATH = Path(__file__).with_name("science.mplstyle")
 MODEL_DIR = Path(
     os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_version"))
 ).expanduser().resolve()
+
+
+try:
+    plt.style.use(str(STYLE_PATH))
+except OSError:
+    warnings.warn("science.mplstyle not found; using matplotlib defaults.")
 
 MODEL_PATH = MODEL_DIR / "physical_model_k1_cpu.pt2"
 METADATA_PATH = MODEL_DIR / "physical_model_metadata.json"
@@ -211,7 +220,7 @@ def main() -> int:
     if globals_order != cfg_globals:
         raise ValueError("metadata globals_order must match cfg.data.global_variables")
 
-    keep_idx, _labels = _select_species(species_order, PLOT_SPECIES)
+    keep_idx, _ = _select_species(species_order, PLOT_SPECIES)
     n_species_plotted = len(keep_idx)
 
     y_mat, g_mat, t_vec = _load_first_shard(processed_dir)

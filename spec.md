@@ -73,9 +73,9 @@ Engineering style requirements:
 
 ## 3. Canonical Paths And Config
 
-- Canonical default config file: `/Users/imalsky/Desktop/Chemulator-Editing/config/config_job0.jsonc`.
+- Canonical default config file: `config/config_job0.jsonc`.
 - No CLI parser arguments are required.
-- Default behavior should load the default config path directly.
+- Default behavior should load that repository-local default config path directly.
 - Multi-job usage (`job0`, `job1`, etc.) is supported by separate config files, but not via argparse.
 - `paths.raw_data_files` must be explicitly configured and non-empty; there is no automatic `data/raw` scan fallback.
 - `data.species_variables` must be explicitly configured and non-empty; there is no species auto-detection fallback.
@@ -167,7 +167,6 @@ This is considered sufficient for leakage control in this project.
 - Default prediction head: `predict_delta`.
 - Optimizer support target: AdamW only.
 - Gradient accumulation is not supported.
-- Remove/ignore LAMB support and references.
 - Resume behavior is explicit-only via `training.resume`; implicit auto-resume from `work_dir/last.ckpt` is not part of target behavior.
 - Sampling contract for training pairs:
   - Pair sampling is stochastic per access using worker-local RNG streams.
@@ -197,7 +196,6 @@ All training/preprocessing runs are expected to produce full artifacts:
 - Physical-I/O inference artifacts:
   - Exported model artifact with baked-in normalization/metadata (for example `physical_model_k1_cpu.pt2`).
   - Companion metadata file documenting variable order and reference values (for example `physical_model_metadata.json`).
-- Testing/evaluation scripts must use the physical-I/O artifact interface (artifact + metadata) rather than requiring users to pass normalized tensors manually.
 - Reusing existing processed artifacts must be an explicit user choice (`preprocessing.reuse_existing_data=true`); default behavior is to fail fast instead of implicitly reusing.
 
 ## 13. Metrics And Evaluation

@@ -50,7 +50,7 @@ except ImportError:
     h5py = None
 
 # Import all utilities from preprocessor_utils
-from preprocessor_utils import (
+from src.preprocessor_utils import (
     SHARD_FILENAME_FORMAT,
     format_bytes, ensure_directory, load_config_value, get_storage_dtype,
     parse_precision_np_dtype,
@@ -655,7 +655,7 @@ class DataPreprocessor:
             rank_results: List[Tuple[dict, List[str], Optional[np.ndarray]]]
         ) -> None:
 
-            for file_report, valid_groups, _tc in rank_results:
+            for file_report, valid_groups, _ in rank_results:
                 self._drop_report["files"].append(file_report)
 
                 n_total = int(file_report.get("groups_total", 0))
@@ -917,7 +917,7 @@ class DataPreprocessor:
         if use_weighting:
             # Weighting uses per-species log ranges regardless of active species normalization method.
             for key in self.species_vars:
-                need_mean_std, need_min_max, _need_log = need_flags[key]
+                need_mean_std, need_min_max, _ = need_flags[key]
                 need_flags[key] = (need_mean_std, need_min_max, True)
             if self.rank == 0:
                 self.logger.info(

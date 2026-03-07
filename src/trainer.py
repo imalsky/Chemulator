@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """trainer.py
 
-Pure-PyTorch training loop.
-
-The original project used PyTorch Lightning. This codebase now avoids that
-external dependency and implements a small, explicit training loop.
+Small, explicit PyTorch training loop for one-step flow-map training.
 
 Design constraints requested for this codebase:
   - Fail fast with simple error messages.
@@ -25,9 +22,9 @@ import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from utils import PrecisionPolicy
-from normalizer import NormalizationHelper
-from model import _z_to_log10_phys as _shared_z_to_log10_phys
+from src.utils import PrecisionPolicy
+from src.normalizer import NormalizationHelper
+from src.model import _z_to_log10_phys as _shared_z_to_log10_phys
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -231,6 +228,18 @@ class AdaptiveStiffLoss(nn.Module):
         *,
         return_components: bool = False,
     ) -> torch.Tensor | Dict[str, torch.Tensor]:
+        """Evaluate the training loss for normalized species batches.
+
+        Inputs:
+          - ``pred_z``: predicted normalized species, shape ``[B, K, S]``.
+          - ``true_z``: target normalized species, shape ``[B, K, S]``.
+
+        Outputs:
+          - Scalar total loss by default.
+          - When ``return_components=True``, a dict containing the scalar
+            ``total``, ``phys``, ``z``, and diagnostic error terms.
+        """
+
         if pred_z.shape != true_z.shape:
             raise ValueError("Pred/GT shape mismatch")
 
