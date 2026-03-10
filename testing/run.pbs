@@ -1,0 +1,56 @@
+#!/bin/bash
+#PBS -N MYGPUPOST
+#PBS -q gpu_long
+#PBS -W group_list=s2458
+#PBS -l select=1:ncpus=32:ngpus=1:mem=400gb:model=gh200
+#PBS -l walltime=72:00:00
+#PBS -j oe
+#PBS -m abe
+
+set -euo pipefail
+
+SUBMIT_DIR="${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
+if [ -d "${SUBMIT_DIR}/src" ] && [ -d "${SUBMIT_DIR}/testing" ]; then
+  REPO_ROOT="$(cd "${SUBMIT_DIR}" && pwd -P)"
+elif [ -d "${SUBMIT_DIR}/../src" ] && [ -d "${SUBMIT_DIR}/../testing" ]; then
+  REPO_ROOT="$(cd "${SUBMIT_DIR}/.." && pwd -P)"
+else
+  echo "ERROR: unable to locate repo root from submit directory: ${SUBMIT_DIR}"
+  exit 2
+fi
+cd -P "${REPO_ROOT}"
+
+# ---- Conda (match the working run.pbs approach) ----
+module purge
+module use -a /swbuild/analytix/tools/modulefiles
+module load miniconda3/gh2
+
+CONDA_BASE="$(conda info --base)"
+# shellcheck disable=SC1090
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+
+CONDA_ENV="${CONDA_ENV:-pyt2_8_gh}"
+set +e
+conda activate "${CONDA_ENV}"
+rc=$?
+set -e
+if [ $rc -ne 0 ]; then
+  echo "ERROR: failed to activate conda env: ${CONDA_ENV}"
+  echo "Available envs are:"
+  conda info --envs || true
+  exit 2
+fi
+
+# Optional h5py reinstall for environments that need a node-local override.
+# Disabled by default because the shared conda env is not writable on this cluster.
+if [ "${REINSTALL_H5PY:-0}" = "1" ]; then
+  pip install --user --no-cache-dir --force-reinstall h5py
+fi
+
+# ---- Same runtime exports as the training PBS script ----
+export HDF5_USE_FILE_LOCKING=FALSE
+export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}:${PYTHONPATH:-}"
+
+python -u "${REPO_ROOT}/testing/export.py"
+python -u "${REPO_ROOT}/testing/training_logs.py"
+python -u "${REPO_ROOT}/testing/predictions.py"

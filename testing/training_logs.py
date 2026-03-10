@@ -3,11 +3,11 @@
 plot_losses.py - Plot epoch-level training/validation losses from models/<run>/metrics.csv.
 
 Assumes repo layout:
-  Auto-Chem/
+  <repo>/
     src/
     testing/  (this file)
-    science.mplstyle  (your style file, ideally at repo root)
-    models/v3/metrics.csv
+    testing/science.mplstyle
+    models/<run>/metrics.csv
 
 Saves:
   <run_dir>/plots/loss_curves.png
@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # -----------------------------------------------------------------------------
 
 # Run/artifact selection (main knobs).
-RUN_DIR: str = "models/v3"  # Absolute path or repo-relative path
+RUN_DIR: str = "models/v3_even_smaller_time_range"  # Absolute path or repo-relative path
 METRICS_FILE: str = "metrics.csv"
 
 # Output.

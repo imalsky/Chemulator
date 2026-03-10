@@ -30,3 +30,8 @@ test/models/
 *.jpg
 *.tfevents*
 .DS_Store
+.idea/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/

@@ -65,7 +65,7 @@ from model import create_model  # noqa: E402
 REQUIRED_GLOBALS: Tuple[str, str] = ("P", "T")
 
 # Runtime settings (edit here; no argparse).
-RUN_DIR = (REPO_ROOT / "models" / "v3").resolve()
+RUN_DIR = (REPO_ROOT / "models" / "v3_even_smaller_time_range").resolve()
 CHECKPOINT = "checkpoints/last.ckpt"  # relative paths are resolved against run config directory
 EXPORT_DEVICES = "cpu,cuda"  # requested targets; unavailable devices are skipped with CPU fallback
 EXPORT_DTYPE = "float32"

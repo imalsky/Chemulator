@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import torch
@@ -25,8 +26,21 @@ from torch._export.serde.serialize import SerializedArtifact, deserialize
 EXPORT_PATH = Path(__file__).with_name("model.pt2")
 PLOT_PATH = Path(__file__).with_name("test_plot_dt_1.png")
 DEVICE = torch.device("cpu")
-DTYPE = torch.float32
 ROLLOUT_STEPS = 1000
+
+
+def _parse_export_dtype(raw: Any) -> torch.dtype:
+    if not isinstance(raw, str) or not raw.strip():
+        raise KeyError("metadata.json is missing export_dtype")
+
+    value = raw.strip().lower()
+    if value == "float32":
+        return torch.float32
+    if value == "float16":
+        return torch.float16
+    if value == "bfloat16":
+        return torch.bfloat16
+    raise ValueError(f"unsupported export_dtype in metadata: {raw!r}")
 
 
 print("Step 1: load the exported model")
@@ -37,18 +51,20 @@ print(f"export: {EXPORT_PATH.resolve()}")
 with zipfile.ZipFile(EXPORT_PATH, "r") as zf:
     archive_root = zf.namelist()[0].split("/", 1)[0] + "/"
     metadata = json.loads(zf.read(f"{archive_root}extra/metadata.json").decode("utf-8"))
+    infer_dtype = _parse_export_dtype(metadata.get("export_dtype"))
     artifact = SerializedArtifact(exported_program=zf.read(f"{archive_root}models/model.json"),
                                   state_dict=zf.read(f"{archive_root}data/weights/model.pt"),
                                   constants=zf.read(f"{archive_root}data/constants/model.pt"),
                                   example_inputs=zf.read(f"{archive_root}data/sample_inputs/model.pt"))
 
 # You have to match the specific ordering
-model = deserialize(artifact).module().to(device=DEVICE, dtype=DTYPE)
+model = deserialize(artifact).module().to(device=DEVICE, dtype=infer_dtype)
 species_names = list(metadata["species_variables"])
 global_names = list(metadata["global_variables"])
 
 print(f"species order: {species_names}")
 print(f"global order:  {global_names}")
+print(f"model dtype:   {str(infer_dtype).replace('torch.', '')}")
 print()
 
 print("Step 2: build one simple input")
@@ -69,15 +85,15 @@ y_phys = torch.tensor(
         8.4217173529958508e-25,
     ]],
     device=DEVICE,
-    dtype=DTYPE,
+    dtype=infer_dtype,
 )
 
 # dt_seconds shape: (1,)
 dt_value = 1
-dt_seconds = torch.tensor([dt_value], device=DEVICE, dtype=DTYPE)
+dt_seconds = torch.tensor([dt_value], device=DEVICE, dtype=infer_dtype)
 
 # g_phys shape: (1, n_globals)
-g_phys = torch.zeros((1, len(global_names)), device=DEVICE, dtype=DTYPE)
+g_phys = torch.zeros((1, len(global_names)), device=DEVICE, dtype=infer_dtype)
 g_phys[0, global_names.index("P")] = 6.909815748102695e8
 g_phys[0, global_names.index("T")] = 1127.748742423797
 

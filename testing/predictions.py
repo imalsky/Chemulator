@@ -31,12 +31,12 @@ ROOT = Path(__file__).resolve().parents[1]
 # -----------------------------------------------------------------------------
 
 # Model/artifact selection (main knobs you typically edit first).
-MODEL_RUN_DIR: str = "models/v3"  # Absolute path or repo-relative path
+MODEL_RUN_DIR: str = "models/v3_even_smaller_time_range"  # Absolute path or repo-relative path
 MODEL_EXPORT_FILE: str = "export_cpu_dynB_1step_phys.pt2"
 
 # Inference settings.
 INFER_DEVICE: torch.device = torch.device("cpu")
-INFER_DTYPE: torch.dtype = torch.float32
+INFER_DTYPE: torch.dtype | None = None  # None => use export metadata dtype exactly
 
 # Data selection.
 EVAL_SPLIT: str = "test"
@@ -74,7 +74,31 @@ def _resolve_output_dir(run_dir: Path) -> Path:
     return (run_dir / PLOTS_SUBDIR).resolve()
 
 
-def _load_export_module(export_path: Path) -> Tuple[torch.nn.Module, Dict[str, Any]]:
+def _parse_export_dtype(raw: Any) -> torch.dtype:
+    if not isinstance(raw, str) or not raw.strip():
+        raise KeyError("export metadata missing export_dtype")
+
+    value = raw.strip().lower()
+    if value == "float32":
+        return torch.float32
+    if value == "float16":
+        return torch.float16
+    if value == "bfloat16":
+        return torch.bfloat16
+    raise ValueError(f"unsupported export_dtype in metadata: {raw!r}")
+
+
+def _select_infer_dtype(meta: Mapping[str, Any]) -> torch.dtype:
+    export_dtype = _parse_export_dtype(meta.get("export_dtype"))
+    if INFER_DTYPE is not None and INFER_DTYPE != export_dtype:
+        raise ValueError(
+            f"INFER_DTYPE={str(INFER_DTYPE).replace('torch.', '')} does not match "
+            f"export metadata dtype={str(export_dtype).replace('torch.', '')}"
+        )
+    return export_dtype if INFER_DTYPE is None else INFER_DTYPE
+
+
+def _load_export_module(export_path: Path) -> Tuple[torch.nn.Module, Dict[str, Any], torch.dtype]:
     extra_files = {"metadata.json": ""}
     ep = torch.export.load(str(export_path), extra_files=extra_files)
     meta_raw = extra_files.get("metadata.json", "")
@@ -83,8 +107,9 @@ def _load_export_module(export_path: Path) -> Tuple[torch.nn.Module, Dict[str, A
     meta = json.loads(meta_raw)
     if not isinstance(meta, dict):
         raise TypeError("embedded metadata.json must be a JSON object")
-    model = ep.module().to(device=INFER_DEVICE, dtype=INFER_DTYPE)
-    return model, meta
+    infer_dtype = _select_infer_dtype(meta)
+    model = ep.module().to(device=INFER_DEVICE, dtype=infer_dtype)
+    return model, meta, infer_dtype
 
 
 def _resolve_normalization_path(meta: Mapping[str, Any]) -> Path:
@@ -241,13 +266,14 @@ def _rollout(
     y0_phys: np.ndarray,
     g_phys: np.ndarray,
     dt_seconds: np.ndarray,
+    infer_dtype: torch.dtype,
 ) -> np.ndarray:
     if g_phys.shape != (len(REQUIRED_GLOBALS),):
         raise ValueError(f"g_phys must have shape ({len(REQUIRED_GLOBALS)},), got {g_phys.shape}")
 
-    y = torch.from_numpy(y0_phys.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=INFER_DTYPE).unsqueeze(0)
-    g = torch.from_numpy(g_phys.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=INFER_DTYPE).unsqueeze(0)
-    dt_all = torch.from_numpy(dt_seconds.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=INFER_DTYPE)
+    y = torch.from_numpy(y0_phys.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=infer_dtype).unsqueeze(0)
+    g = torch.from_numpy(g_phys.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=infer_dtype).unsqueeze(0)
+    dt_all = torch.from_numpy(dt_seconds.astype(np.float32, copy=False)).to(device=INFER_DEVICE, dtype=infer_dtype)
 
     preds: List[torch.Tensor] = []
     for k in range(int(dt_all.shape[0])):
@@ -365,13 +391,17 @@ def main() -> None:
         raise FileNotFoundError(f"missing export: {export_path}")
 
     output_dir = _resolve_output_dir(run_dir)
+    configured_dtype = "from_metadata" if INFER_DTYPE is None else str(INFER_DTYPE).replace("torch.", "")
     print(
         f"[config] export={export_path} run_dir={run_dir} "
-        f"device={INFER_DEVICE.type} dtype={INFER_DTYPE} split={EVAL_SPLIT}"
+        f"device={INFER_DEVICE.type} dtype={configured_dtype} split={EVAL_SPLIT}"
     )
 
-    model, meta = _load_export_module(export_path)
-    print(f"[model] file={export_path.name} meta.export_device_tag={meta.get('export_device_tag')}")
+    model, meta, infer_dtype = _load_export_module(export_path)
+    print(
+        f"[model] file={export_path.name} meta.export_device_tag={meta.get('export_device_tag')} "
+        f"infer_dtype={str(infer_dtype).replace('torch.', '')}"
+    )
 
     norm_path = _resolve_normalization_path(meta)
     processed_dir = norm_path.parent
@@ -411,7 +441,13 @@ def main() -> None:
     g_phys = _denormalize_globals(g_z, global_keys, manifest)
     dt_seq_seconds = _dt_norm_to_seconds(dt_seq_norm, manifest)
 
-    y_pred_phys = _rollout(model, y0_phys=y0_phys, g_phys=g_phys, dt_seconds=dt_seq_seconds)
+    y_pred_phys = _rollout(
+        model,
+        y0_phys=y0_phys,
+        g_phys=g_phys,
+        dt_seconds=dt_seq_seconds,
+        infer_dtype=infer_dtype,
+    )
     t_eval = np.cumsum(dt_seq_seconds, dtype=np.float64)
 
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")

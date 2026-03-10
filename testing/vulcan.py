@@ -17,6 +17,7 @@ import json
 import math
 import pickle
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -48,10 +49,10 @@ OUT_DIR = (RUN_DIR / "plots").resolve()
 EXPORT_PATH = (RUN_DIR / "export_cpu_dynB_1step_phys.pt2").resolve()
 
 DEVICE = "cpu"
-DTYPE = torch.float32
+DTYPE: torch.dtype | None = None  # None => use export metadata dtype exactly
 REQUIRED_GLOBALS = ("P", "T")
 
-VULCAN_DIR = Path("/Users/imalsky/Desktop/Chemistry_Project/Vulcan/0D_full_NCHO/solar")
+VULCAN_DIR = (ROOT / "data" / "vulcan" / "0D_full_NCHO" / "solar").resolve()
 PROFILE = "2000K_1bar"
 
 START_T_SEC = 1e-2  # requested anchor (snapped to nearest VULCAN sample)
@@ -101,7 +102,31 @@ def load_vulcan(profile: str):
     return t, MR.astype(np.float64), idx, T_K, barye
 
 
-def _load_export_with_metadata(path: Path) -> tuple[torch.nn.Module, dict]:
+def _parse_export_dtype(raw: Any) -> torch.dtype:
+    if not isinstance(raw, str) or not raw.strip():
+        raise KeyError("Export metadata missing export_dtype")
+
+    value = raw.strip().lower()
+    if value == "float32":
+        return torch.float32
+    if value == "float16":
+        return torch.float16
+    if value == "bfloat16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported export_dtype in metadata: {raw!r}")
+
+
+def _select_infer_dtype(meta: dict) -> torch.dtype:
+    export_dtype = _parse_export_dtype(meta.get("export_dtype"))
+    if DTYPE is not None and DTYPE != export_dtype:
+        raise ValueError(
+            f"DTYPE={str(DTYPE).replace('torch.', '')} does not match "
+            f"export metadata dtype={str(export_dtype).replace('torch.', '')}"
+        )
+    return export_dtype if DTYPE is None else DTYPE
+
+
+def _load_export_with_metadata(path: Path) -> tuple[torch.nn.Module, dict, torch.dtype]:
     extra_files = {"metadata.json": ""}
     ep = torch.export.load(str(path), extra_files=extra_files)
     raw_meta = extra_files.get("metadata.json", "")
@@ -110,8 +135,9 @@ def _load_export_with_metadata(path: Path) -> tuple[torch.nn.Module, dict]:
     meta = json.loads(raw_meta)
     if not isinstance(meta, dict):
         raise TypeError("Embedded metadata.json must be a JSON object")
-    model = ep.module().to(device=DEVICE, dtype=DTYPE)
-    return model, meta
+    infer_dtype = _select_infer_dtype(meta)
+    model = ep.module().to(device=DEVICE, dtype=infer_dtype)
+    return model, meta, infer_dtype
 
 
 def _resolve_manifest_path(meta: dict) -> Path:
@@ -134,13 +160,21 @@ def _step(model, y: torch.Tensor, dt: torch.Tensor, g: torch.Tensor) -> torch.Te
 
 
 @torch.inference_mode()
-def rollout_phys(model, y0_phys: np.ndarray, g_phys: np.ndarray, dt_sec: float, n: int) -> np.ndarray:
+def rollout_phys(
+    model,
+    y0_phys: np.ndarray,
+    g_phys: np.ndarray,
+    dt_sec: float,
+    n: int,
+    *,
+    dtype: torch.dtype,
+) -> np.ndarray:
     """
     Physical-space rollout. Inputs/outputs are physical abundances.
     """
-    y = torch.from_numpy(y0_phys.astype(np.float32)).to(device=DEVICE, dtype=DTYPE).unsqueeze(0)  # [1,S]
-    g = torch.from_numpy(g_phys.astype(np.float32)).to(device=DEVICE, dtype=DTYPE).unsqueeze(0)  # [1,G]
-    dt = torch.tensor([float(dt_sec)], device=DEVICE, dtype=DTYPE)  # [1]
+    y = torch.from_numpy(y0_phys.astype(np.float32)).to(device=DEVICE, dtype=dtype).unsqueeze(0)  # [1,S]
+    g = torch.from_numpy(g_phys.astype(np.float32)).to(device=DEVICE, dtype=dtype).unsqueeze(0)  # [1,G]
+    dt = torch.tensor([float(dt_sec)], device=DEVICE, dtype=dtype)  # [1]
 
     ys = []
     for _ in range(int(n)):
@@ -201,7 +235,7 @@ def main():
     if not EXPORT_PATH.exists():
         raise FileNotFoundError(f"Missing export: {EXPORT_PATH}")
 
-    model, meta = _load_export_with_metadata(EXPORT_PATH)
+    model, meta, infer_dtype = _load_export_with_metadata(EXPORT_PATH)
     manifest_path = _resolve_manifest_path(meta)
     manifest = json.loads(manifest_path.read_text())
 
@@ -211,7 +245,7 @@ def main():
     gvars = list(manifest.get("global_variables") or [])
     if gvars != list(REQUIRED_GLOBALS):
         raise ValueError(f"normalization.json global_variables must be exactly {list(REQUIRED_GLOBALS)}")
-    print(f"[model] {EXPORT_PATH.name}  device={DEVICE} dtype=torch.float32")
+    print(f"[model] {EXPORT_PATH.name}  device={DEVICE} dtype={str(infer_dtype).replace('torch.', '')}")
     print(f"[manifest] {manifest_path}")
 
     t_all, MR_all, vidx, T_K, barye = load_vulcan(PROFILE)
@@ -235,7 +269,7 @@ def main():
         g_phys[i] = barye if nm.strip().lower().startswith("p") else T_K
 
     # Roll out in physical space.
-    y_pred = rollout_phys(model, y0_phys, g_phys, float(DT_SEC), int(N_STEPS))
+    y_pred = rollout_phys(model, y0_phys, g_phys, float(DT_SEC), int(N_STEPS), dtype=infer_dtype)
 
     # Keep predictions normalized as mixing ratios.
     y_pred = np.clip(y_pred, 1e-30, None)

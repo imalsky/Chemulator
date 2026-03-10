@@ -1,13 +1,15 @@
 # Autoregressive Chemical Kinetics Emulator Specification
 
-Version: 1.5
-Date: 2026-03-06
+Version: 1.6
+Date: 2026-03-10
 Audience: Professional collaborators and maintainers
 
 ## 0. Execution Environment
-1. Canonical runtime environment is Conda environment `nn`.
-2. All canonical commands and validations must run via this environment.
-3. Running outside `nn` is non-canonical and may be considered an unsupported setup.
+1. Canonical local development environment is Conda environment `nn`.
+2. All canonical local commands and local validations must run via `nn`.
+3. `run.pbs` uses an HPC-specific environment and currently defaults to `pyt2_8_gh`.
+4. The local `nn` environment and the HPC batch environment are intentionally different and are not required to match.
+5. Running local development commands outside `nn` is non-canonical and may be considered an unsupported setup.
 
 ## 1. Product Goal
 1. Build and maintain an accurate, fast autoregressive chemical kinetics emulator.
@@ -21,10 +23,10 @@ Audience: Professional collaborators and maintainers
 4. Runtime artifacts may still be generated under artifact directories (for example `models/` and `figures/`).
 
 ## 3. Engineering Principles
-1. Fail fast everywhere.
-2. No defensive fallbacks.
+1. Fail fast in canonical preprocessing, training, and export contracts.
+2. Diagnostic scripts under `testing/` may be more permissive when they are not release gates.
 3. No silent behavior changes.
-4. Hard-fail on malformed config, schema mismatch, ambiguous keys, and unsupported modes.
+4. Hard-fail on malformed config, schema mismatch, ambiguous keys, and unsupported modes in canonical runtime paths.
 5. Keep logic explicit and simple.
 6. Avoid magic numbers in logic bodies.
 7. Place stable defaults as named module-level constants in each executable script.
@@ -83,20 +85,22 @@ Audience: Professional collaborators and maintainers
 11. Baked normalization in export is mandatory.
 12. Export naming standard is mandatory:
 13. `export_{device}_dynB_1step_phys.pt2`
-14. Required targets are CPU and CUDA.
-15. MPS support is retained as best-effort if low maintenance overhead.
-16. Export metadata source of truth is embedded `metadata.json` inside the `.pt2` artifact.
-17. No sidecar metadata JSON is required.
-18. For `torch.export` artifacts, inference loaders must not call `model.eval()` or `model.train()` on `ep.module()` because these mode-switch APIs are unsupported; run inference under `torch.inference_mode()` instead.
+14. Canonical requested targets are CPU and CUDA.
+15. `testing/export.py` may skip unavailable accelerator targets and may still emit any locally available target instead of failing the whole diagnostic run.
+16. MPS support is retained as best-effort if low maintenance overhead.
+17. Export metadata source of truth is embedded `metadata.json` inside the `.pt2` artifact.
+18. No sidecar metadata JSON is required.
+19. For `torch.export` artifacts, inference loaders must not call `model.eval()` or `model.train()` on `ep.module()` because these mode-switch APIs are unsupported; run inference under `torch.inference_mode()` instead.
 
 ## 4.4 Testing Script Canonicalization
 1. `testing/` is the only place where temporary duplicate workflows are tolerated.
-2. The `new_` scripts become canonical and are renamed to remove the prefix.
-3. Canonical script names after consolidation are:
-4. `testing/export.py`
-5. `testing/predictions.py`
-6. Legacy duplicate scripts are removed.
-7. Misspelled legacy script `testing/prections.py` is removed.
+2. Scripts under `testing/` are diagnostic utilities and may use explicit best-effort behavior for portability and local usability.
+3. The `new_` scripts become canonical and are renamed to remove the prefix.
+4. Canonical script names after consolidation are:
+5. `testing/export.py`
+6. `testing/predictions.py`
+7. Legacy duplicate scripts are removed.
+8. Misspelled legacy script `testing/prections.py` is removed.
 
 ## 5. Data and Schema Contracts
 1. Raw input data schema is stable and assumed unchanged.
@@ -139,14 +143,16 @@ Audience: Professional collaborators and maintainers
 
 ## 9. Developer Tooling Notes
 ### 9.1 Canonical Environment Installs
-1. Tooling must be installed in Conda environment `nn`.
-2. Canonical install commands:
-3. `conda activate nn`
-4. `pip install lightning`
-5. `pip install pyflakes`
-6. `pip install vulture`
-7. `pip install ruff`
-8. The codebase targets the `lightning.pytorch` namespace; direct imports from `pytorch_lightning` are non-canonical even if that package is present transitively in the environment.
+1. Local developer tooling must be installed in Conda environment `nn`.
+2. HPC batch scripts may activate a separate cluster-managed environment; `run.pbs` currently defaults to `pyt2_8_gh`.
+3. The local `nn` environment and the HPC batch environment are expected to differ.
+4. Canonical local install commands:
+5. `conda activate nn`
+6. `pip install lightning`
+7. `pip install pyflakes`
+8. `pip install vulture`
+9. `pip install ruff`
+10. The codebase targets the `lightning.pytorch` namespace; direct imports from `pytorch_lightning` are non-canonical even if that package is present transitively in the environment.
 
 ### 9.2 Dead Code Search Workflow
 1. Run checks from project root under environment `nn`.
