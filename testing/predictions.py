@@ -39,7 +39,7 @@ MODEL_PATH = MODEL_DIR / "physical_model_k1_cpu.pt2"
 METADATA_PATH = MODEL_DIR / "physical_model_metadata.json"
 CONFIG_PATH = MODEL_DIR / "config.json"
 
-SAMPLE_IDX = 3
+SAMPLE_IDX = 5
 Q_COUNT = 100
 XMIN, XMAX = 1e-3, 1e8
 PLOT_SPECIES: List[str] = []
