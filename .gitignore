@@ -46,3 +46,6 @@ htmlcov/
 # Historical scratch areas
 old/
 old_code/
+
+# Claude Code
+CLAUDE.md
