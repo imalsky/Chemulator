@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Scatter + error metrics on test split using physical-I/O model."""
+"""Scatter + error metrics on test split using physical-I/O model.
+
+Sample size is configurable via --n-samples / --n-shards (or the environment
+variables CHEMULATOR_N_SAMPLES / CHEMULATOR_N_SHARDS). Pass
+--n-samples 84 --n-shards 1 to reproduce the published run.
+"""
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
 import warnings
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -26,7 +32,7 @@ from matplotlib.ticker import LogLocator, NullFormatter, NullLocator
 REPO = Path(__file__).resolve().parent.parent
 STYLE_PATH = Path(__file__).with_name("science.mplstyle")
 MODEL_DIR = Path(
-    os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_version"))
+    os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_model"))
 ).expanduser().resolve()
 
 
@@ -39,12 +45,30 @@ MODEL_PATH = MODEL_DIR / "physical_model_k1_cpu.pt2"
 METADATA_PATH = MODEL_DIR / "physical_model_metadata.json"
 CONFIG_PATH = MODEL_DIR / "config.json"
 
-N_SAMPLES = 84
+PROCESSED_DIR_ENV = "CHEMULATOR_PROCESSED_DIR"
+
+# Sampling size. The published run used 84 trajectories from a single shard;
+# pass --n-samples 84 --n-shards 1 to reproduce exactly. The default is larger
+# so the tail percentiles (99, 99.9) rest on more than one shard; it costs
+# tens of seconds on a laptop CPU.
+DEFAULT_N_SAMPLES = 2048
+DEFAULT_N_SHARDS = 8
 Q_COUNT = 100
 PLOT_SPECIES: List[str] = []
 
+# Additive floor in the fractional-error denominator:
+#   frac_err = |y_pred - y_true| / (|y_true| + EPS_FRACTIONAL)
+# It keeps the ratio finite where y_true underflows, and it also means the
+# reported fractional errors are deflated for |y_true| of order 1e-20 and
+# below. The printed stats spell out the definition so the floor cannot be
+# mistaken for a plain relative error.
 EPS_FRACTIONAL = 1e-20
+
+# Lower clamp applied to the scatter axes and to the log10 error statistics.
+# Points below it are drawn (and scored) at the floor rather than at their true
+# value, so the affected fraction is printed alongside the stats.
 PLOT_FLOOR = 5e-20
+
 ABUND_BUCKET_THRESHOLD = 1e-10
 
 
@@ -69,15 +93,98 @@ def _select_species(species_order: List[str], plot_species: List[str]) -> Tuple[
     return keep, [labels[i] for i in keep]
 
 
-def _load_first_shard(processed_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    shards = sorted((processed_dir / "test").glob("*.npz"))
-    if not shards:
+def _resolve_processed_dir(cfg: dict) -> Path:
+    """Resolve the processed-data root: env override first, then the config.
+
+    No silent fallback. A hydrated config records paths.processed_data_dir as
+    it was at training time, so it can be stale relative to the shards on disk;
+    the error names the override and the likely alternative rather than
+    guessing. Same env var as testing/export.py.
+    """
+    raw = os.getenv(PROCESSED_DIR_ENV)
+    if raw:
+        processed_dir = Path(raw).expanduser().resolve()
+    else:
+        processed_dir = _resolve_cfg_path(cfg["paths"]["processed_data_dir"], base_dir=REPO)
+
+    if (processed_dir / "test").is_dir():
+        return processed_dir
+
+    alt = processed_dir / "processed"
+    hint = ""
+    if (alt / "test").is_dir():
+        hint = f" A test split does exist at {alt}, so the configured path is likely stale."
+    raise FileNotFoundError(
+        f"No test split under processed data dir: {processed_dir}."
+        f" Set {PROCESSED_DIR_ENV} to override paths.processed_data_dir.{hint}"
+    )
+
+
+def _load_test_trajectories(
+    processed_dir: Path, *, n_samples: int, n_shards: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    """Load up to n_samples trajectories spread over the first n_shards shards.
+
+    Trajectories are taken in file order from each shard, so --n-shards 1
+    --n-samples 84 reproduces the single-shard sample used for the published
+    figure. Returns per-trajectory time rows, so all shards must share the
+    time grid (a preprocessing invariant).
+    """
+    shard_paths = sorted((processed_dir / "test").glob("*.npz"))
+    if not shard_paths:
         raise FileNotFoundError(f"No test shards found in {processed_dir / 'test'}")
-    with np.load(shards[0], allow_pickle=False) as d:
-        y_mat = np.asarray(d["y_mat"], dtype=np.float32)
-        g_mat = np.asarray(d["globals"], dtype=np.float32)
-        t_vec = np.asarray(d["t_vec"], dtype=np.float32)
-    return y_mat, g_mat, t_vec
+
+    selected = shard_paths[:n_shards]
+    per_shard = -(-n_samples // len(selected))
+
+    y_parts: List[np.ndarray] = []
+    g_parts: List[np.ndarray] = []
+    t_parts: List[np.ndarray] = []
+    used: List[str] = []
+    remaining = n_samples
+
+    for path in selected:
+        if remaining <= 0:
+            break
+        with np.load(path, allow_pickle=False) as d:
+            y_mat = np.asarray(d["y_mat"], dtype=np.float32)
+            g_mat = np.asarray(d["globals"], dtype=np.float32)
+            t_vec = np.asarray(d["t_vec"], dtype=np.float32)
+
+        k = min(per_shard, remaining, y_mat.shape[0])
+        if k <= 0:
+            continue
+        if t_vec.ndim == 1:
+            t_rows = np.broadcast_to(t_vec, (k, t_vec.shape[0])).copy()
+        elif t_vec.ndim == 2:
+            if t_vec.shape[0] != y_mat.shape[0]:
+                raise ValueError(
+                    f"t_vec rows do not match trajectories in {path.name}: "
+                    f"{t_vec.shape[0]} != {y_mat.shape[0]}"
+                )
+            t_rows = t_vec[:k]
+        else:
+            raise ValueError(f"Unsupported t_vec shape in {path.name}: {t_vec.shape}")
+
+        y_parts.append(y_mat[:k])
+        g_parts.append(g_mat[:k])
+        t_parts.append(t_rows)
+        used.append(path.name)
+        remaining -= k
+
+    if not y_parts:
+        raise RuntimeError("No trajectories loaded from the test split")
+
+    grid = t_parts[0].shape[1]
+    if any(part.shape[1] != grid for part in t_parts):
+        raise RuntimeError("Test shards disagree on the time-grid length")
+
+    return (
+        np.concatenate(y_parts, axis=0),
+        np.concatenate(g_parts, axis=0),
+        np.concatenate(t_parts, axis=0),
+        used,
+    )
 
 
 def _time_for_sample(t_vec: np.ndarray, idx: int) -> np.ndarray:
@@ -163,6 +270,7 @@ def _print_count_breakdown(context: Dict[str, object], points_after_filters: int
             f"(total duplicate indices counted as separate points: {int(context['dup_total'])})."
         )
 
+    print(f"Test shards read:            {int(context['n_shards'])} ({', '.join(context['shards'])})")
     print(f"Species plotted:             {int(context['n_species'])}")
     print(f"Total query times (sum K):   {int(context['total_q'])}")
     print(
@@ -187,8 +295,16 @@ def _print_error_stats(y_true_flat: np.ndarray, y_pred_flat: np.ndarray) -> None
     y_pred_clamped = np.maximum(y_pred, PLOT_FLOOR)
     log_err = np.log10(y_pred_clamped) - np.log10(y_true_clamped)
 
+    clamped = (y_true < PLOT_FLOOR) | (y_pred < PLOT_FLOOR)
+    clamped_pct = 100.0 * float(np.mean(clamped))
+
     pcts = np.percentile(frac_err * 100, [50, 90, 95, 99, 99.9])
     print("\nError stats:")
+    print(f"Definition:       frac err = |y_pred - y_true| / (|y_true| + {EPS_FRACTIONAL:.1e})")
+    print(
+        f"Log10 stats clamp both values at {PLOT_FLOOR:.1e}: "
+        f"{clamped_pct:.2f} % of points in this bucket are affected"
+    )
     print(f"Points:           {int(y_true.size)}")
     print(f"Average % error:  {100.0 * float(np.mean(frac_err)):.3f}")
     print(f"Linear MAE:       {float(np.mean(np.abs(diff))):.4e}")
@@ -203,13 +319,62 @@ def _print_error_stats(y_true_flat: np.ndarray, y_pred_flat: np.ndarray) -> None
     print(f"Max Frac Error:   {100.0 * float(np.max(frac_err)):.2f} %")
 
 
-def main() -> int:
+def _print_floor_disclosure(y_true_flat: np.ndarray, y_pred_flat: np.ndarray) -> None:
+    """State how much of the scatter is clamped onto the plot floor.
+
+    Both scatter axes clamp at PLOT_FLOOR, so points with true and predicted
+    values below it are drawn at the same location, exactly on the 1:1 line.
+    """
+    mask = np.isfinite(y_true_flat) & np.isfinite(y_pred_flat)
+    n = int(np.sum(mask))
+    if n == 0:
+        print("\nPlot floor: no finite points to report.")
+        return
+
+    below_true = y_true_flat[mask] < PLOT_FLOOR
+    below_pred = y_pred_flat[mask] < PLOT_FLOOR
+    both = below_true & below_pred
+
+    print(f"\n--- Plot floor disclosure (PLOT_FLOOR = {PLOT_FLOOR:.1e}) ---")
+    print(f"Finite points:               {n}")
+    print(f"True below floor:            {int(below_true.sum())} ({100.0 * float(np.mean(below_true)):.2f} %)")
+    print(f"Predicted below floor:       {int(below_pred.sum())} ({100.0 * float(np.mean(below_pred)):.2f} %)")
+    print(
+        f"Both below floor:            {int(both.sum())} ({100.0 * float(np.mean(both)):.2f} %) "
+        "drawn at the floor, i.e. stacked on the 1:1 line"
+    )
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--n-samples",
+        type=int,
+        default=int(os.getenv("CHEMULATOR_N_SAMPLES", str(DEFAULT_N_SAMPLES))),
+        help="Trajectories to evaluate, spread over the selected shards (env: CHEMULATOR_N_SAMPLES)",
+    )
+    parser.add_argument(
+        "--n-shards",
+        type=int,
+        default=int(os.getenv("CHEMULATOR_N_SHARDS", str(DEFAULT_N_SHARDS))),
+        help="Test shards to read, in sorted file order (env: CHEMULATOR_N_SHARDS)",
+    )
+    args = parser.parse_args(argv)
+    if args.n_samples < 1:
+        raise ValueError("--n-samples must be >= 1")
+    if args.n_shards < 1:
+        raise ValueError("--n-shards must be >= 1")
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
     cfg = _load_json(CONFIG_PATH)
     meta = _load_json(METADATA_PATH)
     ep = torch.export.load(MODEL_PATH)
     model = ep.module()
 
-    processed_dir = _resolve_cfg_path(cfg["paths"]["processed_data_dir"], base_dir=REPO)
+    processed_dir = _resolve_processed_dir(cfg)
     species_order = [str(x) for x in meta["species_order"]]
     globals_order = [str(x) for x in meta["globals_order"]]
     cfg_species = [str(x) for x in cfg["data"]["species_variables"]]
@@ -223,8 +388,10 @@ def main() -> int:
     keep_idx, _ = _select_species(species_order, PLOT_SPECIES)
     n_species_plotted = len(keep_idx)
 
-    y_mat, g_mat, t_vec = _load_first_shard(processed_dir)
-    n_use = min(N_SAMPLES, y_mat.shape[0])
+    y_mat, g_mat, t_vec, shards_used = _load_test_trajectories(
+        processed_dir, n_samples=args.n_samples, n_shards=args.n_shards
+    )
+    n_use = int(y_mat.shape[0])
 
     all_true = []
     all_pred = []
@@ -276,6 +443,8 @@ def main() -> int:
         "ku_stats": _stats_1d(np.asarray(traj_Ku, dtype=int)),
         "dup_total": int(dup_total),
         "dup_traj": int(dup_traj),
+        "n_shards": int(len(shards_used)),
+        "shards": list(shards_used),
     }
 
     bucket_mask = finite_mask & (y_true_flat > ABUND_BUCKET_THRESHOLD)
@@ -287,9 +456,12 @@ def main() -> int:
     _print_count_breakdown(context, finite_points, "Bucket: all finite points")
     _print_error_stats(y_true_flat[finite_mask], y_pred_flat[finite_mask])
 
+    _print_floor_disclosure(y_true_flat, y_pred_flat)
+
     out_png = MODEL_DIR / "plots" / "accuracy.png"
     _plot_scatter(y_true_flat, y_pred_flat, out_png)
-    print(f"Model path: {MODEL_PATH}")
+    print(f"\nModel path: {MODEL_PATH}")
+    print(f"Processed data: {processed_dir}")
     print(f"Plot saved: {out_png}")
     return 0
 

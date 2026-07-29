@@ -1,7 +1,15 @@
 # Data and model artifacts
 data/*
 !data/.gitkeep
-models/
+models/*
+# Exception: the small text records of the published run (paper provenance).
+# Checkpoints and exported binaries stay ignored via the *.ckpt / *.pt2 rules.
+!models/final_model/
+models/final_model/*
+!models/final_model/config.json
+!models/final_model/train.log
+!models/final_model/metrics.jsonl
+!models/final_model/physical_model_metadata.json
 logs/
 plots/
 figures/
@@ -46,6 +54,10 @@ htmlcov/
 # Historical scratch areas
 old/
 old_code/
+# Local A/B exploration of the latent-linear and two-step variants. Postdates
+# the published model and is not part of what the paper reports.
+local_ab/
 
-# Claude Code
+# Local agent/editor state
 CLAUDE.md
+.claude/

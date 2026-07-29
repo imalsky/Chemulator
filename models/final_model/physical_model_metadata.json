@@ -1,0 +1,46 @@
+{
+  "species_order": [
+    "C2H2_evolution",
+    "CH4_evolution",
+    "CO2_evolution",
+    "CO_evolution",
+    "H2O_evolution",
+    "H2_evolution",
+    "HCN_evolution",
+    "H_evolution",
+    "N2_evolution",
+    "NH3_evolution",
+    "OH_evolution",
+    "O_evolution"
+  ],
+  "species_mean": {
+    "C2H2_evolution": 1.958727656241888e-11,
+    "CH4_evolution": 4.111797264447451e-08,
+    "CO2_evolution": 7.594484360498613e-10,
+    "CO_evolution": 1.6771232874823614e-06,
+    "H2O_evolution": 1.4155064215827569e-05,
+    "H2_evolution": 0.6978811098006793,
+    "HCN_evolution": 1.9309129808667934e-10,
+    "H_evolution": 5.576945421532626e-05,
+    "N2_evolution": 1.5658231624916199e-09,
+    "NH3_evolution": 3.248609164265487e-10,
+    "OH_evolution": 1.431465995659881e-10,
+    "O_evolution": 8.748247672229141e-14
+  },
+  "globals_order": [
+    "P",
+    "T"
+  ],
+  "globals_mean": {
+    "P": 100000.01883189686,
+    "T": 1791.5923084910407
+  },
+  "dt_bounds_sec": {
+    "min": 0.0002949258422052617,
+    "max": 100000000.0
+  },
+  "sources": {
+    "config_path": "/Users/imalsky/Desktop/Emulators/Chemulator_Project/Chemulator/models/final_model/config.json",
+    "normalization_path": "/Users/imalsky/Desktop/Emulators/Chemulator_Project/Chemulator/data/normalization.json"
+  }
+}

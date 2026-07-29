@@ -1,0 +1,321 @@
+{
+  // ============================================================================
+  // PAPER CONFIG. The configuration behind the trained model reported in
+  // Malsky et al., "Accelerating Chemical Kinetics for Exoplanet Atmospheres
+  // using Neural Networks": the 11,577,356-parameter residual
+  // encoder-operator-decoder flow map archived in models/final_model.
+  // ============================================================================
+  // Written in the CURRENT config schema and reconstructed from two artifacts of
+  // that run, models/final_model/config.json (the hydrated config the run wrote)
+  // and models/final_model/train.log. The archived config on its own no longer
+  // loads: eight of its dataset/preprocessing keys are now rejected by
+  // src.main.reject_deprecated_config_keys, it carries no
+  // training.warmup_start_factor (required at src/trainer.py) and no
+  // preprocessing.reuse_existing_data, and its paths.processed_data_dir predates
+  // the current data/processed layout.
+  //
+  // Verified against the paper: src.model.create_model on this file builds a
+  // FlowMapAutoencoder with exactly 11,577,356 trainable parameters, with the
+  // latent residual (model.dynamics_residual=true) and the output residual
+  // (model.predict_delta=true) both enabled. Every model, dataset and training
+  // value below matches models/final_model/config.json, which matches Table 1.
+  //
+  // One value is not in the archived config and was recovered from the run:
+  // training.warmup_start_factor = 0.1, read out of the SequentialLR state in
+  // models/final_model/best.ckpt (LinearLR start_factor 0.1, total_iters 10,
+  // then CosineAnnealingLR T_max 290, eta_min 5e-7).
+  //
+  // Where this file deliberately differs from the archived config.json:
+  //  1. precision. train.log records "Hardware settings: TF32=True" and
+  //     "Precision config: Lightning=bf16-mixed, Dataset=torch.bfloat16", while
+  //     the archived config says amp="off", tf32=false. That block was written
+  //     by hand after the run and does not describe it. train.log is the truth
+  //     and is what this file follows. See the note in the precision block for
+  //     the CPU/MPS fallback.
+  //  2. normalization.methods.t_time. The archived config says "log-min-max",
+  //     but the run reused already-processed shards so that method never ran.
+  //     The canonical time grid contains t=0 and the preprocessor hard-fails on
+  //     a log-domain time method with non-positive times, so "min-max" is used
+  //     here, as in the paper-era config. Normalized t_time is never consumed at
+  //     training or inference time, so the choice is inert.
+  //  3. model.architecture. The archived config reaches the same class through
+  //     the legacy model.mlp_only=false switch. "autoencoder" is the current
+  //     spelling of that dispatch and builds an identical module.
+  //  4. paths.work_dir. The run wrote to models/big_flow, archived here as
+  //     models/final_model. Training from this file writes to a fresh directory
+  //     so it cannot overwrite the published artifacts.
+  //
+  // Environment: python 3.12, torch 2.8 (requirements.txt). The published run
+  // itself was driven by a PyTorch Lightning trainer (best.ckpt records
+  // lightning 2.5.5); this repository has since moved to a plain PyTorch loop.
+  // testing/export.py still reads that checkpoint format, so the published
+  // checkpoint can be re-exported without retraining.
+  "paths": {
+    "processed_data_dir": "data/processed",
+    "work_dir": "models/paper_repro",
+    "overwrite": false,
+    // The 382 raw HDF5 files behind the published dataset, exactly as recorded
+    // in data/processed/normalization.json (meta.raw_data_files). This list is
+    // read only when preprocessing actually runs: with reuse_existing_data=true
+    // and complete processed shards in place it is never touched, which is how
+    // the published run went (train.log: "[pre] Reusing existing preprocessed
+    // data"). If you start from the archived processed shards instead of the raw
+    // files, point processed_data_dir at them and ignore this list.
+    "raw_data_files": [
+      "data/raw/run10017-result.h5", "data/raw/run10018-result.h5", "data/raw/run10019-result.h5", "data/raw/run10020-result.h5",
+      "data/raw/run10021-result.h5", "data/raw/run10022-result.h5", "data/raw/run10023-result.h5", "data/raw/run10024-result.h5",
+      "data/raw/run10025-result.h5", "data/raw/run10026-result.h5", "data/raw/run10027-result.h5", "data/raw/run10028-result.h5",
+      "data/raw/run10029-result.h5", "data/raw/run10030-result.h5", "data/raw/run10031-result.h5", "data/raw/run10032-result.h5",
+      "data/raw/run10033-result.h5", "data/raw/run10034-result.h5", "data/raw/run10035-result.h5", "data/raw/run10036-result.h5",
+      "data/raw/run10037-result.h5", "data/raw/run10038-result.h5", "data/raw/run10039-result.h5", "data/raw/run10040-result.h5",
+      "data/raw/run10041-result.h5", "data/raw/run10042-result.h5", "data/raw/run10043-result.h5", "data/raw/run10044-result.h5",
+      "data/raw/run10045-result.h5", "data/raw/run10046-result.h5", "data/raw/run10047-result.h5", "data/raw/run10048-result.h5",
+      "data/raw/run10049-result.h5", "data/raw/run10050-result.h5", "data/raw/run10051-result.h5", "data/raw/run10052-result.h5",
+      "data/raw/run10053-result.h5", "data/raw/run10054-result.h5", "data/raw/run10055-result.h5", "data/raw/run10056-result.h5",
+      "data/raw/run10057-result.h5", "data/raw/run10058-result.h5", "data/raw/run10059-result.h5", "data/raw/run10060-result.h5",
+      "data/raw/run10061-result.h5", "data/raw/run10062-result.h5", "data/raw/run10063-result.h5", "data/raw/run10064-result.h5",
+      "data/raw/run10065-result.h5", "data/raw/run10066-result.h5", "data/raw/run10067-result.h5", "data/raw/run10068-result.h5",
+      "data/raw/run10069-result.h5", "data/raw/run10070-result.h5", "data/raw/run10071-result.h5", "data/raw/run10072-result.h5",
+      "data/raw/run10073-result.h5", "data/raw/run10074-result.h5", "data/raw/run10075-result.h5", "data/raw/run10076-result.h5",
+      "data/raw/run10077-result.h5", "data/raw/run10078-result.h5", "data/raw/run10079-result.h5", "data/raw/run10080-result.h5",
+      "data/raw/run10081-result.h5", "data/raw/run10082-result.h5", "data/raw/run10083-result.h5", "data/raw/run10093-result.h5",
+      "data/raw/run10100-result.h5", "data/raw/run10116-result.h5", "data/raw/run10117-result.h5", "data/raw/run10118-result.h5",
+      "data/raw/run10119-result.h5", "data/raw/run10120-result.h5", "data/raw/run10121-result.h5", "data/raw/run10122-result.h5",
+      "data/raw/run10123-result.h5", "data/raw/run10124-result.h5", "data/raw/run10125-result.h5", "data/raw/run10126-result.h5",
+      "data/raw/run10127-result.h5", "data/raw/run10128-result.h5", "data/raw/run10129-result.h5", "data/raw/run10130-result.h5",
+      "data/raw/run10131-result.h5", "data/raw/run10132-result.h5", "data/raw/run10133-result.h5", "data/raw/run10134-result.h5",
+      "data/raw/run10135-result.h5", "data/raw/run10136-result.h5", "data/raw/run10137-result.h5", "data/raw/run10138-result.h5",
+      "data/raw/run10139-result.h5", "data/raw/run10140-result.h5", "data/raw/run10141-result.h5", "data/raw/run10142-result.h5",
+      "data/raw/run10143-result.h5", "data/raw/run10144-result.h5", "data/raw/run10145-result.h5", "data/raw/run10146-result.h5",
+      "data/raw/run10147-result.h5", "data/raw/run10148-result.h5", "data/raw/run10149-result.h5", "data/raw/run10150-result.h5",
+      "data/raw/run10201-result.h5", "data/raw/run10202-result.h5", "data/raw/run10203-result.h5", "data/raw/run10204-result.h5",
+      "data/raw/run10205-result.h5", "data/raw/run10206-result.h5", "data/raw/run10207-result.h5", "data/raw/run10208-result.h5",
+      "data/raw/run10209-result.h5", "data/raw/run10210-result.h5", "data/raw/run10234-result.h5", "data/raw/run10241-result.h5",
+      "data/raw/run10242-result.h5", "data/raw/run10243-result.h5", "data/raw/run10244-result.h5", "data/raw/run10245-result.h5",
+      "data/raw/run10246-result.h5", "data/raw/run10247-result.h5", "data/raw/run10248-result.h5", "data/raw/run10249-result.h5",
+      "data/raw/run10251-result.h5", "data/raw/run10252-result.h5", "data/raw/run10253-result.h5", "data/raw/run10254-result.h5",
+      "data/raw/run10255-result.h5", "data/raw/run10256-result.h5", "data/raw/run10257-result.h5", "data/raw/run10258-result.h5",
+      "data/raw/run10259-result.h5", "data/raw/run10260-result.h5", "data/raw/run10261-result.h5", "data/raw/run10262-result.h5",
+      "data/raw/run10263-result.h5", "data/raw/run10264-result.h5", "data/raw/run10265-result.h5", "data/raw/run10266-result.h5",
+      "data/raw/run10267-result.h5", "data/raw/run10268-result.h5", "data/raw/run10269-result.h5", "data/raw/run10270-result.h5",
+      "data/raw/run6001-result.h5", "data/raw/run6002-result.h5", "data/raw/run6003-result.h5", "data/raw/run6004-result.h5",
+      "data/raw/run6005-result.h5", "data/raw/run6006-result.h5", "data/raw/run6007-result.h5", "data/raw/run6008-result.h5",
+      "data/raw/run6009-result.h5", "data/raw/run6010-result.h5", "data/raw/run6011-result.h5", "data/raw/run6012-result.h5",
+      "data/raw/run6013-result.h5", "data/raw/run6015-result.h5", "data/raw/run6016-result.h5", "data/raw/run6018-result.h5",
+      "data/raw/run6019-result.h5", "data/raw/run6020-result.h5", "data/raw/run6021-result.h5", "data/raw/run6022-result.h5",
+      "data/raw/run6023-result.h5", "data/raw/run6024-result.h5", "data/raw/run6025-result.h5", "data/raw/run6026-result.h5",
+      "data/raw/run6027-result.h5", "data/raw/run6028-result.h5", "data/raw/run6029-result.h5", "data/raw/run6030-result.h5",
+      "data/raw/run6031-result.h5", "data/raw/run6032-result.h5", "data/raw/run6033-result.h5", "data/raw/run6034-result.h5",
+      "data/raw/run6035-result.h5", "data/raw/run6036-result.h5", "data/raw/run6037-result.h5", "data/raw/run6038-result.h5",
+      "data/raw/run6039-result.h5", "data/raw/run6040-result.h5", "data/raw/run6041-result.h5", "data/raw/run6042-result.h5",
+      "data/raw/run6043-result.h5", "data/raw/run6044-result.h5", "data/raw/run6045-result.h5", "data/raw/run6046-result.h5",
+      "data/raw/run6047-result.h5", "data/raw/run6048-result.h5", "data/raw/run6049-result.h5", "data/raw/run6050-result.h5",
+      "data/raw/run6051-result.h5", "data/raw/run6052-result.h5", "data/raw/run6053-result.h5", "data/raw/run6054-result.h5",
+      "data/raw/run6055-result.h5", "data/raw/run6057-result.h5", "data/raw/run6058-result.h5", "data/raw/run6059-result.h5",
+      "data/raw/run6060-result.h5", "data/raw/run6061-result.h5", "data/raw/run6062-result.h5", "data/raw/run6063-result.h5",
+      "data/raw/run6064-result.h5", "data/raw/run6065-result.h5", "data/raw/run6066-result.h5", "data/raw/run6067-result.h5",
+      "data/raw/run6068-result.h5", "data/raw/run6069-result.h5", "data/raw/run6070-result.h5", "data/raw/run6071-result.h5",
+      "data/raw/run6072-result.h5", "data/raw/run6073-result.h5", "data/raw/run6074-result.h5", "data/raw/run6075-result.h5",
+      "data/raw/run6076-result.h5", "data/raw/run6077-result.h5", "data/raw/run6078-result.h5", "data/raw/run6079-result.h5",
+      "data/raw/run6080-result.h5", "data/raw/run6081-result.h5", "data/raw/run6082-result.h5", "data/raw/run6083-result.h5",
+      "data/raw/run6084-result.h5", "data/raw/run6085-result.h5", "data/raw/run6086-result.h5", "data/raw/run6087-result.h5",
+      "data/raw/run6088-result.h5", "data/raw/run6089-result.h5", "data/raw/run6090-result.h5", "data/raw/run6091-result.h5",
+      "data/raw/run6092-result.h5", "data/raw/run6093-result.h5", "data/raw/run6094-result.h5", "data/raw/run6095-result.h5",
+      "data/raw/run6096-result.h5", "data/raw/run6097-result.h5", "data/raw/run6098-result.h5", "data/raw/run6099-result.h5",
+      "data/raw/run9008-result.h5", "data/raw/run9009-result.h5", "data/raw/run9028-result.h5", "data/raw/run9029-result.h5",
+      "data/raw/run9030-result.h5", "data/raw/run9031-result.h5", "data/raw/run9032-result.h5", "data/raw/run9033-result.h5",
+      "data/raw/run9034-result.h5", "data/raw/run9035-result.h5", "data/raw/run9036-result.h5", "data/raw/run9037-result.h5",
+      "data/raw/run9038-result.h5", "data/raw/run9039-result.h5", "data/raw/run9040-result.h5", "data/raw/run9041-result.h5",
+      "data/raw/run9042-result.h5", "data/raw/run9051-result.h5", "data/raw/run9054-result.h5", "data/raw/run9056-result.h5",
+      "data/raw/run9057-result.h5", "data/raw/run9058-result.h5", "data/raw/run9059-result.h5", "data/raw/run9060-result.h5",
+      "data/raw/run9061-result.h5", "data/raw/run9062-result.h5", "data/raw/run9063-result.h5", "data/raw/run9064-result.h5",
+      "data/raw/run9065-result.h5", "data/raw/run9068-result.h5", "data/raw/run9069-result.h5", "data/raw/run9070-result.h5",
+      "data/raw/run9071-result.h5", "data/raw/run9074-result.h5", "data/raw/run9075-result.h5", "data/raw/run9076-result.h5",
+      "data/raw/run9077-result.h5", "data/raw/run9079-result.h5", "data/raw/run9080-result.h5", "data/raw/run9081-result.h5",
+      "data/raw/run9082-result.h5", "data/raw/run9085-result.h5", "data/raw/run9087-result.h5", "data/raw/run9088-result.h5",
+      "data/raw/run9092-result.h5", "data/raw/run9094-result.h5", "data/raw/run9095-result.h5", "data/raw/run9099-result.h5",
+      "data/raw/run9100-result.h5", "data/raw/run9103-result.h5", "data/raw/run9104-result.h5", "data/raw/run9106-result.h5",
+      "data/raw/run9107-result.h5", "data/raw/run9110-result.h5", "data/raw/run9111-result.h5", "data/raw/run9114-result.h5",
+      "data/raw/run9115-result.h5", "data/raw/run9122-result.h5", "data/raw/run9125-result.h5", "data/raw/run9129-result.h5",
+      "data/raw/run9131-result.h5", "data/raw/run9133-result.h5", "data/raw/run9141-result.h5", "data/raw/run9142-result.h5",
+      "data/raw/run9143-result.h5", "data/raw/run9144-result.h5", "data/raw/run9146-result.h5", "data/raw/run9147-result.h5",
+      "data/raw/run9148-result.h5", "data/raw/run9149-result.h5", "data/raw/run9150-result.h5", "data/raw/run9151-result.h5",
+      "data/raw/run9152-result.h5", "data/raw/run9153-result.h5", "data/raw/run9154-result.h5", "data/raw/run9156-result.h5",
+      "data/raw/run9222-result.h5", "data/raw/run9261-result.h5", "data/raw/run9294-result.h5", "data/raw/run9299-result.h5",
+      "data/raw/run9303-result.h5", "data/raw/run9304-result.h5", "data/raw/run9305-result.h5", "data/raw/run9306-result.h5",
+      "data/raw/run9307-result.h5", "data/raw/run9309-result.h5", "data/raw/run9310-result.h5", "data/raw/run9311-result.h5",
+      "data/raw/run9312-result.h5", "data/raw/run9313-result.h5", "data/raw/run9314-result.h5", "data/raw/run9315-result.h5",
+      "data/raw/run9316-result.h5", "data/raw/run9317-result.h5", "data/raw/run9318-result.h5", "data/raw/run9321-result.h5",
+      "data/raw/run9323-result.h5", "data/raw/run9324-result.h5", "data/raw/run9327-result.h5", "data/raw/run9329-result.h5",
+      "data/raw/run9330-result.h5", "data/raw/run9331-result.h5", "data/raw/run9332-result.h5", "data/raw/run9333-result.h5",
+      "data/raw/run9334-result.h5", "data/raw/run9336-result.h5", "data/raw/run9339-result.h5", "data/raw/run9340-result.h5",
+      "data/raw/run9341-result.h5", "data/raw/run9342-result.h5", "data/raw/run9343-result.h5", "data/raw/run9344-result.h5",
+      "data/raw/run9348-result.h5", "data/raw/run9350-result.h5", "data/raw/run9422-result.h5", "data/raw/run9423-result.h5",
+      "data/raw/run9424-result.h5", "data/raw/run9425-result.h5", "data/raw/run9426-result.h5", "data/raw/run9427-result.h5",
+      "data/raw/run9428-result.h5", "data/raw/run9429-result.h5", "data/raw/run9430-result.h5", "data/raw/run9431-result.h5",
+      "data/raw/run9432-result.h5", "data/raw/run9433-result.h5", "data/raw/run9434-result.h5", "data/raw/run9435-result.h5",
+      "data/raw/run9436-result.h5", "data/raw/run9437-result.h5", "data/raw/run9438-result.h5", "data/raw/run9439-result.h5",
+      "data/raw/run9440-result.h5", "data/raw/run9441-result.h5", "data/raw/run9442-result.h5", "data/raw/run9443-result.h5",
+      "data/raw/run9444-result.h5", "data/raw/run9445-result.h5", "data/raw/run9446-result.h5", "data/raw/run9447-result.h5",
+      "data/raw/run9448-result.h5", "data/raw/run9598-result.h5"
+    ]
+  },
+
+  "system": {
+    "cudnn_benchmark": true,
+    "deterministic": false,
+    "omp_num_threads": 4,
+    "seed": 42
+  },
+
+  "precision": {
+    // The published run: bf16 mixed precision with TF32 matmuls on one A100 80GB
+    // (train.log lines 6 and 7). dataset_dtype="auto" resolves to the amp dtype,
+    // which is how that run held the normalized tensors in memory
+    // ("Dataset=torch.bfloat16"); the on-disk shards stayed float32.
+    // Cost of reproducing it exactly: holding the targets in bfloat16 quantizes
+    // them by about 0.006 dex on average, so validation losses from this recipe
+    // sit on a small data-precision floor. A float32 run avoids that.
+    // CPU and MPS: src.utils.resolve_precision_policy hard-errors on anything
+    // but fp32 there. For a smoke run off GPU set amp="off",
+    // dataset_dtype="float32", tf32=false.
+    "amp": "bf16",
+    "dataset_dtype": "auto",
+    "io_dtype": "float32",
+    "time_io_dtype": "float32",
+    "normalize_dtype": "float32",
+    "tf32": true
+  },
+
+  "data": {
+    "global_variables": ["P", "T"],
+    "time_variable": "t_time",
+    // Order is load-bearing: the exported model returns species in exactly this
+    // order.
+    "species_variables": ["C2H2_evolution",
+                          "CH4_evolution",
+                          "CO2_evolution",
+                          "CO_evolution",
+                          "H2O_evolution",
+                          "H2_evolution",
+                          "HCN_evolution",
+                          "H_evolution",
+                          "N2_evolution",
+                          "NH3_evolution",
+                          "OH_evolution",
+                          "O_evolution"]
+  },
+
+  "normalization": {
+    "default_method": "log-standard",
+    "epsilon": 1e-30,
+    "methods": {
+      "P": "log-min-max",
+      "T": "standard",
+      // Documentation only: the preprocessor asserts this equals "log-min-max"
+      // and then takes dt normalization from the manifest, not from here.
+      "dt": "log-min-max",
+      // t_time includes t=0 in this dataset, so a non-log method is required.
+      "t_time": "min-max"
+    },
+    "min_std": 1e-10
+  },
+
+  "preprocessing": {
+    "hdf5_chunk_size": 0,
+    // Trajectories with any species value below this are dropped (23,596,422 of
+    // 85,568,000 in the published dataset; see data/processed/preprocessing_summary.json).
+    "min_value_threshold": 1e-30,
+    "npz_compressed": false,
+    "trajectories_per_shard": 65536,
+    "skip_first_timestep": false,
+    "overwrite_data": false,
+    // The published run reused shards that had already been written. Set false
+    // to preprocess from raw_data_files instead.
+    "reuse_existing_data": true
+  },
+
+  "dataset": {
+    // Table 1: batch size 2048.
+    "batch_size_train": 2048,
+    // Table 1: 4 pairs per anchor. Every anchor emits K=4 targets.
+    "multi_time_per_anchor": true,
+    "times_per_anchor": 4,
+    "use_first_anchor": true,
+    // Loader settings from the A100 run (train.log: "B=2048 workers=4
+    // prefetch=2 pin=True persistent_workers=True"). Tune freely, they do not
+    // change the model.
+    "num_workers": 4,
+    "persistent_workers": true,
+    "pin_memory": true,
+    "prefetch_factor": 2,
+    "preload_to_gpu": false
+  },
+
+  "model": {
+    // Residual encoder-operator-decoder, Section 3 of the paper.
+    // 11,577,356 trainable parameters (train.log: "Model parameters: 11.58M").
+    "architecture": "autoencoder",
+    "latent_dim": 512,
+    "encoder_hidden": [1024, 1024, 1024, 1024],
+    "dynamics_hidden": [1024, 1024, 1024, 1024],
+    "decoder_hidden": [1024, 1024, 1024, 1024],
+    "activation": "silu",
+    "dropout": 0.0,
+    // Residual connection 1 of 2: the operator predicts dz and adds it to the
+    // encoded state. This is the architecture claim of the paper; turning it off
+    // leaves the parameter count unchanged, so it cannot be checked by size.
+    "dynamics_residual": true,
+    // Residual connection 2 of 2: the decoder predicts dy in z-space.
+    "predict_delta": true,
+    "predict_delta_log_phys": false,
+    "softmax_head": false
+  },
+
+  "training": {
+    // Table 1: 300 epochs. The published checkpoint is epoch 294, the best
+    // validation epoch of that run (val loss 1.140711e-02).
+    "epochs": 300,
+    "gradient_clip": 0.0,
+    "optimizer": "adamw",
+
+    "torch_compile": false,
+    "torch_compile_backend": "inductor",
+    "torch_compile_mode": "max-autotune",
+    "compile_dynamic": false,
+    "compile_fullgraph": true,
+
+    // Table 1: lr 1e-4, 10 warmup epochs, then cosine decay to min_lr.
+    "lr": 1e-4,
+    "min_lr": 5e-7,
+    "warmup_epochs": 10,
+    // Recovered from the SequentialLR state in models/final_model/best.ckpt.
+    "warmup_start_factor": 0.1,
+    "weight_decay": 1e-4,
+
+    "max_train_steps_per_epoch": 0,
+    "max_val_batches": 0,
+    "resume": null,
+
+    "use_fraction": 1.0,
+    "val_fraction": 0.1,
+    "test_fraction": 0.1,
+    "min_steps": 1,
+    "max_steps": 99,
+    // Table 1: 8 anchor points per trajectory per epoch.
+    "pairs_per_traj": 8,
+
+    // The paper run used neither EMA (training.ema) nor autoregressive rollout
+    // (training.rollout). Both are later additions and both default to off.
+
+    "adaptive_stiff_loss": {
+      // Table 1: loss weights (1.0, 0.5) on the log10-MAE and the z-space MSE.
+      "lambda_phys": 1.0,
+      "lambda_z": 0.5,
+      "use_weighting": false,
+      "weight_power": 0.5,
+      "w_min": 0.5,
+      "w_max": 2.0
+    }
+  }
+}

@@ -1,0 +1,67 @@
+2026-01-12 11:42:04 | INFO    | main - Work directory: /gpfs/scratch/exoweather/imalsky/Chemulator2/models/big_flow
+2026-01-12 11:42:04 | INFO    | main - Set CUDA device to local_rank=0 (NVIDIA A100 80GB PCIe)
+2026-01-12 11:42:04 | INFO    | main - Set OMP_NUM_THREADS=4
+2026-01-12 11:42:04 | INFO    | main - Set torch num_threads=4
+2026-01-12 11:42:04 | INFO    | main - cudnn.benchmark=True
+2026-01-12 11:42:04 | INFO    | main - Hardware settings: TF32=True, cudnn.benchmark=True, deterministic=False, cudnn.deterministic=False
+2026-01-12 11:42:04 | INFO    | main - Precision config: Lightning=bf16-mixed, Dataset=torch.bfloat16
+2026-01-12 11:42:04 | INFO    | main - Resolved Lightning precision=bf16-mixed; dataset runtime dtype=torch.bfloat16
+2026-01-12 11:42:04 | INFO    | main - [pre] Reusing existing preprocessed data at /gpfs/scratch/exoweather/imalsky/Chemulator2/data/processed
+2026-01-12 11:42:04 | INFO    | main - [hydrate] Keeping cfg.data.species_variables (12 of 12 processed): ['C2H2_evolution', 'CH4_evolution', 'CO2_evolution', 'CO_evolution', 'H2O_evolution', 'H2_evolution', 'HCN_evolution', 'H_evolution', 'N2_evolution', 'NH3_evolution', ...] (+2 more)
+2026-01-12 11:42:04 | INFO    | main - [hydrate] cfg.data.target_species is empty; using the same list as species_variables (12 species).
+2026-01-12 11:42:04 | INFO    | main - Saved final hydrated config
+2026-01-12 11:42:04 | INFO    | main.dataset.train - Dataset species selection: cfg.data.species_variables matches processed list (12 species).
+2026-01-12 11:42:04 | INFO    | main.dataset.train - Dataset globals selection: cfg.data.global_variables matches processed list (2).
+2026-01-12 11:54:19 | INFO    | main.dataset.train - FlowMapPairsDataset init: split=train, shards=767, total_rows=49581263, T=100, S=12 (raw=12), G=2 (raw=2), shared_time_grid=True, dt_table_precomputed=True, shard_size_range=[72, 65536], stage_device=cpu, runtime_dtype=torch.bfloat16
+2026-01-12 11:54:19 | INFO    | main.dataset.train - FlowMapPairsDataset variables: species_variables=['C2H2_evolution', 'CH4_evolution', 'CO2_evolution', 'CO_evolution', 'H2O_evolution', 'H2_evolution', 'HCN_evolution', 'H_evolution', 'N2_evolution', 'NH3_evolution', ...] (+2 more); global_variables=['P', 'T']; time_variable='t_time'
+2026-01-12 11:54:19 | INFO    | main.dataset.val - Dataset species selection: cfg.data.species_variables matches processed list (12 species).
+2026-01-12 11:54:19 | INFO    | main.dataset.val - Dataset globals selection: cfg.data.global_variables matches processed list (2).
+2026-01-12 11:55:58 | INFO    | main.dataset.val - FlowMapPairsDataset init: split=validation, shards=144, total_rows=6192074, T=100, S=12 (raw=12), G=2 (raw=2), shared_time_grid=True, dt_table_precomputed=True, shard_size_range=[14444, 65536], stage_device=cpu, runtime_dtype=torch.bfloat16
+2026-01-12 11:55:58 | INFO    | main.dataset.val - FlowMapPairsDataset variables: species_variables=['C2H2_evolution', 'CH4_evolution', 'CO2_evolution', 'CO_evolution', 'H2O_evolution', 'H2_evolution', 'HCN_evolution', 'H_evolution', 'N2_evolution', 'NH3_evolution', ...] (+2 more); global_variables=['P', 'T']; time_variable='t_time'
+2026-01-12 11:55:58 | INFO    | main - [dl] B=2048 workers=4 prefetch=2 pin=True persistent_workers=True share_times_across_batch=False
+2026-01-12 11:55:58 | INFO    | main - Dataset stats: train=396650104 items/193676 batches; val=49536592 items/24188 batches
+2026-01-12 11:55:58 | INFO    | main - Creating model...
+2026-01-12 11:55:58 | INFO    | main - Model parameters: 11.58M
+2026-01-12 11:55:58 | INFO    | main.trainer - resume: fresh
+2026-01-12 11:55:59 | INFO    | main.dataset.val - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0.0458984, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-12 11:55:59 | INFO    | main.dataset.val - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0.0458984, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-12 11:55:59 | INFO    | main.dataset.val - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0.0458984, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-12 11:55:59 | INFO    | main.dataset.val - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0.0458984, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-12 11:56:15 | INFO    | main.dataset.train - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-12 11:56:15 | INFO    | main.dataset.train - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-12 11:56:15 | INFO    | main.dataset.train - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-12 11:56:17 | INFO    | main.dataset.train - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0.00970459, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-15 16:13:46 | INFO    | main - Work directory: /gpfs/scratch/exoweather/imalsky/Chemulator2/models/big_flow
+2026-01-15 16:13:46 | INFO    | main - Set CUDA device to local_rank=0 (NVIDIA A100 80GB PCIe)
+2026-01-15 16:13:46 | INFO    | main - Set OMP_NUM_THREADS=4
+2026-01-15 16:13:46 | INFO    | main - Set torch num_threads=4
+2026-01-15 16:13:46 | INFO    | main - cudnn.benchmark=True
+2026-01-15 16:13:46 | INFO    | main - Hardware settings: TF32=True, cudnn.benchmark=True, deterministic=False, cudnn.deterministic=False
+2026-01-15 16:13:46 | INFO    | main - Precision config: Lightning=bf16-mixed, Dataset=torch.bfloat16
+2026-01-15 16:13:46 | INFO    | main - Resolved Lightning precision=bf16-mixed; dataset runtime dtype=torch.bfloat16
+2026-01-15 16:13:46 | INFO    | main - [pre] Reusing existing preprocessed data at /gpfs/scratch/exoweather/imalsky/Chemulator2/data/processed
+2026-01-15 16:13:46 | INFO    | main - [hydrate] Keeping cfg.data.species_variables (12 of 12 processed): ['C2H2_evolution', 'CH4_evolution', 'CO2_evolution', 'CO_evolution', 'H2O_evolution', 'H2_evolution', 'HCN_evolution', 'H_evolution', 'N2_evolution', 'NH3_evolution', ...] (+2 more)
+2026-01-15 16:13:46 | INFO    | main - [hydrate] cfg.data.target_species is empty; using the same list as species_variables (12 species).
+2026-01-15 16:13:46 | INFO    | main - Saved final hydrated config
+2026-01-15 16:13:46 | INFO    | main.dataset.train - Dataset species selection: cfg.data.species_variables matches processed list (12 species).
+2026-01-15 16:13:46 | INFO    | main.dataset.train - Dataset globals selection: cfg.data.global_variables matches processed list (2).
+2026-01-15 16:26:12 | INFO    | main.dataset.train - FlowMapPairsDataset init: split=train, shards=767, total_rows=49581263, T=100, S=12 (raw=12), G=2 (raw=2), shared_time_grid=True, dt_table_precomputed=True, shard_size_range=[72, 65536], stage_device=cpu, runtime_dtype=torch.bfloat16
+2026-01-15 16:26:12 | INFO    | main.dataset.train - FlowMapPairsDataset variables: species_variables=['C2H2_evolution', 'CH4_evolution', 'CO2_evolution', 'CO_evolution', 'H2O_evolution', 'H2_evolution', 'HCN_evolution', 'H_evolution', 'N2_evolution', 'NH3_evolution', ...] (+2 more); global_variables=['P', 'T']; time_variable='t_time'
+2026-01-15 16:26:12 | INFO    | main.dataset.val - Dataset species selection: cfg.data.species_variables matches processed list (12 species).
+2026-01-15 16:26:12 | INFO    | main.dataset.val - Dataset globals selection: cfg.data.global_variables matches processed list (2).
+2026-01-15 16:27:58 | INFO    | main.dataset.val - FlowMapPairsDataset init: split=validation, shards=144, total_rows=6192074, T=100, S=12 (raw=12), G=2 (raw=2), shared_time_grid=True, dt_table_precomputed=True, shard_size_range=[14444, 65536], stage_device=cpu, runtime_dtype=torch.bfloat16
+2026-01-15 16:27:58 | INFO    | main.dataset.val - FlowMapPairsDataset variables: species_variables=['C2H2_evolution', 'CH4_evolution', 'CO2_evolution', 'CO_evolution', 'H2O_evolution', 'H2_evolution', 'HCN_evolution', 'H_evolution', 'N2_evolution', 'NH3_evolution', ...] (+2 more); global_variables=['P', 'T']; time_variable='t_time'
+2026-01-15 16:27:58 | INFO    | main - [dl] B=2048 workers=4 prefetch=2 pin=True persistent_workers=True share_times_across_batch=False
+2026-01-15 16:27:58 | INFO    | main - Dataset stats: train=396650104 items/193676 batches; val=49536592 items/24188 batches
+2026-01-15 16:27:58 | INFO    | main - Creating model...
+2026-01-15 16:27:58 | INFO    | main - Model parameters: 11.58M
+2026-01-15 16:27:58 | INFO    | main.trainer - resume: /gpfs/scratch/exoweather/imalsky/Chemulator2/models/big_flow/last.ckpt
+2026-01-15 16:27:59 | INFO    | main.dataset.val - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0.0458984, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-15 16:27:59 | INFO    | main.dataset.val - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0.0458984, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-15 16:27:59 | INFO    | main.dataset.val - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0.0458984, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-15 16:27:59 | INFO    | main.dataset.val - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0.0458984, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-15 16:28:15 | INFO    | main.dataset.train - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-15 16:28:15 | INFO    | main.dataset.train - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-15 16:28:15 | INFO    | main.dataset.train - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-15 16:28:15 | INFO    | main.dataset.train - FlowMapPairsDataset first batch checks: y_i finite=True, y_j finite=True, dt finite=True, g finite=True, dt_range=[0.00970459, 1], batch_size=2048, K=4, S=12, G=2
+2026-01-16 15:52:16 | INFO    | main - Training complete. Best val loss: 1.140711e-02

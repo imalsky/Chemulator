@@ -38,7 +38,8 @@ create_model = model_module.create_model
 
 
 MODEL_DIR_ENV = "CHEMULATOR_MODEL_DIR"
-DEFAULT_MODEL_DIR = REPO_ROOT / "models" / "final_version"
+PROCESSED_DIR_ENV = "CHEMULATOR_PROCESSED_DIR"
+DEFAULT_MODEL_DIR = REPO_ROOT / "models" / "final_model"
 CONFIG_NAME = "config.json"
 PHYS_MODEL_FILENAME = "physical_model_k1_cpu.pt2"
 PHYS_METADATA_FILENAME = "physical_model_metadata.json"
@@ -55,7 +56,15 @@ METHOD_IDS = {
 
 
 def _runtime_assert(cond: torch.Tensor, message: str) -> None:
-    """Export-friendly runtime assert that survives torch.export tracing."""
+    """Runtime assert that survives torch.export tracing.
+
+    Mirrors src.model._runtime_assert: export runs on CPU (async assert
+    captured in the graph); MPS-eager falls back to torch._assert because
+    aten::_assert_async.msg is unimplemented for MPS in torch 2.8.
+    """
+    if cond.device.type == "mps":
+        torch._assert(cond, message)
+        return
     if hasattr(torch.ops.aten, "_assert_async") and hasattr(torch.ops.aten._assert_async, "msg"):
         torch.ops.aten._assert_async.msg(cond, message)
         return
@@ -112,12 +121,16 @@ def _extract_state_dict(payload: Any) -> Dict[str, torch.Tensor]:
             raise ValueError("No state dict found in checkpoint")
         state = tensor_items
 
+    legacy_prefixes = ("criterion.",)
+    legacy_exact = {"target_idx"}
     clean: Dict[str, torch.Tensor] = {}
     for k, v in state.items():
         kk = str(k)
         for prefix in ("model.", "module.", "_orig_mod."):
             if kk.startswith(prefix):
                 kk = kk[len(prefix):]
+        if kk in legacy_exact or any(kk.startswith(p) for p in legacy_prefixes):
+            continue
         if not isinstance(v, torch.Tensor):
             raise ValueError(f"State dict entry is not a tensor: {k}")
         clean[kk] = v
@@ -147,10 +160,37 @@ def _freeze_for_inference(model: nn.Module) -> nn.Module:
     return model
 
 
+def resolve_processed_dir(cfg: Mapping[str, Any], *, base_dir: Path = REPO_ROOT) -> Path:
+    """Resolve the processed-data root from the env override, else the config.
+
+    No silent fallback: a directory without normalization.json is a hard error.
+    A hydrated config records paths.processed_data_dir as it was at training
+    time, so it can be stale relative to the shards on disk; the error names the
+    override and the likely alternative instead of guessing.
+    """
+    raw = os.getenv(PROCESSED_DIR_ENV)
+    if raw:
+        processed_dir = Path(raw).expanduser().resolve()
+    else:
+        processed_dir = _resolve_cfg_path(cfg["paths"]["processed_data_dir"], base_dir=base_dir)
+
+    if (processed_dir / "normalization.json").is_file():
+        return processed_dir
+
+    alt = processed_dir / "processed"
+    hint = ""
+    if (alt / "normalization.json").is_file():
+        hint = f" A manifest does exist at {alt}, so the configured path is likely stale."
+    raise FileNotFoundError(
+        f"No normalization.json under processed data dir: {processed_dir}."
+        f" Set {PROCESSED_DIR_ENV} to override paths.processed_data_dir.{hint}"
+    )
+
+
 def _resolve_config_and_manifest(model_dir: Path) -> Tuple[Dict[str, Any], Dict[str, Any], Path]:
     cfg_path = model_dir / CONFIG_NAME
     cfg = _load_json(cfg_path)
-    processed_dir = _resolve_cfg_path(cfg["paths"]["processed_data_dir"], base_dir=REPO_ROOT)
+    processed_dir = resolve_processed_dir(cfg)
     manifest_path = processed_dir / "normalization.json"
     manifest = _load_json(manifest_path)
     return cfg, manifest, manifest_path
@@ -164,6 +204,37 @@ def _require_list(cfg: Mapping[str, Any], key: str) -> list[str]:
     if key == "species_variables" and not out:
         raise ValueError("data.species_variables must be non-empty")
     return out
+
+
+def _check_manifest_order(
+    manifest: Mapping[str, Any],
+    *,
+    species_keys: Sequence[str],
+    global_keys: Sequence[str],
+) -> None:
+    """Fail if the config ordering disagrees with the processed artifacts.
+
+    Mirrors the training-path check in src/main.py. The exported model is a
+    positional contract, so a permuted config.data.species_variables would
+    silently produce a mis-permuted artifact.
+    """
+    meta = manifest.get("meta")
+    if not isinstance(meta, Mapping):
+        return
+
+    man_species = [str(x) for x in (meta.get("species_variables") or [])]
+    if man_species and man_species != list(species_keys):
+        raise ValueError(
+            "cfg.data.species_variables does not match the processed artifacts. "
+            f"config={list(species_keys)}; manifest={man_species}"
+        )
+
+    man_globals = [str(x) for x in (meta.get("global_variables") or [])]
+    if man_globals and list(global_keys) and man_globals != list(global_keys):
+        raise ValueError(
+            "cfg.data.global_variables does not match the processed artifacts. "
+            f"config={list(global_keys)}; manifest={man_globals}"
+        )
 
 
 def _required_float(stats: Mapping[str, Any], key: str, name: str) -> float:
@@ -523,6 +594,7 @@ def main() -> int:
     data_cfg = cfg["data"]
     species_keys = [str(x) for x in _require_list(data_cfg, "species_variables")]
     global_keys = [str(x) for x in _require_list(data_cfg, "global_variables")]
+    _check_manifest_order(manifest, species_keys=species_keys, global_keys=global_keys)
 
     per_key_stats = manifest.get("per_key_stats")
     methods = manifest.get("normalization_methods")
@@ -604,9 +676,11 @@ def main() -> int:
 
     print(f"Model directory: {model_dir}")
     print(f"Loaded checkpoint: {ckpt_path}")
+    print(f"Normalization manifest: {manifest_path}")
     print(f"Wrote physical model: {out_model_path}")
     print(f"Wrote metadata: {out_meta_path}")
     print(f"Tip: override model dir via {MODEL_DIR_ENV}=<path>")
+    print(f"Tip: override processed data dir via {PROCESSED_DIR_ENV}=<path>")
     return 0
 
 

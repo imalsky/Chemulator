@@ -1,0 +1,25 @@
+# Chemulator: pinned Python environment.
+#
+# These are the versions this code is developed and tested against, on
+# Python 3.12.8 (conda env `nn`, macOS arm64) and on the HPC batch environment
+# used for training. Install with:
+#
+#   python -m pip install -r requirements.txt
+#
+# torch, numpy and h5py are required by src/ (run.sh and run.pbs check for them
+# before starting). matplotlib is only needed by the scripts in testing/.
+torch==2.8.0
+numpy==2.3.2
+h5py==3.14.0
+matplotlib==3.10.0
+
+# Optional: MPI-parallel file scanning in src/preprocessor.py. Off unless
+# preprocessing.use_mpi is enabled; single-process preprocessing needs nothing.
+# mpi4py==4.1.1
+
+# Note on the published model. models/final_model/best.ckpt was written by a
+# PyTorch Lightning 2.5.5 trainer on an A100 80GB; this repository has since
+# moved to a plain PyTorch loop. The torch version of that run is not recorded
+# in any artifact, so it is not pinned here. testing/export.py still reads the
+# Lightning checkpoint format, so the published model can be re-exported with
+# the versions above without retraining.
