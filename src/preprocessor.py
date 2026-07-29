@@ -21,6 +21,10 @@ Quality Control:
 - Time grid validation: Ensures monotonic, consistent time grids per file
 - NaN filtering: Removes trajectories with missing or invalid data
 - Dimension consistency: Validates all species variables are present
+- Retention accounting: Kept/dropped counts and fractions, broken down by reason,
+  are logged at the end of the run and written to preprocessing_summary.json and
+  preprocess_report.json. The min_value_threshold cut is a non-random selection on
+  composition, so it must never be applied silently.
 
 Performance:
 - MPI scales linearly with number of processes
@@ -258,11 +262,18 @@ class DataPreprocessor:
                 "n_valid": 0,
                 "n_dropped": 0,
                 "n_nan": 0,
-                "n_below_threshold": 0
+                "n_below_threshold": 0,
+                # Per-reason breakdown used by the retention record. n_scan_dropped
+                # covers schema/time-grid rejections during the scan phase (its NaN
+                # share is also inside n_nan), the rest are shard-phase drops.
+                "n_scan_dropped": 0,
+                "n_nonfinite_post_scan": 0,
+                "n_use_fraction": 0,
             }
         }
         self._valid_group_names = {}
         self._canonical_time = None
+        self._retention: Optional[Dict[str, Any]] = None
 
     def _setup_mpi_context(self) -> tuple[Any, int, int]:
         """Resolve MPI mode and initialize communicator only when required."""
@@ -666,6 +677,7 @@ class DataPreprocessor:
                 overall["n_total"] += n_total
                 overall["n_valid"] += n_valid
                 overall["n_dropped"] += n_dropped
+                overall["n_scan_dropped"] += n_dropped
                 overall["n_nan"] += int(file_report.get("groups_nan_time", 0))
 
                 # Use canonical key from worker report
@@ -728,6 +740,7 @@ class DataPreprocessor:
             overall["n_total"] += n_total
             overall["n_valid"] += n_valid
             overall["n_dropped"] += n_dropped
+            overall["n_scan_dropped"] += n_dropped
             overall["n_nan"] += int(file_report.get("groups_nan_time", 0))
 
             # Keep a consistent key (absolute path string)
@@ -1114,7 +1127,9 @@ class DataPreprocessor:
                 dropped_post_scan = total_nan + total_below + total_use_fraction
                 overall = self._drop_report["overall"]
                 overall["n_nan"] += total_nan
+                overall["n_nonfinite_post_scan"] += total_nan
                 overall["n_below_threshold"] += total_below
+                overall["n_use_fraction"] += total_use_fraction
                 overall["n_dropped"] += dropped_post_scan
                 overall["n_valid"] = max(0, int(overall["n_valid"]) - dropped_post_scan)
 
@@ -1136,6 +1151,7 @@ class DataPreprocessor:
                         merged_shards_metadata[split].extend(metadata[split])
 
                 # Write metadata files
+                self._finalize_retention(merged_split_counts)
                 self._write_shard_index(merged_shards_metadata)
                 self._write_preprocessing_summary(merged_split_counts)
 
@@ -1158,10 +1174,13 @@ class DataPreprocessor:
             dropped_post_scan = int(local_nan_count + local_below_threshold_count + local_use_fraction_count)
             overall = self._drop_report["overall"]
             overall["n_nan"] += int(local_nan_count)
+            overall["n_nonfinite_post_scan"] += int(local_nan_count)
             overall["n_below_threshold"] += int(local_below_threshold_count)
+            overall["n_use_fraction"] += int(local_use_fraction_count)
             overall["n_dropped"] += dropped_post_scan
             overall["n_valid"] = max(0, int(overall["n_valid"]) - dropped_post_scan)
             self._require_non_empty_splits(local_split_counts)
+            self._finalize_retention(local_split_counts)
             self._write_shard_index(local_shards_metadata)
             self._write_preprocessing_summary(local_split_counts)
             self.logger.info(
@@ -1578,6 +1597,96 @@ class DataPreprocessor:
 
         self.logger.info("Wrote shard_index.json")
 
+    def _finalize_retention(self, split_counts: Dict[str, int]) -> Dict[str, Any]:
+        """Build the trajectory retention record and log it prominently (rank 0).
+
+        Trajectories are dropped whole, and the min_value_threshold cut is a
+        selection on composition rather than a random subsample: it removes every
+        trajectory whose smallest species value falls below the threshold. The
+        counts therefore belong in the log and in the artifacts, so that a run
+        cannot discard a large share of the database without it being visible.
+        """
+        overall = self._drop_report["overall"]
+        n_total = int(overall["n_total"])
+        n_dropped = int(overall["n_dropped"])
+        n_kept = int(sum(int(v) for v in split_counts.values()))
+
+        def _fraction(count: int) -> float:
+            return float(count) / float(n_total) if n_total > 0 else 0.0
+
+        reasons = {
+            "scan_schema_or_time_grid": int(overall["n_scan_dropped"]),
+            "nonfinite_values": int(overall["n_nonfinite_post_scan"]),
+            "below_min_value_threshold": int(overall["n_below_threshold"]),
+            "use_fraction_subsample": int(overall["n_use_fraction"]),
+        }
+
+        retention = {
+            "n_trajectories_raw": n_total,
+            "n_trajectories_kept": n_kept,
+            "n_trajectories_dropped": n_dropped,
+            "kept_fraction": _fraction(n_kept),
+            "dropped_fraction": _fraction(n_dropped),
+            "min_value_threshold": float(self.min_value_threshold),
+            "dropped_by_reason": reasons,
+            "dropped_fraction_by_reason": {
+                name: _fraction(count) for name, count in reasons.items()
+            },
+            "note": (
+                "Trajectories are dropped whole. The min_value_threshold cut removes every "
+                "trajectory whose minimum species value falls below "
+                "preprocessing.min_value_threshold, which is a selection on composition and not "
+                "a uniform subsample of the raw database. Report the retained fraction alongside "
+                "any result derived from this processed dataset."
+            ),
+        }
+
+        self.logger.info("[retention] ---- trajectory retention ----")
+        self.logger.info("[retention] raw trajectories scanned: %d", n_total)
+        self.logger.info("[retention] kept:    %d (%.2f%% of raw)", n_kept, 100.0 * _fraction(n_kept))
+        self.logger.info("[retention] dropped: %d (%.2f%% of raw)", n_dropped, 100.0 * _fraction(n_dropped))
+        for name, count in reasons.items():
+            self.logger.info(
+                "[retention]   %-26s %12d (%.2f%%)", name, count, 100.0 * _fraction(count)
+            )
+
+        accounted = int(sum(reasons.values()))
+        if accounted != n_dropped or n_kept != max(0, n_total - n_dropped):
+            self.logger.warning(
+                "[retention] Drop accounting is inconsistent: dropped=%d by-reason-sum=%d "
+                "kept=%d raw=%d. Treat the per-reason breakdown as approximate.",
+                n_dropped, accounted, n_kept, n_total,
+            )
+
+        n_below = reasons["below_min_value_threshold"]
+        if n_below > 0:
+            self.logger.warning(
+                "[retention] preprocessing.min_value_threshold=%g discarded %d of %d trajectories "
+                "(%.2f%%). This cut is not random: it removes trajectories by minimum species "
+                "value, so the retained sample is biased against low-abundance conditions. "
+                "Disclose it with any result derived from this dataset.",
+                float(self.min_value_threshold), n_below, n_total, 100.0 * _fraction(n_below),
+            )
+
+        self._retention = retention
+        return retention
+
+    def _split_provenance(self) -> Dict[str, Any]:
+        """Record how train/validation/test membership was decided."""
+        return {
+            "seed": int(self.seed),
+            "hash_key_template": "<resolved_raw_file_path>:<group_name>:split",
+            "val_fraction": float(self.val_fraction),
+            "test_fraction": float(self.test_fraction),
+            "use_fraction": float(self.use_fraction),
+            "note": (
+                "Split assignment hashes the fully resolved absolute path of each raw file "
+                "together with the trajectory group name, so re-running preprocessing with the "
+                "raw data at a different location yields a different partition. Archive the "
+                "processed shards to preserve this exact train/validation/test split."
+            ),
+        }
+
     def _write_preprocessing_summary(self, split_counts: Dict[str, int]) -> None:
         """Write preprocessing summary file."""
         summary = {
@@ -1588,6 +1697,7 @@ class DataPreprocessor:
                 "test": int(split_counts["test"]),
             },
             "overall_from_scan": self._drop_report["overall"],
+            "retention": self._retention,
             "time_grid_len": int(self._canonical_time.shape[0]) if self._canonical_time is not None else 0,
             "species_variables": self.species_vars,
             "global_variables": self.global_vars,
@@ -1613,9 +1723,14 @@ class DataPreprocessor:
             manifest_end: float
     ) -> None:
         """Write final preprocessing report."""
+        if self._retention is None:
+            raise RuntimeError("Retention record not finalized before writing reports")
+
         report = {
             "min_value_threshold": self.min_value_threshold,
             "overall_from_scan": self._drop_report["overall"],
+            "retention": self._retention,
+            "split_assignment": self._split_provenance(),
             "timings_sec": {
                 "scan_phase": round(scan_end - scan_start, 3),
                 "dt_computation": round(dt_end - dt_start, 3),
@@ -1639,3 +1754,14 @@ class DataPreprocessor:
             json.dump(report, f, indent=2)
 
         self.logger.info("Wrote preprocess_report.json")
+
+        # Final one-line recap so the retention cut is visible at the tail of the log.
+        self.logger.info(
+            "[retention] kept %d of %d trajectories (%.2f%%); %d dropped by "
+            "min_value_threshold=%g. Full breakdown in preprocess_report.json.",
+            int(self._retention["n_trajectories_kept"]),
+            int(self._retention["n_trajectories_raw"]),
+            100.0 * float(self._retention["kept_fraction"]),
+            int(self._retention["dropped_by_reason"]["below_min_value_threshold"]),
+            float(self.min_value_threshold),
+        )

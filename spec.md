@@ -73,7 +73,9 @@ Engineering style requirements:
 
 ## 3. Canonical Paths And Config
 
-- Canonical default config file: `config/config_job0.jsonc`.
+- Canonical default config file: `config/config_stage1.jsonc` (production
+  stage-1 pretrain). The only other config is `config/config_stage2.jsonc`
+  (autoregressive fine-tune; see §10.2).
 - No CLI parser arguments are required.
 - Default behavior should load that repository-local default config path directly.
 - Multi-job usage (`job0`, `job1`, etc.) is supported by separate config files, but not via argparse.
@@ -163,7 +165,9 @@ This is considered sufficient for leakage control in this project.
 
 ## 10. Model/Training Defaults
 
-- Default model family: autoencoder flow-map.
+- Default model family: latent-linear flow map (`model.architecture =
+  "latent_linear"`); see §10.1. The autoencoder and MLP flow maps remain
+  selectable for A/B comparison and back-compatibility.
 - Default prediction head: `predict_delta`.
 - Optimizer support target: AdamW only.
 - Gradient accumulation is not supported.
@@ -173,6 +177,136 @@ This is considered sufficient for leakage control in this project.
   - Worker-local RNG streams are seeded once from DataLoader worker seeds.
   - Determinism is guaranteed at the run level for fixed seed/config; there is no strict deterministic mapping from `(epoch, idx)` to a specific sampled pair.
   - `set_epoch()` does not reseed pair sampling.
+
+### 10.1 Model Architectures
+
+`model.architecture` selects the flow-map family. All three obey the same
+forward contract — `forward(y_i [B,S], dt_norm [B,K]|[B,K,1], g [B,G]) ->
+y_pred_z [B,K,S]` in z-space, validating `dt_norm ∈ [0,1]` — and share the
+same prediction heads (`predict_delta`, `predict_delta_log_phys`,
+`softmax_head`), implemented once so cross-architecture comparisons are fair.
+
+- `"autoencoder"` — Encoder → LatentDynamics → Decoder (`FlowMapAutoencoder`).
+- `"mlp"` — single (residual) MLP over `[y_i, dt_norm, g]` (`FlowMapMLP`).
+- `"latent_linear"` — the default; see below (`LatentLinearFlowMap`).
+
+Selection and back-compatibility (fail-fast):
+
+- If `model.architecture` is present it is authoritative, and `model.mlp_only`
+  MUST be absent (specifying both is a hard error — no silent precedence).
+- If `model.architecture` is absent, dispatch falls back to the legacy
+  `model.mlp_only` switch unchanged (`true` → `"mlp"`, `false` →
+  `"autoencoder"`). Legacy configs therefore keep working untouched.
+- `model.architecture = "latent_linear"` forbids the `dynamics_hidden` /
+  `dynamics_residual` keys (they are no-ops for this family — hard error
+  rather than silently ignore them).
+
+#### Latent-linear flow map
+
+The latent-linear flow map is the campaign-recommended architecture (June 2026
+Robertson sandbox study; condensed record in the umbrella-level
+`EXPERIMENTS.md`, port design in `IMPLEMENTATION_PLAN.md`). A shared encoder
+trunk reads the anchor state and emits an initial latent, a target
+("equilibrium") latent, and per-mode log10 decay rates; the latent relaxes in
+closed form and a decoder emits the species update:
+
+```
+feats        = trunk([y_i, g])                       # state-dependent features
+h0, h_eq     = head_h0(feats), head_heq(feats)       # [B,L] each
+log10_k      = head_rate(feats)                       # [B,L] per-mode log10 rates
+log10_dt     = dt_log_min + dt_norm * (dt_log_max - dt_log_min)
+decay        = exp(-10 ** clamp(log10_k + log10_dt, max=rate_clamp))
+h(dt)        = h_eq + decay * (h0 - h_eq)             # exact diagonal linear ODE
+out          = Decoder(h(dt))                          # then the shared head
+```
+
+Required behavior / fail-fast rules:
+
+- Rates AND equilibrium MUST be state-dependent (both from the encoder trunk);
+  a fixed/global operator was the single worst formulation in the campaign, so
+  the trunk (`model.encoder_hidden`) must be non-empty.
+- `dt_log_min` / `dt_log_max` MUST be read from the dataset's normalization
+  manifest (`normalization.json` `dt.log_min`/`dt.log_max`) at build time and
+  stored as model buffers — never hardcoded (they are dataset properties). A
+  missing manifest or dt spec is a hard error.
+- `model.decoder_mode = "mlp"` requires non-empty `model.decoder_hidden`;
+  `"linear"` (the interpretable "lindec" deployment variant) requires
+  `model.decoder_hidden = []`. Mismatch is a hard error.
+- The relaxation path runs in fp32 regardless of AMP policy. `log10(k·dt)` is
+  clamped from above at `model.rate_clamp` (default `3.0`) to keep `10**x`
+  finite; there is no lower clamp (decay→1 underflow is exact).
+- The rate-head bias is drawn from `U(model.rate_init)` (default `[-5, 5]`)
+  using a generator seeded with `model.init_seed`, so builds are reproducible.
+
+Required `model` keys for `architecture = "latent_linear"`: `latent_dim`,
+`encoder_hidden`, `decoder_mode`, `decoder_hidden`, `rate_clamp`, `rate_init`,
+`init_seed`, plus the common keys `activation`, `dropout`, `predict_delta`,
+`predict_delta_log_phys`, `softmax_head`.
+
+Recommended starting points (production scale): `latent_dim` ≈ 128 (latent
+expansion `L >> S` is the load-bearing knob, not hidden width),
+`encoder_hidden`/`decoder_hidden` `[1024, 1024]`, `activation` `"silu"`,
+`predict_delta` true, and the pure log10-MAE loss
+(`training.adaptive_stiff_loss.lambda_z = 0.0`; the MSE-z term was found
+inert). The `"linear"` decoder variant (`decoder_mode = "linear"`, lindec) is a
+deployment-tilted option (9–14% fixed-dt edge, p≈0.03) gated on a
+production-scale fixed-dt spot-check — not the default.
+
+Note (training scope): training defaults to strictly one-step pairs (§0). The
+latent-linear architecture is adopted because it is the best one-step flow map
+AND because it remains accurate when stepped autoregressively at fixed `dt` in a
+host model. An **optional** autoregressive training regime is now available
+(§10.2); it is off by default, so the one-step contract above is unchanged
+unless explicitly enabled.
+
+### 10.2 Autoregressive (rollout) training regime — stage 2
+
+Production training is **two-stage** (the campaign-validated recipe; umbrella
+`EXPERIMENTS.md`). Stage 1 (`config_stage1.jsonc`) is the one-step-from-t0 flow
+map above. Stage 2 (`config_stage2.jsonc`) warm-starts from stage-1 weights
+(`training.init_from`, weights only + fresh optimizer at lr/10) and fine-tunes
+autoregressively. Off by default — when the `training.rollout` block is absent or
+`enabled=false`, training is exactly the one-step contract.
+
+When enabled, training switches to a **consecutive-step stepper**: a sample is a
+random anchor plus up to `horizon` consecutive grid steps; the trainer unrolls
+the current curriculum horizon feeding the model's own prediction forward.
+
+Config (`training.rollout`, all required when `enabled=true`; fail-fast in
+`main.validate_rollout_config` + the trainer):
+
+- `enabled` (bool).
+- `horizon` (int ≥ 1) — max consecutive steps. **K=10** (E3: inverted-U; K=1
+  underfits, K=20 unstable).
+- `curriculum_start` (int in [1, horizon]) + `curriculum_ramp_epochs` (int ≥ 0)
+  — linearly ramp the horizon from `curriculum_start` to `horizon` over the ramp
+  (validated **1→10**; constant if ramp=0).
+- `detach_intermediate` (bool) — detach between steps (pushforward). Validated
+  recipe = detached; E4 found detach ≈ full BPTT, detach is cheaper at scale.
+- `discount_gamma` (float in (0,1]) — per-step discount `γ^i` on scored steps.
+  Under detach, **γ<1 is required** (E3: uniform γ=1.0 was 4–14× worse);
+  validated **0.9**. (Irrelevant under BPTT.)
+- `pushforward_skip` (int ≥ 0) — leading no-grad warm steps (Brandstetter);
+  validated **2**.
+- `input_noise_std` (float ≥ 0) — **kept at 0**. GNS-style input noise was
+  **rejected** (E6: 4/4 worse, 3/4 catastrophic 12–14 dex); the knob exists only
+  for the record (if ever revisited, σ ≤ 1e-3).
+
+`training.ema` ({`enabled`, `decay`}) maintains an EMA of the weights; when on,
+`best.ckpt` holds the EMA weights (selected + exported), `last.ckpt` the raw
+weights (resume). `training.init_from` (path) warm-starts model weights only
+(fresh optimizer/schedule) and is mutually exclusive with `training.resume`.
+
+Required behavior / fail-fast rules:
+
+- `enabled=true` requires `dataset.use_first_anchor=false`. `min_steps`/`max_steps`
+  become inert; `pairs_per_traj` = random anchors per trajectory per epoch. The
+  unused one-step `dt_table` is not built in this mode.
+- **Selection metric is fixed-dt rollout at the deployment dt** (the catastrophe
+  detector), with the geometric-grid rollout as the fine discriminator — never
+  one-step/val loss (campaign ρ(one-shot, rollout) = 0.41).
+- Inference/export are unaffected — the trained model is still a one-step
+  physical-I/O artifact (§5); only the training objective changes.
 
 ## 11. Error Handling Policy
 

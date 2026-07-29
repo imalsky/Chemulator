@@ -182,24 +182,34 @@ class AdaptiveStiffLoss(nn.Module):
         self.register_buffer("log_std", torch.tensor(log_stds, dtype=torch.float32), persistent=False)
         self.register_buffer("stat_log_min", torch.tensor(log_mins, dtype=torch.float32), persistent=False)
         self.register_buffer("stat_log_max", torch.tensor(log_maxs, dtype=torch.float32), persistent=False)
-        self.register_buffer("m_standard", self.method_code == _NORM_CODE_STANDARD, persistent=False)
-        self.register_buffer("m_minmax", self.method_code == _NORM_CODE_MIN_MAX, persistent=False)
-        self.register_buffer("m_log_standard", self.method_code == _NORM_CODE_LOG_STANDARD, persistent=False)
-        self.register_buffer("m_log_minmax", self.method_code == _NORM_CODE_LOG_MIN_MAX, persistent=False)
+        # Per-method masks are constants of the manifest: use them here and drop
+        # them. Registering them as buffers only invited per-step device->host
+        # syncs on the hot path (they were never read after construction).
+        m_standard = self.method_code == _NORM_CODE_STANDARD
+        m_minmax = self.method_code == _NORM_CODE_MIN_MAX
+        m_log_standard = self.method_code == _NORM_CODE_LOG_STANDARD
+        m_log_minmax = self.method_code == _NORM_CODE_LOG_MIN_MAX
 
         # Runtime normalization safety checks (spec requirement).
-        if bool(torch.any(self.m_standard & (self.std <= 0.0))):
+        if bool(torch.any(m_standard & (self.std <= 0.0))):
             raise ValueError("Invalid standard normalization stats: std must be > 0")
-        if bool(torch.any(self.m_standard & (self.std < self.min_std))):
+        if bool(torch.any(m_standard & (self.std < self.min_std))):
             raise ValueError("std below min_std in loss normalization path")
-        if bool(torch.any(self.m_minmax & ((self.vmax - self.vmin) <= 0.0))):
+        if bool(torch.any(m_minmax & ((self.vmax - self.vmin) <= 0.0))):
             raise ValueError("Invalid min-max normalization stats: max must be > min")
-        if bool(torch.any(self.m_log_standard & (self.log_std <= 0.0))):
+        if bool(torch.any(m_log_standard & (self.log_std <= 0.0))):
             raise ValueError("Invalid log-standard normalization stats: log_std must be > 0")
-        if bool(torch.any(self.m_log_standard & (self.log_std < self.min_std))):
+        if bool(torch.any(m_log_standard & (self.log_std < self.min_std))):
             raise ValueError("log_std below min_std in loss normalization path")
-        if bool(torch.any(self.m_log_minmax & ((self.stat_log_max - self.stat_log_min) <= 0.0))):
+        if bool(torch.any(m_log_minmax & ((self.stat_log_max - self.stat_log_min) <= 0.0))):
             raise ValueError("Invalid log-min-max normalization stats: log_max must be > log_min")
+
+        # When every species is log-standard (the production manifest), the
+        # z -> log10(phys) map is a single affine op. Decide that once here so
+        # the loss never runs the generic masked helper, whose four
+        # bool(torch.any(...)) branch tests each force a device->host sync.
+        # The affine result is bitwise identical to the generic path.
+        self._log_standard_only = bool(torch.all(m_log_standard))
 
         # Cache the reciprocal of numel per forward to avoid per-batch tensor creation.
         self._cached_numel: int = 0
@@ -208,6 +218,8 @@ class AdaptiveStiffLoss(nn.Module):
     def _z_to_log10_phys(self, z: torch.Tensor) -> torch.Tensor:
         """Convert z-space species [..., S] directly to log10(physical) [..., S]."""
         z32 = z.to(torch.float32)
+        if self._log_standard_only:
+            return z32 * self.log_std + self.log_mean
         return _shared_z_to_log10_phys(
             z32,
             method_code=self.method_code,
@@ -274,7 +286,6 @@ class AdaptiveStiffLoss(nn.Module):
                 "phys": phys,
                 "z": zterm,
                 "mean_abs_log10": mean_abs_log10,
-                "weighted_mean_abs_log10": weighted_mean_abs_log10,
             }
         return total
 
@@ -286,29 +297,41 @@ class AdaptiveStiffLoss(nn.Module):
 
 @dataclass
 class _EpochMeters:
-    loss_sum: float = 0.0
-    phys_sum: float = 0.0
-    z_sum: float = 0.0
-    abslog_sum: float = 0.0
+    """Weight-averaged loss components over an epoch.
+
+    The running state stays on the device and is read back once, in means().
+    Reading .item() per batch instead syncs the device to the host four times
+    per training step, before backward is even enqueued. The update is the
+    incremental weighted-mean form rather than a running sum: it holds its
+    accuracy over the ~1e5 steps of an epoch in float32, which matters because
+    MPS has no float64.
+    """
+
+    # [4]: loss, phys, z, mean_abs_log10. Allocated on the first update.
+    running: Optional[torch.Tensor] = None
     weight_sum: float = 0.0
 
     def update(self, comps: Dict[str, torch.Tensor], weight: int) -> None:
         w = float(weight)
-        self.loss_sum += float(comps["total"].item()) * w
-        self.phys_sum += float(comps["phys"].item()) * w
-        self.z_sum += float(comps["z"].item()) * w
-        self.abslog_sum += float(comps["mean_abs_log10"].item()) * w
+        vals = torch.stack(
+            (
+                comps["total"].detach(),
+                comps["phys"].detach(),
+                comps["z"].detach(),
+                comps["mean_abs_log10"].detach(),
+            )
+        ).to(torch.float32)
         self.weight_sum += w
+        if self.running is None:
+            self.running = vals
+        else:
+            self.running.add_((vals - self.running) * (w / self.weight_sum))
 
     def means(self) -> Dict[str, float]:
-        if self.weight_sum <= 0.0:
+        if self.weight_sum <= 0.0 or self.running is None:
             raise ValueError("Empty epoch")
-        return {
-            "loss": self.loss_sum / self.weight_sum,
-            "phys": self.phys_sum / self.weight_sum,
-            "z": self.z_sum / self.weight_sum,
-            "mean_abs_log10": self.abslog_sum / self.weight_sum,
-        }
+        loss, phys, z, abslog = self.running.tolist()
+        return {"loss": loss, "phys": phys, "z": z, "mean_abs_log10": abslog}
 
 
 def _mult_err_proxy(mean_abs_log10: float) -> float:
@@ -327,18 +350,48 @@ def _save_checkpoint(
     global_step: int,
     best_val_loss: float,
     cfg: Dict[str, Any],
+    model_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     ckpt = {
         "epoch": int(epoch),
         "global_step": int(global_step),
         "best_val_loss": float(best_val_loss),
-        "model_state": model.state_dict(),
+        "model_state": model.state_dict() if model_state is None else model_state,
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "scaler_state": scaler.state_dict() if scaler is not None else None,
         "cfg": cfg,
     }
     torch.save(ckpt, path)
+
+
+def _model_state_from_payload(payload: Any, path: Path) -> Dict[str, torch.Tensor]:
+    """Model weights from a checkpoint payload, for weight-only warm start.
+
+    Accepts this trainer's own checkpoints ("model_state"), the Lightning-era
+    checkpoints of the archived paper run ("state_dict", keys prefixed "model."
+    and carrying loss-side buffers that are not model parameters), and a bare
+    state_dict. testing/export.py applies the same normalization.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(f"Checkpoint payload is not a dict: {path}")
+    if "model_state" in payload:
+        return dict(payload["model_state"])
+
+    state = payload.get("state_dict")
+    if not isinstance(state, dict):
+        return dict(payload)
+
+    clean: Dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        name = str(key)
+        for prefix in ("model.", "module.", "_orig_mod."):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+        if name == "target_idx" or name.startswith("criterion."):
+            continue  # loss-side buffers, not part of the model
+        clean[name] = value
+    return clean
 
 
 def _load_checkpoint(
@@ -355,6 +408,12 @@ def _load_checkpoint(
         load_kwargs["weights_only"] = False
 
     ckpt = torch.load(path, **load_kwargs)
+    if not isinstance(ckpt, dict) or "model_state" not in ckpt:
+        raise KeyError(
+            f"{path} was not written by this trainer (no 'model_state'). Full-run "
+            "resume needs this trainer's optimizer/scheduler/scaler state; to start "
+            "from foreign weights only, use training.init_from instead."
+        )
     model.load_state_dict(ckpt["model_state"], strict=True)
     optimizer.load_state_dict(ckpt["optimizer_state"])
     if scheduler is not None and ckpt.get("scheduler_state") is not None:
@@ -417,6 +476,80 @@ class Trainer:
         self.save_every_n_epochs = int(tcfg.get("save_every_n_epochs", 1))
         if self.save_every_n_epochs < 1:
             self.save_every_n_epochs = 1
+
+        # Rollout (autoregressive) training: opt-in via training.rollout. When
+        # enabled, training switches from one-step-from-t0 to a consecutive-step
+        # stepper. Each batch is an anchor + `horizon` consecutive grid steps;
+        # the trainer unrolls up to `horizon` steps feeding the model's own
+        # prediction forward. The recipe follows the campaign-validated result
+        # (../EXPERIMENTS.md, the "Best training recipe"; raw log notes.md):
+        #   - horizon K (E3: K=10 optimal) reached via a curriculum that ramps
+        #     `curriculum_start` -> `horizon` over `curriculum_ramp_epochs`,
+        #   - detached states between steps with per-step `discount_gamma`
+        #     (E3: under detach, gamma<1 is REQUIRED — uniform was 4-14x worse),
+        #   - `pushforward_skip` leading no-grad warm steps (Brandstetter 2022),
+        #   - input noise OFF (E6: GNS-style noise REJECTED — 4/4 worse, 3/4
+        #     catastrophic 12-14 dex). The knob is retained (default 0) only so
+        #     a future <=1e-3 sweep is possible; do not enable it without cause.
+        rcfg = tcfg.get("rollout", {}) or {}
+        self.rollout_enabled = bool(rcfg.get("enabled", False))
+        self.rollout_horizon = 1
+        self.rollout_detach = True
+        self.rollout_gamma = 1.0
+        self.rollout_skip = 0
+        self.rollout_noise_std = 0.0
+        self.rollout_curriculum_start = 1
+        self.rollout_curriculum_ramp = 0
+        if self.rollout_enabled:
+            _required = ("horizon", "detach_intermediate", "discount_gamma",
+                         "pushforward_skip", "input_noise_std",
+                         "curriculum_start", "curriculum_ramp_epochs")
+            _missing = [k for k in _required if k not in rcfg]
+            if _missing:
+                raise KeyError(f"Missing config: training.rollout.{_missing}")
+            self.rollout_horizon = int(rcfg["horizon"])
+            if self.rollout_horizon < 1:
+                raise ValueError("training.rollout.horizon must be >= 1")
+            self.rollout_detach = bool(rcfg["detach_intermediate"])
+            self.rollout_gamma = float(rcfg["discount_gamma"])
+            if not (0.0 < self.rollout_gamma <= 1.0):
+                raise ValueError("training.rollout.discount_gamma must be in (0, 1]")
+            self.rollout_skip = int(rcfg["pushforward_skip"])
+            if self.rollout_skip < 0:
+                raise ValueError("training.rollout.pushforward_skip must be >= 0")
+            self.rollout_noise_std = float(rcfg["input_noise_std"])
+            if not math.isfinite(self.rollout_noise_std) or self.rollout_noise_std < 0.0:
+                raise ValueError("training.rollout.input_noise_std must be finite and >= 0")
+            self.rollout_curriculum_start = int(rcfg["curriculum_start"])
+            if not (1 <= self.rollout_curriculum_start <= self.rollout_horizon):
+                raise ValueError("training.rollout.curriculum_start must be in [1, horizon]")
+            self.rollout_curriculum_ramp = int(rcfg["curriculum_ramp_epochs"])
+            if self.rollout_curriculum_ramp < 0:
+                raise ValueError("training.rollout.curriculum_ramp_epochs must be >= 0")
+            if not self.rollout_detach and self.rollout_gamma != 1.0:
+                self.log.warning(
+                    "training.rollout.discount_gamma=%.3f with detach_intermediate=false "
+                    "(BPTT): gamma is irrelevant under BPTT (E3/E4) — using it anyway.",
+                    self.rollout_gamma,
+                )
+
+        # EMA (exponential moving average of weights). Production selects/exports
+        # the EMA weights (literature: ACE ~+15% long-rollout). best.ckpt holds
+        # EMA weights (deployable); last.ckpt holds raw weights (for resume).
+        # Softest-evidence ingredient of the recipe — off unless requested.
+        ecfg = tcfg.get("ema", {}) or {}
+        self.ema_enabled = bool(ecfg.get("enabled", False))
+        self.ema_decay = float(ecfg.get("decay", 0.999))
+        if self.ema_enabled and not (0.0 < self.ema_decay < 1.0):
+            raise ValueError("training.ema.decay must be in (0, 1)")
+        self.ema_shadow: Optional[Dict[str, torch.Tensor]] = None
+        self._raw_backup: Optional[Dict[str, torch.Tensor]] = None
+
+        # Two-stage warm-start (`init_from`, weights only) vs crash-resume
+        # (`resume`, full run state) are mutually exclusive.
+        if (isinstance(tcfg.get("init_from"), str) and tcfg["init_from"].strip()
+                and isinstance(tcfg.get("resume"), str) and tcfg["resume"].strip()):
+            raise ValueError("training.resume and training.init_from are mutually exclusive")
 
         opt_name = str(tcfg["optimizer"]).lower().strip()
         if opt_name != "adamw":
@@ -533,6 +666,30 @@ class Trainer:
 
         return None
 
+    def _maybe_init_from(self) -> None:
+        """Two-stage warm-start: load ONLY model weights from a prior stage's
+        checkpoint, with a fresh optimizer / schedule / epoch counter. This is
+        how stage-2 (autoregressive fine-tune at lr/10) starts from stage-1
+        (one-jump pretrain) weights. Distinct from `training.resume` (full
+        crash-resume of the same run). Skipped if a resume already restored a run.
+        Also accepts the Lightning-era checkpoint layout of the archived paper
+        run (see _model_state_from_payload).
+        """
+        if self.start_epoch > 0:
+            return
+        raw = self.cfg["training"].get("init_from")
+        if not (isinstance(raw, str) and raw.strip()):
+            return
+        p = _resolve_repo_path(raw)
+        if not p.is_file():
+            raise FileNotFoundError(f"training.init_from checkpoint not found: {p}")
+        load_kwargs: dict[str, Any] = {"map_location": self.device}
+        if "weights_only" in inspect.signature(torch.load).parameters:
+            load_kwargs["weights_only"] = False
+        state = _model_state_from_payload(torch.load(p, **load_kwargs), p)
+        self.model.load_state_dict(state, strict=True)
+        self.log.info("Warm-started model weights from %s (fresh optimizer/schedule)", str(p))
+
     def _maybe_resume(self) -> None:
         p = self._resume_path()
         if p is None:
@@ -571,11 +728,131 @@ class Trainer:
     def _to_device(self, x: torch.Tensor) -> torch.Tensor:
         return x.to(self.device, non_blocking=(self.device.type == "cuda"))
 
+    def _current_horizon(self, epoch: int) -> int:
+        """Curriculum: linearly ramp the rollout horizon from
+        ``curriculum_start`` to ``horizon`` over ``curriculum_ramp_epochs``
+        (E3 / GraphCast/Stormer staged-horizon practice). Constant if ramp=0."""
+        K = self.rollout_horizon
+        if self.rollout_curriculum_ramp <= 0:
+            return K
+        start = self.rollout_curriculum_start
+        frac = min(1.0, max(0.0, epoch / float(self.rollout_curriculum_ramp)))
+        return max(start, min(K, int(round(start + frac * (K - start)))))
+
+    # ------------------------------ EMA ----------------------------------
+
+    def _ema_update(self) -> None:
+        if not self.ema_enabled or self.ema_shadow is None:
+            return
+        d = self.ema_decay
+        with torch.no_grad():
+            for n, p in self.model.named_parameters():
+                self.ema_shadow[n].mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    def _ema_state_dict(self) -> Dict[str, torch.Tensor]:
+        """Full state_dict with parameters replaced by their EMA shadow (buffers
+        — e.g. the dt-bound constants — are taken from the live model)."""
+        sd = dict(self.model.state_dict())
+        for n, v in (self.ema_shadow or {}).items():
+            sd[n] = v.detach().clone()
+        return sd
+
+    def _swap_to_ema(self) -> None:
+        """Temporarily load EMA weights into the model (for EMA validation)."""
+        self._raw_backup = {n: p.detach().clone() for n, p in self.model.named_parameters()}
+        with torch.no_grad():
+            for n, p in self.model.named_parameters():
+                p.copy_(self.ema_shadow[n])
+
+    def _restore_raw(self) -> None:
+        if self._raw_backup is None:
+            return
+        with torch.no_grad():
+            for n, p in self.model.named_parameters():
+                p.copy_(self._raw_backup[n])
+        self._raw_backup = None
+
+    def _forward_loss(self, batch, *, is_train: bool, epoch: int):
+        """Compute (loss, comps, n_elements) for one batch. Call inside autocast.
+
+        One-step (default): a single model call predicting the K targets from the
+        anchor. Rollout (training.rollout.enabled): unroll up to the current
+        curriculum horizon of CONSECUTIVE grid steps, feeding the model's own
+        prediction forward. The first ``pushforward_skip`` steps are no-grad warm
+        steps (off-manifold input generation); the remaining scored steps use a
+        per-step discount ``gamma^i`` and are detached between steps (pushforward)
+        unless ``detach_intermediate=false`` (full BPTT). ``comps`` carries the
+        scalar total plus phys/z/mean_abs_log10 for logging.
+        """
+        y0, dt, y_tgt, g = batch
+        y0 = self._to_device(y0)
+        dt = self._to_device(dt)
+        y_tgt = self._to_device(y_tgt)
+        g = self._to_device(g)
+
+        if not self.rollout_enabled:
+            pred = self.model(y0, dt, g)
+            comps = self.criterion(pred, y_tgt, return_components=True)  # type: ignore[arg-type]
+            B, K, S = y_tgt.shape
+            return comps["total"], comps, B * K * S
+
+        B, Hmax, S = y_tgt.shape
+        # Validation always uses the full horizon; training follows the curriculum.
+        K = self._current_horizon(epoch) if is_train else self.rollout_horizon
+        K = min(K, Hmax)
+        skip = min(self.rollout_skip, K - 1)  # always leave >= 1 scored step
+
+        h = y0
+        if is_train and self.rollout_noise_std > 0.0:
+            h = h + self.rollout_noise_std * torch.randn_like(h)
+
+        loss = h.new_zeros(())
+        w_sum = 0.0
+        n_scored = 0
+        comp_sums: Dict[str, torch.Tensor] = {}
+        for s in range(K):
+            dt_s = dt[:, s:s + 1]                            # [B,1]
+            if s < skip:
+                # Pushforward warm step: advance the state with no gradient.
+                with torch.no_grad():
+                    h = self.model(h, dt_s, g)[:, 0, :]
+                continue
+            pred = self.model(h, dt_s, g)[:, 0, :]           # [B,S]
+            w = self.rollout_gamma ** (s - skip)
+            step = self.criterion(pred.unsqueeze(1), y_tgt[:, s, :].unsqueeze(1),  # type: ignore[arg-type]
+                                  return_components=True)
+            loss = loss + w * step["total"]
+            w_sum += w
+            # Reported components stay UNWEIGHTED means over the scored window
+            # (the discount shapes the gradient, not the diagnostics). Every
+            # step contributes the same element count, so the mean of the
+            # per-step means is the mean over the window.
+            for k in ("phys", "z", "mean_abs_log10"):
+                comp_sums[k] = step[k] if k not in comp_sums else comp_sums[k] + step[k]
+            n_scored += 1
+            h = pred.detach() if self.rollout_detach else pred
+
+        # Normalize by the discount mass so the loss scale is curriculum-stable
+        # (the effective LR does not drift as K ramps).
+        loss = loss / max(w_sum, 1e-12)
+
+        inv_n = 1.0 / float(n_scored)
+        comps = {"total": loss}
+        comps.update({k: v * inv_n for k, v in comp_sums.items()})
+        return loss, comps, B * n_scored * S
+
     def train(self) -> float:
         self.model.to(self.device)
         self.model.train()
 
         self._maybe_resume()
+        self._maybe_init_from()
+
+        if self.ema_enabled:
+            # Build (or re-warm) the EMA shadow from current weights, on device,
+            # AFTER any resume / warm-start — production re-warms EMA at each
+            # stage start.
+            self.ema_shadow = {n: p.detach().clone() for n, p in self.model.named_parameters()}
 
         metrics_path = self.work_dir / "metrics.jsonl"
 
@@ -583,29 +860,25 @@ class Trainer:
             self.model.train()
             train_m = _EpochMeters()
 
+            # Rate this epoch actually trains with. The scheduler steps at the
+            # end of the epoch, so reading it after that would log the NEXT
+            # epoch's rate.
+            lr_now = float(self.optimizer.param_groups[0]["lr"])
+
             self.optimizer.zero_grad(set_to_none=True)
 
             for step, batch in enumerate(self.train_loader):
                 if self.max_train_steps_per_epoch and step >= self.max_train_steps_per_epoch:
                     break
 
-                y_i, dt_norm, y_j, g = batch
-                y_i = self._to_device(y_i)
-                dt_norm = self._to_device(dt_norm)
-                y_j = self._to_device(y_j)
-                g = self._to_device(g)
-
                 with self._autocast_ctx():
-                    pred = self.model(y_i, dt_norm, g)
-                    comps = self.criterion(pred, y_j, return_components=True)  # type: ignore[arg-type]
-                    loss = comps["total"]
+                    loss, comps, weight = self._forward_loss(batch, is_train=True, epoch=epoch)
 
                 if not torch.isfinite(loss):
                     raise ValueError("Non-finite train loss")
 
                 # Metrics weight = number of scalar elements
-                B, K, S = y_j.shape
-                train_m.update(comps, weight=B * K * S)
+                train_m.update(comps, weight=weight)
 
                 if self.scaler is not None:
                     self.scaler.scale(loss).backward()
@@ -625,6 +898,7 @@ class Trainer:
                     self.optimizer.step()
 
                 self.optimizer.zero_grad(set_to_none=True)
+                self._ema_update()
                 self.global_step += 1
 
             if self.scheduler is not None:
@@ -639,6 +913,10 @@ class Trainer:
             val_loss = float("nan")
 
             if self.val_loader is not None:
+                # Validate on the EMA weights when enabled — those are the
+                # selected + exported weights, so selection must see them.
+                if self.ema_enabled:
+                    self._swap_to_ema()
                 self.model.eval()
                 val_m = _EpochMeters()
                 with torch.no_grad():
@@ -646,28 +924,22 @@ class Trainer:
                         if self.max_val_batches and bidx >= self.max_val_batches:
                             break
 
-                        y_i, dt_norm, y_j, g = batch
-                        y_i = self._to_device(y_i)
-                        dt_norm = self._to_device(dt_norm)
-                        y_j = self._to_device(y_j)
-                        g = self._to_device(g)
-
                         with self._autocast_ctx():
-                            pred = self.model(y_i, dt_norm, g)
-                            comps = self.criterion(pred, y_j, return_components=True)  # type: ignore[arg-type]
-                            loss = comps["total"]
+                            loss, comps, weight = self._forward_loss(batch, is_train=False, epoch=epoch)
 
                         if not torch.isfinite(loss):
                             raise ValueError("Non-finite val loss")
 
-                        B, K, S = y_j.shape
-                        val_m.update(comps, weight=B * K * S)
+                        val_m.update(comps, weight=weight)
+                if self.ema_enabled:
+                    self._restore_raw()
 
                 val_means = val_m.means()
                 val_mult = _mult_err_proxy(val_means["mean_abs_log10"])
                 val_loss = float(val_means["loss"])
 
-                # Track best
+                # Track best. best.ckpt stores the EMA (deployable) weights when
+                # EMA is on; last.ckpt below always stores the raw weights.
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     _save_checkpoint(
@@ -680,6 +952,7 @@ class Trainer:
                         global_step=self.global_step,
                         best_val_loss=self.best_val_loss,
                         cfg=self.cfg,
+                        model_state=self._ema_state_dict() if self.ema_enabled else None,
                     )
 
             # Always persist last.ckpt every epoch so explicit resume never depends on cadence.
@@ -708,7 +981,6 @@ class Trainer:
                 )
 
             # Log to console
-            lr_now = float(self.optimizer.param_groups[0]["lr"])
             if val_means is None:
                 self.log.info(
                     "Epoch %d/%d lr=%.3e train_loss=%.6g train_phys=%.6g train_z=%.6g train_mult=%.6g",

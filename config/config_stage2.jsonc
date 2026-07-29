@@ -1,0 +1,173 @@
+{
+  // ============================================================================
+  // PRODUCTION STAGE 2 — autoregressive (rollout) fine-tune.
+  // ============================================================================
+  // Warm-starts from config_stage1.jsonc's best.ckpt (EMA weights) and fine-tunes
+  // the SAME latent-linear model as a consecutive-step stepper at lr/10. This is
+  // the campaign-validated AR recipe (../EXPERIMENTS.md "Best training recipe";
+  // raw evidence in notes.md):
+  //   - horizon K=10 (E3: inverted-U; K=1 underfits, K=20 unstable), reached by a
+  //     curriculum ramping 1→10 over 30 epochs (staged-horizon, GraphCast/Stormer),
+  //   - DETACHED states between steps with per-step discount γ=0.9 (E3: under
+  //     detach, γ<1 is REQUIRED — uniform was 4–14× worse; detach ≈ BPTT but
+  //     cheaper memory at this scale),
+  //   - 2 pushforward warm steps (Brandstetter),
+  //   - input noise OFF (E6: GNS-style noise REJECTED — 4/4 worse, 3/4
+  //     catastrophic 12–14 dex),
+  //   - lr = stage-1 peak / 10, held ~constant (E5).
+  // Run config_stage1.jsonc to completion BEFORE launching this.
+  "paths": {
+    "processed_data_dir": "data/processed",
+    "raw_data_files": ["data/raw/run10018-result.h5"],
+    "work_dir": "models/prod_stage2",
+    "overwrite": false
+  },
+
+  "system": {
+    "cudnn_benchmark": true,
+    "deterministic": false,
+    "omp_num_threads": 4,
+    "seed": 42
+  },
+
+  "precision": {
+    "amp": "off",
+    "dataset_dtype": "float32",
+    "io_dtype": "float32",
+    "time_io_dtype": "float32",
+    "normalize_dtype": "float32",
+    "tf32": true
+  },
+
+  "data": {
+    "global_variables": ["P", "T"],
+    "time_variable": "t_time",
+    "species_variables": ["C2H2_evolution",
+                          "CH4_evolution",
+                          "CO2_evolution",
+                          "CO_evolution",
+                          "H2O_evolution",
+                          "H2_evolution",
+                          "HCN_evolution",
+                          "H_evolution",
+                          "N2_evolution",
+                          "NH3_evolution",
+                          "OH_evolution",
+                          "O_evolution"]
+  },
+
+  "normalization": {
+    "default_method": "log-standard",
+    "epsilon": 1e-30,
+    "methods": {
+      "P": "log-min-max",
+      "T": "standard",
+      "t_time": "min-max"
+    },
+    "min_std": 1e-10
+  },
+
+  "preprocessing": {
+    "hdf5_chunk_size": 0,
+    "min_value_threshold": 1e-30,
+    "npz_compressed": false,
+    "trajectories_per_shard": 65536,
+    "skip_first_timestep": false,
+    "overwrite_data": false,
+    // Reuse the shards stage 1 built.
+    "reuse_existing_data": true
+  },
+
+  "dataset": {
+    // Rollout regime manages sampling; the next three are inert but required.
+    // use_first_anchor MUST be false (consecutive rollout needs random anchors).
+    // Rollout unrolls up to K=10 → ~K× activation vs one-step; halve batch if OOM.
+    "batch_size_train": 2048,
+    "multi_time_per_anchor": false,
+    "times_per_anchor": 1,
+    "use_first_anchor": false,
+    "num_workers": 8,
+    "persistent_workers": true,
+    "pin_memory": true,
+    "prefetch_factor": 4,
+    "preload_to_gpu": false
+  },
+
+  "model": {
+    // ---- MUST be byte-identical to config_stage1.jsonc (warm-start strict-load) ----
+    "architecture": "latent_linear",
+    "latent_dim": 512,
+    "encoder_hidden": [4096, 4096, 4096],
+    "decoder_mode": "mlp",
+    "decoder_hidden": [4096, 4096, 4096],
+    "rate_clamp": 3.0,
+    "rate_init": [-5.0, 5.0],
+    "init_seed": 0,
+    "activation": "silu",
+    "dropout": 0.0,
+    "predict_delta": true,
+    "predict_delta_log_phys": false,
+    "softmax_head": false
+  },
+
+  "training": {
+    "epochs": 200,
+    "gradient_clip": 1.0,
+    "optimizer": "adamw",
+
+    "torch_compile": false,
+    "torch_compile_backend": "inductor",
+    "torch_compile_mode": "max-autotune",
+    "compile_dynamic": false,
+    "compile_fullgraph": true,
+
+    // lr = stage-1 peak / 10, held constant (warmup_epochs=0 + min_lr=lr → flat;
+    // the AR fine-tune is NOT re-warmed — E5).
+    "lr": 3e-5,
+    "min_lr": 3e-5,
+    "warmup_epochs": 0,
+    "warmup_start_factor": 0.1,
+    "weight_decay": 1e-4,
+
+    "max_train_steps_per_epoch": 0,
+    "max_val_batches": 0,
+    "resume": null,
+    // WARM-START (weights only, fresh optimizer/schedule) from stage-1 best.ckpt.
+    "init_from": "models/prod_stage1/best.ckpt",
+
+    "use_fraction": 1.0,
+    "val_fraction": 0.1,
+    "test_fraction": 0.1,
+    // Inert in rollout mode (steps are consecutive); pairs_per_traj = random
+    // anchors sampled per trajectory per epoch.
+    "min_steps": 1,
+    "max_steps": 1,
+    "pairs_per_traj": 8,
+
+    // ---- Autoregressive (rollout) training regime ----
+    "rollout": {
+      "enabled": true,
+      "horizon": 10,
+      "detach_intermediate": true,
+      "discount_gamma": 0.9,
+      "pushforward_skip": 2,
+      "input_noise_std": 0.0,
+      "curriculum_start": 1,
+      "curriculum_ramp_epochs": 30
+    },
+
+    "ema": {
+      "enabled": true,
+      "decay": 0.999
+    },
+
+    "adaptive_stiff_loss": {
+      "lambda_phys": 1.0,
+      "lambda_z": 0.0,
+      "use_weighting": false,
+      "weight_power": 0.5,
+      "w_min": 0.5,
+      "w_max": 2.0
+    }
+  }
+}

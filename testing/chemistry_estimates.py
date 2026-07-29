@@ -34,7 +34,7 @@ except Exception:
 REPO = Path(__file__).resolve().parent.parent
 STYLE_PATH = Path(__file__).with_name("science.mplstyle")
 MODEL_DIR = Path(
-    os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_version"))
+    os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_model"))
 ).expanduser().resolve()
 
 CONFIG_PATH = MODEL_DIR / "config.json"

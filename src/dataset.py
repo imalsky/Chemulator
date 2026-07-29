@@ -15,6 +15,13 @@ This dataset returns training pairs in *z-space*:
   - g:       [G]
 
 Sampling contract:
+  - `pairs_per_traj` counts ANCHORS per trajectory, not pairs. One dataset item
+    is one anchor and emits `dataset.times_per_anchor` targets, so a trajectory
+    contributes pairs_per_traj * times_per_anchor pairs per epoch.
+  - With `dataset.use_first_anchor`, the FIRST of the pairs_per_traj items for a
+    trajectory is pinned to t0 and the remaining anchors are drawn uniformly
+    over the grid. Offsets are drawn per anchor and clipped so the target index
+    stays on the grid; the anchor range does not depend on max_steps.
   - Pair sampling is stochastic per access using a worker-local RNG stream.
   - Each worker seeds that stream once from the DataLoader worker seed.
   - Sampling is not a pure deterministic function of (epoch, idx).
@@ -39,6 +46,20 @@ from src.normalizer import NormalizationHelper
 
 # PyTorch RNG seeds are 32-bit unsigned integers.
 _RNG_MODULUS = 2**32
+
+# Normalized dt can miss [0, 1] by a float ULP at the endpoints: the manifest dt
+# bounds are derived from the float32 time grid, so the grid increment that IS
+# the bound normalizes to a few 1e-8 outside it once the log is taken in
+# float64. Only excursions of that size are absorbed; anything larger is real
+# extrapolation and must still fail validation.
+_DT_NORM_EDGE_TOL = 1e-6
+
+
+def _snap_dt_norm_edges(dt_norm: torch.Tensor) -> torch.Tensor:
+    """Snap sub-tolerance excursions at the normalized-dt bounds onto [0, 1]."""
+    below = (dt_norm < 0.0) & (dt_norm >= -_DT_NORM_EDGE_TOL)
+    above = (dt_norm > 1.0) & (dt_norm <= 1.0 + _DT_NORM_EDGE_TOL)
+    return dt_norm.masked_fill(below, 0.0).masked_fill(above, 1.0)
 
 
 def _seed_worker(worker_id: int) -> None:
@@ -169,10 +190,36 @@ class FlowMapPairsDataset(torch.utils.data.Dataset):
 
         self.max_steps = int(max_steps_global)
 
-        # Anchors are restricted so that all offsets up to max_steps are valid.
-        self.max_anchor = self.T - 1 - self.max_steps
+        # Anchor range is independent of max_steps. Anchors run over the whole
+        # grid (any i that admits at least min_steps of room) and the offset is
+        # clipped per anchor in __getitem__ so that j = i + offset stays on the
+        # grid. Deriving max_anchor from max_steps instead would collapse every
+        # anchor onto t0 whenever max_steps = T-1, which is the usual setting.
+        self.max_anchor = self.T - 1 - self.min_steps
         if self.max_anchor < 0:
             raise ValueError("Time grid too short")
+
+        # Rollout (autoregressive) training mode: opt-in via training.rollout.
+        # In this mode a sample is a random anchor plus H CONSECUTIVE grid steps
+        # (anchor -> anchor+1 -> ... -> anchor+H); the trainer feeds the model's
+        # own prediction forward. This trains the deployment stepper directly
+        # (vs the default one-step-from-anchor flow map). Every anchor must be
+        # random, so dataset.use_first_anchor must be false.
+        rollout_cfg = (self.cfg.get("training", {}) or {}).get("rollout", {}) or {}
+        self.rollout_enabled = bool(rollout_cfg.get("enabled", False))
+        self.rollout_horizon = 1
+        if self.rollout_enabled:
+            self.rollout_horizon = int(rollout_cfg.get("horizon", 0))
+            if self.rollout_horizon < 1:
+                raise ValueError("training.rollout.horizon must be >= 1")
+            if self.use_first_anchor:
+                raise ValueError(
+                    "training.rollout.enabled=true requires dataset.use_first_anchor=false "
+                    "(consecutive rollout training samples random anchors over the grid)"
+                )
+            self.rollout_max_anchor = self.T - 1 - self.rollout_horizon
+            if self.rollout_max_anchor < 0:
+                raise ValueError("Time grid too short for training.rollout.horizon")
 
         # Second pass: preallocate and fill (avoids list + concatenate peak memory).
         y_phys = torch.empty(self.n_traj, self.T, self.S, dtype=self.normalize_dtype)
@@ -198,45 +245,70 @@ class FlowMapPairsDataset(torch.utils.data.Dataset):
         # y_phys/g_phys are large staging tensors; free them before dt-table work.
         del y_phys, g_phys
 
-        # Shared time grid and a compact Δt table.
+        # Shared time grid and the Δt table.
         #
-        # We only ever sample anchors i in [0, max_anchor] and offsets in
-        # [min_steps, max_steps]. Precompute exactly that band:
-        #   dt_table[i, off] = normalized(t[i + (min_steps + off)] - t[i])
         # Compute dt normalization in float64 to avoid spurious out-of-range
         # failures from float32 roundoff at interval endpoints.
         t_torch = torch.from_numpy(t_ref).to(torch.float64)
 
-        anchor_idx = torch.arange(0, self.max_anchor + 1, dtype=torch.long)
-        offsets = torch.arange(self.min_steps, self.max_steps + 1, dtype=torch.long)
-        j_idx = anchor_idx[:, None] + offsets[None, :]
+        # Consecutive-step Δt vector for rollout training: dt_consec[k] =
+        # normalized(t[k+1] - t[k]) for k in [0, T-2]. Computed in float64 and
+        # clamped to [0,1] — the smallest grid increment sits at (or, by a float
+        # ULP, just below) the manifest dt lower bound, which is a pure
+        # boundary-roundoff, not real extrapolation. Always built (cheap); only
+        # used when training.rollout.enabled.
+        dt_consec_phys = t_torch[1:] - t_torch[:-1]
+        dt_consec_f64 = self.norm.normalize_dt_from_phys(dt_consec_phys).clamp_(0.0, 1.0)
+        dt_consec = dt_consec_f64.to(self.dtype)  # [T-1]
 
-        dt_phys = t_torch[j_idx] - t_torch[anchor_idx[:, None]]  # [A, O]
-        dt_norm_f64 = self.norm.normalize_dt_from_phys(dt_phys)
-        try:
-            self.norm.validate_dt_norm(dt_norm_f64)
-        except ValueError as e:
-            t_min = float(np.min(t_ref))
-            t_max = float(np.max(t_ref))
-            dt_min = float(dt_phys.min())
-            dt_max = float(dt_phys.max())
-            raise ValueError(
-                f"{e} [split={self.split} t_dtype={t_ref.dtype} T={int(t_ref.shape[0])} "
-                f"t_range=[{t_min:.6g}, {t_max:.6g}] dt_phys_range=[{dt_min:.6g}, {dt_max:.6g}] "
-                f"min_steps={self.min_steps} max_steps={self.max_steps}]"
-            ) from e
-        dt_norm = dt_norm_f64.to(self.dtype)
+        # One-step table dt_table[i, j] = normalized(t[j] - t[i]) for the default
+        # one-step-from-anchor sampling. Anchors and offsets are drawn
+        # independently (the offset is clipped per anchor), so the reachable set
+        # is the whole upper triangle j > i and a band table is not enough. The
+        # table is [T, T], the same O(T^2) as the widest band. Entries with
+        # j <= i are never sampled; they are filled with the manifest dt lower
+        # bound so the log10 stays defined, then zeroed. Skipped entirely in
+        # rollout mode (the rollout sampler uses dt_consec, not this table).
+        dt_norm = None
+        if not self.rollout_enabled:
+            unreachable = torch.ones((self.T, self.T), dtype=torch.bool).tril()  # j <= i
+            dt_phys = t_torch[None, :] - t_torch[:, None]  # [T, T], dt_phys[i,j] = t[j]-t[i]
+            dt_min_phys = 10.0 ** float(self.norm.dt_spec.log_min)
+            dt_phys = torch.where(unreachable, torch.full_like(dt_phys, dt_min_phys), dt_phys)
+
+            # Same boundary-roundoff treatment as the consecutive-step vector
+            # above: the smallest grid increment sits one float32 ULP below the
+            # manifest bound, which is rounding, not extrapolation.
+            dt_norm_f64 = _snap_dt_norm_edges(self.norm.normalize_dt_from_phys(dt_phys))
+            dt_norm_f64.masked_fill_(unreachable, 0.0)
+            try:
+                self.norm.validate_dt_norm(dt_norm_f64)
+            except ValueError as e:
+                reachable = ~unreachable
+                t_min = float(np.min(t_ref))
+                t_max = float(np.max(t_ref))
+                dt_min = float(dt_phys[reachable].min())
+                dt_max = float(dt_phys[reachable].max())
+                raise ValueError(
+                    f"{e} [split={self.split} t_dtype={t_ref.dtype} T={int(t_ref.shape[0])} "
+                    f"t_range=[{t_min:.6g}, {t_max:.6g}] dt_phys_range=[{dt_min:.6g}, {dt_max:.6g}] "
+                    f"min_steps={self.min_steps} max_steps={self.max_steps}]"
+                ) from e
+            dt_norm = dt_norm_f64.to(self.dtype)
 
         # Keep only what we need.
         self.y = y_z
         self.g = g_z
-        self.dt_table = dt_norm  # [A, O]
+        self.dt_table = dt_norm  # [T, T] or None in rollout mode
+        self.dt_consec = dt_consec  # [T-1]
 
         # Optionally move all tensors to GPU (requires num_workers=0 in DataLoader).
         if self.preload_to_gpu:
             self.y = self.y.to(self.device, non_blocking=False)
             self.g = self.g.to(self.device, non_blocking=False)
-            self.dt_table = self.dt_table.to(self.device, non_blocking=False)
+            if self.dt_table is not None:
+                self.dt_table = self.dt_table.to(self.device, non_blocking=False)
+            self.dt_consec = self.dt_consec.to(self.device, non_blocking=False)
 
         self.logger.info(
             "Loaded %s split: N=%d T=%d S=%d G=%d dtype=%s",
@@ -275,21 +347,32 @@ class FlowMapPairsDataset(torch.utils.data.Dataset):
         return self.n_traj * self.pairs_per_traj
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.rollout_enabled:
+            return self._getitem_rollout(idx)
+
         self._ensure_worker_rng_seeded()
 
-        # Map index to trajectory.
+        # Map index to trajectory. The pairs_per_traj items of a trajectory are
+        # the consecutive indices [traj * pairs_per_traj, (traj+1) * pairs_per_traj).
         traj = int(idx) // self.pairs_per_traj
+        item = int(idx) % self.pairs_per_traj
 
-        # Anchor selection.
-        if self.use_first_anchor:
+        # Anchor selection: with use_first_anchor, the first of the
+        # pairs_per_traj items for this trajectory is pinned to t0 and the rest
+        # are uniform over [0, max_anchor]. Every epoch therefore sees each
+        # trajectory once from t0 and pairs_per_traj-1 times from a random state.
+        if self.use_first_anchor and item == 0:
             i = 0
         else:
             i = int(torch.randint(low=0, high=self.max_anchor + 1, size=(1,), generator=self._gen).item())
 
-        # Offsets.
+        # Offsets, clipped to the room left after the anchor so that
+        # j = i + offset stays on the grid. i <= T-1-min_steps guarantees
+        # max_off >= min_steps.
         K = self.times_per_anchor if self.multi_time_per_anchor else 1
+        max_off = min(self.max_steps, self.T - 1 - i)
 
-        offsets = torch.randint(low=self.min_steps, high=self.max_steps + 1, size=(K,), generator=self._gen)
+        offsets = torch.randint(low=self.min_steps, high=max_off + 1, size=(K,), generator=self._gen)
         j = i + offsets
 
         dev = self.device if self.preload_to_gpu else torch.device("cpu")
@@ -299,10 +382,35 @@ class FlowMapPairsDataset(torch.utils.data.Dataset):
         y_j = self.y[traj, j_dev]  # [K,S]
         g = self.g[traj]  # [G]
 
-        # dt_norm from precomputed band table indexed by (anchor_i, offset)
-        dt_norm = self.dt_table[i, offsets.to(dtype=torch.long, device=dev) - self.min_steps]  # [K]
+        # dt_norm from the precomputed table indexed by (anchor_i, target_j)
+        dt_norm = self.dt_table[i, j_dev]  # [K]
 
         return y_i, dt_norm, y_j, g
+
+    def _getitem_rollout(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Rollout sample: random anchor + H consecutive grid steps.
+
+        Returns (y_anchor [S], dt_steps [H], y_targets [H, S], g [G]) where
+        dt_steps[s] is the normalized Δt from step (anchor+s) to (anchor+s+1) and
+        y_targets[s] is the true state at (anchor+s+1). The trainer unrolls these
+        H steps, feeding the model's own prediction forward (optionally detached,
+        optionally with input noise). Shapes mirror the one-step contract
+        (K -> H), but the SEMANTICS differ: these are consecutive, fed-forward
+        steps, not K independent targets from one anchor.
+        """
+        self._ensure_worker_rng_seeded()
+        traj = int(idx) // self.pairs_per_traj
+        H = self.rollout_horizon
+        a = int(torch.randint(low=0, high=self.rollout_max_anchor + 1, size=(1,), generator=self._gen).item())
+
+        dev = self.device if self.preload_to_gpu else torch.device("cpu")
+        tgt_idx = torch.arange(a + 1, a + H + 1, dtype=torch.long, device=dev)
+
+        y_anchor = self.y[traj, a]            # [S]
+        y_targets = self.y[traj, tgt_idx]     # [H, S]
+        dt_steps = self.dt_consec[a:a + H]    # [H]
+        g = self.g[traj]                      # [G]
+        return y_anchor, dt_steps, y_targets, g
 
 
 # -----------------------------------------------------------------------------

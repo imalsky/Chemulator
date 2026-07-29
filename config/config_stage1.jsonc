@@ -1,0 +1,161 @@
+{
+  // ============================================================================
+  // PRODUCTION STAGE 1 — one-jump pretrain (the default config).
+  // ============================================================================
+  // The campaign-validated recipe is TWO-STAGE (../EXPERIMENTS.md "Best training
+  // recipe"; E5: staged beat from-scratch on the deployment metric, 0.256 vs
+  // 0.379). This is stage 1: train the latent-linear flow map as a one-step
+  // map y(t+dt)=Φ(y,g,dt) over the full dt range. Stage 2 (config_stage2.jsonc)
+  // then warm-starts from this run's best.ckpt and fine-tunes autoregressively
+  // at lr/10. Run stage 1 to completion FIRST, then stage 2.
+  //
+  // Model: latent-linear "base"/F3 (F3: sweeps a matched MLP; L1: state-dependent
+  // rates AND equilibrium are both load-bearing — fixed/global is 8.5x worse).
+  // fp32 (amp="off") + TF32 matmuls on GH200, per request.
+  "paths": {
+    "processed_data_dir": "data/processed",
+    "raw_data_files": ["data/raw/run10018-result.h5"],
+    "work_dir": "models/prod_stage1",
+    "overwrite": false
+  },
+
+  "system": {
+    "cudnn_benchmark": true,
+    "deterministic": false,
+    "omp_num_threads": 4,
+    "seed": 42
+  },
+
+  "precision": {
+    // fp32. tf32=true → GH200 matmuls use TF32 tensor cores (fp32 storage).
+    // The latent-linear 10^(·)→exp(−k·dt) relaxation runs in fp32 internally
+    // regardless of this policy.
+    "amp": "off",
+    "dataset_dtype": "float32",
+    "io_dtype": "float32",
+    "time_io_dtype": "float32",
+    "normalize_dtype": "float32",
+    "tf32": true
+  },
+
+  "data": {
+    "global_variables": ["P", "T"],
+    "time_variable": "t_time",
+    "species_variables": ["C2H2_evolution",
+                          "CH4_evolution",
+                          "CO2_evolution",
+                          "CO_evolution",
+                          "H2O_evolution",
+                          "H2_evolution",
+                          "HCN_evolution",
+                          "H_evolution",
+                          "N2_evolution",
+                          "NH3_evolution",
+                          "OH_evolution",
+                          "O_evolution"]
+  },
+
+  "normalization": {
+    "default_method": "log-standard",
+    "epsilon": 1e-30,
+    "methods": {
+      "P": "log-min-max",
+      "T": "standard",
+      "t_time": "min-max"
+    },
+    "min_std": 1e-10
+  },
+
+  "preprocessing": {
+    "hdf5_chunk_size": 0,
+    "min_value_threshold": 1e-30,
+    "npz_compressed": false,
+    "trajectories_per_shard": 65536,
+    "skip_first_timestep": false,
+    "overwrite_data": false,
+    // Preprocess once; stage 2 reuses the same processed shards.
+    "reuse_existing_data": true
+  },
+
+  "dataset": {
+    // batch <= 2048 (paper: >2048 degraded generalization; 8192 plateaued).
+    "batch_size_train": 2048,
+    // One-jump pretrain: sample K targets from t0 over the dt range (single
+    // dt-conditioned model — E2: per-dt-band specialists collapse at fixed dt).
+    "multi_time_per_anchor": true,
+    "times_per_anchor": 2,
+    "use_first_anchor": true,
+    "num_workers": 8,
+    "persistent_workers": true,
+    "pin_memory": true,
+    "prefetch_factor": 4,
+    "preload_to_gpu": false
+  },
+
+  "model": {
+    // ---- MUST be byte-identical to config_stage2.jsonc (warm-start strict-load) ----
+    "architecture": "latent_linear",
+    "latent_dim": 512,
+    "encoder_hidden": [4096, 4096, 4096],
+    "decoder_mode": "mlp",
+    "decoder_hidden": [4096, 4096, 4096],
+    "rate_clamp": 3.0,
+    "rate_init": [-5.0, 5.0],
+    "init_seed": 0,
+    "activation": "silu",
+    "dropout": 0.0,
+    "predict_delta": true,
+    "predict_delta_log_phys": false,
+    "softmax_head": false
+  },
+
+  "training": {
+    "epochs": 400,
+    "gradient_clip": 1.0,
+    "optimizer": "adamw",
+
+    "torch_compile": false,
+    "torch_compile_backend": "inductor",
+    "torch_compile_mode": "max-autotune",
+    "compile_dynamic": false,
+    "compile_fullgraph": true,
+
+    // Stage-1 peak LR 3e-4; warmup then cosine decay.
+    "lr": 3e-4,
+    "min_lr": 5e-7,
+    "warmup_epochs": 30,
+    "warmup_start_factor": 0.1,
+    "weight_decay": 1e-4,
+
+    "max_train_steps_per_epoch": 0,
+    "max_val_batches": 0,
+    // Crash-resume (full run state). Leave null; stage 2 uses `init_from`, not this.
+    "resume": null,
+    // No warm-start for stage 1 (trains from random init).
+    "init_from": null,
+
+    "use_fraction": 1.0,
+    "val_fraction": 0.1,
+    "test_fraction": 0.1,
+    "min_steps": 1,
+    "max_steps": 99,
+    "pairs_per_traj": 4,
+
+    // EMA: best.ckpt holds EMA weights (which stage 2 warm-starts from and which
+    // get exported). ACE: ~+15% long-rollout. Softest-evidence ingredient.
+    "ema": {
+      "enabled": true,
+      "decay": 0.9995
+    },
+
+    "adaptive_stiff_loss": {
+      "lambda_phys": 1.0,
+      // pure log10-MAE (L3: the MSE-z term is inert).
+      "lambda_z": 0.0,
+      "use_weighting": false,
+      "weight_power": 0.5,
+      "w_min": 0.5,
+      "w_max": 2.0
+    }
+  }
+}

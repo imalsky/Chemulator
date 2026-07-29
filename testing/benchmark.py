@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -25,12 +26,13 @@ import torch
 REPO = Path(__file__).resolve().parent.parent
 STYLE_PATH = Path(__file__).with_name("science.mplstyle")
 MODEL_DIR = Path(
-    os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_version"))
+    os.getenv("CHEMULATOR_MODEL_DIR", str(REPO / "models" / "final_model"))
 ).expanduser().resolve()
 
 CPU_MODEL = MODEL_DIR / "physical_model_k1_cpu.pt2"
 GPU_MODEL = MODEL_DIR / "physical_model_k1_gpu.pt2"  # optional
 META_PATH = MODEL_DIR / "physical_model_metadata.json"
+REPORT_PATH = MODEL_DIR / "reports" / "bench_throughput_k1.json"
 
 WARMUP_STEPS = 10
 MEASURE_STEPS = 200
@@ -39,7 +41,24 @@ EXPORT_MAX_BATCH = 4096
 MAX_BATCH_CPU = EXPORT_MAX_BATCH
 MAX_BATCH_GPU = EXPORT_MAX_BATCH
 
-VULCAN_BASELINE_Y = 100.0
+# Override the CPU thread count; a throughput curve is uninterpretable without
+# it, so the value actually used is written to the legend and to the report.
+THREADS_ENV = "BENCH_THREADS"
+
+# Assumed throughput of a 0-D VULCAN chemistry update on a single CPU core,
+# in updates per second. THIS IS AN ASSUMPTION, NOT A MEASUREMENT: no VULCAN
+# timing was performed for this work and no VULCAN benchmark exists anywhere in
+# this repository. It is drawn only as an order-of-magnitude reference level.
+# Any speedup read off the figure inherits the assumption, so replace this with
+# a measured or citable rate before quoting a speedup factor.
+VULCAN_ASSUMED_SPS = 100.0
+VULCAN_ASSUMED_LABEL = "VULCAN, CPU (assumed, not measured)"
+VULCAN_ASSUMED_WARNING = (
+    f"Warning: the reference line at {VULCAN_ASSUMED_SPS:g} samples/s is an ASSUMED VULCAN "
+    "rate, not a measurement. No VULCAN timing exists in this repository, so any "
+    "speedup read off this plot rests on that assumption."
+)
+
 YMIN, YMAX = 10.0, 1.0e7
 
 
@@ -66,6 +85,21 @@ def _p2_batches(max_cap: int) -> List[int]:
 def _sync(dev: str) -> None:
     if dev.startswith("cuda"):
         torch.cuda.synchronize()
+
+
+def _configure_threads() -> int:
+    """Apply the BENCH_THREADS override, if any, and return the thread count."""
+    raw = os.getenv(THREADS_ENV)
+    if raw:
+        n = int(raw)
+        if n < 1:
+            raise ValueError(f"{THREADS_ENV} must be >= 1")
+        torch.set_num_threads(n)
+    return int(torch.get_num_threads())
+
+
+def _cpu_label(threads: int) -> str:
+    return f"CPU ({threads} thread{'s' if threads != 1 else ''})"
 
 
 def _make_inputs(
@@ -164,9 +198,49 @@ def _autoset_log_xlim(ax, curves: List[Tuple[str, List[int], List[float]]]) -> N
     ax.set_xlim(max(min(xs) / pad, 1e-6), max(xs) * pad)
 
 
+def _write_report(*, out_path: Path, curves: List[Tuple[str, List[int], List[float]]], threads: int) -> None:
+    """Record the numbers behind the plot, with enough host detail to read them."""
+    payload: Dict[str, Any] = {
+        "host": {
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "torch_num_threads": threads,
+            "torch_num_interop_threads": int(torch.get_num_interop_threads()),
+            "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        },
+        "settings": {
+            "warmup_steps": WARMUP_STEPS,
+            "measure_steps": MEASURE_STEPS,
+            "max_batch": EXPORT_MAX_BATCH,
+        },
+        "vulcan_reference": {
+            "samples_per_second": VULCAN_ASSUMED_SPS,
+            "measured": False,
+            "note": (
+                "Assumed single-core VULCAN rate. Not measured in this work and not "
+                "derived from any benchmark in this repository."
+            ),
+        },
+        "curves": [
+            {"label": label, "batch": [int(b) for b in bs], "throughput_sps": [float(t) for t in th]}
+            for label, bs, th in curves
+        ],
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     if not CPU_MODEL.is_file():
         raise FileNotFoundError(f"Missing CPU model artifact: {CPU_MODEL}")
+
+    threads = _configure_threads()
+    print(
+        f"- Host: {platform.platform()} machine={platform.machine()} torch={torch.__version__} "
+        f"torch_num_threads={threads} (override with {THREADS_ENV}=<n>)"
+    )
 
     meta = _load_json(META_PATH)
     species_order = list(meta["species_order"])
@@ -181,7 +255,7 @@ def main() -> int:
     png_out = MODEL_DIR / "plots" / "bench_throughput_k1.png"
 
     bs_cpu, thr_cpu = _bench_device(
-        label="CPU",
+        label=_cpu_label(threads),
         model_path=CPU_MODEL,
         device="cpu",
         dtype=torch.float32,
@@ -192,7 +266,7 @@ def main() -> int:
         max_batch=MAX_BATCH_CPU,
     )
     if thr_cpu:
-        curves.append(("CPU", bs_cpu, thr_cpu))
+        curves.append((_cpu_label(threads), bs_cpu, thr_cpu))
 
     if torch.cuda.is_available() and GPU_MODEL.is_file():
         bs_gpu, thr_gpu = _bench_device(
@@ -215,6 +289,8 @@ def main() -> int:
         print("No curves to plot.")
         return 0
 
+    _write_report(out_path=REPORT_PATH, curves=curves, threads=threads)
+
     try:
         plt.style.use(str(STYLE_PATH))
     except OSError:
@@ -223,7 +299,13 @@ def main() -> int:
     fig, ax = plt.subplots(figsize=(6, 6))
     for label, bs, th in curves:
         ax.plot(bs, th, marker="o", label=label)
-    ax.axhline(y=VULCAN_BASELINE_Y, linewidth=2, color="gray", linestyle="--", label="VULCAN, CPU")
+    ax.axhline(
+        y=VULCAN_ASSUMED_SPS,
+        linewidth=2,
+        color="gray",
+        linestyle="--",
+        label=VULCAN_ASSUMED_LABEL,
+    )
 
     ax.set_xlabel("Batch size (B)")
     ax.set_ylabel("Throughput (samples/second)")
@@ -240,6 +322,8 @@ def main() -> int:
     plt.close(fig)
 
     print(f"\nSaved plot: {png_out}")
+    print(f"Saved report: {REPORT_PATH}")
+    print(f"\n{VULCAN_ASSUMED_WARNING}")
     return 0
 
 

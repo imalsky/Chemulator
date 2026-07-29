@@ -7,6 +7,18 @@
 #PBS -W group_list=s2458
 #PBS -j oe
 # --- end PBS ---
+#
+# Usage
+# -----
+#   Production is a TWO-STAGE run. Submit stage 1 first; when it finishes, submit
+#   stage 2 (which warm-starts from stage-1 best.ckpt — see config_stage2.jsonc).
+#   Stage 1 (one-jump pretrain; also the default config):
+#       qsub -N chem_stage1 -v FLOWMAP_CONFIG=$PWD/config/config_stage1.jsonc run.pbs
+#   Stage 2 (autoregressive fine-tune; run AFTER stage 1 completes):
+#       qsub -N chem_stage2 -v FLOWMAP_CONFIG=$PWD/config/config_stage2.jsonc run.pbs
+#   (qsub does not forward the environment unless you pass -v; add CONDA_ENV via
+#    -v FLOWMAP_CONFIG=...,CONDA_ENV=pyt2_8_gh if your env is not the default.)
+# Each config writes to its own paths.work_dir, so A/B runs never collide.
 
 set -euo pipefail
 
@@ -23,10 +35,13 @@ fi
 
 cd -P "${PROJECT_ROOT:-${PBS_O_WORKDIR:?}}"
 ROOT="$(/bin/pwd -P)"
-FLOWMAP_CONFIG="${FLOWMAP_CONFIG:-$ROOT/config/config_job0.jsonc}"
+FLOWMAP_CONFIG="${FLOWMAP_CONFIG:-$ROOT/config/config_stage1.jsonc}"
 
 mkdir -p "$ROOT/logs"
-LOG="$ROOT/logs/${PBS_JOBNAME:-job}.${PBS_JOBID:-$$}.log"
+# Suffix the log with the config basename so concurrent A/B jobs (job0/job1/
+# job2) sharing a PBS job name still land in distinct log files.
+CFG_TAG="$(basename "${FLOWMAP_CONFIG%.jsonc}")"
+LOG="$ROOT/logs/${PBS_JOBNAME:-job}.${CFG_TAG}.${PBS_JOBID:-$$}.log"
 exec > >(stdbuf -oL -eL tee -a "$LOG") 2>&1
 
 echo "#####################################################"

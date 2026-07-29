@@ -15,7 +15,7 @@ from src.utils import resolve_precision_policy
 class ConfigContractsTests(unittest.TestCase):
     def test_default_config_path_is_repo_local(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent
-        self.assertEqual(DEFAULT_CONFIG_PATH, repo_root / "config" / "config_job0.jsonc")
+        self.assertEqual(DEFAULT_CONFIG_PATH, repo_root / "config" / "config_stage1.jsonc")
 
     def test_reject_deprecated_config_keys_fails_fast(self) -> None:
         cfg = {

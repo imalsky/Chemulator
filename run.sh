@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 cd "$ROOT"
 
 CONDA_ENV="${CONDA_ENV:-}"
-FLOWMAP_CONFIG="${FLOWMAP_CONFIG:-$ROOT/config/config_job0.jsonc}"
+FLOWMAP_CONFIG="${FLOWMAP_CONFIG:-$ROOT/config/config_stage1.jsonc}"
 
 if [ -n "$CONDA_ENV" ]; then
   CONDA_EXE="$(command -v conda || true)"

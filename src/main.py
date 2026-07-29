@@ -47,7 +47,7 @@ from src.preprocessor import DataPreprocessor
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config_job0.jsonc"
+DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "config_stage1.jsonc"
 
 # Number of hash bytes used to derive a 32-bit seed.
 _SEED_BYTES = 4
@@ -87,6 +87,14 @@ def reject_deprecated_config_keys(cfg: Dict[str, Any]) -> None:
         if k in ds:
             deprecated.append(("dataset", k))
 
+    # Precision is owned by cfg["precision"]; these Lightning-era system keys
+    # are read by nothing, so a config that sets them gets settings it did not
+    # ask for (e.g. system.tf32=true while precision.tf32 is false).
+    system_cfg = cfg.get("system", {})
+    for k in ("dtype", "io_dtype", "tf32"):
+        if k in system_cfg:
+            deprecated.append(("system", k))
+
     data_cfg = cfg.get("data", {})
     if "target_species" in data_cfg:
         deprecated.append(("data", "target_species"))
@@ -121,6 +129,55 @@ def reject_deprecated_config_keys(cfg: Dict[str, Any]) -> None:
     if deprecated:
         keys = ", ".join(f"{a}.{b}" for a, b in deprecated)
         raise KeyError(f"Unsupported config key(s): {keys}")
+
+
+def validate_rollout_config(cfg: Dict[str, Any]) -> None:
+    """Fail fast on a malformed training.rollout block (autoregressive mode).
+
+    When training.rollout.enabled is true, training switches from the default
+    one-step-from-t0 flow map to a consecutive-step stepper that unrolls H steps,
+    feeding the model's own prediction forward (z-space input noise + optional
+    detached pushforward). This validates the block up front, before
+    preprocessing; the dataset and trainer enforce the same constraints at their
+    consumption points (defense in depth). See local_ab/RESULTS_2step.md for the
+    sweep that selected this recipe.
+    """
+    rcfg = (cfg.get("training", {}) or {}).get("rollout")
+    if rcfg is None:
+        return
+    if not isinstance(rcfg, dict):
+        raise KeyError("training.rollout must be a mapping")
+    if "enabled" not in rcfg:
+        raise KeyError("Missing config: training.rollout.enabled")
+    if not bool(rcfg["enabled"]):
+        return
+
+    required = ("horizon", "detach_intermediate", "discount_gamma", "pushforward_skip",
+                "input_noise_std", "curriculum_start", "curriculum_ramp_epochs")
+    missing = [k for k in required if k not in rcfg]
+    if missing:
+        raise KeyError(f"Missing config: training.rollout.{missing}")
+
+    horizon = int(rcfg["horizon"])
+    if horizon < 1:
+        raise ValueError("training.rollout.horizon must be >= 1")
+    gamma = float(rcfg["discount_gamma"])
+    if not (0.0 < gamma <= 1.0):
+        raise ValueError("training.rollout.discount_gamma must be in (0, 1]")
+    if int(rcfg["pushforward_skip"]) < 0:
+        raise ValueError("training.rollout.pushforward_skip must be >= 0")
+    if float(rcfg["input_noise_std"]) < 0.0:
+        raise ValueError("training.rollout.input_noise_std must be >= 0")
+    cstart = int(rcfg["curriculum_start"])
+    if not (1 <= cstart <= horizon):
+        raise ValueError("training.rollout.curriculum_start must be in [1, horizon]")
+    if int(rcfg["curriculum_ramp_epochs"]) < 0:
+        raise ValueError("training.rollout.curriculum_ramp_epochs must be >= 0")
+    if bool(cfg.get("dataset", {}).get("use_first_anchor", False)):
+        raise ValueError(
+            "training.rollout.enabled=true requires dataset.use_first_anchor=false "
+            "(consecutive rollout training samples random anchors over the grid)"
+        )
 
 
 def _derive_seed(base_seed: int, tag: str) -> int:
@@ -601,6 +658,7 @@ def main() -> None:
     cfg_path = Path(cfg_path_str).expanduser().resolve()
     cfg = load_json_config(cfg_path)
     reject_deprecated_config_keys(cfg)
+    validate_rollout_config(cfg)
 
     # Validate required top-level sections and their keys.
     _required_sections: dict[str, tuple[str, ...]] = {
